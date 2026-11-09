@@ -359,6 +359,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
+| `src/sources/main-session.ts` | The built-in User Session Source: the configurable operator, the Policy part that admits it, and the scope; it has no polls, Channel or thread context |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
 | `src/sources/poll.ts` | What GitHub and Feishu polling share: `POLL_HORIZON_MS`, `polled`, `cursorAt`, and `pollThreads`, which keeps a failure on its Thread as `pollError` |
@@ -489,11 +490,11 @@ Nothing deletes old records yet, so these grow without bound: the `trigger`, `di
 
 ### Main Session tools
 
-The main Session has 14 application tools:
+The main Session has 15 application tools:
 
 | Purpose | Tools |
 | --- | --- |
-| Read and route | `orchestrator_read`, `orchestrator_route` |
+| Read, register and route | `orchestrator_read`, `orchestrator_user_trigger_create`, `orchestrator_route` |
 | Manage Tickets | `orchestrator_ticket_retry`, `orchestrator_ticket_request_status`, `orchestrator_ticket_note` |
 | Re-evaluate | `orchestrator_trigger_requeue` |
 | Assess proactive work | `orchestrator_eval`, `orchestrator_eval_read`, `orchestrator_eval_decide` |
@@ -501,6 +502,10 @@ The main Session has 14 application tools:
 | Configure | `orchestrator_settings_save`, `orchestrator_policy_sync`, `orchestrator_prompts_save` |
 
 `orchestrator_route` accepts 1–20 decisions in order. Each accept, attach, stop or ignore runs as a separate Engine command. It also permits ignoring an inferred candidate directly from its card. `orchestrator_ticket_note` sends a fact as context, not authority.
+
+`orchestrator_user_trigger_create` registers the current native user message as a `main-session` Trigger and returns its `trigger_id`; the tool reads the operator and the Source switch from the User Session Source, and refuses unless the Policy's allowed list contains that operator. The Trigger skips an assessment because the main Session routes it directly; the ticket's Mandate records `main-session` as its Source.
+
+The main Session is the only Session and is allowed to dispatch by default, but its role prompt makes it read-only by default: it must not edit files, run commands that write, or change another Session's directory. A write the person asks for directly needs their confirmation first; otherwise it goes to a full-tool Ticket. This is a prompt rule, not a tool or sandbox restriction: the router preset still has its shell, and the main Session's permission preset remains `danger-full-access`.
 
 Settings saves select `policy`, `eval`, `executor`, `pause`, or `source`; the last also names its Source id. A prompt save with `preview: true` composes text without saving.
 

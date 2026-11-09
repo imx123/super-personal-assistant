@@ -86,6 +86,9 @@ export class Engine {
 
   // The main Session
 
+  /** Register a direct user request for the main Session to route itself, without an assessment delivery. */
+  recordTriggerForRouting(trigger: Trigger): ReceiveResult { return this.repo.atomic(() => this.intake.receive(trigger, false)) }
+
   /** The candidate of the Eval that holds a Trigger, as its assessor sees it; undefined while no Eval holds it. */
   candidate(triggerId: string): Candidate | undefined { return this.evals.candidate(triggerId) }
   /**
@@ -267,7 +270,7 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

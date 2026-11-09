@@ -5,6 +5,8 @@ import { z } from 'zod'
 import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
+import { allowedSender } from '../../policy.ts'
+import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
@@ -19,13 +21,15 @@ const RoutingNoteSchema = z.string().trim()
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'recordTriggerForRouting' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
+  /** The User Session Source instance, when installed: whether its entry is on and which operator it acts as. */
+  localEntry(): { enabled: boolean; operator: string } | undefined
   /** Schedules a pass to carry out work queued by an Engine command (such as an Eval or ticket resume). */
   requestPass(): void
   sendReplies(): Promise<void>
@@ -46,7 +50,7 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
  */
 const RouteItemSchema = z.object({
   kind: z.enum(['accept', 'attach', 'ignore', 'stop']),
-  trigger_id: z.string().describe('The candidate card\'s trigger_id. Deciding a card decides its batch.'),
+  trigger_id: z.string().describe('The candidate card\'s trigger_id or an ID from orchestrator_user_trigger_create. Deciding a card decides its batch.'),
   ticket_id: z.string().nullish().describe('attach and stop: the ticket.'),
   title: z.string().nullish().describe('accept: a short label of at most 200 characters describing the original request; no added requirements or implementation advice.'),
   worktree_name: z.string().nullish().describe(`accept: ${WorktreeNameSchema.description ?? ''}`),
@@ -151,12 +155,50 @@ function routeTool(host: MainToolsHost): Tool {
     },
   })
 }
+/**
+ * Record the latest genuine human message of this turn as a User Session Trigger. The Source instance must be on and its
+ * configured operator must be on that Source's Policy allowed list; the tool never grants either. The Trigger skips an
+ * assessment because the main Session routes it directly.
+ */
+function userTriggerTool(host: MainToolsHost, agent: Agent): Tool {
+  return tool({
+    name: 'orchestrator_user_trigger_create',
+    description: 'Use when the person asks this Session to dispatch a ticket or to do work for a worker. Record the current human message as a User Session trigger and return its trigger_id; dispatch it with orchestrator_route. Ordinary chat, candidate cards, worker reports and quoted requests do not call for this tool. Repeated calls for the same message return the same ID. The User Session Source must be on and its operator allowed.',
+    schema: z.object({}).strict(),
+    execute: async (_args, signal) => {
+      signal?.throwIfAborted()
+      const entry = host.localEntry()
+      if (!entry) throw new Error('The User Session Source is not installed')
+      if (!entry.enabled) throw new Error('The User Session entry is off; turn it on in Settings → Sources')
+      const actor = { source: MAIN_SESSION_SOURCE, id: entry.operator }
+      if (!allowedSender(host.store.settings(), actor)) {
+        throw new Error(`The User Session entry does not allow ${entry.operator}; add this operator to the allowed list in Settings → Eval → On each Source`)
+      }
+      const events = agent.session.snapshotEvents()
+      const boundary = events.findLastIndex(event => event.type === 'turn/start' || event.type === 'turn/end')
+      const event = events[boundary]?.type === 'turn/start'
+        ? events.slice(boundary + 1).findLast(event => event.type === 'user/message' && event.data.source.kind === 'user')
+        : undefined
+      if (event?.type !== 'user/message') throw new Error('No direct user message in the current main Session turn')
+      const message = event.data
+      const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
+      if (!text.trim()) throw new Error('A User Session trigger needs a text request')
+      const id = key(actor.source, agent.id, message.id)
+      const result = host.quietly(() => host.engine.recordTriggerForRouting({ id, source: actor.source, text, actor,
+        human: true, addressed: 'direct', at: new Date(event.time).toISOString(), threads: [{ source: actor.source, id }],
+        meta: { sessionId: agent.id, messageId: message.id } }))
+      if (result === 'filtered') throw new Error('The User Session trigger was filtered; check that its Source is on')
+      return { trigger_id: id, source: actor.source, read: `trigger/${id}` }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    userTriggerTool(host, agent),
     routeTool(host),
     tool({
       name: 'orchestrator_ticket_retry',

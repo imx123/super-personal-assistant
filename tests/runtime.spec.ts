@@ -136,6 +136,20 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
   const ticket = runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
+const USER_TRIGGER_TOOL = 'orchestrator_user_trigger_create'
+/** Append a native main-Session turn with one user message, as DSH records it. */
+function nativeTurn(text = '整理这条任务', id = 'native-1'): void {
+  const session = agents.get(runtime.masterId)!.session
+  const events = session.snapshotEvents() as SessionEvent[]
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  const push = (type: string, data: unknown) => {
+    const event = { type, data, seq: events.length + 1, time: Date.parse('2026-09-09T00:00:00Z') } as SessionEvent
+    events.push(event)
+    ctx.emit('session/event', session, event)
+  }
+  push('turn/start', { turn: 1 })
+  push('user/message', { id, role: 'user', source: { kind: 'user', rpcId: id }, content: [{ type: 'text', text }] })
+}
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
@@ -214,28 +228,59 @@ beforeEach(async () => {
   await runtime.ready
   // Source kinds are normally registered by plugins that are not loaded in unit tests.
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
-  runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
+  runtime.store.saveSettings({ ...runtime.store.settings(), policy: { ...runtime.store.settings().policy, sources: { 'main-session': { allowed: [{ id: 'dsh-user' }] }, feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } }, eval: { ...runtime.store.settings().eval, mode: 'auto' }, sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT() } }, feishu: { enabled: true, config: { cli: BOT(), chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
 
-it('keeps native main Session messages out of trigger intake while the local entry is disabled', async () => {
-  const session = agents.get(runtime.masterId)!.session
-  const events = session.snapshotEvents() as SessionEvent[]
-  const ctx = (runtime as unknown as { ctx: Context }).ctx
-  const push = (type: string, data: unknown) => {
-    const event = { type, data, seq: events.length + 1, time: Date.parse('2026-09-09T00:00:00Z') } as SessionEvent
-    events.push(event)
-    ctx.emit('session/event', session, event)
-  }
-  const id = key('main-session', runtime.masterId, 'native-rpc-1')
-  push('turn/start', { turn: 1 })
-  push('user/message', { id: 'native-1', role: 'user', source: { kind: 'user', rpcId: 'native-rpc-1' },
-    content: [{ type: 'text', text: '整理这条任务' }] })
-  await runtime.idle()
-  expect(tools.get(runtime.masterId)?.has('orchestrator_user_trigger_create')).toBe(false)
-  expect(runtime.store.triggers.get(id)).toBeUndefined()
+it('registers and dispatches a default User Session request as a full-tool ticket', async () => {
+  nativeTurn('请开个工单，整理明天下午的日程。', 'native-request')
+  expect(tools.get(runtime.masterId)?.has(USER_TRIGGER_TOOL)).toBe(true)
+  const created = await runTool(runtime.masterId, USER_TRIGGER_TOOL, {}) as { trigger_id: string; source: string }
+  expect(created.source).toBe('main-session')
+  expect(await runTool(runtime.masterId, USER_TRIGGER_TOOL, {})).toEqual(created)
+  expect(runtime.store.triggers.get(created.trigger_id)).toMatchObject({ text: '请开个工单，整理明天下午的日程。',
+    source: 'main-session', actor: { source: 'main-session', id: 'dsh-user' }, addressed: 'direct',
+    meta: { sessionId: runtime.masterId, messageId: 'native-request' } })
   expect(runtime.store.tickets.list()).toHaveLength(0)
+
+  const result = await route({ kind: 'accept', trigger_id: created.trigger_id, title: '整理明天下午的日程',
+    worktree_name: 'reschedule-afternoon', acknowledgement: '已登记整理明天下午日程的工单。' })
+  const [ticket] = runtime.store.tickets.list()
+  expect(runtime.store.tickets.list()).toHaveLength(1)
+  expect(ticket).toMatchObject({ origin: { triggerId: created.trigger_id }, channels: [],
+    mandate: { strength: 'explicit', basis: { source: 'main-session' } } })
+  const sessionId = `worker-${ticket!.id}`
+  expect(deliveries.mock.calls.some(([delivery]) => delivery.sessionId === sessionId && delivery.text.includes('请开个工单'))).toBe(true)
+  // The dispatched ticket keeps the full work tools; only the main Session is read-only by prompt.
+  expect(tools.get(sessionId)?.has('orchestrator_report')).toBe(true)
+  expect(result.ticket).toMatchObject({ ticket_id: ticket!.id })
+})
+
+it('uses the configured User Session operator and refuses it when the Policy no longer lists it', async () => {
+  await runtime.settings.save('source:main-session', { enabled: true, config: { operator: 'alice' } },
+    runtime.store.blockRevision('source:main-session'), 'panel')
+  const settings = runtime.store.settings()
+  await runtime.settings.save('policy', { ...settings.policy, sources: { ...settings.policy.sources,
+    'main-session': { allowed: [{ id: 'alice' }] } } }, runtime.store.blockRevision('policy'), 'panel')
+  nativeTurn('调研这个仓库', 'native-config')
+  const created = await runTool(runtime.masterId, USER_TRIGGER_TOOL, {}) as { trigger_id: string }
+  expect(runtime.store.triggers.get(created.trigger_id)).toMatchObject({ actor: { source: 'main-session', id: 'alice' } })
+
+  const current = runtime.store.settings()
+  await runtime.settings.save('policy', { ...current.policy, sources: { ...current.policy.sources,
+    'main-session': { allowed: [] } } }, runtime.store.blockRevision('policy'), 'panel')
+  nativeTurn('再来一个', 'native-denied')
+  await expect(runTool(runtime.masterId, USER_TRIGGER_TOOL, {})).rejects.toThrow(/does not allow alice/)
+  expect(runtime.store.triggers.get(key('main-session', runtime.masterId, 'native-denied'))).toBeUndefined()
+})
+
+it('refuses the User Session entry while its Source is off', async () => {
+  await runtime.settings.save('source:main-session', { enabled: false, config: { operator: 'dsh-user' } },
+    runtime.store.blockRevision('source:main-session'), 'panel')
+  nativeTurn('这条不该登记', 'native-off')
+  await expect(runTool(runtime.masterId, USER_TRIGGER_TOOL, {})).rejects.toThrow(/entry is off/)
+  expect(runtime.store.triggers.get(key('main-session', runtime.masterId, 'native-off'))).toBeUndefined()
 })
 
 it.each([['auto', ['danger-full-access', 'auto']], ['danger-full-access', ['danger-full-access']]] as const)(

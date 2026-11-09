@@ -43,6 +43,16 @@ An Executor can follow a related Thread, such as another Issue or pull request, 
 
 Human messages that reach no Ticket, including Threads whose Tickets were stopped by a person, take the Eval path. Bot messages take that path independently of their delivery to subscribed Tickets.
 
+## The main Session entry
+
+The main Session is also a Source, named `main-session`. It is not polled: when the person asks the main Session to dispatch work, its `orchestrator_user_trigger_create` tool records the current native user message as one Trigger and the main Session routes it with `orchestrator_route`.
+
+- The Source card configures one operator ID, `dsh-user` by default. The Trigger's actor is `{source: "main-session", id: <operator>}`.
+- Only an operator on that Source's Policy allowed list can originate work. A fresh database seeds the list with `dsh-user`; changing the operator needs the matching list entry.
+- The entry tool refuses while the Source is off or the operator is not allowed. It does not bypass the gate, and the accept still creates a normal Mandate.
+- The main Session is the only Session and is allowed to dispatch by default. Its role prompt makes it read-only by default: it reads, inspects and routes, and does not write in the shared workspace or another Session's directory. A write the person asks for directly needs their confirmation first; otherwise it goes to a full-tool Ticket. This is prompt text, not a capability restriction.
+- Each native message is its own domain Thread, so independent tasks do not fan out to one another. This is a deliberate choice of the entry, separate from the DSH chat Session, which stays continuous.
+
 ## Strength
 
 | Strength | Cases |

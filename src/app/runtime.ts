@@ -14,8 +14,9 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
-import { allowedSender, settingsPolicy } from '../policy.ts'
+import { policyVersion, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
+import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE } from '../sources/main-session.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
@@ -112,6 +113,17 @@ export class Runtime extends Service implements SourceHost {
           .catch(() => { /* sync() records its failure in health. */ })
         return () => {}
       })
+      sources.register(mainSessionKind)
+      // Seed the default User Session policy once. A later removal of the entry is the operator's choice and is kept.
+      if (!store.get(KV.runtime.mainSessionPolicySeeded)) {
+        const current = store.settings()
+        if (!current.policy.sources[MAIN_SESSION_SOURCE]) {
+          const value = { ...current, policy: { ...current.policy, sources: { ...current.policy.sources,
+            [MAIN_SESSION_SOURCE]: { allowed: [{ id: DEFAULT_MAIN_SESSION_OPERATOR }], admission: {} } } } }
+          store.saveSettings(value, { source: 'internal', block: 'policy', policyVersion: policyVersion(value), policyChanged: false, notified: [] })
+        }
+        store.set(KV.runtime.mainSessionPolicySeeded, true)
+      }
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
@@ -167,6 +179,8 @@ export class Runtime extends Service implements SourceHost {
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
+        localEntry: () => { const instance = sources.instance<{ operator: string }>(MAIN_SESSION_SOURCE)
+          return instance ? { enabled: instance.enabled, operator: instance.config.operator } : undefined },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()

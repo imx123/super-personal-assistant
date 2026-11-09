@@ -8,30 +8,48 @@
 - 基线导入提交：`chore: import V2 tool baseline (2026-11-09 19:38)`
 - 本仓库不附带 V2 验收记录；V2 验收属于上一轮实验，和这里的开发基线分开。
 
-## 当前状态
+## 主入口的权限模型
 
-主入口（在原生主 Session 里注入 Trigger）已停用。停用的是入口本身，不是通用的执行控制：
+主入口现在是正式 Source：`main-session`（`src/sources/main-session.ts`）。
 
-- 已移除：`orchestrator_user_trigger_create` 工具及其提示词、`Engine.recordTriggerForRouting`、`Intake.receive` 的跳过评估参数、`USER_SESSION_ACTOR` 在 `allowedSender` 里的硬编码放行，以及对应的入口测试。
-- 已保留：`stopAssignment`、`interruptedAt` / `turnBegan`、`executionStatus` 回执、面板的“停止本次派工”接口与按钮、Worker 权限预设选择、Windows 的 `pwsh` 与路径适配。
-- 暂不定义：主入口的 thread 语义。DSH 主 Session 是连续聊天；领域里的 `Trigger.threads` 目前仍是每条消息一个独立 Thread（这是 V1 本地面板、V2 工具沿用的写法，不是上游原有设计）。等主入口权限和分派一起设计时再定。
-- 仍在但不会触发：`src/executor/dsh.ts` 和 `src/app/runtime.ts` 里按 `source === 'main-session'` 走的回执分支。入口停用期间没有这种 Ticket；后续重做入口时再决定复用还是删除。
+- 它在 Settings → Sources 里是一张“用户会话”卡片，只有一个 `operator` 字段，默认 `dsh-user`。
+- Policy 的“On each Source”里增加“用户会话”的 allowed list。只有名单里的 operator 能从主 Session 发起工作。
+- 新库首次启动会写入一条默认 Policy：`main-session` 允许 `dsh-user`。这是普通 Policy 记录，可在界面修改或删除，不是 `allowedSender` 的硬编码放行。
+- 入口工具是 `orchestrator_user_trigger_create`：主 Session 明确派工时登记当前原生消息为一条 Trigger，再由 `orchestrator_route` 建单。普通聊天不建单。
+- 工具在 Source 关闭或 operator 不在 allowed list 时直接拒绝，并说明要改哪里；它不绕过 gate，accept 仍会正常创建 Mandate。
+- 主入口派出的 Ticket 使用现有 Worker preset，保留全工具；只读限制不施加给 Ticket。
+
+### 只读约束
+
+主 Session 是唯一的，默认允许派单。它自己的工作方式是“提示词级只读”：
+
+- 可以读、查、路由和回复；不修改共享工作区，也不改其他 Worker 或 PM 的目录。
+- 人明确要求主 Session 自己写文件或执行写命令时，它先说明需要什么写操作并征求确认；确认后可以由它自己做，或者按情况派一张全工具 Ticket。
+- 这不是工具或沙箱限制：Router preset 仍保留 shell，主 Session 的权限仍是 `danger-full-access`。约束在 `prompts/orchestrator.md`，靠模型遵守。
+
+### Thread
+
+DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目前仍是每条消息一个独立 Thread（`main-session:<triggerId>`，V1 本地面板、V2 工具沿用的写法，不是上游原有设计）。这样多个任务不会通过同一个 Thread 互相 fan-out；thread 语义等后续任务分派/交接设计时再定。
+
+## 已保留的通用执行控制
+
+`stopAssignment`、`interruptedAt` / `turnBegan`、`executionStatus` 回执、面板的“停止本次派工”接口与按钮、Worker 权限预设选择、Windows 的 `pwsh` 与路径适配都保留。
+
+`src/executor/dsh.ts` 和 `src/app/runtime.ts` 里按 `source === 'main-session'` 走的回执分支仍在；主入口重新启用后会用到它们。
 
 ## 验证
 
 2026-11-09 在本机验证：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过。
-- 定向 6 个测试文件共 626 项：625 通过，1 项失败，原因是 Windows 下 Git 配置路径转义与断言不一致（与上游已知失败同类）。
-- `tests/docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档链接检查通过。
-
-## 为什么停用
-
-主入口原来的 actor 是合成的 `main-session/dsh-user`，在 `allowedSender` 里直接放行，没有可审计的 policy 条目。权限模型还没定，所以先撤销这个特权；后续用显式的 policy 配置或一个真正的本地 Source 重新引入。停用期间主入口不能派工，GitHub / 飞书入口和面板控制不受影响。
+- 定向 6 个测试文件（`runtime`、`policy`、`core-engine`、`model-surface`、`tools`、`runtime-concurrency`）共 628 项：627 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
+- 设置与面板相关的 5 个测试文件（`settings`、`registry`、`panel-settings`、`panel-source`、`views`）50 项全部通过；`index`、`http` 7 项全部通过。
+- `tests/docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档和链接检查通过。
+- 模型可见文本预算（`model-surface`）已重新压到 59000 字符以内。
 
 ## 后续顺序
 
-1. 权限控制
+1. 权限控制（当前）
 2. 任务分派
 3. 任务交接
 4. 意外中断与恢复
@@ -39,15 +57,20 @@
 
 ## 文档说明
 
-`docs/000` 到 `docs/008` 是上游文档，仍描述上游行为；与本基线不一致的地方，以本文件为准。`docs/PHASE1_MODIFICATION_PLAN_V2.zh-CN.md` 是历史计划，不是当前验收依据。
+`docs/000` 到 `docs/008` 是上游文档；与本基线不一致的地方，以本文件和新增的 `docs/002` 主入口小节为准。`docs/PHASE1_MODIFICATION_PLAN_V2.zh-CN.md` 是历史计划，不是当前验收依据。
 
-本次停用涉及的文件：
+本次改动涉及的文件：
 
 | 文件 | 变更 |
 | --- | --- |
-| `src/app/tools/main.ts` | 删除主入口工具、工具注册和路由描述里的入口引用 |
-| `src/core/engine.ts` | 删除 `recordTriggerForRouting`，从主 Session 的 Engine 接口移除 |
-| `src/core/intake.ts` | 删除跳过评估的参数，恢复每次接收都按规则排队 |
-| `src/policy.ts` | 删除 `USER_SESSION_ACTOR` 及 `allowedSender` 的硬编码放行 |
-| `prompts/dispatch.md` | 删除主入口工具的使用说明 |
-| `tests/runtime.spec.ts` | 删除主入口派工测试，改为断言入口工具不存在、原生消息不进入 Trigger |
+| `src/sources/main-session.ts` | 新增内置 User Session Source：operator 配置、Policy part、scope |
+| `src/app/tools/main.ts` | 恢复 `orchestrator_user_trigger_create`，增加 Source 开关与 allowed list 检查 |
+| `src/core/engine.ts` | 恢复 `recordTriggerForRouting` |
+| `src/core/intake.ts` | 恢复跳过评估的参数 |
+| `src/policy.ts` | 不再有 `USER_SESSION_ACTOR` 特判；权限走正常 `allowedSender` |
+| `src/app/runtime.ts` | 注册 User Session Source，首启写入默认 Policy，给工具提供 operator |
+| `src/kv.ts` | 记录默认 Policy 是否已播种 |
+| `prompts/orchestrator.md` | 主 Session 提示词级只读，写操作先确认 |
+| `prompts/dispatch.md` | 恢复主入口工具的使用说明 |
+| `tests/runtime.spec.ts`、`tests/policy.spec.ts` | 覆盖默认允许、operator 配置、拒绝和关闭状态 |
+| `docs/002`、`docs/004`、`docs/005`、`docs/007` | 记录主入口权限、只读约束、Source 卡片和工具 |
