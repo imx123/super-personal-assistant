@@ -1,6 +1,8 @@
-# dsh-superagent
+# super personal assistant
 
-> **This checkout is the working baseline for the superagent project.** The upstream research prototype is kept separately for reference. See [docs/BASELINE.zh-CN.md](docs/BASELINE.zh-CN.md) for the current baseline, what is intentionally disabled, and the next work order.
+> **Independent development baseline derived from the [dsh-superagent research prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)** (upstream commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`). This repository is not an official DeepSeek product and is not endorsed by DeepSeek. The upstream MIT license and copyright are retained in [LICENSE](LICENSE); see [NOTICE](NOTICE) for attribution.
+>
+> See [docs/BASELINE.zh-CN.md](docs/BASELINE.zh-CN.md) for the current baseline, the main-Session permission model, and the next work order.
 
 > **Research prototype for reference only, not an official DeepSeek product.** This code grew out of our team's day-to-day development work, with much of the engineering done by coding agents. Treat it as research code, not production-ready software. It may still contain bugs, and its coding style and engineering practices may be inconsistent. Review and adapt it before using it in your own environment.
 >

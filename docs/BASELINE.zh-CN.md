@@ -2,7 +2,7 @@
 
 ## 这是什么
 
-本仓库是 superagent 的独立开发基线。上游官方原型保留在 `../prototype`，只作参考，不在这里修改。本仓库从 `windows-v2/source` 的 2026-11-09 19:38 工具版导入。
+本仓库是 superagent 的独立开发基线，派生自 MIT 许可的 [dsh-superagent research prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)。上游官方原型作为独立参考保留，不在本仓库内修改；本仓库的起点是 2026-11-09 的 19:38 工具版。
 
 - 上游来源提交：`8c32a9dc5d72c033816c6a8110b37f40cf94fba4`
 - 基线导入提交：`chore: import V2 tool baseline (2026-11-09 19:38)`

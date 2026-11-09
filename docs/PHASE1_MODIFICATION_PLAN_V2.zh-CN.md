@@ -95,4 +95,4 @@ Worker 的结构化结果仍通过 `orchestrator_report` 和原版 Effects 回 R
 
 先提交本计划。实施时按「独立运行时与原版 Windows 对照 → 主入口派工 → 原生干预与回报 → 真实演示」四个检查点交付证据。预期只涉及输入适配、Windows 部署接线、已有页面的必要状态映射和最小停止命令。对任何权限或审批变化另列依据、范围和影响。
 
-原版基线和首次试验分别见 [上游审查](PHASE0_BASELINE.zh-CN.md) 与 [真实场景原始记录](../../windows-preview/scenario-v41/scenario-evidence.json)。
+原版基线和首次试验属于上一轮实验记录，不在本仓库内；本文件是历史计划，不是当前验收依据。
