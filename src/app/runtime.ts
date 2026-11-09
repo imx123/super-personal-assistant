@@ -16,7 +16,7 @@ import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { policyVersion, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
-import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE } from '../sources/main-session.ts'
+import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
@@ -114,15 +114,25 @@ export class Runtime extends Service implements SourceHost {
         return () => {}
       })
       sources.register(mainSessionKind)
-      // Seed the default User Session policy once. A later removal of the entry is the operator's choice and is kept.
+      const userSession = sources.instance<{ operator: string }>(MAIN_SESSION_SOURCE)
+      const operator = userSession?.config.operator ?? DEFAULT_MAIN_SESSION_OPERATOR
+      // Seed the default User Session policy once. A later change of its operator is synced below.
       if (!store.get(KV.runtime.mainSessionPolicySeeded)) {
         const current = store.settings()
         if (!current.policy.sources[MAIN_SESSION_SOURCE]) {
           const value = { ...current, policy: { ...current.policy, sources: { ...current.policy.sources,
-            [MAIN_SESSION_SOURCE]: { allowed: [{ id: DEFAULT_MAIN_SESSION_OPERATOR }], admission: {} } } } }
+            [MAIN_SESSION_SOURCE]: { allowed: [{ id: operator }], admission: {} } } } }
           store.saveSettings(value, { source: 'internal', block: 'policy', policyVersion: policyVersion(value), policyChanged: false, notified: [] })
         }
         store.set(KV.runtime.mainSessionPolicySeeded, true)
+      }
+      // A configured operator is authoritative: repair a hand-edited or older allowed list at every start.
+      if (userSession) {
+        const current = store.settings()
+        const synced = syncMainSessionOperator(current, userSession.config.operator)
+        if (synced !== current) {
+          store.saveSettings(synced, { source: 'internal', block: 'policy', policyVersion: policyVersion(synced), policyChanged: false, notified: [] })
+        }
       }
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)

@@ -1,12 +1,24 @@
 /** The User Session Source: native messages in the single main Session, admitted through the normal Policy. */
 import { z } from 'zod'
-import { AllowedSchema } from '../policy.ts'
+import { AllowedSchema, type Settings } from '../policy.ts'
 import type { SourceKind } from './kind.ts'
 
 /** Stable Source ID of the main Session entry. */
 export const MAIN_SESSION_SOURCE = 'main-session'
 /** The operator ID a fresh deployment allows and the entry uses until it is changed. */
 export const DEFAULT_MAIN_SESSION_OPERATOR = 'dsh-user'
+
+/**
+ * Make the User Session Policy part follow its configured operator: the allowed list becomes exactly this operator,
+ * keeping the display name already recorded for it. Used when the Source card saves and once at startup.
+ */
+export function syncMainSessionOperator(settings: Settings, operator: string): Settings {
+  const current = settings.policy.sources[MAIN_SESSION_SOURCE]
+  const name = current?.allowed.find(entry => entry.id === operator)?.name
+  const entry = { ...current, allowed: [{ id: operator, ...(name ? { name } : {}) }], admission: current?.admission ?? {} }
+  if (JSON.stringify(current) === JSON.stringify(entry)) return settings
+  return { ...settings, policy: { ...settings.policy, sources: { ...settings.policy.sources, [MAIN_SESSION_SOURCE]: entry } } }
+}
 
 const ConfigSchema = z.object({
   /** The local operator the main Session acts as; the Policy's allowed list must contain this ID. */
@@ -32,8 +44,8 @@ export const mainSessionKind: SourceKind<MainSessionConfig> = {
     type: 'text',
     label: { zh: '操作者标识', en: 'Operator ID' },
     hint: {
-      zh: '主 Session 派单时使用的本地身份。必须同时出现在 Policy 的“能发起工作的用户会话操作者”名单里；改这里后要同步改名单。',
-      en: 'Local identity used when the main Session dispatches. It must also appear in the Policy list of User Session operators allowed to originate work; changing it here needs the matching list change.',
+      zh: '主 Session 派单时使用的本地身份。保存时会自动把 Policy 的 allowed list 同步成这个标识；要停用，请用本卡片的 Source 开关。',
+      en: 'Local identity used when the main Session dispatches. Saving syncs the Policy allowed list to this ID; use this card\'s Source switch to turn the entry off.',
     },
   }],
   health: [],
@@ -46,8 +58,8 @@ export const mainSessionKind: SourceKind<MainSessionConfig> = {
       type: 'rows',
       label: { zh: '能发起工作的用户会话操作者', en: 'User Session operators who may originate work' },
       hint: {
-        zh: '只有这里的标识能在主 Session 里登记派工请求。默认包含 dsh-user；改 Source 卡片的操作者标识时，也要在这里加同一个标识。',
-        en: 'Only these IDs may register dispatch requests from the main Session. dsh-user is included by default; when the Source card changes its operator ID, add the same ID here.',
+        zh: '由 Source 卡片的 operator 自动同步，保存时名单只保留当前 operator。一般不需要手动编辑；要停用请用 Source 开关。',
+        en: 'Synced from the Source card\'s operator; saving keeps only the current operator. Usually no manual edit is needed; use the Source switch to turn the entry off.',
       },
       columns: [{ key: 'id', type: 'text', label: { zh: '标识', en: 'ID' } },
         { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }],

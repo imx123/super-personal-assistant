@@ -14,7 +14,8 @@
 
 - 它在 Settings → Sources 里是一张“用户会话”卡片，只有一个 `operator` 字段，默认 `dsh-user`。
 - Policy 的“On each Source”里增加“用户会话”的 allowed list。只有名单里的 operator 能从主 Session 发起工作。
-- 新库首次启动会写入一条默认 Policy：`main-session` 允许 `dsh-user`。这是普通 Policy 记录，可在界面修改或删除，不是 `allowedSender` 的硬编码放行。
+- 新库首次启动会写入一条默认 Policy：`main-session` 允许 `dsh-user`。保存 Source 卡片时，allowed list 会自动同步成当前 operator（只保留它，已有显示名会保留）；启动时也会校正一次。它不是 `allowedSender` 的硬编码放行。
+- 手改 allowed list 会被下一次保存或启动校正；要停用主入口，用 Source 卡片的启用开关，不要用删名单的方式。
 - 入口工具是 `orchestrator_user_trigger_create`：主 Session 明确派工时登记当前原生消息为一条 Trigger，再由 `orchestrator_route` 建单。普通聊天不建单。
 - 工具在 Source 关闭或 operator 不在 allowed list 时直接拒绝，并说明要改哪里；它不绕过 gate，accept 仍会正常创建 Mandate。
 - 主入口派出的 Ticket 使用现有 Worker preset，保留全工具；只读限制不施加给 Ticket。
@@ -42,8 +43,8 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 2026-11-09 在本机验证：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过。
-- 定向 6 个测试文件（`runtime`、`policy`、`core-engine`、`model-surface`、`tools`、`runtime-concurrency`）共 628 项：627 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
-- 设置与面板相关的 5 个测试文件（`settings`、`registry`、`panel-settings`、`panel-source`、`views`）50 项全部通过；`index`、`http` 7 项全部通过。
+- 定向 6 个测试文件（`runtime`、`policy`、`core-engine`、`model-surface`、`tools`、`runtime-concurrency`）共 630 项：629 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
+- 设置、面板、registry 和 views 相关的 5 个测试文件共 50 项全部通过；`index`、`http` 7 项全部通过。
 - `tests/docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档和链接检查通过。
 - 模型可见文本预算（`model-surface`）已重新压到 59000 字符以内。
 

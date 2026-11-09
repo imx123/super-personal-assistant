@@ -257,12 +257,10 @@ it('registers and dispatches a default User Session request as a full-tool ticke
   expect(result.ticket).toMatchObject({ ticket_id: ticket!.id })
 })
 
-it('uses the configured User Session operator and refuses it when the Policy no longer lists it', async () => {
+it('syncs the allowed list from the configured User Session operator and refuses a hand-edited empty list', async () => {
   await runtime.settings.save('source:main-session', { enabled: true, config: { operator: 'alice' } },
     runtime.store.blockRevision('source:main-session'), 'panel')
-  const settings = runtime.store.settings()
-  await runtime.settings.save('policy', { ...settings.policy, sources: { ...settings.policy.sources,
-    'main-session': { allowed: [{ id: 'alice' }] } } }, runtime.store.blockRevision('policy'), 'panel')
+  expect(runtime.store.settings().policy.sources['main-session']?.allowed).toEqual([{ id: 'alice' }])
   nativeTurn('调研这个仓库', 'native-config')
   const created = await runTool(runtime.masterId, USER_TRIGGER_TOOL, {}) as { trigger_id: string }
   expect(runtime.store.triggers.get(created.trigger_id)).toMatchObject({ actor: { source: 'main-session', id: 'alice' } })
@@ -275,11 +273,24 @@ it('uses the configured User Session operator and refuses it when the Policy no 
   expect(runtime.store.triggers.get(key('main-session', runtime.masterId, 'native-denied'))).toBeUndefined()
 })
 
+it('repairs the User Session allowed list from the configured operator at startup', async () => {
+  await runtime.stop()
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  const settings = store.settings()
+  store.saveSettings({ ...settings, sources: { ...settings.sources, 'main-session': { enabled: true, config: { operator: 'alice' } } },
+    policy: { ...settings.policy, sources: { ...settings.policy.sources,
+      'main-session': { allowed: [{ id: 'dsh-user' }] } } } })
+  store.close()
+  await restart()
+  expect(runtime.store.settings().policy.sources['main-session']?.allowed).toEqual([{ id: 'alice' }])
+  expect(runtime.store.settings().sources['main-session']?.config).toMatchObject({ operator: 'alice' })
+})
+
 it('refuses the User Session entry while its Source is off', async () => {
   await runtime.settings.save('source:main-session', { enabled: false, config: { operator: 'dsh-user' } },
     runtime.store.blockRevision('source:main-session'), 'panel')
   nativeTurn('这条不该登记', 'native-off')
-  await expect(runTool(runtime.masterId, USER_TRIGGER_TOOL, {})).rejects.toThrow(/entry is off/)
+  await expect(runTool(runtime.masterId, USER_TRIGGER_TOOL, {})).rejects.toThrow('The User Session entry is off; turn it on in Settings → Sources')
   expect(runtime.store.triggers.get(key('main-session', runtime.masterId, 'native-off'))).toBeUndefined()
 })
 

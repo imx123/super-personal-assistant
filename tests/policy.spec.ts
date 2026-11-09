@@ -3,6 +3,7 @@ import { SettingsSchema, assessmentOutcome, policyEffects, settingsPolicy, polic
 import type { MandateBasis } from '../src/core/index.ts'
 import { migrateSettings } from '../src/app/migration.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
+import { MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../src/sources/main-session.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
 import type { Thread, Ticket, Trigger } from '../src/core/index.ts'
@@ -65,6 +66,14 @@ describe('gate', () => {
     expect(allowedSender(base, { source: 'main-session', id: 'dsh-user' })).toBeUndefined()
     expect(anyoneAllowed(base)).toBe(true)
     expect(anyoneAllowed(SettingsSchema.parse({}))).toBe(false)
+  })
+  it('keeps the User Session allowed list in step with its configured operator', () => {
+    const settings = SettingsSchema.parse({ policy: { sources: { 'main-session': { allowed: [{ id: 'old' }, { id: 'dsh-user' }] } } } })
+    const synced = syncMainSessionOperator(settings, 'alice')
+    expect(synced.policy.sources[MAIN_SESSION_SOURCE]?.allowed).toEqual([{ id: 'alice' }])
+    expect(syncMainSessionOperator(synced, 'alice')).toBe(synced)
+    const named = SettingsSchema.parse({ policy: { sources: { 'main-session': { allowed: [{ id: 'alice', name: 'Alice' }] } } } })
+    expect(syncMainSessionOperator(named, 'alice').policy.sources[MAIN_SESSION_SOURCE]?.allowed).toEqual([{ id: 'alice', name: 'Alice' }])
   })
   it('assesses follow-ups on Threads with Tickets, explicit from an allowed sender and inferred from anyone else', () => {
     const quiet = { meta: { chatId: CHAT, direct: false, mentioned: false } }

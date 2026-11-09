@@ -5,6 +5,7 @@ import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
 import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { SourceHost } from '../sources/host.ts'
+import { MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { resolveRoleModel } from './role-models.ts'
@@ -168,7 +169,11 @@ export class Settings {
     if (stale()) throw new SettingsConflict('Settings changed during the checks. Reload before saving.')
     // Re-read current settings after async checks in case unrelated blocks were saved concurrently.
     const old = store.settings()
-    const settings = rules.merge(old, parsed, id)
+    let settings = rules.merge(old, parsed, id)
+    if (kind === 'source' && id === MAIN_SESSION_SOURCE) {
+      const operator = this.host.sources.instance<{ operator: string }>(id, settings)?.config.operator
+      if (operator) settings = syncMainSessionOperator(settings, operator)
+    }
     if (JSON.stringify(SettingsSchema.parse(settings)) === JSON.stringify(old)) {
       const delivery = await sessions.delivery(`settings:${block}`)
       return { saved: true, revision: store.blockRevision(block), policy_changed: false, restarting: false, context_delivery: delivery }
