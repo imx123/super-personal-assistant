@@ -219,7 +219,7 @@ beforeEach(async () => {
 })
 afterEach(async () => { expect(controller.prompt).not.toHaveBeenCalled(); await runtime?.stop(); vi.restoreAllMocks(); rmSync(directory, { recursive: true, force: true }) })
 
-it('keeps native main Session messages in chat, outside Candidate Card intake', async () => {
+it('keeps native main Session messages out of trigger intake while the local entry is disabled', async () => {
   const session = agents.get(runtime.masterId)!.session
   const events = session.snapshotEvents() as SessionEvent[]
   const ctx = (runtime as unknown as { ctx: Context }).ctx
@@ -233,45 +233,9 @@ it('keeps native main Session messages in chat, outside Candidate Card intake', 
   push('user/message', { id: 'native-1', role: 'user', source: { kind: 'user', rpcId: 'native-rpc-1' },
     content: [{ type: 'text', text: '整理这条任务' }] })
   await runtime.idle()
+  expect(tools.get(runtime.masterId)?.has('orchestrator_user_trigger_create')).toBe(false)
   expect(runtime.store.triggers.get(id)).toBeUndefined()
-  expect(runtime.sources.kind('main-session')).toBeUndefined()
   expect(runtime.store.tickets.list()).toHaveLength(0)
-  expect(relays(runtime.masterId)).not.toContainEqual(expect.objectContaining({ kind: 'candidate' }))
-})
-
-it('registers a user Session trigger only on demand and routes it as an explicit ticket', async () => {
-  const session = agents.get(runtime.masterId)!.session
-  const events = session.snapshotEvents() as SessionEvent[]
-  const push = (type: string, data: unknown) => {
-    events.push({ type, data, seq: events.length + 1, time: Date.parse('2026-09-09T00:00:00Z') } as SessionEvent)
-  }
-  const tool = 'orchestrator_user_trigger_create'
-  const text = '请开个工单，整理明天下午的日程。'
-  push('turn/start', { turn: 1 })
-  push('user/message', { id: 'native-request', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
-  const created = await runTool(runtime.masterId, tool, {}) as { trigger_id: string; source: string }
-  expect(created.source).toBe('main-session')
-  expect(await runTool(runtime.masterId, tool, {})).toEqual(created)
-  expect(runtime.store.triggers.get(created.trigger_id)).toMatchObject({ text, source: 'main-session', addressed: 'direct',
-    meta: { sessionId: runtime.masterId, messageId: 'native-request' } })
-  expect(runtime.store.tickets.list()).toHaveLength(0)
-
-  const item = { kind: 'accept', trigger_id: created.trigger_id, title: '整理明天下午的日程',
-    worktree_name: 'reschedule-afternoon', acknowledgement: '已登记整理明天下午日程的工单。' }
-  const result = await route(item)
-  expect(await route(item)).toMatchObject({ ticket: { ticket_id: (result.ticket as { ticket_id: string }).ticket_id } })
-  const [ticket] = runtime.store.tickets.list()
-  expect(runtime.store.tickets.list()).toHaveLength(1)
-  expect(ticket).toMatchObject({ origin: { triggerId: created.trigger_id }, channels: [],
-    mandate: { strength: 'explicit', basis: { source: 'main-session' } } })
-  expect(deliveries.mock.calls.some(([delivery]) => delivery.sessionId === `worker-${ticket!.id}` && delivery.text.includes(text))).toBe(true)
-  expect(tools.get(`worker-${ticket!.id}`)?.has(tool)).toBe(false)
-  expect(relays(runtime.masterId)).not.toContainEqual(expect.objectContaining({ kind: 'candidate' }))
-
-  push('turn/end', { turn: 1 })
-  push('turn/start', { turn: 2 })
-  push('user/message', { id: 'worker-report', role: 'user', source: { kind: 'orchestrator' }, content: [{ type: 'text', text }] })
-  await expect(runTool(runtime.masterId, tool, {})).rejects.toThrow('No direct user message')
 })
 
 it.each([['auto', ['danger-full-access', 'auto']], ['danger-full-access', ['danger-full-access']]] as const)(

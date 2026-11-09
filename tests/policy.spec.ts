@@ -61,6 +61,8 @@ describe('gate', () => {
     expect(policy.gate(github(MEMBER, 'mention'), thread(), [])).toEqual({ admissible: false, reason: 'not_a_member' })
     expect(allowedSender(base, { source: 'github', id: 'ALICE' })).toEqual({ id: 'Alice' })
     expect(allowedSender(base, { source: 'feishu', id: 'Alice' })).toBeUndefined()
+    // The retired main-session identity has no hardcoded sender entry; it needs an explicit policy entry like any other actor.
+    expect(allowedSender(base, { source: 'main-session', id: 'dsh-user' })).toBeUndefined()
     expect(anyoneAllowed(base)).toBe(true)
     expect(anyoneAllowed(SettingsSchema.parse({}))).toBe(false)
   })

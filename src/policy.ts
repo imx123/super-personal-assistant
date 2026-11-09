@@ -116,10 +116,7 @@ export const POLICY_REVISION = 'mandate-v3'
 export function policyVersion(settings: Settings): string {
   return key(POLICY_REVISION, JSON.stringify({ rules: settings.policy.rules, mode: settings.eval.mode, sources: settings.policy.sources }))
 }
-export const USER_SESSION_ACTOR = { source: 'main-session', id: 'dsh-user' } as const
 export function allowedSender(settings: Settings, actor: ActorRef): z.infer<typeof AllowedSchema> | undefined {
-  // This identity is assigned by the main Session tool from a native user message, never by an external adapter.
-  if (actor.source === USER_SESSION_ACTOR.source && actor.id === USER_SESSION_ACTOR.id) return USER_SESSION_ACTOR
   return settings.policy.sources[actor.source]?.allowed.find(entry => sameName(entry.id, actor.id))
 }
 /** Look up `actor` in the Source's `bots` policy list (validated by the Source's kind), whose messages are admitted as inferred candidates at most. */
