@@ -8,11 +8,12 @@ prototype:
   Upstream commit: 8c32a9dc5d72c033816c6a8110b37f40cf94fba4
 
 Upstream copyright: Copyright (c) 2026 DeepSeek Harness Team
-Upstream license: MIT (see LICENSE)
+Upstream license: MIT (see LICENSE-MIT)
 
 This repository is not an official DeepSeek product and is not endorsed by
 DeepSeek. The names "DeepSeek" and "DeepSeek Harness" identify the upstream
 project and the runtime this work builds on; they do not imply affiliation.
 
-The upstream LICENSE and copyright notice are retained. Changes in this
+This repository is distributed under GPL-3.0-or-later (see LICENSE). The
+upstream MIT notice and copyright are retained in LICENSE-MIT. Changes in this
 repository are independently maintained by imx123.

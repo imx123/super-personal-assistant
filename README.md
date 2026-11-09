@@ -1,6 +1,6 @@
 # super personal assistant
 
-> **Independent development baseline derived from the [dsh-superagent research prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)** (upstream commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`). This repository is not an official DeepSeek product and is not endorsed by DeepSeek. The upstream MIT license and copyright are retained in [LICENSE](LICENSE); see [NOTICE](NOTICE) for attribution.
+> **Independent development baseline derived from the [dsh-superagent research prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)** (upstream commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`). This repository is not an official DeepSeek product and is not endorsed by DeepSeek. The upstream MIT license and copyright are retained in [LICENSE-MIT](LICENSE-MIT); see [NOTICE](NOTICE) for attribution.
 >
 > See [docs/BASELINE.zh-CN.md](docs/BASELINE.zh-CN.md) for the current baseline, the main-Session permission model, and the next work order.
 
@@ -40,4 +40,4 @@ Read the numbered documents in order; each builds only on the ones before it.
 
 ## License
 
-[MIT](LICENSE)
+This project is distributed under [GPL-3.0-or-later](LICENSE). The upstream dsh-superagent prototype remains MIT-licensed; its notice is in [LICENSE-MIT](LICENSE-MIT).
