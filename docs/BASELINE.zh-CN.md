@@ -8,34 +8,37 @@
 - 基线导入提交：`chore: import V2 tool baseline (2026-11-09 19:38)`
 - 本仓库不附带 V2 验收记录；V2 验收属于上一轮实验，和这里的开发基线分开。
 
-## P2.1 当前范围：Project Profile + PM 小号 Router
+### 已完成的 P2.1
 
-P2.1 只做 Project 的最小闭环，不做 Project Ticket，也不做 child ticket 外部 thread 订阅或对外回复。
+P2.1 建好了 Project Profile、PMMandate、`DecisionKind 'project'`、`project` 表、`createProject`、PM Session 和 Project Tab。这些仍在下文生效。
+
+## P2.2a 当前范围：PM 创建 Project Ticket + child ticket 外部 thread
+
+P2.2a 做 PM 创建 PM-owned Ticket 的最小闭环，并允许 child ticket 在创建时订阅外部 thread；不做能力档、child 报告回 PM、Project 暂停/停止或 PM 独立模型。
 
 已实现：
 
-- `DecisionKind` 增加 `project`；`Decision.projectId` 与 `Ticket.projectId` 为可选字段，P2.1 的 Project Decision 有 `projectId`、没有 `ticketId`，现有 Ticket 的 `projectId` 保持为空。
-- 新增 `ProjectProfile` 与 `PMMandate`（项目级 Mandate，不是 Ticket Mandate）；PM Session 固定为 `pm-<projectId>`。
-- Store 增加 `project` 表和 `projects` repository（`get` / `save` / `list`），Runtime 的 SQLite 与测试用 `MemoryRepositories` 同步实现。
-- Engine 新增 `createProject(triggerId, title, goal)`：校验 Trigger、按 Trigger 幂等、走 gate-only Eval（真实 `evalId`，不调 assessor、不投 candidate），同一事务写入 Project Profile、PM Mandate 与 `project` Decision，并 emit `project.created`。另加最小的 `projectReport`，把 PM 的汇报写回 Project。
-- 主 Session 新增独立工具 `orchestrator_project_create`：不放进 `orchestrator_route`，不创建 Ticket、不启动 Worker；创建后 `Sessions.ensure` 建 PM Session 并只发一条初始化消息（幂等）。
-- PM Session：`Sessions` role 增加 `pm`，新增 `PM_PRESET = 'dsh-superagent-pm'` 与 `cordis.patch.yml` 中对应的 preset；PM 只有 `orchestrator_read`、`orchestrator_project_report`，没有 shell、文件写入、web、子代理；权限优先 `workspace-write`，宿主没有时才退到 `read-only`/完整权限。`orchestrator_read` 只能读自己的 `project/<id>`。新增 `prompts/pm.md`，提示词组装识别 PM 角色并附加当前 Project 摘要。
-- 读模型：`src/app/views/projects.ts` 提供 Project 列表/详情；API 增加 `GET projects`、`GET projects/:id`；`orchestrator_read` 增加 `projects`、`project/<id>` 资源。
-- 面板新增最小的 Project Tab：列表、详情（goal/status/PM Session/latest report）和“打开 PM Session”；不做创建、暂停、停止。`Decision` 的 `project` kind 在面板中也有标记和文案。
+- `MandateBasis` 增加 `via: 'delegated'`（含 `projectId`、`pmSessionId`）；`DecisionKind` 增加 `delegated`，`Decision.ticketId` 对 delegated 必填，`Decision.mandate` 记录 Ticket 的 Mandate，`evalId` 是真实记录 ID。`Policy.revalidate` 对 delegated 直接返回 true，不查外部 allowed list。
+- 新增内置 Source kind `internal`（`src/sources/internal.ts`）：空 schema、无 channel、无 poll、无 health、无 threadContext，`scope` 恒为 listened；Runtime 启动时注册。
+- Engine 新增 `createProjectTickets(projectId, [pmSessionId,] tasks)`：校验 Project 存在且 active，给了 PM Session 时校验调用者就是该项目的 PM；每个 task 生成一条内部 Trigger（actor `{source:'internal', id: pmSessionId}`、`human:false`、不设 addressed、一条独立 Thread）、一个 record-only Eval（真实 `evalId`、`basis.via='delegated'`、strength 取 PM Mandate、不调 assessor、不投 candidate）→ `delegated` Decision → Ticket。Ticket 带 `projectId`、`decisionId`、从 PM Mandate 复制的 strength/policyVersion/actor、task scope/goal、内部 Trigger origin、`channels: []`、title、`prepareTicket` 生成的 execution，以及新 Assignment + `executor.start`；emit `ticket.created`。整批原子，一个 task 失败则全批不建；同一 projectId + task index 幂等。
+- Ticket 不自动订阅 Project 的源 Thread；只订阅 task 显式列出的 `threads`。`Tickets` 新增 PM 创建入口 `createDelegated` 与公开订阅入口 `subscribeExternal(ticketId, ref, contextOnly)`：校验 ThreadRef、按 ticket 去重、`contextOnly` 写入 `Thread.context`；不写 `Ticket.follows`，不自动订阅 origin。
+- PM 新增 `orchestrator_project_ticket_create`：仅 PM Session 注册；接收 1–5 个 task（title/goal 长度受限，worktree_name 在同批唯一），返回 `{ tickets: projectTicketCard[], project: projectCard, note }`，不声称 worker 已完成。PM 只能建自己项目内的 Ticket；Project 不存在或结束拒绝。
+- PM Session 权限改为默认 `auto`（宿主提供 auto 时），否则 `workspace-write`、`read-only`，最后才 full；child Ticket 的 Worker 仍走现有 worker 权限逻辑（auto 优先），不额外强制 workspace-write。
+- PM 读范围扩展：`orchestrator_read` 允许自己的 `project/<id>`、`project/<id>/tickets`，以及 `projectId` 属于自己项目的 `ticket/<id>`；其他资源拒绝。Project 详情/API/资源能看到 child Ticket 列表与各自 thread；面板 Project 页也列出 child Ticket 和 thread（context-only 有标记）。
+- `prompts/pm.md` 更新：PM 可以创建 Ticket，只建项目内 Ticket，不自己实现，不声称 worker 已完成。
 
-明确未做：PM 创建 Ticket、`orchestrator_project_ticket_create`、child ticket 外部 thread 订阅、Project 暂停/停止、Memory/RAG、Fast Router 拆分、父 Ticket 或 `Ticket.parentId`。主窗口 active dispatch 的 directEval 路线保持原样（仍是 gate-only），没有改动。
+明确未做：能力档 `read-only/workspace-write/full` 与 `denyTools`、P2.2b 的可选 `allow_tools` 白名单、child report/attention 回 PM（仍去主 Session，已知下一段）、Project 暂停/停止/删除、PM 独立模型、父 Ticket、Dispatch、TaskSpec、Fast Router、Memory/RAG。主窗口 active dispatch 的 directEval 路线保持原样。
 
 改动文件：
 
 | 文件 | 变更 |
 | --- | --- |
-| `src/core/model.ts`、`ports.ts`、`memory.ts`、`engine.ts`、`evals.ts`、`reasons.ts`、`errors.ts`、`index.ts` | Project 类型、Decision kind、Project repository、`createProject` / `projectReport`、gate-only project Eval |
-| `src/app/store.ts`、`views/projects.ts`、`cards.ts`、`resources.ts`、`api.ts`、`http.ts` | `project` 表、Project 读模型、卡片与读资源、两条 API |
-| `src/app/tools/main.ts`、`sessions.ts`、`prompts.ts`、`context.ts`、`runtime.ts` | 主 Session 工具、PM Session、PM preset、PM prompt 与初始化 |
-| `cordis.patch.yml`、`prompts/pm.md`、`src/client/marks.ts`、`src/client/locales.ts` | PM preset、PM 角色提示词、`project` Decision 的前端标记与文案 |
-| `src/client/route.ts`、`app.tsx`、`projects.tsx` | Project Tab 的路由、页面渲染、列表/详情与“打开 PM Session” |
+| `src/core/model.ts`、`ports.ts`、`engine.ts`、`evals.ts`、`tickets.ts`、`errors.ts`、`reasons.ts`、`index.ts` | delegated 类型与 Decision、内部 Trigger 与 record-only Eval、`createProjectTickets`、`createDelegated` / `subscribeExternal`、错误码与原因、任务边界 |
+| `src/policy.ts`、`src/sources/internal.ts`、`src/app/runtime.ts` | delegated 直接认可；内置 internal Source；注册 |
+| `src/app/tools/main.ts`、`sessions.ts`、`prompts.ts`、`cards.ts`、`resources.ts`、`views/projects.ts` | PM 创建/读工具与范围、PM 权限 auto、PM 提示与初始化、Project Ticket 卡片、`project/<id>/tickets`、Project 详情 child Ticket |
+| `prompts/pm.md`、`src/client/projects.tsx`、`locales.ts`、`marks.ts`、`ticket.tsx` | PM 提示词；Project 页 child Ticket/thread；delegated 文案、标记与 basis 展示 |
 | `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 领域、授权、面板、架构与基线范围 |
-| `tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/navigation.spec.ts`、`tests/bundle-patch.spec.ts`、`tests/model-surface.spec.ts`、`tests/fixtures/host.ts`、`tests/fixtures/panel-server.ts` | Project 定向与面板测试、PM 权限/读范围、路由、PM preset 断言、模型可见预算调整、假路由 |
+| `tests/project-tickets.spec.ts`、`tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/fixtures/host.ts` | 新增 PM Ticket 定向测试；PM 权限断言改 auto；Project 面板 child Ticket；权限 fixture 加 auto |
 
 ## 主入口的权限模型
 
@@ -69,22 +72,23 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 ## 验证
 
-2026-11-10 在本机验证 P2.1：
+2026-11-10 在本机验证 P2.2a：
 
-- `tsc --noEmit` 通过，`tsdown` 打包通过。
-- 定向 13 个测试文件（Project、core-engine、policy、bundle-patch、model-surface、tools、runtime、cards、client、navigation、panel-project、panel-panel、panel-overview）共 672 项：671 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
-- `cards.spec.ts` 55 项通过（主 Session prompt 已压回 1400 字符内）；`prompts.spec.ts` 21 项通过。
-- `docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档和链接检查通过。
-- `model-surface` 的 orchestrator 预算从 59,000 调到 60,000，用于 Project 工具和 `projects`/`project/<id>` 读资源；worker 预算不变。
-- 子代理全量记录：1214 项，1166 通过、48 失败，均为 sandbox `spawn EPERM`、Windows 路径/权限位等既有环境问题；本轮未重跑全量。
+- `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
+- 新增 `tests/project-tickets.spec.ts` 7 项全通过：2 张 Project Ticket、delegated Decision/真实 evalId/projectId/ticketId/mandate、无 assessor、不自动订阅 Project 源 thread、显式 thread 与 contextOnly、幂等、整批回滚、非 PM/未知/结束 Project 拒绝、delegated revalidate，以及 runtime 下 PM 工具建 1–2 张 Ticket、Worker Assignment 启动、PM 读项目内 Ticket、读项目外 Ticket 被拒、内部 Trigger `source='internal'`。
+- 定向回归：`projects` 6、`core-engine` 115、`policy` 329、`panel-project` 1、`locales` 6、`model-surface` 7、`bundle-patch` 3、`navigation` 7、`panel-panel` 8、`client` 5 全通过；`tools`、`cards` 通过。
+- 全量 62 个测试文件、1221 项：1173 通过，48 失败。失败均为既有的 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。`locales` 的 reason 文案检查已补齐 `reason.projectTicketCreated` 后通过。
+- `model-surface` 预算未上调：新增的 `project/<id>/tickets` 读资源与 PM 工具没有超出 orchestrator/worker 的既有预算。
+- 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是本轮环境限制，不是测试失败。
 
 ## 后续顺序
 
 1. 权限控制（初版已完成）
-2. 任务分派 / P2.1 Project + PM（当前）
-3. 任务交接
-4. 意外中断与恢复
-5. 再扩展新功能
+2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（当前完成）
+3. P2.2b 可选 tool allowlist（PM 建 Ticket 时可传 `allow_tools`，空=worker 全工具；不做 denyTools/能力档）
+4. 任务交接
+5. 意外中断与恢复
+6. 再扩展新功能
 
 ## 文档说明
 

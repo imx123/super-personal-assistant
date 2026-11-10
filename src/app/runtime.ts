@@ -17,6 +17,7 @@ import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, ty
 import { policyVersion, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
+import { internalKind } from '../sources/internal.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
@@ -114,6 +115,7 @@ export class Runtime extends Service implements SourceHost {
         return () => {}
       })
       sources.register(mainSessionKind)
+      sources.register(internalKind)
       const userSession = sources.instance<{ operator: string }>(MAIN_SESSION_SOURCE)
       const operator = userSession?.config.operator ?? DEFAULT_MAIN_SESSION_OPERATOR
       // Seed the default User Session policy once. A later change of its operator is synced below.

@@ -129,7 +129,8 @@ export function pmProjectSection(project: ProjectProfile): string {
   return ['## Project', `Project: ${project.title} (${project.id})`, `Goal: ${project.goal}`,
     `Status: ${project.status}; mandate strength: ${project.mandate.strength}; mandate scope: ${project.mandate.scope}`,
     report ? `Latest report (${report.at}): ${report.summary}` : 'No report yet.',
-    'Manage this Project and record progress with orchestrator_project_report. The host gives you no tool that creates Tickets yet: create none and claim no worker started.'].join('\n')
+    'Manage this Project and record progress with orchestrator_project_report. Create its Tickets with '
+      + 'orchestrator_project_ticket_create, inside this Project only; their workers start separately and you do no implementation yourself.'].join('\n')
 }
 /** The first message a PM Session receives when its Project is created, as one JSON object. */
 export function projectInitMessage(project: ProjectProfile): string {
@@ -138,7 +139,8 @@ export function projectInitMessage(project: ProjectProfile): string {
       pm_session_id: project.pmSessionId, decision_id: project.decisionId,
       mandate: { strength: project.mandate.strength, scope: project.mandate.scope, goal: project.mandate.goal } },
     note: 'You are the PM of this Project. Manage it against the goal and report with orchestrator_project_report. '
-      + 'Create no Ticket: the host gives you no such tool yet. No worker was started.' })
+      + 'Create its Tickets with orchestrator_project_ticket_create; each one gets its own worker, started separately. '
+      + 'No Ticket or worker exists yet.' })
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */

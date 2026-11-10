@@ -50,6 +50,7 @@ const DECISION_MARKS: Record<Outcome, Omit<Mark, 'label'>> = {
   accept: { dot: 'done', icon: 'decision', tone: 'success' }, reopen: { dot: 'done', icon: 'refresh', tone: 'success' },
   stop: { dot: 'idle', icon: 'stop', tone: 'danger' }, ignore: { dot: 'idle', icon: 'dismiss', tone: 'neutral' },
   project: { dot: 'done', icon: 'decision', tone: 'success' },
+  delegated: { dot: 'done', icon: 'decision', tone: 'success' },
   unavailable: { dot: 'warning', icon: 'alert', tone: 'warning' }, wouldAccept: { dot: 'idle', icon: 'dismiss', tone: 'warning' },
 }
 /** Maps a Decision outcome to its visual mark, distinguishing `wouldAccept` (an ignore that observe mode would have accepted). */

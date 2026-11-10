@@ -6,8 +6,8 @@ import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
-import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, projectCard, textPage, threadCard, ticketCard,
-  ticketDetails, triggerCard, type TicketThread } from './cards.ts'
+import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, projectCard, projectTicketCard, textPage,
+  threadCard, ticketCard, ticketDetails, triggerCard, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
@@ -29,7 +29,8 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
   { name: 'projects', holds: 'Project Profiles, newest first' },
-  { name: 'project/<id>', holds: 'one Project Profile' },
+  { name: 'project/<id>', holds: 'one Project Profile with the ids of the Tickets its PM created' },
+  { name: 'project/<id>/tickets', holds: 'the Tickets its PM created, newest first, with the external Threads each subscribes to' },
   { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
     + 'report, and its inputs, newest first', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
@@ -87,6 +88,13 @@ const main = ({ host, ticketId }: Read): MainResourceHost => {
   return host as MainResourceHost
 }
 const text = ({ resource, offset, limit }: Read, body: string) => textPage(resource, body, offset, limit ?? 4000)
+/** The Tickets a Project's PM created, newest first. */
+const projectTickets = (store: ResourceHost['store'], projectId: string): Ticket[] =>
+  store.tickets.list().filter(ticket => ticket.projectId === projectId)
+/** The external Threads a Ticket subscribes to, marking the ones it follows for context only. */
+const ticketThreads = (store: ResourceHost['store'], ticketId: string): TicketThread[] => store.threads.list()
+  .filter(thread => thread.subscriptions.includes(ticketId))
+  .map(thread => ({ thread: thread.key, ...thread.context?.includes(ticketId) ? { context: true as const } : {} }))
 function list<T>({ offset, limit }: Read, fetch: (offset: number, count: number) => T[]) {
   const size = Math.min(limit ?? 20, 50)
   const items = fetch(offset, size + 1)
@@ -134,15 +142,22 @@ const ROUTES: readonly Route[] = [
   }],
   ['projects', read => {
     const { store } = main(read)
-    return list(read, (offset, count) => store.projects.list().slice(offset, offset + count).map(projectCard))
+    return list(read, (offset, count) => store.projects.list().slice(offset, offset + count)
+      .map(project => projectCard(project, projectTickets(store, project.id))))
   }],
   ['project/', read => {
     const { store } = main(read)
-    const [id, ...more] = read.rest.split('/')
+    const [id, section, ...more] = read.rest.split('/')
     if (!id || more.length) throw new Error('Unknown context resource')
     const project = store.projects.get(id)
     if (!project) throw new UserError('unknownProject')
-    return projectCard(project)
+    const tickets = projectTickets(store, id)
+    if (section === 'tickets') {
+      return list(read, (offset, count) => tickets.slice(offset, offset + count)
+        .map(ticket => projectTicketCard(ticket, ticketThreads(store, ticket.id))))
+    }
+    if (section !== undefined) throw new Error('Unknown context resource')
+    return projectCard(project, tickets)
   }],
   ['thread/', read => {
     const { host, rest, ticketId } = read

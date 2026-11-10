@@ -213,6 +213,8 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
     revalidate(mandate: Mandate) {
       // Revalidation rules follow docs/002 (Eval path; Resume revalidates).
       const { basis } = mandate
+      // A Project PM delegated this Ticket: the PM Mandate is its authority, so no external allowed list applies.
+      if (basis.via === 'delegated') return true
       const { source } = basis
       const current = source && basis.scope ? listened(sources, source, basis.scope) : undefined
       if (current && !current.listened) return false

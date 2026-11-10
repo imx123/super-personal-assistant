@@ -21,7 +21,7 @@ The tabs follow the workflow: **Overview**, **Source**, **Trigger**, **Eval**, *
 | Trigger | Threads filtered by Subscribed, Evaluating, New Triggers in 24 h, or All Threads. Each Thread shows its Triggers newest first, Decisions and Subscriptions |
 | Eval | Decisions with their reason and matched rules |
 | Execution | Executor state, Pause processing, and Tickets filtered by Open, Pending, Working, Waiting for a Trigger or Ended. Ticket details show actions, authorization, waiting Inputs, Subscriptions and Assignments |
-| Project | The Projects the Router created, newest first. A Project shows its goal, status, PM Session, creating Decision and latest PM report, with **Open PM Session**. P2.1 offers no create, pause or stop action |
+| Project | The Projects the Router created, newest first. A Project shows its goal, status, PM Session, creating Decision, child Tickets with the external Threads each follows (context-only marked), and the latest PM report, with **Open PM Session**. The panel offers no create, pause or stop action; the PM creates Tickets from its Session |
 | Settings | Sources, Eval, Execution, Prompts and Deployment. Each group includes its save history |
 
 ### Reading individual records

@@ -24,6 +24,7 @@ export const REASONS = {
   ignoredFromCard: 'Ignored from its card, without a rule assessment',
   observed: 'Observe mode: would accept ({text})',
   projectCreated: 'Created Project {project}',
+  projectTicketCreated: 'Delegated Ticket for Project {project}',
 } as const
 export type ReasonCode = keyof typeof REASONS
 /** Reason code and template values; `triggerId` identifies the trigger in a batch that the reason applies to. */

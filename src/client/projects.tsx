@@ -28,7 +28,7 @@ function ProjectList() {
 }
 
 function ProjectPage({ id }: { id: string }) {
-  const { t, call } = usePanel()
+  const { t, call, navigate } = usePanel()
   const { data, error } = usePoll(() => call('GET projects/:id', { id }), [id])
   if (!data) return <>
     <PageHead title={t('term.project')} />
@@ -41,6 +41,18 @@ function ProjectPage({ id }: { id: string }) {
       <span className="dt-status-text" data-state="ongoing">{valueLabel(t, 'projectStatus', data.status)}</span>
     </div>
     <Section title={t('projectGoal')}><p>{data.goal}</p></Section>
+    <Section title={t('projectTickets')}>
+      {data.tickets.length ? <ul className="dt-list">{data.tickets.map(ticket => <li key={ticket.id} className="dt-row dt-link">
+        <div className="dt-row-main">
+          <div className="dt-row-title">
+            <button type="button" className="dt-open" onClick={() => navigate({ page: 'execution', id: ticket.id })}>{ticket.title}</button>
+          </div>
+          <div className="dt-row-meta">
+            {ticket.threads.map(thread => <span key={thread.thread}>{thread.thread}{thread.context ? ` (${t('contextOnly')})` : ''}</span>)}
+          </div>
+        </div>
+      </li>)}</ul> : <Hint>{t('projectNoTickets')}</Hint>}
+    </Section>
     <Section title={t('projectPmSession')}>
       <KeyValues rows={[[t('projectPmSession'), data.pmSessionId], [t('projectCreated'), <When at={data.createdAt} />],
         [t('projectUpdated'), <When at={data.updatedAt} />]]} />

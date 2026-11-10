@@ -59,11 +59,23 @@ Creating a Project is not an accept and does not go through `orchestrator_route`
 
 - The Project's Decision still passes the gate: a Trigger the gate does not admit cannot become a Project. The Eval is gate-only: it generates a real Eval id and a Decision of kind `project`, but it never asks the assessor and never delivers a candidate.
 - The same transaction creates the `project` Decision (with `projectId` and no `ticketId`), the Project Profile and the Project PM Mandate. The Project id is `key('project', triggerId)`, so a repeated call returns the Project created first and records no second Decision or PM Session.
-- No Ticket is accepted and no worker starts. The main Session receives the Project card and only acknowledges it.
+- No Ticket is accepted and no worker starts at Project creation. The main Session receives the Project card and only acknowledges it.
 - The `PMMandate` carries the gate's strength, Policy version, basis and actor, as a Ticket Mandate does, plus the Project and its goal. It authorizes managing the Project, not arbitrary file or repository work.
-- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm`, with `orchestrator_read` and `orchestrator_project_report` only. It is a small Router: it keeps the Project's goal in view and reports to the Project. Its read tool accepts only its own `project/<id>`; every other resource is refused. Its permission preset is `workspace-write` when offered, else `read-only`, and full access only when neither exists. P2.1 gives it no tool that creates Tickets; that arrives with the Project Ticket tools.
+- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm` with three tools: `orchestrator_read`, `orchestrator_project_ticket_create` and `orchestrator_project_report`. It is a small Router: it keeps the Project's goal in view, delegates its Tickets and reports to the Project. Its read tool accepts its own `project/<id>`, its `project/<id>/tickets`, and a `ticket/<id>` only when that Ticket's `projectId` is its Project; every other resource is refused. It takes the `auto` permission preset when the host offers it, else `workspace-write`, then `read-only`; full access only when none exists.
 
-The Project Profiles and their latest reports are read through `GET projects` and `GET projects/:id`, and through the `projects` and `project/<id>` read resources.
+### A PM's delegated Tickets
+
+The PM creates Tickets only inside its own Project, never arbitrary work, with `orchestrator_project_ticket_create`. One call takes 1–5 tasks, each with a title, goal, optional scope and note, optional worktree name, and optional external Threads.
+
+- The Engine validates that the caller is that Project's PM Session and that the Project is active. An unknown Project, a non-PM caller or an ended Project creates nothing.
+- Each task records one Trigger of the built-in `internal` Source: actor `{source: 'internal', id: pmSessionId}`, `human: false`, no addressed mark, and one internal Thread of its own.
+- A record-only Eval with a real Eval id records a `delegated` Decision, without asking the assessor and without delivering a candidate. Its basis is `{via: 'delegated', projectId, pmSessionId}`; its strength comes from the PM Mandate. The Decision names the Ticket and the Project, and records the Ticket's Mandate.
+- The Ticket's Mandate copies the PM Mandate's strength, Policy version and actor, narrows the scope to the task's scope (or goal), and carries the delegated basis. `Policy.revalidate` accepts a delegated Mandate directly: the PM Mandate is its authority, so no external allowed list is checked.
+- The Ticket has no Channel and does not subscribe to the Project's source Thread. It subscribes only to the external Threads its task names; a `contextOnly` Thread is recorded in `Thread.context`, so its messages reach the worker without granting authority and do not resume an ended Ticket. Unknown thread keys or malformed references refuse the whole batch.
+- Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call reuses the Ticket each task position already produced.
+- The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.
+
+The Project Profiles, their latest reports and their child Ticket ids are read through `GET projects` and `GET projects/:id`, and through the `projects`, `project/<id>` and `project/<id>/tickets` read resources.
 
 ## Strength
 

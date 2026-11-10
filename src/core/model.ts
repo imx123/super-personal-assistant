@@ -120,6 +120,11 @@ export type MandateBasis = Received & { sender?: string; rules?: string[] } & (
   | { via: 'listed'; addressed?: 'mention' | 'direct'; observation?: { mode?: AcceptMode }; authority?: string }
   /** A message of a bot on its Source's bot list: an inferred candidate at most, never an explicit request or a stop. */
   | { via: 'bot'; addressed?: 'mention' | 'direct'; observation: { mode: AcceptMode } }
+  /**
+   * A Ticket its Project's PM created through the internal Source: the PM Mandate authorizes it, so revalidation accepts
+   * it without looking at an external allowed list.
+   */
+  | { via: 'delegated'; projectId: string; pmSessionId?: string }
 )
 
 /** Immutable authorization produced by an accept decision; execution is bounded by it and it never changes. */
@@ -145,7 +150,7 @@ export interface PMMandate extends Mandate {
 export interface ProjectReport { summary: string; at: string }
 /**
  * A Project the Router created from one of its Triggers, and the PM Session that manages it: a small Router inside the
- * Project. P2.1 keeps it read-mostly: it has a goal, its PM Mandate, and the PM's latest report; its Tickets arrive later.
+ * Project. It has a goal, its PM Mandate, the PM's latest report, and the Tickets its PM created (by `projectId`).
  */
 export interface ProjectProfile {
   id: string
@@ -167,6 +172,20 @@ export const pmSessionId = (projectId: string): string => `pm-${projectId}`
 /** The Project a PM Session id names, or undefined for a Session that is not a Project's PM. */
 export const projectOfSession = (sessionId: string): string | undefined =>
   sessionId.startsWith('pm-') ? sessionId.slice('pm-'.length) : undefined
+/** A Thread a child Ticket subscribes to when its PM creates it, read for context only when `contextOnly` is true. */
+export interface ProjectTicketThread { key: string; contextOnly?: boolean }
+/**
+ * One Ticket a Project's PM asks the Engine to create: its title and goal, an optional narrower scope, a routing note, a
+ * worktree name, and the external Threads it subscribes to. A request is atomic: if one task is invalid, none is created.
+ */
+export interface ProjectTicketTask {
+  title: string
+  goal: string
+  scope?: string
+  note?: string
+  worktree_name?: string
+  threads?: ProjectTicketThread[]
+}
 
 /** Active trigger evaluation on a thread; at most one exists per thread. */
 export interface Evaluation {
@@ -223,7 +242,7 @@ export interface ThreadFact { label?: Text; value: Text; problem?: true }
 /** A thread's facts by id, ordered for display; each writer owns its fact ids. */
 export type ThreadFacts = Record<string, ThreadFact>
 
-export type DecisionKind = 'ignore' | 'accept' | 'reopen' | 'stop' | 'unavailable' | 'project'
+export type DecisionKind = 'ignore' | 'accept' | 'reopen' | 'stop' | 'unavailable' | 'project' | 'delegated'
 /** Outcome of one eval, recorded on the thread. */
 export interface Decision {
   id: string
@@ -236,9 +255,11 @@ export interface Decision {
   /** Why, by code: one reason, or one for each Trigger of the batch it concerns. */
   reason: Reason[]
   strength: Strength
+  /** The Ticket a `delegated` Decision created, which it requires; no other Decision kind requires it. */
   ticketId?: string
-  /** The Project a `project` Decision created; such a Decision has no `ticketId`. */
+  /** The Project a `project` or `delegated` Decision belongs to; a `project` Decision has no `ticketId`. */
   projectId?: string
+  /** The decision's Mandate: a Ticket's for `accept` and `delegated`, the Project's PM Mandate for `project`. */
   mandate?: Mandate
   /** Assessor-supplied audit data (rule assessments, direction, evidence). */
   audit?: Record<string, unknown>
@@ -318,7 +339,7 @@ export interface Ticket {
   id: string
   title: string
   decisionId: string
-  /** The Project it belongs to; empty for a Ticket the Router owns directly (P2.1 creates no Project Tickets yet). */
+  /** The Project it belongs to; empty for a Ticket the Router owns directly. A PM-created Ticket always has one. */
   projectId?: string
   mandate: Mandate
   /** The Channels of the messages it was accepted from, which its replies go to. */

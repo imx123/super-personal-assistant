@@ -10,7 +10,7 @@ import { markdown, preview } from './text.ts'
 export type BasisFact =
   | { name: 'addressed'; value: 'mention' | 'direct' } | { name: 'followup' } | { name: 'admission'; value: AdmissionCell } | { name: 'observation' }
   | { name: 'mode'; value: AcceptMode } | { name: 'rules'; value: { id: string; name: string }[] } | { name: 'sender'; value: string }
-  | { name: 'legacyAuthority'; value: string } | { name: 'bot' }
+  | { name: 'legacyAuthority'; value: string } | { name: 'bot' } | { name: 'delegated'; value: string }
 /**
  * Extracts displayable mandate admission facts in reading order (omitting the receiving scope, which is stored
  * only for re-validation), marking pre-scope records that only have `authority` as `legacy`.
@@ -19,7 +19,8 @@ export function basisFacts(basis: MandateBasis, rule: Snapshot['rule']): { facts
   const facts: BasisFact[] = []
   if (basis.sender) facts.push({ name: 'sender', value: basis.sender })
   if (basis.via === 'bot') facts.push({ name: 'bot' })
-  if (basis.via !== 'followup' && basis.addressed) facts.push({ name: 'addressed', value: basis.addressed })
+  if (basis.via === 'delegated') facts.push({ name: 'delegated', value: basis.projectId })
+  if (basis.via !== 'followup' && 'addressed' in basis && basis.addressed) facts.push({ name: 'addressed', value: basis.addressed })
   // Imported bases already record their follow-up in `authority`.
   if (basis.via === 'followup' && !basis.authority) facts.push({ name: 'followup' })
   if (basis.via === 'admission') facts.push({ name: 'admission', value: basis.cell })

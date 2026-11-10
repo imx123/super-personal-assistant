@@ -2,13 +2,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPM, type EngineForPeople,
-  type ProjectProfile } from '../../core/index.ts'
+import { UserError, PROJECT_TICKETS, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPM,
+  type EngineForPeople, type ProjectProfile, type ProjectTicketTask, type Ticket } from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
-import { ticketCard, projectCard } from '../cards.ts'
+import { projectCard, projectTicketCard, ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
@@ -19,11 +19,26 @@ import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 const RoutingNoteSchema = z.string().trim()
   .refine(text => wordCount(text) <= NOTE_WORDS, `Routing note must not exceed ${NOTE_WORDS} words (Chinese uses word segmentation). Shorten it; do not split it across deliveries.`)
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
+/** One Ticket a Project PM delegates: the work, where it applies, and the external Threads its worker should follow. */
+const ProjectTaskSchema = z.object({
+  title: z.string().trim().min(1).max(PROJECT_TICKETS.title)
+    .describe('A short label describing the work; no implementation advice the PM did not receive.'),
+  goal: z.string().trim().min(1).max(PROJECT_TICKETS.goal).describe('The outcome this Ticket must reach.'),
+  scope: z.string().trim().max(PROJECT_TICKETS.scope).optional()
+    .describe('Optional narrower boundary; defaults to the goal.'),
+  note: RoutingNoteSchema.optional(),
+  worktree_name: WorktreeNameSchema.optional(),
+  threads: z.array(z.object({
+    key: z.string().trim().min(3).max(PROJECT_TICKETS.threadKey).describe('A source:id key, such as github:123 or feishu:<chat>:<root message>.'),
+    contextOnly: z.boolean().optional().describe('true reads the Thread for context only; it grants nothing and resumes no Ticket.'),
+  }).strict()).max(PROJECT_TICKETS.threads).optional(),
+}).strict()
+export type ProjectTaskInput = z.infer<typeof ProjectTaskSchema>
 export interface MainToolsHost {
   readonly context: Context
   readonly engine: Pick<EngineForMainSession, 'recordTriggerForRouting' | 'createProject' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
     & EngineForPM & EngineForPeople
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'projects' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
@@ -215,6 +230,35 @@ function projectCreateTool(host: MainToolsHost): Tool {
     },
   })
 }
+/**
+ * `orchestrator_project_ticket_create`: the PM delegates 1–5 Tickets inside its own Project. The Engine creates each
+ * delegated Decision, Ticket and first Assignment atomically; a repeated request reuses what each task index created.
+ * Workers are started separately, so the tool never says one finished.
+ */
+function projectTicketCreateTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_create',
+    description: 'Create 1-5 Tickets inside this Project, each with its own worker, when the Project goal needs work done. '
+      + 'The Tickets are delegated under the Project Mandate; they are queued and their workers start separately, so do not say a Ticket, worker or pull request has finished. '
+      + 'A repeated request reuses the Ticket each task position created. List external Threads a Ticket should follow with their source:id keys; other forms are refused.',
+    schema: z.object({
+      tasks: z.array(ProjectTaskSchema).min(1).max(PROJECT_TICKETS.max).refine(tasks => {
+        const names = tasks.flatMap(task => task.worktree_name ? [task.worktree_name] : [])
+        return new Set(names).size === names.length
+      }, 'worktree_name must be unique within one request'),
+    }).strict(),
+    execute: async args => {
+      const tickets = host.quietly(() => host.engine.createProjectTickets(project.id, project.pmSessionId, args.tasks as ProjectTicketTask[]))
+      const threads = host.store.threads.list()
+      const cards = tickets.map(ticket => projectTicketCard(ticket, threads.filter(thread => thread.subscriptions.includes(ticket.id))
+        .map(thread => ({ thread: thread.key, ...thread.context?.includes(ticket.id) ? { context: true as const } : {} }))))
+      host.requestPass()
+      const current = host.store.projects.get(project.id) ?? project
+      return { tickets: cards, project: projectCard(current, tickets),
+        note: 'Tickets are delegated; their workers are queued and start separately. No worker has finished.' }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -366,18 +410,31 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   ]
 }
 /**
- * A Project PM Session's tools: read its own Project Profile and report on it. It gets no routing, Ticket, settings,
- * shell, file, web or subagent tool, and no other record of the installation.
+ * A Project PM Session's tools: read its own Project, its Tickets and one of those Tickets, create Tickets inside the
+ * Project, and report on it. It gets no routing, settings, shell, file, web or subagent tool, and no other record of the
+ * installation.
  */
 export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
-  const own = `project/${project.id}`
+  const own = `project/${project.id}`, ownTickets = `${own}/tickets`
+  /** The Project Ticket a `ticket/<id>` resource names, when it belongs to this Project. */
+  const ownTicket = (resource: string): Ticket | undefined => {
+    if (!resource.startsWith('ticket/')) return undefined
+    const id = resource.slice('ticket/'.length)
+    if (!id || id.includes('/')) return undefined
+    const ticket = host.store.tickets.get(id)
+    return ticket?.projectId === project.id ? ticket : undefined
+  }
   return [
-    readTool(`Read this Project's Profile, ${own}. A PM reads no other record.`, false,
-      (resource, offset, limit, signal) => {
-        if (resource !== own) throw new Error(`A Project PM may read only its own Project (${own}); ${resource} is outside it`)
+    readTool(`Read this Project's Profile (${own}), the Tickets it created (${ownTickets}), or one of those Tickets (ticket/<id>). A PM reads nothing outside its own Project.`,
+      false, (resource, offset, limit, signal) => {
+        if (resource !== own && resource !== ownTickets && !ownTicket(resource)) {
+          throw new Error(`A Project PM may read only its own Project (${own}), its Tickets (${ownTickets}), and a Ticket inside it; ${resource} is outside it`)
+        }
         return readResource(resources, resource, offset, limit, undefined, signal)
-      }, `${own}: this Project's goal, status, PM Session, mandate and latest report`),
+      }, `${own}: this Project's goal, status, PM Session, mandate, latest report and child Ticket ids; ${ownTickets}: its child Tickets with their Threads; `
+        + 'ticket/<id>: one of those Tickets only'),
+    projectTicketCreateTool(host, project),
     tool({
       name: 'orchestrator_project_report',
       description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',

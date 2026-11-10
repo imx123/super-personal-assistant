@@ -162,11 +162,12 @@ export class Sessions {
     await this.decorate(result.agent)
     const permissions = ctx.permissionPresets
     // Auto is advertised only while the host's reviewer is registered. Tool denials or errors never change this selection.
-    // A PM manages a Project but does no file work: it takes the narrowest preset that still lets it work, never full access
-    // while the host offers a narrower one.
+    // A PM manages a Project and may create its Tickets, so it takes `auto` as a worker does; without it, the narrowest
+    // preset that still lets it work, and full access only when the host offers nothing narrower.
     const preset = role === 'worker' ? (permissions.names.includes('auto') ? 'auto' : 'danger-full-access')
-      : role === 'pm' ? (permissions.names.includes('workspace-write') ? 'workspace-write'
-        : permissions.names.includes('read-only') ? 'read-only' : 'danger-full-access')
+      : role === 'pm' ? (permissions.names.includes('auto') ? 'auto'
+        : permissions.names.includes('workspace-write') ? 'workspace-write'
+          : permissions.names.includes('read-only') ? 'read-only' : 'danger-full-access')
         : 'danger-full-access'
     permissions.set(result.agent.session, preset)
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })

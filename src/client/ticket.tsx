@@ -73,7 +73,7 @@ function MandateDetails({ ticket, actor }: { ticket: TicketPageView; actor: stri
     if (item.name === 'mode' || item.name === 'addressed') return valueLabel(t, item.name, item.value)
     if (item.name === 'admission') return valueLabel(t, 'admissionCell', item.value)
     if (item.name === 'rules') return item.value.map(rule => rule.name).join(t('listSeparator'))
-    return item.name === 'sender' ? item.value : t('yes')
+    return item.name === 'sender' || item.name === 'delegated' ? item.value : t('yes')
   }
   const { legacy } = ticket.basis
   // Omit `sender` when it matches `actor`, which is already shown on the status line.

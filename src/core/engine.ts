@@ -1,7 +1,7 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, liveTicket, pmSessionId } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ProjectProfile, ThreadRef, Ticket, Trigger } from './model.ts'
+import { isoTime, liveTicket, pmSessionId, threadKey } from './model.ts'
+import type { ChannelRef, Decision, PolicyEffect, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger } from './model.ts'
 import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -16,6 +16,66 @@ export type { WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
 export type { Reply, ReplyRequest } from './replies.ts'
+
+/** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
+export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300 } as const
+const WORKTREE_NAME = /^[a-z]+(?:-[a-z0-9]+){0,3}$/
+/** A short lowercase ASCII worktree name from an English title, or `task-<n>` when the title has none. */
+function worktreeName(title: string, index: number): string {
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').split('-').filter(Boolean).slice(0, 4).join('-').slice(0, 32)
+    .replace(/-+$/, '')
+  return slug && WORKTREE_NAME.test(slug) ? slug : `task-${index + 1}`
+}
+/** Parse a `source:id` thread key a PM named; `source` is a Source kind and the rest is the Source's own thread id. */
+function projectThread(value: string): ThreadRef {
+  const colon = value.indexOf(':')
+  const source = colon > 0 ? value.slice(0, colon) : ''
+  const id = colon > 0 ? value.slice(colon + 1) : ''
+  if (!source || !id || value.length > PROJECT_TICKETS.threadKey || !/^[a-z][a-z0-9-]*$/.test(source) || !id.trim()) {
+    throw new UserError('invalidThread', { thread: value })
+  }
+  return { source, id }
+}
+/** One validated task, with its deterministic index and the Threads it subscribes to, deduplicated. */
+interface PreparedProjectTask {
+  index: number
+  title: string
+  goal: string
+  scope: string
+  note?: string
+  worktree_name: string
+  threads: (ThreadRef & { contextOnly: boolean })[]
+}
+/** Validate one task and its Threads before the batch creates anything. */
+function prepareProjectTask(task: ProjectTicketTask, index: number): PreparedProjectTask {
+  const invalid = (reason: string): never => { throw new UserError('invalidProjectTask', { reason }) }
+  if (!task || typeof task !== 'object') invalid('the task is not an object')
+  const text = (value: unknown) => typeof value === 'string' ? value.trim() : ''
+  const title = text(task.title), goal = text(task.goal), scope = text(task.scope), note = text(task.note)
+  if (!title) invalid('title is required')
+  if (title.length > PROJECT_TICKETS.title) invalid(`title exceeds ${PROJECT_TICKETS.title} characters`)
+  if (!goal) invalid('goal is required')
+  if (goal.length > PROJECT_TICKETS.goal) invalid(`goal exceeds ${PROJECT_TICKETS.goal} characters`)
+  if (scope.length > PROJECT_TICKETS.scope) invalid(`scope exceeds ${PROJECT_TICKETS.scope} characters`)
+  if (note.length > PROJECT_TICKETS.note) invalid(`note exceeds ${PROJECT_TICKETS.note} characters`)
+  const worktree = text(task.worktree_name)
+  if (worktree && (worktree.length > 32 || !WORKTREE_NAME.test(worktree))) {
+    invalid(`worktree_name "${worktree}" is not 1-4 lowercase English kebab-case words of at most 32 characters`)
+  }
+  if (task.threads !== undefined && !Array.isArray(task.threads)) invalid('threads must be an array')
+  const threads = new Map<string, ThreadRef & { contextOnly: boolean }>()
+  for (const item of task.threads ?? []) {
+    if (!item || typeof item !== 'object' || typeof item.key !== 'string') invalid('each thread needs a source:id key')
+    const ref = projectThread(item.key.trim())
+    const key = threadKey(ref)
+    const previous = threads.get(key)
+    // An ordinary Subscription outweighs an earlier context-only one for the same Thread.
+    threads.set(key, { ...ref, contextOnly: previous ? previous.contextOnly && item.contextOnly === true : item.contextOnly === true })
+  }
+  if (threads.size > PROJECT_TICKETS.threads) invalid(`more than ${PROJECT_TICKETS.threads} threads`)
+  return { index, title, goal, scope: scope || goal, ...(note ? { note } : {}), worktree_name: worktree || worktreeName(title, index),
+    threads: [...threads.values()] }
+}
 
 /**
  * Single transactional entry point for mutating Triggers, Threads, Decisions, Tickets, and Assignments.
@@ -108,6 +168,53 @@ export class Engine {
       this.repo.projects.save(project)
       this.options.emit?.({ type: 'project.created', at: decision.at, data: { projectId, decisionId: decision.id, pmSessionId: project.pmSessionId } })
       return project
+    })
+  }
+  /**
+   * Create the Tickets a Project's PM delegated, one internal Trigger, record-only `delegated` Eval and Decision per task,
+   * in one transaction: a task the PM's request cannot create leaves no Trigger, Decision or Ticket behind. The Project must
+   * still be active; when the caller names its Session id, it must be the Project's own PM. A repeated call reuses the Ticket
+   * each task index produced before. No Ticket subscribes to the Project's source Thread; only the external Threads a task names.
+   * @throws UserError when the Project is unknown or has ended, the caller is not its PM, or a task is invalid.
+   */
+  createProjectTickets(projectId: string, tasks: readonly ProjectTicketTask[]): Ticket[]
+  createProjectTickets(projectId: string, pmSessionId: string, tasks: readonly ProjectTicketTask[]): Ticket[]
+  createProjectTickets(projectId: string, pmSessionIdOrTasks: string | readonly ProjectTicketTask[],
+    maybeTasks?: readonly ProjectTicketTask[]): Ticket[] {
+    const tasks = Array.isArray(pmSessionIdOrTasks) ? pmSessionIdOrTasks : maybeTasks
+    const callerSessionId = Array.isArray(pmSessionIdOrTasks) ? undefined : pmSessionIdOrTasks
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      if (callerSessionId !== undefined && project.pmSessionId !== callerSessionId) throw new UserError('notProjectPm')
+      if (!tasks || !Array.isArray(tasks) || !tasks.length) throw new UserError('invalidProjectTask', { reason: 'give 1 to 5 tasks' })
+      if (tasks.length > PROJECT_TICKETS.max) throw new UserError('invalidProjectTask', { reason: `at most ${PROJECT_TICKETS.max} tasks` })
+      const prepared = tasks.map((task, index) => prepareProjectTask(task, index))
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const existing = prepared.map(task => this.repo.tickets.get(key('ticket', project.id, 'delegated', String(task.index))))
+      const names = new Set(existing.flatMap(ticket => ticket?.execution ? [ticket.execution.name.replace(`-${ticket.id.slice(0, 12)}`, '')] : []))
+      for (const task of prepared) {
+        if (!existing[task.index] && names.has(task.worktree_name)) throw new UserError('duplicateWorktree', { name: task.worktree_name })
+        names.add(task.worktree_name)
+      }
+      return prepared.map(task => {
+        const done = existing[task.index]
+        if (done) return done
+        const ticketId = key('ticket', project.id, 'delegated', String(task.index))
+        const triggerId = key('trigger', project.id, 'delegated', String(task.index))
+        const trigger: Trigger = { id: triggerId, source: 'internal', threads: [{ source: 'internal', id: triggerId }],
+          actor: { source: 'internal', id: project.pmSessionId }, human: false, at, text: `${task.title}: ${task.goal}`,
+          meta: { projectId: project.id, pmSessionId: project.pmSessionId, taskIndex: task.index, title: task.title, goal: task.goal,
+            scope: task.scope, ...(task.note ? { note: task.note } : {}) } }
+        this.repo.triggers.save(trigger)
+        const { decision, mandate } = this.evals.delegated(trigger, project, ticketId, task.scope)
+        this.tickets.createDelegated(ticketId, decision.id, mandate, project.id, trigger, { kind: 'accept', title: task.title,
+          scope: task.scope, reason: { code: 'projectTicketCreated', values: { project: project.id } }, name: task.worktree_name,
+          ...(task.note ? { note: task.note } : {}) }, decision.at)
+        for (const thread of task.threads) this.tickets.subscribeExternal(ticketId, thread, thread.contextOnly)
+        return this.repo.tickets.get(ticketId)!
+      })
     })
   }
   /**
@@ -309,7 +416,7 @@ export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadCl
 export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'createProject' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply'
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
-export type EngineForPM = Pick<Engine, 'projectReport'>
+export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

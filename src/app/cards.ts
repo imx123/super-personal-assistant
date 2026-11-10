@@ -27,16 +27,22 @@ export function ticketCard(ticket: Ticket) {
   const ended = ticket.ended && { at: ticket.ended.at, by: ticket.ended.by, reason: ticket.ended.reason ?? ticket.ended.outcome }
   const { attention } = ticket
   return { ticket_id: ticket.id, title: ticket.title, state: cardState(ticket), strength: ticket.mandate.strength,
+    ...(ticket.projectId ? { project_id: ticket.projectId } : {}),
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
 }
-/** Compact model-facing projection of a Project Profile: its goal, PM Session, creating Decision and latest report. */
-export function projectCard(project: ProjectProfile) {
+/** Compact model-facing projection of a Project Profile: its goal, PM Session, creating Decision, latest report and child Ticket ids. */
+export function projectCard(project: ProjectProfile, tickets: readonly Ticket[] = []) {
   const report = project.latestReport
   return { project_id: project.id, title: project.title, goal: project.goal, status: project.status,
     pm_session_id: project.pmSessionId, decision_id: project.decisionId, mandate: { strength: project.mandate.strength, scope: project.mandate.scope },
+    ...(tickets.length ? { ticket_ids: tickets.map(ticket => ticket.id) } : {}),
     ...(report ? { latest_report: { at: report.at, summary: report.summary } } : {}), read: `project/${project.id}` }
+}
+/** A Project Ticket card with the external Threads it subscribes to, as its PM sees it after creating the Ticket. */
+export function projectTicketCard(ticket: Ticket, threads: readonly TicketThread[] = []) {
+  return { ...ticketCard(ticket), project_id: ticket.projectId, ...(threads.length ? { threads } : {}) }
 }
 /** Strips `policyVersion`, an internal hash that callers never query by. */
 const mandateOf = ({ policyVersion: _version, ...mandate }: Mandate) => mandate

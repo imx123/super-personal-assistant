@@ -54,14 +54,14 @@ Each part extends `EnginePart` (`src/core/part.ts`), which provides options and 
 | Part | Responsibility | Depends on |
 | --- | --- | --- |
 | `Intake` | A Source's Trigger: stored once with its disposition, recorded on its Threads and their correlations, fanned out to the subscribed Tickets and, unless it is a person's message that reached one, queued for Eval on its primary Thread | Tickets |
-| `Evals` | The Evals of Threads: batching, the gate's strength, actor and basis with the Trigger that gave them (`primary`), the deadline from the candidate's delivery and its shift by a pause, the requeue of an expired Eval, candidates, replays and hand-backs, the requeue on a Policy change, the gate-only `project` Decision that creates a Project, and the Decision each Eval ends with: accept, stop, ignore, unavailable or project | Tickets |
-| `Tickets` | The Ticket lifecycle: creation from an accept with its Mandate, Subscriptions and first Assignment, the Threads it follows and their closes (`followsDone`), attached Threads and Threads followed for context, Inputs and notes, resume and the messages a resume refuses, retry, restart, stop and end, the Subscriptions it drops, and the notice of a Policy change to the Tickets it bears on | Replies |
+| `Evals` | The Evals of Threads: batching, the gate's strength, actor and basis with the Trigger that gave them (`primary`), the deadline from the candidate's delivery and its shift by a pause, the requeue of an expired Eval, candidates, replays and hand-backs, the requeue on a Policy change, the gate-only `project` Decision that creates a Project, the record-only `delegated` Decision a Project PM's internal Trigger produces, and the Decision each Eval ends with: accept, stop, ignore, unavailable, project or delegated | Tickets |
+| `Tickets` | The Ticket lifecycle: creation from an accept with its Mandate, Subscriptions and first Assignment, the `delegated` creation a Project PM's task produces (no Channel, no acknowledgement, no Subscription to the internal Thread), external Thread subscriptions for a PM-created Ticket, the Threads it follows and their closes (`followsDone`), attached Threads and Threads followed for context, Inputs and notes, resume and the messages a resume refuses, retry, restart, stop and end, the Subscriptions it drops, and the notice of a Policy change to the Tickets it bears on | Replies |
 | `Assignments` | What the Executor and its workers report: an Assignment started, Inputs reached it or failed to, a restart interrupted it, and a worker's Report with its question for a person | Tickets, Replies |
 | `Replies` | Channel writes through the `Outbox`: the acknowledgement, the answer, the result and the attention message, each by the rule that allows it | Nothing |
 
 Commands use imperative names such as `stopTicket`; facts reported by adapters use past-tense names such as `assignmentStarted`. The query `candidate` uses a noun.
 
-Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `EngineForMainSession`, `EngineForPeople`, `EngineForSettings` or `EngineForExecutor`.
+Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `EngineForMainSession`, `EngineForPM`, `EngineForPeople`, `EngineForSettings` or `EngineForExecutor`.
 
 | Role | Method | Effect |
 | --- | --- | --- |
@@ -72,6 +72,7 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 | Main Session | `candidateDelivered(evalId)` | The Eval's candidate reached the main Session: its deadline counts from now |
 | Main Session | `decide(triggerId, outcome)` | Records an Eval Decision, or a direct Decision for an explicit request. Accept creates the Ticket, Mandate, Assignment, Subscriptions and acknowledgement atomically. An inferred candidate ignored from its card records `ignoredFromCard` before the supplied reason. While `followupOwners` still owns a human follow-up, only stop is allowed |
 | Main Session | `createProject(triggerId, title, goal)` | Creates a Project from a Trigger in one transaction: a gate-only `project` Decision with a real Eval id (no assessor and no candidate), the Project Profile, and the PM Mandate, which the Decision also records. It is idempotent by Trigger (`key('project', triggerId)`), and creates no Ticket |
+| Project PM | `createProjectTickets(projectId, pmSessionId, tasks)` | Delegates 1–5 Tickets inside one active Project in one transaction. It validates the caller as the Project's PM when its Session id is given, then for each task records an `internal` Trigger, a record-only Eval and `delegated` Decision with a real Eval id, and a Ticket whose Mandate copies the PM Mandate's strength, Policy version and actor; no assessor runs. Explicit external Threads are subscribed, context-only ones recorded in `Thread.context`. It is atomic and idempotent per task position |
 | Project PM | `projectReport(projectId, summary)` | Records the PM Session's latest report on its Project, which the Project reads show |
 | Main Session | `attach(ticketId, triggerId, note?)` | Routes a Trigger to a Ticket it points at, whose Executor then decides it as a follow-up, and ends the Eval that holds it, whose other Triggers wait for a fresh Eval; an ended Ticket resumes under its Mandate at once unless processing is paused. A follow-up an Executor still decides is refused, as is one routed back to the Ticket that handed it back |
 | Main Session | `requestStatus(ticketId)` | Asks a waiting Executor Session for its status, and answers whether it asked |
@@ -300,13 +301,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
 | `src/kv.ts` | `KV`: every family of `kv` records with its key, its value's type and its owner, and the `Key` and `Family` types the Store and `SourceContext.state` take |
 | `src/navigation.ts` | Opens a DeepSeek Harness Session from the panel once the host's catalog lists it |
-| `src/core/model.ts` | The domain types, among them the typed Ticket and `Mandate`, the Project Profile with its PM Mandate, with `threadKey`, `ticketOutcome`, `reached`, `followupOwners`, `settled`, `waitsForPerson`, `liveTicket`, `runningAssignment`, `latestAssignment` and `latestReport` |
+| `src/core/model.ts` | The domain types, among them the typed Ticket and `Mandate`, the Project Profile with its PM Mandate and `ProjectTicketTask`, with `threadKey`, `ticketOutcome`, `reached`, `followupOwners`, `settled`, `waitsForPerson`, `liveTicket`, `runningAssignment`, `latestAssignment` and `latestReport` |
 | `src/core/ports.ts` | The ports: `Repositories` (with Projects), `Policy`, `SourceScope`, `Assessor`, `Executor`, `Outbox`, and the domain events |
-| `src/core/engine.ts` | The Engine, the core's entry point, and the role interfaces `EngineForSources`, `EngineForMainSession`, `EngineForPeople`, `EngineForSettings` and `EngineForExecutor` |
+| `src/core/engine.ts` | The Engine, the core's entry point, the Project Ticket delegation command with its task bounds, and the role interfaces `EngineForSources`, `EngineForMainSession`, `EngineForPM`, `EngineForPeople`, `EngineForSettings` and `EngineForExecutor` |
 | `src/core/part.ts` | `EnginePart`, the base of the Engine's parts, and `EngineOptions` |
 | `src/core/intake.ts` | `Intake`: Triggers from Sources, to their Tickets and, unless a person's message reached one, to Eval |
-| `src/core/evals.ts` | `Evals`: the Evals of Threads and their Decisions |
-| `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, Subscriptions and Inputs |
+| `src/core/evals.ts` | `Evals`: the Evals of Threads, their Decisions, and the record-only `delegated` Eval a PM's internal Trigger produces |
+| `src/core/tickets.ts` | `Tickets`: the Ticket lifecycle, the Threads a Ticket follows, external Thread subscriptions, Subscriptions and Inputs |
 | `src/core/assignments.ts` | `Assignments`: the Executor's facts and its workers' Reports |
 | `src/core/replies.ts` | `Replies`: the Engine's Channel writes |
 | `src/core/stage.ts` | `ticketStage` and `canRetry`: the Ticket stages of [003 Execution](003-execution.md) |
@@ -339,17 +340,17 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
-| `src/app/cards.ts` | Compact cards of Triggers, Tickets, Projects, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
-| `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role, including Projects |
+| `src/app/cards.ts` | Compact cards of Triggers, Tickets, Projects, Project Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
+| `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role, including Projects and a Project's Tickets |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
-| `src/app/tools/main.ts` | The main Session's tools |
+| `src/app/tools/main.ts` | The main Session's tools, and the Project PM's read, Ticket-creation and report tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
-| `src/app/views/projects.ts` | The Project list and detail reads: goal, status, PM Session, creating Decision, PM Mandate and latest report |
+| `src/app/views/projects.ts` | The Project list and detail reads: goal, status, PM Session, creating Decision, PM Mandate, latest report and child Tickets with their Threads |
 | `src/app/views/threads.ts` | The Thread lists, a Thread's timeline, the search and the Decision list |
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
@@ -362,6 +363,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
 | `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
+| `src/sources/internal.ts` | The built-in `internal` Source kind: one Trigger per delegated Project Ticket, no configuration, channel, poll, health entry or context reader |
 | `src/sources/main-session.ts` | The built-in User Session Source: the configurable operator, the Policy part that admits it, and the scope; it has no polls, Channel or thread context |
 | `src/sources/registry.ts` | `SourceRegistry` |
 | `src/sources/host.ts` | `SourceHost`, `SourceContext`, `Health`, `health` and the fixed health texts |
@@ -426,6 +428,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/projects.spec.ts` | Project creation through the Engine and the main Session tool: the gate-only `project` Decision with a real Eval id, the PM Mandate and PM Session, idempotency, the Project read view and routes |
+| `tests/project-tickets.spec.ts` | PM-created Project Tickets through the Engine and the runtime: internal Triggers, record-only `delegated` Decisions with real Eval ids, Mandates, external Thread subscriptions and context-only ones, no assessor, no automatic Project Thread subscription, idempotency, whole-batch rollback, PM-only creation, delegated revalidation, and the PM's read scope over its Project and its Tickets |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
@@ -463,9 +466,9 @@ One SQLite file, `<stateDir>/orchestrator.sqlite`, which only the Store opens.
 | `disposition` | Where each Trigger went: `filtered` with the Source's reason code, its Eval and Decision, the Tickets it reached, by fan-out or attachment, whether it was requeued, the Tickets that handed it back with their reasons, and those whose Executor acknowledged or answered it | Engine |
 | `trigger_thread` | Which Threads each Trigger is on, with its time and whether a person wrote it, so a Thread's Triggers are read without scanning every Trigger, in order of time and then id: a page of a Thread's timeline continues from a `<at>|<id>` cursor, and Triggers that share a time are not skipped | Store, with each Trigger |
 | `thread` | Threads: Subscriptions, the Tickets that follow it for context, queued Triggers, the Eval in progress, the count of its expiries and `meta`; the generated columns `active`, set while Triggers are queued or an Eval runs, and `subscribed`, its Source while a Ticket subscribes to it | Engine; Sources write `meta` |
-| `ticket` | Tickets with their Mandate, origin, execution, Assignments, Channels, Inputs and the Threads they follow; the generated columns `open`, set while it has not ended, and `active`, set while Inputs are undelivered or the latest Assignment is pending or running | Engine |
-| `decision` | Decisions, by Thread | Engine |
-| `project` | Project Profiles with their goal, status, PM Session, PM Mandate and latest report | Engine |
+| `ticket` | Tickets with their Mandate, origin, Project id (for a PM-created Ticket), execution, Assignments, Channels, Inputs and the Threads they follow; the generated columns `open`, set while it has not ended, and `active`, set while Inputs are undelivered or the latest Assignment is pending or running | Engine |
+| `decision` | Decisions, by Thread, including the `delegated` Decision of a Project Ticket | Engine |
+| `project` | Project Profiles with their goal, status, PM Session, PM Mandate and latest report; its child Tickets are the `ticket` rows whose `projectId` names it | Engine |
 | `effect` | The effect queue: per kind and key, the payload, its order, failed attempts with the last error, and when it is due | Effects; the schema 11 migration queues what earlier versions kept for the main Session |
 | `outbox` | The receipt of each message for a Channel, by id, with the Ticket it is for and its `status`, `pending`, `sent` or `dropped`, kept so an id is never queued twice; for a dropped message, when and why, as the generated column `dropped`, its time, and a reason code. A message that waits has a `reply` effect, which holds its attempts | The Outbox |
 | `kv` | Every other record, by key | The part that names it |
@@ -512,7 +515,9 @@ The main Session has 16 application tools:
 
 `orchestrator_user_trigger_create` registers the current native user message as a `main-session` Trigger and returns its `trigger_id`; the tool reads the operator and the Source switch from the User Session Source, and refuses unless the Policy's allowed list contains that operator. Saving the Source and Runtime startup keep that list equal to the configured operator (only that operator, keeping its display name); the Source switch turns the entry off. The Trigger skips an assessment because the main Session routes it directly; the ticket's Mandate records `main-session` as its Source.
 
-`orchestrator_project_create` is separate from `orchestrator_route`: it creates a Project Profile, its PM Mandate and a `project` Decision with a real Eval id through a gate-only Eval, then resolves the PM Session (`pm-<projectId>`, preset `dsh-superagent-pm`) and sends it one initialization message. It accepts no Ticket and starts no worker; a repeated call for the same `trigger_id` returns the same Project and sends no second message. The main Session only acknowledges it.
+`orchestrator_project_create` is separate from `orchestrator_route`: it creates a Project Profile, its PM Mandate and a `project` Decision with a real Eval id through a gate-only Eval, then resolves the PM Session (`pm-<projectId>`, preset `dsh-superagent-pm`) and sends it one initialization message. It accepts no Ticket and starts no worker at creation; a repeated call for the same `trigger_id` returns the same Project and sends no second message. The main Session only acknowledges it.
+
+The Project's PM then delegates work itself with `orchestrator_project_ticket_create` (see Project PM Session below). The main Session has no tool for Project Tickets.
 
 The main Session is the only Session and is allowed to dispatch by default, but its role prompt makes it read-only by default: it must not edit files, run commands that write, or change another Session's directory. A write the person asks for directly needs their confirmation first; otherwise it goes to a full-tool Ticket. This is a prompt rule, not a tool or sandbox restriction: the router preset still has its shell, and the main Session's permission preset remains `danger-full-access`.
 
@@ -524,11 +529,15 @@ The main Session also has DeepSeek Harness's `skill`, `bash`, `read`, `read_imag
 
 New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`). Shell commands and job waits return after 5 seconds. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
 
-New PM Sessions use `dsh-superagent-pm` (`PM_PRESET`): time context and compaction only, with no shell, file, web, skill, todo, scheduling, goal, workflow or subagent tool. The PM's own application tools are `orchestrator_read` and `orchestrator_project_report`; its Session id is `pm-<projectId>` and it works in a directory under the state directory, since it does no file work. It takes the `workspace-write` permission preset when the host offers it, else `read-only`, and full access only when neither exists. Its `orchestrator_read` accepts only its own `project/<id>` and refuses every other resource.
-
 The `noWait` guard in `src/app/sessions.ts` refuses main-Session shell commands that invoke `sleep` at a command position, shell `timeoutMs` above 30 seconds, and `job_output` waits above 5 seconds. Reports and job results arrive automatically, so waiting only delays incoming candidates.
 
 Existing main Sessions on `standard` also need explicit timeouts for foreground commands and job waits; otherwise that preset's defaults hold the step for 60 and 30 seconds respectively. The host determines the current preset through `presetForSession`, falls back to the Session projection or header, and assumes `standard` if it cannot read the value.
+
+### Project PM Session
+
+New PM Sessions use `dsh-superagent-pm` (`PM_PRESET`): time context and compaction only, with no shell, file, web, skill, todo, scheduling, goal, workflow or subagent tool. The PM's own application tools are `orchestrator_read`, `orchestrator_project_ticket_create` and `orchestrator_project_report`; its Session id is `pm-<projectId>` and it works in a directory under the state directory, since it does no file work. It takes the `auto` permission preset when the host offers it, else `workspace-write`, then `read-only`, and full access only when none exists. Its `orchestrator_read` accepts its own `project/<id>`, its `project/<id>/tickets`, and a `ticket/<id>` whose `projectId` is its Project; every other resource is refused.
+
+`orchestrator_project_ticket_create` takes 1–5 tasks, each with a title, goal, optional scope, note and worktree name (unique within the call), and optional external `threads` as `source:id` keys with `contextOnly`. The Engine creates the Tickets for the Project's PM only while the Project is active; each task gets one `internal` Trigger, a record-only `delegated` Eval and Decision, and a Ticket with no Channel and no Subscription to the Project's source Thread. Unknown thread keys refuse the whole batch. A repeated call reuses the Ticket each task position already created, and each Ticket's worker starts through the normal worker path.
 
 ### Executor tools
 
@@ -570,7 +579,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | Resources | Content |
 | --- | --- |
 | `tickets`, `triggers`, `threads`, `decisions` | Paged lists as `{items, next_offset}`; activity lists put newest first |
-| `projects`, `project/<id>` | Project Profiles, newest first, and one Project Profile; a Project PM may read only its own `project/<id>` |
+| `projects`, `project/<id>`, `project/<id>/tickets` | Project Profiles with their child Ticket ids, one Project Profile, and its child Tickets with their external Threads; a Project PM may read only its own `project/<id>`, `project/<id>/tickets`, and a `ticket/<id>` inside it |
 | `decision/<id>` | One Decision |
 | `thread/<key>` | Label, Tickets, recent Decisions and a page of Triggers |
 | `trigger/<id>` | Message text, replied-to Trigger and neighboring messages, excluding CI runs |

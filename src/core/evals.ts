@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
-import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, PMMandate, Strength, Thread, Trigger } from './model.ts'
+import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, PMMandate, ProjectProfile, Strength, Thread, Trigger } from './model.ts'
 import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -175,6 +175,25 @@ export class Evals extends EnginePart {
     const mandate: PMMandate = { strength: evaluation.strength, policyVersion: evaluation.policyVersion, basis: evaluation.basis,
       actor: evaluation.actor, scope: goal, projectId, goal }
     const decision = this.finish(thread, evaluation, { kind: 'project', reason: [reason], projectId, mandate })
+    return { decision, mandate }
+  }
+  /**
+   * Record the gate-less, record-only Eval of one internal Trigger the PM of `project` delegated: a real Eval id and a
+   * `delegated` Decision with the Ticket's Mandate, without asking the assessor or delivering a candidate. The PM Mandate
+   * is the authority, so the Eval's strength comes from it and its basis is `delegated`; nothing external is checked.
+   */
+  delegated(trigger: Trigger, project: ProjectProfile, ticketId: string, scope: string): { decision: Decision; mandate: Mandate } {
+    const thread = this.thread(trigger.threads[0]!)
+    const at = this.now()
+    const basis: MandateBasis = { via: 'delegated', projectId: project.id, pmSessionId: project.pmSessionId }
+    const evaluation: Evaluation = { id: key('eval', thread.key, 'delegated', trigger.id), threadKey: thread.key, triggerIds: [trigger.id],
+      primary: trigger.id, strength: project.mandate.strength, actor: trigger.actor, basis, policyVersion: this.policy().version, startedAt: at, deadline: at }
+    thread.lastAt = trigger.at
+    this.repo.threads.save(thread)
+    const mandate: Mandate = { strength: project.mandate.strength, policyVersion: project.mandate.policyVersion, basis,
+      actor: project.mandate.actor, scope }
+    const decision = this.record(thread, evaluation, { kind: 'delegated', reason: [{ code: 'projectTicketCreated', values: { project: project.id } }],
+      ticketId, projectId: project.id, mandate })
     return { decision, mandate }
   }
   /**

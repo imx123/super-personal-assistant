@@ -12,6 +12,9 @@ flowchart LR
   T -->|batch| E[Eval]
   T -->|Subscription fan-out| K[Ticket]
   E -->|accept with Mandate / stop| K
+  PM[Project PM] -->|internal Trigger| T2[Internal Thread]
+  T2 -->|delegated, record-only| E2[Delegated Decision]
+  E2 -->|Ticket with delegated Mandate| K
   E -->|ignore / unavailable| X[recorded]
   P[Policy change] -->|notice| K
   K -->|Assignment| W[Executor]
@@ -31,9 +34,9 @@ Source, Thread, Eval, Mandate and Subscription form the core domain; the rest su
 | Channel | The write side of a Thread; the Source defines its addresses | A Thread may have several Channels; a Ticket holds a set of them | Acknowledgements, replies, pull requests and resolved reviews are all writes |
 | Policy | The versioned assessment rules and each Source's part: who may originate work through that Source, in that Source's own identities, how the list is synchronized, and which bots may make candidates | The Policy version covers the rules, the accept mode and the Source parts. A change that bears on a live Ticket, such as a change to a rule it was accepted under, is delivered to its Assignment; it does not revoke Mandates. Identities on different Sources are never mapped to each other | When the rules change, a running Eval must be discarded |
 | Eval | The judgement on a batch of Triggers, in two layers: gate and assessment | Input: the Trigger batch, a Thread snapshot, every Ticket on the Thread including ended ones, and the current Policy. Output: a Decision. Holds no state | Decides whether new work starts, goes on or stops |
-| Mandate | What an accept grants: the Policy version, the scope, the strength, the matched rules, the sender's identity on that Source and how the Source received the Trigger | Immutable; wider scope means a new Ticket. A Ticket's end does not end it: only a person's stop withdraws it, and a Policy that no longer holds it revokes it. Revalidated against the current Policy before an ended Ticket resumes | States why the work may be done, and how far it may go |
-| Ticket | A unit of authorized work | Only Eval creates one. Refers to its Mandate; holds its Channels and Inputs. Goes open → ended, and back to open when a person's message on one of its Threads resumes it, unless a person stopped it. Defines its own state instead of following the Executor's. Its `projectId` is empty while the Router owns it directly | Owns the execution and its reports |
-| Project | A goal the Router delegates to one PM Session for ongoing management | Created from one Trigger by a `project` Decision with a real Eval id, through a gate-only Eval that creates no Ticket. Holds its Project Profile, its goal, the PM Mandate and the PM's latest report. The PM is a small Router inside the Project and starts no work in P2.1 | Keeps a longer goal separate from one unit of Ticket work |
+| Mandate | What an accept grants: the Policy version, the scope, the strength, the matched rules, the sender's identity on that Source and how the Source received the Trigger | Immutable; wider scope means a new Ticket. A Ticket's end does not end it: only a person's stop withdraws it, and a Policy that no longer holds it revokes it. Revalidated against the current Policy before an ended Ticket resumes. A `delegated` Mandate is revalidated by its Project PM Mandate, not by an external allowed list | States why the work may be done, and how far it may go |
+| Ticket | A unit of authorized work | An Eval creates one on the external path; a Project's PM creates one inside its Project through a `delegated`, record-only Eval. Refers to its Mandate; holds its Channels and Inputs. Goes open → ended, and back to open when a person's message on one of its Threads resumes it, unless a person stopped it. Defines its own state instead of following the Executor's. Its `projectId` is empty while the Router owns it directly; a PM-created Ticket carries its Project's id | Owns the execution and its reports |
+| Project | A goal the Router delegates to one PM Session for ongoing management | Created from one Trigger by a `project` Decision with a real Eval id, through a gate-only Eval that creates no Ticket. Holds its Project Profile, its goal, the PM Mandate, the PM's latest report and the Tickets its PM created. The PM is a small Router inside the Project: it creates 1–5 Project Tickets per call and starts no other work | Keeps a longer goal separate from one unit of Ticket work |
 | Assignment | The binding of a Ticket to one Executor instance | A Ticket has several over time. Goes pending → running → ended independently of the Ticket. Only its final report may end the Ticket on the Executor's side | The Executor is outside the domain, but who executes must be inside it |
 | Subscription | A many-to-many relation between Tickets and Threads, held by the Thread | A matching Trigger fans out to every live subscribed Ticket, with no check of who sent it; a person's message that reaches a Ticket this way takes no Eval. A Thread an Executor follows for context reaches its Ticket the same way, but lends it no authority and does not resume it. An ended Ticket keeps its Subscriptions, including that of a pull request that closed or merged: a person's message resumes it under the same Mandate, with no Eval or Decision; messages from bots and CI do not reach it, since its Executor reads its Threads again when it resumes. A Ticket a person stopped receives nothing. The main Session attaches a Thread to an existing Ticket only when its message points at that Ticket explicitly. A person can drop every Subscription on a Thread; an Executor can drop only its own Ticket's Subscription to a Thread it finds unrelated, except the Thread its Ticket started on and a Thread a Source made it follow, such as its pull request's | Later discussion reaches the Executor without anyone mentioning the agent again |
 
@@ -43,7 +46,7 @@ The Executor, with its Sessions and directories, is outside the domain and conne
 
 Aggregates: a Source holds its read position. A Thread holds its Subscriptions, its running Eval, which runs serially and merges Triggers that arrive meanwhile into the next batch, and its Decision history. A Ticket holds its Assignments, Channels and Inputs, and refers to Decisions by id.
 
-A Project is created by a Decision of kind `project`, which names its `projectId` and no `ticketId`; the Eval that produces it never asks the assessor. Its `PMMandate` has the shape of a Mandate but delegates project-level management to `pm-<projectId>`, names the Project's goal and uses that goal as its scope; the Decision records the same PM Mandate for audit. Tickets created for a Project, which arrive in a later phase, carry its `projectId`; none exist yet.
+A Project is created by a Decision of kind `project`, which names its `projectId` and no `ticketId`; the Eval that produces it never asks the assessor. Its `PMMandate` has the shape of a Mandate but delegates project-level management to `pm-<projectId>`, names the Project's goal and uses that goal as its scope; the Decision records the same PM Mandate for audit. The PM creates Tickets for the Project through an internal Source: each task records an internal Trigger whose actor is the PM Session, a record-only Eval with a real eval id and a `delegated` basis, and a `delegated` Decision that names the Ticket and the Project; the Ticket's Mandate carries the PM Mandate's strength, Policy version and actor, its own scope and the delegated basis. A Ticket so created carries the Project's `projectId`, no Channel, and only the external Threads its task names as Subscriptions; it never inherits the Project's source Thread.
 
 ## Rejected concepts
 
@@ -96,7 +99,7 @@ A reference list of the terms this and the later documents use, with their Chine
 | Mandate | 授权 | What an accept grants: strength, scope and the Policy version it relied on |
 | Ticket | 工单 | A unit of authorized work |
 | Project | 项目 | A goal the Router delegates to one PM Session, with a Project Profile and a PM Mandate |
-| PM | 项目经理 | The Session that manages one Project; a small Router inside it, `pm-<projectId>` |
+| PM | 项目经理 | The Session that manages one Project and creates its Tickets; a small Router inside it, `pm-<projectId>` |
 | Project PM Mandate | 项目授权 | What creating a Project delegates to its PM: the gate authorization, the Project and its goal |
 | Assignment | 派工 | The binding of a Ticket to one Executor instance |
 | Subscription | 订阅 | The relation between a Ticket and a Thread |
@@ -107,12 +110,13 @@ A reference list of the terms this and the later documents use, with their Chine
 | Attention | 待人工决定 | A question on a Ticket that waits for a person's answer |
 | Disposition | 去向 | The record of a Trigger being filtered, evaluated or fanned out |
 | Input | 输入 | Context delivered to a Ticket: fanned-out Triggers, Policy changes, resumes and text |
+| Internal dispatch | 内部派工 | The built-in Source a Project PM records one Trigger on per delegated Ticket |
 | Scope | 范围 | The work a Mandate allows |
 | Strength | 强度 | How strong the basis of a Mandate or an Eval is |
 
 | Group | Values |
 | --- | --- |
-| Decision | accept 接单 · stop 停止 · ignore 忽略 · unavailable 未完成 · project 建项目 |
+| Decision | accept 接单 · stop 停止 · ignore 忽略 · unavailable 未完成 · project 建项目 · delegated 项目派工 |
 | Strength | explicit 明确 · inferred 推断 |
 | Assignment | pending 待启动 · running 执行中 · ended 已结束 |
 | Report | progress 进展 · waiting 等待 · ready 就绪 · blocked 受阻 · failed 失败 · dropped 无需处理 |

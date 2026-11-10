@@ -56,6 +56,47 @@ export class Tickets extends EnginePart {
     this.emit('ticket.created', { ticketId: id, decisionId, strength: mandate.strength })
   }
   /**
+   * Create a Ticket its Project's PM delegated: no acknowledgement, no Channel, and no Subscription to the internal
+   * Trigger's own Thread, since the PM remains the Project's only outward voice. Explicit external Threads are subscribed
+   * separately through `subscribeExternal`. Its first Assignment is queued like any other.
+   */
+  createDelegated(id: string, decisionId: string, mandate: Mandate, projectId: string, trigger: Trigger,
+    outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, at: string): Ticket {
+    let ticket: Ticket = { id, title: outcome.title, decisionId, projectId, mandate, channels: [], assignments: [], inputs: [], undelivered: [],
+      createdAt: at, updatedAt: at, origin: { triggerId: trigger.id, triggerIds: [trigger.id] } }
+    ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
+    const assignment = this.newAssignment(ticket)
+    this.repo.tickets.save(ticket)
+    this.options.executor.start(this.require(id), assignment)
+    this.emit('ticket.created', { ticketId: id, decisionId, strength: mandate.strength })
+    return this.require(id)
+  }
+  /**
+   * Subscribe an open ticket to an external Thread its PM named when creating it, or upgrade a context-only Subscription
+   * to an ordinary one. It changes only Thread.subscriptions (and Thread.context for context-only), never `Ticket.follows`.
+   * @returns false when the ticket already subscribes to the Thread.
+   * @throws UserError when the reference is invalid or the ticket is unknown or has ended.
+   */
+  subscribeExternal(ticketId: string, ref: ThreadRef, contextOnly = false): boolean {
+    if (typeof ref?.source !== 'string' || typeof ref?.id !== 'string' || !ref.source.trim() || !ref.id.trim()) {
+      throw new UserError('invalidThread', { thread: JSON.stringify(ref) })
+    }
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const current = this.thread(ref)
+    if (current.subscriptions.includes(ticketId)) {
+      // A later ordinary Subscription makes an earlier context-only one ordinary; otherwise it is already covered.
+      if (!contextOnly && current.context?.includes(ticketId)) { this.subscribe(ticketId, ref); return true }
+      return false
+    }
+    this.subscribe(ticketId, ref)
+    if (!contextOnly) return true
+    const thread = this.thread(ref)
+    thread.context = [...new Set([...thread.context ?? [], ticketId])]
+    this.repo.threads.save(thread)
+    return true
+  }
+  /**
    * Subscribes an open ticket to `thread` and records it in `ticket.follows` (`own` when opened by the ticket).
    * @throws UserError when the ticket is unknown or has ended.
    */
