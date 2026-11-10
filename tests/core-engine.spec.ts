@@ -86,7 +86,7 @@ describe('operator execution controls', () => {
     expect(runningAssignment(h.repo.tickets.get(id)!)?.interruptedAt).toBeUndefined()
   })
 
-  it('ends just the selected assignment and refuses a stale stop after a manual retry', () => {
+  it('ends just the selected assignment, needs a person to approve its resume, and refuses a stale stop after a retry', () => {
     const h = harness()
     const id = accepted(h).ticketId!
     const first = runningAssignment(h.repo.tickets.get(id)!)!
@@ -94,6 +94,9 @@ describe('operator execution controls', () => {
     h.engine.stopAssignment(id, first.id)
     expect(h.executor.stop).toHaveBeenCalledTimes(1)
     expect(h.repo.tickets.get(id)?.ended).toBeUndefined()
+    // A person's stop guards the resume until a person explicitly allows it.
+    expect(() => h.engine.retryTicket(id)).toThrow(new UserError('manualStopNeedsUserApproval'))
+    h.engine.allowResume(id)
     h.engine.retryTicket(id)
     h.settle()
     expect(() => h.engine.stopAssignment(id, first.id)).toThrow(new UserError('assignmentEnded'))

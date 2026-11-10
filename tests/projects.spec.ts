@@ -272,10 +272,8 @@ describe('Project persistence and read views', () => {
       expect(project).toMatchObject({ title: 'Settings site', goal: 'Ship a clearer settings site', pmSessionId: `pm-${project.id}` })
       expect(project.mandate.scope).toBe('Ship a clearer settings site')
       expect(projectOfSession(project.pmSessionId)).toBe(project.id)
-      // The PM has only its read, create-Ticket, message, revive and report tools, and takes the auto preset before the narrower ones.
-      expect([...host.tools.get(project.pmSessionId)!.keys()].sort()).toEqual(['orchestrator_project_report',
-        'orchestrator_project_ticket_create', 'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive',
-        'orchestrator_read'])
+      // The PM has its own read, create, message, revive, handoff and report tools, and takes the auto preset first.
+      expect([...host.tools.get(project.pmSessionId)!.keys()].sort()).toEqual([...PM_TOOLS].sort())
       expect(host.permissions.set).toHaveBeenCalledWith(expect.objectContaining({ id: project.pmSessionId }), 'auto')
       const messages = host.deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === project.pmSessionId)
       expect(messages).toHaveLength(1)

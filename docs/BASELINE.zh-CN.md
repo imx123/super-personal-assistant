@@ -325,6 +325,21 @@ P3-A 把人停止 Worker 与 Project hard pause 收拢到同一个 `Tickets.hard
 
 改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/notices.ts`、`runtime.ts`、`http.ts`、`api.ts`、`sessions.ts`、`tools/main.ts`、`views/records.ts`、`views/projects.ts`；`src/client/projects.tsx`、`ticket.tsx`、`locales.ts`；`docs/002`、`docs/005`、`docs/007`、本文件；`tests/manual-stop.spec.ts` 及既有 projects/project-tickets/http/panel-project/runtime 定向测试。
 
+## 已完成的 P3-B：同 Project 换执行者、跨 Project 新 Ticket
+
+P3-B 只做 Agent 之间的执行权交接：同 Project 保留 Ticket/Mandate/worktree 换 Worker Session；跨 Project 由目标 PM 决定是否接收并在目标 Project 新建独立 Ticket。不做父 Ticket/Dispatch/TaskSpec、Project Memory/RAG、真实 GitHub、`human-owned` 状态，也不移动/复制 worktree。
+
+已实现：
+
+- `Handoff`（`kind: transfer|split`、`status: pending|accepted|rejected`、`from/to`、`reason`、`summary`、`unfinished`、目标 Ticket 的 `request`、`approvedBy`、`decidedAt/decisionReason`）写入 `Ticket.handoffs`；`Assignment.endedReason` 新增 `handedOff`，`Ticket.ended.outcome` 新增 `handedOff`；没有 `parentId`、Dispatch 或独立表。
+- `Assignment.sessionId` 记录派工实际运行的 Worker Session；`workerSessionId(ticketId, seq)` 生成 `worker-<ticketId>` / `-h<n>`，`ticketOfSession` 解析后缀，`latestSessionId`/`workerSessionsOf` 覆盖启动、投递、报告路由、面板链接、归档/暂停/关停与旧 Session 工具守卫。
+- `Engine.transferTicket`/PM 工具 `orchestrator_project_ticket_handoff`：同 Ticket/Mandate/worktree；旧 Assignment `handedOff`、旧 Session 取消并停后台；新 Assignment 用 `-h<seq>`，收到交接摘要 Input；Ticket 保持 open，不建 Decision。多次交接递增 h1/h2。
+- 跨 Project：`Engine.requestProjectHandoff` + `orchestrator_project_ticket_handoff_to_project` 写 pending 记录并通知目标 PM（需要时启动目标 PM Session）；`Engine.decideProjectHandoff` + `orchestrator_project_ticket_handoff_decide` 由目标 PM 拒绝或接收。接收时经正常 delegated 路径在目标 Project 新建独立 Ticket（新 Decision/Mandate/worktree），双向保存同一 accepted Handoff，源 Ticket 停 Worker 并以 `handedOff` 结束；只传摘要/未完成项/链接。
+- 守卫：源/目标 Project 必须 active（paused/archived/ended 各有错误）；源 Ticket 必须 open 且最新 Assignment 未结束；目标只能是另一个 Project；目标 PM 才能决定；同一接受重复调用返回同一目标 Ticket；接收后源 Ticket 不再被 human 消息自动唤醒。
+- PM 工具边界扩大为 8 个（新增 3 个 handoff 工具）；Worker/主 Session 无 handoff 工具。面板 Ticket 页显示交接历史与每个 Assignment 的 Session 链接，Project 页显示待处理跨 Project 交接请求与来源链接。
+
+改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/sessions.ts`、`archive-reconcile.ts`、`runtime.ts`、`resources.ts`、`views/records.ts`、`views/tickets.ts`、`views/projects.ts`、`tools/main.ts`、`cards.ts`；`src/client/ticket.tsx`、`projects.tsx`、`locales.ts`；`docs/001`、`002`、`005`、`007`、`P3_HANDOFF`、本文件；`tests/handoff.spec.ts` 及既有 handoff 相关测试。
+
 ## 验证
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
@@ -346,6 +361,13 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - `projects` 15 项、`project-tickets` 27 项、`http` 5 项、`panel-project` 4 项，以及 `tickets`、`executor`、`archive-reconcile`、`pm-tools` 定向通过。
 - `runtime` 定向除既有 Windows Git 配置路径转义 1 项外通过；该失败与本改动无关。
 
+2026-11-10 在本机验证 P3-B：
+
+- `tsc --noEmit` 通过，`tsdown` 打包通过。
+- 新增 `tests/handoff.spec.ts` 12 项全通过：Session id 后缀解析；同 Project transfer 的 h1/h2、旧 Assignment `handedOff`、Mandate/worktree 不变、briefing Input、事件与 executor.stop；项目状态/PM/Ticket 守卫；跨 Project pending/幂等/拒绝/接收、独立 Ticket、双向记录、无 parentId、worktree 不迁移、重复接收幂等、paused/ended/越权拒绝；读模型；Runtime 下 `-h1` 启动、旧 Session cancel、新 Session 报告路由、Ticket 页链接、工具边界与 Project archive 覆盖新旧 Session；两个 PM 的完整跨 Project 接收流程。
+- 既有 `projects`、`project-tickets`、`manual-stop`、`http`、`panel-project`、`pm-tools`、`locales`、`archive-reconcile` 定向通过。
+- `runtime` 定向 99 项中 98 通过，唯一失败仍是既有 Windows Git 配置路径转义项。
+
 ## 后续顺序
 
 1. 权限控制（初版已完成）
@@ -360,9 +382,10 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 10. P2.8 eval.pmModel 独立 PM 模型（已完成；只影响新 PM Session）
 11. P2.9 Project 状态变更 domain events（已完成；仅审计/测试，不 relay）
 12. 任务交接 P3-A 人工停止标签 / Project hard pause / PM revive / 用户批准（已完成）
-13. 任务交接 P3-B 同 Project 换执行者、跨 Project 新 Ticket（下一步；设计见 [P3_HANDOFF.zh-CN.md](P3_HANDOFF.zh-CN.md)）；PM 直接回答 child attention 仍留待后续
-14. 意外中断与恢复
-15. 再扩展新功能
+13. 任务交接 P3-B 同 Project 换执行者、跨 Project 新 Ticket（已完成；设计见 [P3_HANDOFF.zh-CN.md](P3_HANDOFF.zh-CN.md)）
+14. PM 直接回答 child attention、同 Project Worker→PM 新 Ticket 独立入口（留待后续；目前 PM 可用 `orchestrator_project_ticket_create` 建新票）
+15. 意外中断与恢复
+16. 再扩展新功能
 
 ## 文档说明
 

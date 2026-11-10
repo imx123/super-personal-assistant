@@ -1,6 +1,6 @@
 # P3 任务交接设计
 
-> 状态：P3-A（人工停止标签、Project hard pause、PM revive、用户批准）已实现；P3-B（同 Project 换执行者、跨 Project 新 Ticket）待实现。本文只记录 P3 任务交接的边界、流程和待确认项；实现与验收另开提交。
+> 状态：P3-A（人工停止标签、Project hard pause、PM revive、用户批准）与 P3-B（同 Project 换执行者、跨 Project 新 Ticket）均已实现。本文保留设计边界与决策记录；实现细节见 `docs/001`、`docs/002`、`docs/005`、`docs/007` 与 BASELINE。
 
 ## 1. 先区分三种“交接”
 
@@ -165,6 +165,14 @@ interface ManualStop {
 - 同 Project transfer 不结束 Ticket，只结束旧 Assignment。
 - 新 Session id：`worker-<ticketId>-h<seq>`；所有按 `workerSessionId(ticketId)` 的查找需要支持 handoff session 列表，不能假设唯一。
 
+P3-B 实现补充：
+
+- `Assignment.sessionId?: string` 记录该派工实际运行的 Worker Session；旧记录没有时按 `worker-<ticketId>` 解释。`workerSessionId(ticketId, seq)` 统一生成 id，`ticketOfSession` 解析 `-h<n>` 后缀，`latestSessionId`/`workerSessionsOf` 服务查找、报告路由、面板链接、归档、暂停和关停。
+- `Handoff` 增加 `status: 'pending' | 'accepted' | 'rejected'`、`request`（目标 Project 应建的新 Ticket 任务）、`approvedBy`、`decidedAt`、`decisionReason`；`from`/`to` 的 `ticketId` 在 pending 请求阶段只有 `from` 与 `to.projectId`。跨 Project 记录在同一 `Ticket.handoffs` 数组上双向保存，不建独立表、不加 `parentId`。
+- 同 Project transfer：旧 Assignment 结束为 `handedOff`，旧 Session 取消并停后台；Ticket/Mandate/worktree 不变；新 Assignment 的 Session 为 `-h<seq>`，并通过 text Input 收到交接摘要；Ticket 保持 open，不建 Decision。
+- 跨 Project：源 PM 用 `orchestrator_project_ticket_handoff_to_project` 写 pending 并通知目标 PM；目标 PM 用 `orchestrator_project_ticket_handoff_decide` 接收/拒绝。接收时经正常 delegated 路径在目标 Project 新建独立 Ticket（新 Decision/Mandate/worktree），双向写 accepted Handoff，源 Ticket 停止 Worker 并以 `handedOff` 结束；不移动/复制 worktree，不传未提交改动。目标 paused/archived/ended 或非其 PM 均拒绝。
+- PM 工具边界增加 `orchestrator_project_ticket_handoff`、`orchestrator_project_ticket_handoff_to_project`、`orchestrator_project_ticket_handoff_decide`；Worker 只能报告需要接手，没有换 Session 的工具。
+
 ## 5. 批准层级
 
 | 场景 | 批准者 |
@@ -180,8 +188,8 @@ interface ManualStop {
 ## 6. 与现有工具的关系
 
 - `orchestrator_trigger_handback` 保持不变，只处理消息退回。
-- 同 Project transfer 建议新增 PM 工具：`orchestrator_project_ticket_handoff`；Worker 只能报告，不能调用。
-- 跨 Project 建议新增 PM-to-PM 请求工具：`orchestrator_project_ticket_handoff_to_project`（目标 PM 接收/拒绝）；不需要 Router 单独批准。
+- 同 Project transfer 新增 PM 工具 `orchestrator_project_ticket_handoff`（P3-B 已实现）；Worker 只能报告，不能调用。
+- 跨 Project 新增 PM-to-PM 请求/决定工具 `orchestrator_project_ticket_handoff_to_project` 与 `orchestrator_project_ticket_handoff_decide`（P3-B 已实现；目标 PM 接收/拒绝）；不需要 Router 单独批准。
 - 人要求暂停任务：建议新增 PM/Router 的 stop 工具（例如 `orchestrator_project_ticket_stop`，mode=`assignment`|`ticket`），因为当前 PM 只有读取/建单/消息/汇报工具，主入口也没有 stop 工具；否则“上级终止任务”只能走面板 API。
 - 人工直接停止：面板/API 走 hard stop，并在父级写入 `userStopped` 提醒；不新增 handoff 工具。
 - PM 的“项目暂停”：Project 控制/PM 面板增加 soft/hard 二选一入口，复用 `POST projects/:id/pause`；hard 额外写 Router `projectPausedByUser` 提醒，并只清除 `scope: 'project'` 标签。
@@ -224,10 +232,10 @@ interface ManualStop {
 
 1. 面板“停止”按钮的精确作用域（P3-A 已定）：工单页“停止本次派工”= 单 Worker hard stop（`scope: 'worker'`）；工单页“停止工单”= 结束 Ticket；Project 页“项目暂停（soft/hard）”= Project 级；按钮和确认文案已写清各自作用域。
 2. `userStopped` 提醒（P3-A 已定）：单 Worker 停止沿用执行回执 relay，payload 附 `manual_stop`/`needs_user_approval`；Project hard pause 只发一条 durable `projectPausedByUser` relay，逐 Worker 回执被抑制。
-3. 同 Project transfer 用 `Assignment.endedReason='handedOff'`；人工 stop 用 `userStopped`/`operatorStopped` 的区分（待 P3-B）。
+3. 同 Project transfer 用 `Assignment.endedReason='handedOff'`（P3-B 已完成）；人工 stop 仍用 `stoppedByOperator`，两者在 Ticket 的 `assignment.endedReason` 上可直接区分。
 4. 抽出唯一的 `hardStopWorker` 原语（P3-A 已完成）；`pauseProject` 只做逐 Worker 循环和聚合，不再直接改 Assignment 状态。
-5. 新 Session `worker-<ticketId>-h<n>` 需要改造所有 `workerSessionId(ticketId)` 查找、报告路由和面板链接；旧 Session 只保留历史，不再被自动唤醒（待 P3-B）。
-6. 同 Project handoff 是否允许 Ticket 已 ended 后重开；建议必须先 resume/retry，handoff 不负责重开 Ticket（待 P3-B）。
+5. 新 Session `worker-<ticketId>-h<n>`（P3-B 已完成）：`workerSessionId(ticketId, seq)`、`ticketOfSession` 解析后缀、`Assignment.sessionId` 记录所属 Session、`latestSessionId`/`workerSessionsOf` 覆盖查找、报告路由、面板链接、归档/暂停/关停；旧 Session 只保留历史，工具守卫拒绝其继续工作。
+6. 同 Project handoff 是否允许 Ticket 已 ended 后重开（P3-B 已定）：不允许；handoff 只接受 open 且最新 Assignment 未结束的 Ticket，不负责重开。
 7. 新增 `Ticket.manualStop`（scope `worker`/`project`）（P3-A 已完成）：单 Worker 停止写 worker，Project hard pause 写 project；已有 worker 标签不被 project 覆盖。
 8. 新增 PM `orchestrator_project_ticket_revive`（P3-A 已完成）：只允许在 Project active 时恢复；worker 标签返回“需要用户批准”；resume 后的“无标签但最新 Assignment 由 operator 停止”也是可恢复记录。
 9. 新增用户审批入口（API/面板）清除 worker 标签（P3-A 已完成：`POST tickets/:id/allow-resume`）；Project resume 入口清除 project 标签，PM 不能自行清 worker 标签。

@@ -8,8 +8,9 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
-import { assignmentStopped, key, latestAssignment, liveTicket, projectOfSession, WORK_TOOLS, type ProjectProfile, type Ticket } from '../core/index.ts'
-import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
+import { assignmentStopped, key, latestAssignment, latestSessionId, liveTicket, projectOfSession, WORK_TOOLS, workerSessionsOf,
+  type ProjectProfile, type Ticket } from '../core/index.ts'
+import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId, type DeliveryMode } from './delivery.ts'
 import type { Effects } from './effects.ts'
@@ -75,10 +76,11 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions, the main Session, and a Project's PM are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PM_PRESET = 'dsh-superagent-pm'
-/** The tools a Project's PM may see and call: it reads its Project, creates and messages its Tickets, revives hard-paused
- * Workers, and reports on it. */
+/** The tools a Project's PM may see and call: it reads its Project, creates, messages, hands off and revives its Tickets,
+ * decides handoffs addressed to it, and reports. */
 export const PM_TOOLS = ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
-  'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive'] as const
+  'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive', 'orchestrator_project_ticket_handoff',
+  'orchestrator_project_ticket_handoff_to_project', 'orchestrator_project_ticket_handoff_decide'] as const
 /**
  * The tool boundary of a Project's PM. `tools.restrict` masks only the tools a Session inherits (DSH's global layer and its
  * preset's) and rejects scope-local names, so naming the PM's own tools there fails with `names unknown global tools`
@@ -276,9 +278,9 @@ export class Sessions {
   async resumeProject(_project: ProjectProfile): Promise<ProjectPauseResult> {
     return { delivered: false, cancelled: [], notLoaded: [], failures: [] }
   }
-  /** The PM Session and every child Ticket Session of a Project, without duplicates. */
+  /** The PM Session and every Worker Session of every child Ticket of a Project, without duplicates; a Worker may have several after handoffs. */
   private projectSessions(project: ProjectProfile): string[] {
-    const child = this.host.store.tickets.list().filter(ticket => ticket.projectId === project.id).map(ticket => workerSessionId(ticket.id))
+    const child = this.host.store.tickets.list().filter(ticket => ticket.projectId === project.id).flatMap(ticket => workerSessionsOf(ticket))
     return [...new Set([project.pmSessionId, ...child])]
   }
   /**
@@ -502,6 +504,9 @@ export class Sessions {
       const current = store.tickets.get(ticketId)
       if (current?.archived) return 'Ticket is archived with its Project; unarchive the Project before continuing work'
       if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
+      if (ticketOfSession(agent.id) === ticketId && latestSessionId(current) !== agent.id) {
+        return 'This Worker Session was handed off; the work of this Ticket continues in its new Session, and this one keeps only history'
+      }
       return assignmentStopped(latestAssignment(current)) ? 'Assignment stopped by the operator; use Retry before continuing work' : undefined
     })]
   }

@@ -107,6 +107,8 @@ export interface DomainEvents {
   'ticket.manualStopCleared': { ticketId: string; scope: 'worker' | 'project'; by: 'user' | 'pm' }
   /** A Project's PM revived a Worker its Project's hard pause stopped, under the Ticket's unchanged Mandate. */
   'ticket.revived': { ticketId: string; assignmentId: string; pmSessionId: string }
+  /** Work was handed over: a new Worker Session on the same Ticket, or a new Ticket in another Project. */
+  'ticket.handedOff': { ticketId: string; handoffId: string; kind: 'transfer' | 'split'; toTicketId: string; toSessionId: string }
   /** A Project was archived from active or paused. */
   'project.archived': { projectId: string; from: 'active' | 'paused' }
   /** An archived Project returned to its previous status. */

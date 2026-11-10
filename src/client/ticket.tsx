@@ -164,6 +164,22 @@ export function TicketPage({ id }: { id: string }) {
       <span className="dt-banner-label">{t('deliveryFailedPrefix')}</span>{data.deliveryError}
     </p>}
     <MandateDetails ticket={data} actor={actor} />
+    {data.handoffs?.length ? <Section title={t('handoffTitle')} count={data.handoffs.length}>
+      <ul className="dt-list">{data.handoffs.map(handoff => <li key={handoff.id} className="dt-row">
+        <div className="dt-row-main">
+          <div className="dt-row-title">{t(handoff.kind === 'transfer' ? 'handoffTransfer' : 'handoffSplit')}
+            {' · '}{t(`handoff${handoff.status[0]!.toUpperCase()}${handoff.status.slice(1)}` as 'handoffPending')}</div>
+          <div className="dt-row-meta">
+            <span>{t('handoffFrom')}: {handoff.from.projectId}{handoff.from.sessionId ? ` · ${handoff.from.sessionId}` : ''}</span>
+            <span>{t('handoffTo')}: {handoff.to.projectId}{handoff.to.sessionId ? ` · ${handoff.to.sessionId}` : ''}</span>
+            <When at={handoff.at} />
+          </div>
+          {handoff.reason && <Hint>{t('handoffReason')}: {handoff.reason}</Hint>}
+          <div className="dt-row-quote"><MarkdownLite text={handoff.summary} /></div>
+          {handoff.unfinished?.length ? <Hint>{t('handoffUnfinished')}: {handoff.unfinished.join(t('listSeparator'))}</Hint> : undefined}
+        </div>
+      </li>)}</ul>
+    </Section> : undefined}
     {undelivered.length > 0 && <Section title={t('undeliveredInputs')} count={undelivered.length}>
       <Hint>{data.deliveryError ? t('inputRetryHint') : data.paused ? t('inputPausedHint') : t('inputWaitingHint')}</Hint>
       <InputList inputs={undelivered} />

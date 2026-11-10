@@ -2,8 +2,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type { Engine, ProjectProfile } from '../core/index.ts'
-import { projectOfSession } from '../core/index.ts'
-import { ticketOfSession, workerSessionId } from '../executor/dsh.ts'
+import { projectOfSession, workerSessionsOf } from '../core/index.ts'
+import { ticketOfSession } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
@@ -156,7 +156,7 @@ export class ArchiveReconciler {
   /** The Project's PM and child worker Sessions the host does not report archived; a host without that view reports none. */
   private missingSessions(project: ProjectProfile): string[] {
     const expected = [project.pmSessionId, ...this.host.store.tickets.list()
-      .filter(ticket => ticket.projectId === project.id).map(ticket => workerSessionId(ticket.id))]
+      .filter(ticket => ticket.projectId === project.id).flatMap(ticket => workerSessionsOf(ticket))]
     return expected.filter(sessionId => this.host.sessions.archivedSession(sessionId) === false)
   }
   private async unarchiveProject(sessionId: string): Promise<void> {

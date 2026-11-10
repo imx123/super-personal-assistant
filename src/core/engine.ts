@@ -1,8 +1,9 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, latestAssignment, liveTicket, pmSessionId, runningAssignment, threadKey, waitsForPerson, WORK_TOOLS } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger }
-  from './model.ts'
+import { assignmentSessionId, isoTime, latestAssignment, liveTicket, pmSessionId, runningAssignment, threadKey, waitsForPerson,
+  workerSessionId, WORK_TOOLS } from './model.ts'
+import type { ChannelRef, Decision, Handoff, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef,
+  Ticket, Trigger } from './model.ts'
 import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -32,6 +33,20 @@ export interface ProjectPauseReport {
   project: ProjectProfile
   workers: ProjectPauseWorkers
 }
+/** A same-Project handoff: why the Worker changes and what its successor needs to continue. */
+export interface TicketHandoffRequest { reason: string; summary: string; unfinished?: string[] }
+/** A cross-Project handoff request: the Ticket its target Project's PM should create, plus what to carry over. */
+export interface ProjectHandoffRequest extends TicketHandoffRequest {
+  targetProjectId: string
+  title: string
+  goal: string
+  scope?: string
+  worktree_name?: string
+}
+/** What a target PM decided about a cross-Project handoff, and the Ticket it created when accepted. */
+export interface ProjectHandoffResult { handoff: Handoff; ticket?: Ticket }
+/** The bounds a cross-Project handoff's summary and unfinished items keep. */
+export const HANDOFF = { summary: 4000, unfinished: 20, item: 500 } as const
 
 /** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
 export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300, tools: 32 } as const
@@ -78,6 +93,34 @@ function prepareAllowTools(value: unknown, inherited: readonly string[] | undefi
   }
   return tools
 }
+/** Validate the task and carry-over fields of a cross-Project handoff before any state changes. */
+function prepareHandoff(input: ProjectHandoffRequest): { request: NonNullable<Handoff['request']>; reason: string; summary: string;
+  unfinished?: string[] } {
+  const invalid = (reason: string): never => { throw new UserError('invalidHandoff', { reason }) }
+  const text = (value: unknown) => typeof value === 'string' ? value.trim() : ''
+  const title = text(input.title), goal = text(input.goal), scope = text(input.scope), reason = text(input.reason)
+  const summary = text(input.summary), worktree = text(input.worktree_name)
+  if (!title) invalid('title is required')
+  if (title.length > PROJECT_TICKETS.title) invalid(`title exceeds ${PROJECT_TICKETS.title} characters`)
+  if (!goal) invalid('goal is required')
+  if (goal.length > PROJECT_TICKETS.goal) invalid(`goal exceeds ${PROJECT_TICKETS.goal} characters`)
+  if (scope.length > PROJECT_TICKETS.scope) invalid(`scope exceeds ${PROJECT_TICKETS.scope} characters`)
+  if (!reason) invalid('reason is required')
+  if (reason.length > 500) invalid('reason exceeds 500 characters')
+  if (!summary) invalid('summary is required')
+  if (summary.length > HANDOFF.summary) invalid(`summary exceeds ${HANDOFF.summary} characters`)
+  if (worktree && (worktree.length > 32 || !WORKTREE_NAME.test(worktree))) {
+    invalid(`worktree_name "${worktree}" is not 1-4 lowercase English kebab-case words of at most 32 characters`)
+  }
+  const unfinished = input.unfinished
+  if (unfinished !== undefined && !Array.isArray(unfinished)) invalid('unfinished must be an array of work items')
+  const items = (unfinished ?? []).map(text)
+  if (items.length > HANDOFF.unfinished) invalid(`more than ${HANDOFF.unfinished} unfinished items`)
+  if (items.some(item => !item || item.length > HANDOFF.item)) invalid(`each unfinished item needs 1-${HANDOFF.item} characters`)
+  return { request: { title, goal, scope: scope || goal, ...(worktree ? { worktree_name: worktree } : {}) }, reason, summary,
+    ...items.length ? { unfinished: items } : {} }
+}
+
 /** One validated task, with its deterministic index, the tools it allows, and the Threads it subscribes to, deduplicated. */
 interface PreparedProjectTask {
   index: number
@@ -386,6 +429,146 @@ export class Engine {
     })
   }
   /**
+   * A Project PM moves one of its Tickets to a new Worker: the same Ticket, Mandate and worktree, a new Session named
+   * `worker-<ticketId>-h<seq>`, and the old Assignment and Session stopped. Only the PM may call it; a Worker can only
+   * report that it needs another Worker.
+   * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, or the Ticket is not
+   * its own, is ended, carries a manual stop, or has no running or pending Assignment.
+   */
+  transferTicket(projectId: string, pmSessionId: string, ticketId: string, request: TicketHandoffRequest): Ticket {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+      const summary = typeof request?.summary === 'string' ? request.summary.trim() : ''
+      if (!summary) throw new UserError('invalidHandoff', { reason: 'summary is required' })
+      if (summary.length > HANDOFF.summary) throw new UserError('invalidHandoff', { reason: `summary exceeds ${HANDOFF.summary} characters` })
+      return this.tickets.transfer(ticketId, projectId, pmSessionId, { reason: request.reason?.trim() || 'Handed to a new Worker',
+        summary, ...request.unfinished?.length ? { unfinished: request.unfinished } : {} })
+    })
+  }
+  /**
+   * A source Project's PM asks another Project's PM to take over work beyond its Project: the request names the new Ticket
+   * the target would create, and carries only a summary, the unfinished items and links, never the worktree or uncommitted
+   * changes. It is pending until the target PM decides; the source Ticket keeps running meanwhile. Repeated identical
+   * requests return the same record.
+   * @throws UserError when either Project is unknown or not active, the caller is not the source PM, the target is the
+   * source, or the Ticket is not the source's, is ended, or has no running or pending Assignment.
+   */
+  requestProjectHandoff(projectId: string, pmSessionId: string, ticketId: string, input: ProjectHandoffRequest): Handoff {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      const targetId = typeof input?.targetProjectId === 'string' ? input.targetProjectId.trim() : ''
+      const target = targetId ? this.repo.projects.get(targetId) : undefined
+      if (!target) throw new UserError('unknownProject')
+      if (target.id === project.id) throw new UserError('handoffTarget')
+      if (target.status === 'archived') throw new UserError('projectArchived')
+      if (target.status === 'paused') throw new UserError('projectPaused')
+      if (target.status !== 'active') throw new UserError('projectEnded')
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      if (ticket.manualStop) throw new UserError(ticket.manualStop.scope === 'worker' ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+      const latest = latestAssignment(ticket)
+      if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
+      const prepared = prepareHandoff(input)
+      const id = key('handoff', ticketId, target.id, JSON.stringify({ ...prepared, reason: prepared.reason }))
+      const existing = ticket.handoffs?.find(handoff => handoff.id === id)
+      if (existing) return existing
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const handoff: Handoff = { id, at, kind: 'split', status: 'pending',
+        from: { ticketId, projectId, sessionId: latest.sessionId }, to: { projectId: target.id },
+        reason: prepared.reason, summary: prepared.summary, ...prepared.unfinished ? { unfinished: prepared.unfinished } : {},
+        request: prepared.request }
+      ticket.handoffs = [...ticket.handoffs ?? [], handoff]
+      ticket.updatedAt = at
+      this.repo.tickets.save(ticket)
+      return handoff
+    })
+  }
+  /**
+   * The target Project's PM decides a pending cross-Project handoff. Rejecting marks it rejected and leaves the source
+   * Ticket running. Accepting creates a new, independent Ticket in the target Project under its own Mandate and worktree
+   * (new Decision, no parent), records the accepted Handoff on both Tickets, and ends the source Ticket with outcome
+   * `handedOff` after stopping its Assignment and Session. Links carry over; worktrees and uncommitted changes do not.
+   * @throws UserError when the target Project is unknown, paused, archived or ended, the caller is not its PM, the Handoff
+   * is unknown, already decided or not addressed to this Project, or the source Ticket is no longer open.
+   */
+  decideProjectHandoff(projectId: string, pmSessionId: string, handoffId: string,
+    decision: { action: 'accept' | 'reject'; reason?: string }): ProjectHandoffResult {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      let source: Ticket | undefined, handoff: Handoff | undefined
+      for (const ticket of this.repo.tickets.list()) {
+        const found = ticket.handoffs?.find(item => item.id === handoffId)
+        if (found) { source = ticket; handoff = found; break }
+      }
+      if (!source || !handoff) throw new UserError('unknownHandoff')
+      if (handoff.kind !== 'split' || handoff.to.projectId !== projectId) throw new UserError('notProjectTicket')
+      if (handoff.status === 'accepted') {
+        const ticket = handoff.to.ticketId ? this.repo.tickets.get(handoff.to.ticketId) : undefined
+        return { handoff, ...ticket ? { ticket } : {} }
+      }
+      if (handoff.status !== 'pending') throw new UserError('handoffHandled')
+      const at = this.options.now?.() ?? new Date().toISOString()
+      if (decision.action === 'reject') {
+        const rejected: Handoff = { ...handoff, status: 'rejected', decidedAt: at,
+          ...(decision.reason?.trim() ? { decisionReason: decision.reason.trim().slice(0, 1000) } : {}) }
+        this.replaceHandoff(source, rejected)
+        return { handoff: rejected }
+      }
+      const origin = this.repo.tickets.get(handoff.from.ticketId!)
+      if (!origin || !liveTicket(origin)) throw new UserError('ticketEnded')
+      const request = handoff.request
+      if (!request) throw new UserError('invalidHandoff', { reason: 'the request names no Ticket task' })
+      const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: request.title, goal: request.goal,
+        scope: request.scope, worktree_name: request.worktree_name,
+        note: `Handoff from Project ${handoff.from.projectId}, Ticket ${handoff.from.ticketId}. Read the handoff summary and `
+          + 'unfinished work in this Ticket\'s handoff briefing.' }])
+      const target = this.repo.tickets.get(created!.id)!
+      const sessionId = target.assignments.at(-1)?.sessionId ?? workerSessionId(target.id)
+      const accepted: Handoff = { ...handoff, status: 'accepted', decidedAt: at,
+        to: { ticketId: target.id, projectId, sessionId }, approvedBy: { kind: 'pm', sessionId: pmSessionId } }
+      this.replaceHandoff(origin, accepted)
+      target.handoffs = [...target.handoffs ?? [], accepted]
+      target.updatedAt = at
+      this.repo.tickets.save(target)
+      this.tickets.briefHandoff(target, accepted, false)
+      // A source Ticket hands its work to one place only: its other pending requests are no longer actionable.
+      const siblings = this.repo.tickets.get(origin.id)!
+      siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id !== accepted.id && item.status === 'pending' && item.kind === 'split'
+        ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Handed off to Project ${projectId}` }
+        : item)
+      siblings.updatedAt = at
+      this.repo.tickets.save(siblings)
+      this.tickets.handoffAway(origin.id, `Handed off to Project ${projectId}`)
+      this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId: origin.id, handoffId: accepted.id, kind: 'split',
+        toTicketId: target.id, toSessionId: sessionId } })
+      return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
+    })
+  }
+  /** Save a decided Handoff on its source Ticket, replacing the pending record in place. */
+  private replaceHandoff(source: Ticket, handoff: Handoff): void {
+    source.handoffs = (source.handoffs ?? []).map(item => item.id === handoff.id ? handoff : item)
+    source.updatedAt = this.options.now?.() ?? new Date().toISOString()
+    this.repo.tickets.save(source)
+  }
+  /**
    * End a Project and cascade-stop every still-open Ticket it owns, using the ordinary Ticket stop semantics so history,
    * Sessions and directories stay. It is idempotent: an ended or archived Project returns unchanged.
    * @throws UserError when the Project is unknown.
@@ -468,7 +651,9 @@ export class Engine {
       const ticket = this.repo.tickets.get(ticketId)
       if (!ticket || ticket.archived) return
       const assignment = latestAssignment(ticket)
-      if (assignment && assignment.state !== 'ended') {
+      // An older Worker Session a handoff left keeps only history: archiving it must not end the current Assignment.
+      if (!assignment || assignmentSessionId(ticket.id, assignment) !== sessionId) return
+      if (assignment.state !== 'ended') {
         assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'sessionArchived'
         ticket.updatedAt = at
         this.repo.tickets.save(ticket)
@@ -486,12 +671,15 @@ export class Engine {
   }
   /**
    * A child Worker Session was unarchived outside the Project's own commands: leave the Ticket and Assignment as they are
-   * and add an optional pending note for the PM. It never restarts the Assignment.
+   * and add an optional pending note for the PM. It never restarts the Assignment, and an older Session a handoff left adds
+   * no note.
    */
   workerSessionUnarchived(ticketId: string, sessionId: string, at = new Date().toISOString()): void {
     this.repo.atomic(() => {
       const ticket = this.repo.tickets.get(ticketId)
       if (!ticket || ticket.archived || !liveTicket(ticket)) return
+      const assignment = latestAssignment(ticket)
+      if (!assignment || assignmentSessionId(ticket.id, assignment) !== sessionId) return
       const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
       if (!project || project.status === 'archived') return
       const id = key('project-note', project.id, 'workerRestored', ticket.id, sessionId)
@@ -723,7 +911,8 @@ export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadCl
 export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'createProject' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply'
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
-export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket' | 'reviveProjectTicket'>
+export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket' | 'reviveProjectTicket'
+  | 'transferTicket' | 'requestProjectHandoff' | 'decideProjectHandoff'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
   | 'pauseProject' | 'pauseProjectReport' | 'allowResume' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>

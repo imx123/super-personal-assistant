@@ -185,7 +185,7 @@ async function drive(host: Host) {
     direction: { implementation_requested: true, target_basis: 'specified', requires_design_decision: false, evidence: 'it names the text' } })).ticket as { ticket_id: string }
   const b = proactive.ticket_id
   await runtime.idle()
-  const [workerA, workerB] = [a, b].map(workerSessionId) as [string, string]
+  const [workerA, workerB] = [a, b].map(id => workerSessionId(id)) as [string, string]
   await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'Needs a decision.', human_action: 'Desktop too?' })
   await run(workerA, 'orchestrator_report', { state: 'progress', summary: 'It reads the config.', human_action: null, reply_to_trigger_id: request.id })
   const other = feishu('9', '@bot 顺便看看这个')

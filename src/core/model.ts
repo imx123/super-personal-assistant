@@ -82,7 +82,7 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && !ticket.archived && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
+    return !!ticket && !ticket.archived && (liveTicket(ticket) || (ticket.ended?.by !== 'human' && ticket.ended?.outcome !== 'handedOff'
       && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
   })
 }
@@ -197,6 +197,38 @@ export interface ProjectProfile {
 }
 /** The PM Session id of a Project: deterministic, so a retried creation reaches the same Session. */
 export const pmSessionId = (projectId: string): string => `pm-${projectId}`
+/**
+ * The Worker Session id of a Ticket: `worker-<ticketId>` for its first Worker, and `worker-<ticketId>-h<seq>` after
+ * `seq` handoffs to a new Worker, which keep the same Ticket, Mandate and worktree.
+ */
+export const workerSessionId = (ticketId: string, handoff = 0): string =>
+  handoff > 0 ? `worker-${ticketId}-h${handoff}` : `worker-${ticketId}`
+/** The Ticket a Worker Session id names, with or without a handoff suffix, or undefined for a Session that is not a Worker's. */
+export function ticketOfSession(sessionId: string): string | undefined {
+  if (!sessionId.startsWith('worker-')) return undefined
+  const rest = sessionId.slice('worker-'.length)
+  const handedOff = /^(.*)-h\d+$/.exec(rest)
+  return handedOff ? handedOff[1] : rest
+}
+/** The Session id an Assignment's Worker runs in; Assignments recorded before handoffs have none and ran in the base Session. */
+export const assignmentSessionId = (ticketId: string, assignment: Pick<Assignment, 'sessionId'>): string =>
+  assignment.sessionId ?? workerSessionId(ticketId)
+/** The Session id of a Ticket's latest Assignment, which is the Worker's current one. */
+export function latestSessionId(ticket: Pick<Ticket, 'id' | 'assignments'>): string {
+  const assignment = latestAssignment(ticket)
+  return assignment ? assignmentSessionId(ticket.id, assignment) : workerSessionId(ticket.id)
+}
+/**
+ * Every Worker Session a Ticket had: its base Session and those of its Assignments and Handoffs, so archiving, pausing or
+ * shutting down a Ticket reaches the old Sessions a handoff left behind.
+ */
+export function workerSessionsOf(ticket: Pick<Ticket, 'id' | 'assignments' | 'handoffs'>): string[] {
+  const sessions = [...ticket.assignments.map(assignment => assignmentSessionId(ticket.id, assignment)),
+    ...(ticket.handoffs ?? []).flatMap(handoff => [
+      handoff.from.ticketId === ticket.id ? handoff.from.sessionId : undefined,
+      handoff.to.ticketId === ticket.id ? handoff.to.sessionId : undefined]).filter((id): id is string => !!id)]
+  return [...new Set([workerSessionId(ticket.id), ...sessions])]
+}
 /** The Project a PM Session id names, or undefined for a Session that is not a Project's PM. */
 export const projectOfSession = (sessionId: string): string | undefined =>
   sessionId.startsWith('pm-') ? sessionId.slice('pm-'.length) : undefined
@@ -311,6 +343,8 @@ export interface Assignment {
   startedAt?: string
   endedAt?: string
   endedReason?: string
+  /** The Worker Session this Assignment's worker runs in; absent for Assignments recorded before handoffs. */
+  sessionId?: string
   report?: { state: ReportState; summary: string; at: string }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string
@@ -360,8 +394,8 @@ export interface PolicyEffect {
 }
 
 export type TicketEndBy = 'executor' | 'human'
-/** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, or stopped by a person. */
-export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
+/** How a ticket ended: with its result, with its pull request merged or closed unmerged, with nothing to do, stopped by a person, or handed to another Project. */
+export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped' | 'handedOff'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
 /** Set when its Project's archive made a Ticket non-executable; unarchiving the Project clears it. */
@@ -379,6 +413,36 @@ export interface ManualStop {
   /** The Worker Session that was stopped, when it had one. */
   sessionId?: string
   reason?: string
+}
+/** Whether a Handoff moved a Ticket to a new Worker (`transfer`) or split work into another Project (`split`). */
+export type HandoffKind = 'transfer' | 'split'
+/** A cross-Project request waits for its target PM; a transfer or accepted split is decided. */
+export type HandoffStatus = 'pending' | 'accepted' | 'rejected'
+/** One side of a Handoff: its Ticket and Project, and the Worker Session when one ran or will run there. */
+export interface HandoffEndpoint { ticketId?: string; projectId: string; sessionId?: string }
+/**
+ * Work handed from one Worker or Project to another, recorded on both Tickets. A `transfer` keeps the same Ticket, Mandate
+ * and worktree and only changes the Worker Session; a `split` ends the source Ticket and asks the target Project's PM to
+ * create a new, independent Ticket with a new Mandate. Neither means a parent/child Ticket: `from` and `to` are peers.
+ */
+export interface Handoff {
+  id: string
+  at: string
+  kind: HandoffKind
+  status: HandoffStatus
+  from: HandoffEndpoint
+  to: HandoffEndpoint
+  /** Why the work moved; kept with the record and the new Worker's briefing. */
+  reason?: string
+  /** What the receiving Worker or PM needs to continue, without worktree contents or uncommitted changes. */
+  summary: string
+  /** The work items still open at handoff time. */
+  unfinished?: string[]
+  /** The target Ticket a split asks its PM to create, bounded like a Project ticket task. */
+  request?: { title: string; goal: string; scope?: string; worktree_name?: string }
+  approvedBy?: { kind: 'pm' | 'router'; sessionId?: string }
+  decidedAt?: string
+  decisionReason?: string
 }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
@@ -417,6 +481,8 @@ export interface Ticket {
   updatedAt: string
   /** The Triggers it was accepted from: the one that started it, and the batch its Eval held. */
   origin: { triggerId: string; triggerIds: string[] }
+  /** Work handed to or from this Ticket, on both sides of a transfer or a cross-Project split; no parent/child link. */
+  handoffs?: Handoff[]
   /** What its Executor chose: its short name, directory and assignment text. */
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
@@ -448,7 +514,7 @@ export function reached(ticket: Ticket, trigger: Trigger, thread: (key: string) 
     return current?.subscriptions.includes(ticket.id) === true && (context || !current.context?.includes(ticket.id))
   }) || (input && (context || !trigger.threads.every(ref => thread(threadKey(ref))?.context?.includes(ticket.id))))
 }
-export const latestAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.at(-1)
+export const latestAssignment = (ticket: Pick<Ticket, 'assignments'>): Assignment | undefined => ticket.assignments.at(-1)
 export const OPERATOR_STOP = 'stoppedByOperator'
 export const assignmentStopped = (assignment: Assignment | undefined): boolean =>
   assignment?.state === 'ended' && assignment.endedReason === OPERATOR_STOP

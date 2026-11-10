@@ -1,7 +1,6 @@
 /** Ticket list, ticket detail, mandate basis formatting, and executor load views. */
-import { liveTicket, threadKey, ticketStage, type AcceptMode, type AdmissionCell, type MandateBasis, type Ticket,
+import { assignmentSessionId, liveTicket, threadKey, ticketStage, type AcceptMode, type AdmissionCell, type MandateBasis, type Ticket,
   type TicketStage } from '../../core/index.ts'
-import { workerSessionId } from '../../executor/dsh.ts'
 import type { Store } from '../store.ts'
 import { channelLink, decisionView, newestFirst, page, snapshot, threadSummary, ticketLine, type Snapshot,
   type ViewHost } from './records.ts'
@@ -78,8 +77,10 @@ export function ticketDetail(host: ViewHost, id: string) {
     basis: basisFacts(ticket.mandate.basis, view.rule), paused: store.settings().paused,
     channels: ticket.channels.map(channel => channelLink(view, channel)),
     decision: decision ? decisionView(view, decision) : undefined,
-    // Every started Assignment ran in the ticket's one worker Session. A running assignment whose worker reported a non-progress state has finished its turn unless a human response resumed the ticket.
-    assignments: ticket.assignments.map(assignment => ({ ...assignment, ...assignment.startedAt ? { ref: workerSessionId(ticket.id) } : {},
+    ...ticket.handoffs?.length ? { handoffs: ticket.handoffs } : {},
+    // Each Assignment names the Worker Session it ran in; a handoff keeps earlier ones in the same Ticket.
+    assignments: ticket.assignments.map(assignment => ({ ...assignment, ...assignment.startedAt
+      ? { ref: assignmentSessionId(ticket.id, assignment) } : {},
       ...assignment.state === 'running' && assignment.report && assignment.report.state !== 'progress' && stage !== 'working'
         ? { turnEndedAt: assignment.report.at } : {} })),
     inputs: ticket.inputs.slice().reverse().map(input),

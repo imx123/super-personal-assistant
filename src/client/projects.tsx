@@ -114,6 +114,19 @@ function ProjectPage({ id }: { id: string }) {
       <KeyValues rows={[[t('projectPmSession'), data.pmSessionId], [t('projectCreated'), <When at={data.createdAt} />],
         [t('projectUpdated'), <When at={data.updatedAt} />]]} />
     </Section>
+    {data.handoffRequests?.length ? <Section title={t('handoffRequests')} count={data.handoffRequests.length}>
+      <Hint>{t('handoffRequestHint')}</Hint>
+      <ul className="dt-list">{data.handoffRequests.map(request => <li key={request.handoff_id} className="dt-row">
+        <div className="dt-row-main">
+          <div className="dt-row-title">{t('handoffRequestFrom', { project: request.project_id ?? '', title: request.title })}</div>
+          <div className="dt-row-meta"><When at={request.at} />
+            {request.request?.goal ? <span>{request.request.goal}</span> : undefined}
+          </div>
+          <div className="dt-row-quote"><MarkdownLite text={request.summary} /></div>
+          {request.unfinished?.length ? <Hint>{t('handoffUnfinished')}: {request.unfinished.join(t('listSeparator'))}</Hint> : undefined}
+        </div>
+      </li>)}</ul>
+    </Section> : undefined}
     <Section title={t('projectLatestReport')}>
       {report ? <><MarkdownLite text={report.summary} /><When at={report.at} /></> : <Hint>{t('projectNoReport')}</Hint>}
     </Section>

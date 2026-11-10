@@ -2,12 +2,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, PROJECT_TICKETS, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPM,
-  type EngineForPeople, type ProjectProfile, type ProjectTicketTask, type Ticket } from '../../core/index.ts'
+import { UserError, HANDOFF, PROJECT_TICKETS, followupOwners, key, latestSessionId, reasonText, type Decision, type DecisionKind,
+  type EngineForMainSession, type EngineForPM, type EngineForPeople, type ProjectProfile, type ProjectTicketTask, type Ticket }
+  from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
-import { workerSessionId } from '../../executor/dsh.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
+import { relaySession } from '../notices.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { projectCard, projectTicketCard, ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
@@ -302,7 +303,7 @@ function projectTicketMessageTool(host: MainToolsHost, project: ProjectProfile):
     execute: async args => {
       const ticket = host.store.tickets.get(args.ticket_id)
       if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
-      const sessionArchived = host.sessions.archivedSession(workerSessionId(ticket.id))
+      const sessionArchived = host.sessions.archivedSession(latestSessionId(ticket))
       if (sessionArchived === true) {
         const result = host.quietly(() => host.engine.messageTicket(args.ticket_id, args.text, false, true))
         return { delivered: 'not_started', ticket: projectTicketCard(result.ticket),
@@ -319,6 +320,116 @@ function projectTicketMessageTool(host: MainToolsHost, project: ProjectProfile):
     },
   })
 }
+const HandoffSummarySchema = z.string().trim().min(1).max(HANDOFF.summary)
+const HandoffUnfinishedSchema = z.array(z.string().trim().min(1).max(HANDOFF.item)).max(HANDOFF.unfinished).optional()
+/**
+ * `orchestrator_project_ticket_handoff`: the PM moves one of its Tickets to a new Worker. A Worker can only report that it
+ * needs a successor; it has no tool that changes its own Session.
+ */
+function projectTicketHandoffTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_handoff',
+    description: 'Move one child Ticket to a new Worker inside this Project: the Ticket, Mandate and worktree stay, the old '
+      + 'Assignment ends as handedOff and its Session stops, and a new Session worker-<ticketId>-h<seq> gets a handoff briefing. '
+      + 'The Ticket stays open and no new Decision is created. Only this Project\'s PM may call it; a Worker can only report '
+      + 'that it needs another Worker.',
+    schema: z.object({
+      ticket_id: z.string().min(1).max(200),
+      reason: z.string().trim().min(1).max(500).describe('Why this Worker cannot continue.'),
+      summary: HandoffSummarySchema.describe('What the new Worker needs to continue: state, decisions, and links.'),
+      unfinished: HandoffUnfinishedSchema.describe('Open work items the new Worker must finish.'),
+    }).strict(),
+    execute: async args => {
+      const ticket = host.store.tickets.get(args.ticket_id)
+      if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
+      const handed = await host.quietly(() => host.engine.transferTicket(project.id, project.pmSessionId, args.ticket_id, {
+        reason: args.reason, summary: args.summary, ...args.unfinished ? { unfinished: args.unfinished } : {} }))
+      host.requestPass()
+      const handoff = handed.handoffs?.at(-1)
+      return { ticket: projectTicketCard(handed), handoff_id: handoff?.id, session_id: handoff?.to.sessionId,
+        note: 'The old Assignment ended as handedOff and its Session stops; one new Assignment is queued under the same Mandate and worktree.' }
+    },
+  })
+}
+/**
+ * `orchestrator_project_ticket_handoff_to_project`: the source PM asks another Project's PM to take over work beyond this
+ * Project. The target PM decides; nothing ends or moves until it accepts.
+ */
+function projectHandoffRequestTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_handoff_to_project',
+    description: 'Ask another Project\'s PM to take over work that is beyond this Project. The target PM decides whether to '
+      + 'accept and create a new independent Ticket there; the source Ticket keeps running until it accepts. Carry only a '
+      + 'summary, unfinished items and links: never the worktree or uncommitted changes. The target Project must be active.',
+    schema: z.object({
+      ticket_id: z.string().min(1).max(200),
+      target_project_id: z.string().min(1).max(200),
+      title: z.string().trim().min(1).max(PROJECT_TICKETS.title).describe('The title of the Ticket the target Project would create.'),
+      goal: z.string().trim().min(1).max(PROJECT_TICKETS.goal).describe('The outcome that Ticket must reach, as a fresh task.'),
+      scope: z.string().trim().max(PROJECT_TICKETS.scope).optional(),
+      worktree_name: WorktreeNameSchema.optional(),
+      reason: z.string().trim().min(1).max(500).describe('Why this work belongs to the target Project.'),
+      summary: HandoffSummarySchema.describe('What the target PM needs to decide and continue.'),
+      unfinished: HandoffUnfinishedSchema,
+    }).strict(),
+    execute: async args => {
+      const ticket = host.store.tickets.get(args.ticket_id)
+      if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
+      const target = host.store.projects.get(args.target_project_id)
+      if (!target) throw new UserError('unknownProject')
+      const handoff = await host.quietly(() => host.engine.requestProjectHandoff(project.id, project.pmSessionId, args.ticket_id, {
+        targetProjectId: args.target_project_id, title: args.title, goal: args.goal, ...args.scope ? { scope: args.scope } : {},
+        ...args.worktree_name ? { worktree_name: args.worktree_name } : {}, reason: args.reason, summary: args.summary,
+        ...args.unfinished ? { unfinished: args.unfinished } : {} }))
+      let notified = true
+      try {
+        await host.sessions.openProject(target)
+        host.sessions.relay(`handoff-request:${handoff.id}`, JSON.stringify({ kind: 'handoff_request', handoff_id: handoff.id,
+          from_project_id: project.id, from_ticket_id: args.ticket_id, title: args.title, summary: handoff.summary,
+          ...handoff.unfinished ? { unfinished: handoff.unfinished } : {}, read: `project/${target.id}` }),
+        `Handoff request from ${project.title}`, target.pmSessionId)
+      } catch { notified = false }
+      host.requestPass()
+      return { handoff_id: handoff.id, status: handoff.status, target_project: target.id, notified,
+        note: notified ? 'The target PM was notified; it decides whether to accept.' : 'The request is stored; the target PM was not running and may not see it until opened.' }
+    },
+  })
+}
+/**
+ * `orchestrator_project_ticket_handoff_decide`: the target PM accepts or rejects a pending cross-Project handoff. Accepting
+ * creates the target Ticket with its own Mandate and worktree and ends the source Ticket as handed off.
+ */
+function projectHandoffDecideTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_handoff_decide',
+    description: 'Decide a pending handoff addressed to this Project by another Project\'s PM. Accept creates a new, '
+      + 'independent Ticket in this Project with its own Mandate and worktree and ends the source Ticket as handedOff; reject '
+      + 'leaves the source Ticket running. Only this Project\'s PM may decide, and only for requests addressed to it.',
+    schema: z.object({
+      handoff_id: z.string().min(1).max(500),
+      action: z.enum(['accept', 'reject']),
+      reason: z.string().trim().max(1000).optional().describe('For reject: why this Project cannot take the work.'),
+    }).strict(),
+    execute: async args => {
+      const result = await host.quietly(() => host.engine.decideProjectHandoff(project.id, project.pmSessionId, args.handoff_id,
+        { action: args.action, ...args.reason ? { reason: args.reason } : {} }))
+      const sourceProject = host.store.projects.get(result.handoff.from.projectId)
+      const sourceTicket = result.handoff.from.ticketId ? host.store.tickets.get(result.handoff.from.ticketId) : undefined
+      const payload = { kind: 'handoff_decision', handoff_id: result.handoff.id, action: args.action,
+        from_ticket_id: result.handoff.from.ticketId, to_ticket_id: result.handoff.to.ticketId, to_project_id: project.id,
+        ...result.handoff.decisionReason ? { reason: result.handoff.decisionReason } : {} }
+      host.sessions.relay(`handoff-decision:${result.handoff.id}:${args.action}`, JSON.stringify(payload),
+        `Handoff ${args.action === 'accept' ? 'accepted' : 'rejected'}: ${result.handoff.request?.title ?? result.handoff.id}`,
+        relaySession(sourceTicket, sourceProject))
+      host.requestPass()
+      return { handoff: result.handoff, ...result.ticket ? { ticket: projectTicketCard(result.ticket) } : {},
+        note: args.action === 'accept'
+          ? 'A new independent Ticket was created in this Project; its Worker starts separately. The source Ticket ended as handedOff.'
+          : 'The request is rejected; the source Ticket keeps running.' }
+    },
+  })
+}
+
 /**
  * `orchestrator_project_ticket_revive`: the PM restores one of its Workers that a Project hard pause stopped, after the
  * Project is active again. The Ticket keeps its Mandate and worktree; a person's single-Worker stop is refused until a
@@ -521,6 +632,9 @@ export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
     projectTicketCreateTool(host, project),
     projectTicketMessageTool(host, project),
     projectTicketReviveTool(host, project),
+    projectTicketHandoffTool(host, project),
+    projectHandoffRequestTool(host, project),
+    projectHandoffDecideTool(host, project),
     tool({
       name: 'orchestrator_project_report',
       description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',

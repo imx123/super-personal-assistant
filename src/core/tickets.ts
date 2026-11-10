@@ -1,10 +1,10 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { assignmentStopped, latestAssignment, latestReport, liveTicket, OPERATOR_STOP, readUntil, runningAssignment, settled,
-  threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, ManualStop, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput,
-  TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
+import { assignmentSessionId, assignmentStopped, latestAssignment, latestReport, liveTicket, OPERATOR_STOP, readUntil, runningAssignment,
+  settled, threadKey, waitsForPerson, workerSessionId } from './model.ts'
+import type { Assignment, ChannelRef, Evaluation, Follow, Handoff, Mandate, ManualStop, PolicyEffect, ThreadRef, Ticket, TicketEndBy,
+  TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -164,6 +164,7 @@ export class Tickets extends EnginePart {
     this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.archived) throw new UserError('ticketArchived')
+    if (current.ended?.outcome === 'handedOff') throw new UserError('ticketEnded')
     if (this.projectPaused(current)) throw new UserError('projectPaused')
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
@@ -316,6 +317,87 @@ export class Tickets extends EnginePart {
     this.emit('ticket.revived', { ticketId, assignmentId: assignment.id, pmSessionId })
     return this.require(ticketId)
   }
+  /**
+   * Move a Ticket to a new Worker inside its Project: end the current Assignment with `handedOff` and stop its Session,
+   * record the transfer on both sides of the same Ticket, brief the new Worker, and start one new Assignment under the
+   * unchanged Mandate and worktree with Session `worker-<ticketId>-h<seq>`. The Ticket stays open; no Decision is created.
+   * @throws UserError when the ticket is unknown or ended, is not the Project's, carries a manual stop, or has no running or
+   * pending Assignment to hand over.
+   */
+  transfer(ticketId: string, projectId: string, pmSessionId: string, request: { reason: string; summary: string; unfinished?: string[] }): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+    this.refuseManualStop(ticket)
+    const latest = latestAssignment(ticket)
+    if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
+    const at = this.now()
+    const handoff = (seq: number): Handoff => ({ id: key('handoff', ticketId, 'transfer', String(seq), request.summary),
+      at, kind: 'transfer', status: 'accepted',
+      from: { ticketId, projectId, sessionId: assignmentSessionId(ticketId, latest) },
+      to: { ticketId, projectId, sessionId: workerSessionId(ticketId, seq) },
+      reason: request.reason, summary: request.summary, ...request.unfinished?.length ? { unfinished: request.unfinished } : {},
+      approvedBy: { kind: 'pm', sessionId: pmSessionId }, decidedAt: at })
+    const seq = this.transferCount(ticket) + 1
+    const record = handoff(seq)
+    this.endAssignment(ticket, latest, 'handedOff')
+    this.requeueUntaken(ticket, latest)
+    if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
+    delete ticket.attention
+    delete ticket.delivery
+    ticket.handoffs = [...ticket.handoffs ?? [], record]
+    this.briefHandoff(ticket, record)
+    const assignment = this.newAssignment(ticket)
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.options.executor.stop(ticket, latest, 'handedOff')
+    this.options.executor.start(ticket, assignment)
+    this.emit('ticket.handedOff', { ticketId, handoffId: record.id, kind: 'transfer', toTicketId: ticketId,
+      toSessionId: record.to.sessionId! })
+    return this.require(ticketId)
+  }
+  /**
+   * End a source Ticket handed to another Project: end its current Assignment with `handedOff` and stop its Session, then
+   * end the Ticket with outcome `handedOff`. The Ticket is not archived or deleted, and its Handoff records stay.
+   * @throws UserError when the ticket is unknown or ended.
+   */
+  handoffAway(ticketId: string, reason?: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) return ticket
+    const latest = latestAssignment(ticket)
+    if (latest && latest.state !== 'ended') {
+      this.endAssignment(ticket, latest, 'handedOff')
+      this.requeueUntaken(ticket, latest)
+      ticket.updatedAt = this.now()
+      this.repo.tickets.save(ticket)
+      this.options.executor.stop(ticket, latest, 'handedOff')
+    }
+    this.end(ticketId, 'executor', 'handedOff', this.now(), reason)
+    return this.require(ticketId)
+  }
+  /**
+   * Add the new Worker's briefing as a text Input, under the Handoff's id, so the receiving Session reads why it has the work
+   * and what is unfinished without the source Ticket's history, worktree or uncommitted changes being transferred.
+   */
+  briefHandoff(ticket: Ticket, handoff: Handoff, moved = handoff.kind === 'transfer'): void {
+    const id = key('input', ticket.id, 'handoff', handoff.id)
+    if (ticket.inputs.some(input => input.id === id)) return
+    const unfinished = handoff.unfinished?.length ? `\nUnfinished:\n${handoff.unfinished.map(item => `- ${item}`).join('\n')}` : ''
+    const where = moved
+      ? 'The Ticket, its Mandate and its worktree are unchanged; inspect the worktree, git history and PR state and continue.'
+      : `This is a new Ticket in Project ${ticket.projectId}, with its own Mandate and worktree. The source Ticket ${handoff.from.ticketId} in Project ${handoff.from.projectId} ended as handed off; its worktree and uncommitted changes were not transferred. Inspect this Ticket's own workspace and continue.`
+    const text = `A Project PM handed this work to a new Worker. Reason: ${handoff.reason ?? 'not stated'}.\n`
+      + `Summary: ${handoff.summary}${unfinished}\n${where}`
+    ticket.inputs.push({ id, kind: 'text', text, at: this.now() })
+    ticket.undelivered.push(id)
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+  }
+  /** The number of accepted transfers a Ticket had, which numbers its next Worker Session. */
+  private transferCount(ticket: Pick<Ticket, 'id' | 'handoffs'>): number {
+    return ticket.handoffs?.filter(handoff => handoff.kind === 'transfer' && handoff.status === 'accepted'
+      && handoff.to.ticketId === ticket.id).length ?? 0
+  }
   /** Record the stop that guards the Worker's automatic resume; a Project stop leaves an earlier `worker` stop in place. */
   private writeManualStop(ticket: Ticket, options: HardStopWorkerOptions): void {
     if (options.scope === 'project' && ticket.manualStop?.scope === 'worker') return
@@ -424,7 +506,8 @@ export class Tickets extends EnginePart {
    */
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
-    if (!ticket || liveTicket(ticket) || ticket.archived || ticket.ended?.by === 'human' || ticket.manualStop || !ticket.undelivered.length) return
+    if (!ticket || liveTicket(ticket) || ticket.archived || ticket.ended?.by === 'human' || ticket.ended?.outcome === 'handedOff'
+      || ticket.manualStop || !ticket.undelivered.length) return
     // A paused Project accepts no new Assignment; the message waits for a person to resume it and retry explicitly.
     if (this.projectPaused(ticket)) return
     const policy = this.policy()
@@ -572,7 +655,8 @@ export class Tickets extends EnginePart {
   private newAssignment(ticket: Ticket): Assignment {
     this.refuseManualStop(ticket)
     if (this.projectPaused(ticket)) throw new UserError('projectPaused')
-    const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now() }
+    const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending',
+      createdAt: this.now(), sessionId: workerSessionId(ticket.id, this.transferCount(ticket)) }
     ticket.assignments.push(assignment)
     delete ticket.delivery
     return assignment

@@ -15,7 +15,7 @@ export function triggerCard(trigger: Trigger, disposition?: TriggerDisposition) 
 }
 /** The states a ticket card shows: an open ticket's stage (docs/003), an ended ticket's outcome, or its Project's archive. */
 export const TICKET_STATES = ['person/delivery', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'working', 'working/queued', 'idle',
-  'completed', 'merged', 'closed', 'dropped', 'stopped', 'archived'] as const
+  'completed', 'merged', 'closed', 'dropped', 'stopped', 'handedOff', 'archived'] as const
 export type TicketCardState = typeof TICKET_STATES[number]
 function cardState(ticket: Ticket): TicketCardState {
   if (ticket.archived) return 'archived'

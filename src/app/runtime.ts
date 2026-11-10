@@ -13,7 +13,8 @@ import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
-import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
+import { Engine, key, latestSessionId, reasonText, workerSessionsOf, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger }
+  from '../core/index.ts'
 import { policyVersion, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
@@ -22,7 +23,7 @@ import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
+import { DshExecutor, sourceTrigger, triggerMessage } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -189,7 +190,7 @@ export class Runtime extends Service implements SourceHost {
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
             if (source?.source === 'main-session' && ended.ended?.by === 'human' && ended.ended.outcome === 'stopped'
               && !ended.assignments.some(item => item.endedAt === ended.ended?.at)) {
-              const relay = executionStatus(ended, 'cancel_ticket', workerSessionId(ended.id), ended.ended.at, ended.assignments.at(-1)?.id)
+              const relay = executionStatus(ended, 'cancel_ticket', latestSessionId(ended), ended.ended.at, ended.assignments.at(-1)?.id)
               const project = ended.projectId ? store.projects.get(ended.projectId) : undefined
               sessions.relay(relay.id, relay.text, relay.summary, relaySession(ended, project))
             }
@@ -284,7 +285,7 @@ export class Runtime extends Service implements SourceHost {
     try {
       this.assessor.stop()
       await this.archiveReconciler.stop()
-      const ids = [this.masterId, ...this.store.tickets.list().map(ticket => workerSessionId(ticket.id))]
+      const ids = [this.masterId, ...this.store.tickets.list().flatMap(ticket => workerSessionsOf(ticket))]
       const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
       for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
       await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
