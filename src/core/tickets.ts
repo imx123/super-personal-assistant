@@ -152,6 +152,7 @@ export class Tickets extends EnginePart {
     this.leftToWorkers(trigger)
     const current = this.require(ticketId)
     if (current.archived) throw new UserError('ticketArchived')
+    if (this.projectPaused(current)) throw new UserError('projectPaused')
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
     return trigger
@@ -224,10 +225,11 @@ export class Tickets extends EnginePart {
   }
   /**
    * Replaces the stalled or explicitly stopped assignment of a retryable open ticket.
-   * @throws UserError when the ticket is unknown or not retryable.
+   * @throws UserError when the ticket is unknown, its Project is paused, or it is not retryable.
    */
   retry(ticketId: string): Ticket {
     const ticket = this.require(ticketId)
+    if (this.projectPaused(ticket)) throw new UserError('projectPaused')
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
     const stopped = assignmentStopped(latest)
@@ -316,6 +318,8 @@ export class Tickets extends EnginePart {
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
     if (!ticket || liveTicket(ticket) || ticket.archived || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
+    // A paused Project accepts no new Assignment; the message waits for a person to resume it and retry explicitly.
+    if (this.projectPaused(ticket)) return
     const policy = this.policy()
     if (policy.paused) return
     if (!policy.revalidate(ticket.mandate)) { this.refuse(ticket); return }
@@ -441,8 +445,16 @@ export class Tickets extends EnginePart {
     const later = ticket.inputs.some(input => input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later
   }
-  /** Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. */
+  /** Whether the Ticket's Project is paused, which blocks every new Assignment, explicit or automatic. */
+  private projectPaused(ticket: Pick<Ticket, 'projectId'>): boolean {
+    return !!ticket.projectId && this.repo.projects.get(ticket.projectId)?.status === 'paused'
+  }
+  /**
+   * Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket.
+   * @throws UserError when the Ticket belongs to a paused Project.
+   */
   private newAssignment(ticket: Ticket): Assignment {
+    if (this.projectPaused(ticket)) throw new UserError('projectPaused')
     const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now() }
     ticket.assignments.push(assignment)
     delete ticket.delivery

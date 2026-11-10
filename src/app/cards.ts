@@ -37,6 +37,7 @@ export function ticketCard(ticket: Ticket) {
 export function projectCard(project: ProjectProfile, tickets: readonly Ticket[] = []) {
   const report = project.latestReport
   return { project_id: project.id, title: project.title, goal: project.goal, status: project.status,
+    ...(project.pauseMode ? { pause_mode: project.pauseMode } : {}),
     pm_session_id: project.pmSessionId, decision_id: project.decisionId, mandate: { strength: project.mandate.strength, scope: project.mandate.scope },
     ...(tickets.length ? { ticket_ids: tickets.map(ticket => ticket.id) } : {}),
     ...(project.pendingNotes?.length ? { pending_notes: project.pendingNotes.map(note => ({ at: note.at, kind: note.kind,

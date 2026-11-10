@@ -261,19 +261,50 @@ export class Engine {
 
   /**
    * Pause or resume a Project: active ↔ paused only. An ended or archived Project ignores the change.
-   * Existing child Tickets continue; only new Tickets are blocked while paused.
-   * @throws UserError when the Project is unknown.
+   * A soft pause blocks new Tickets and Assignments while running Assignments finish; a hard pause also ends every pending
+   * or running child Assignment with `projectPaused` and asks the Executor to stop it. Resuming clears the mode and, from a
+   * hard pause, adds one `resumedFromHard` note for the PM; it never restarts work.
+   * @throws UserError when the Project is unknown or the mode is not `soft`/`hard`.
    */
-  pauseProject(projectId: string, paused: boolean): ProjectProfile {
+  pauseProject(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectProfile {
+    if (mode !== 'soft' && mode !== 'hard') throw new UserError('projectPauseMode')
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.status === 'ended' || project.status === 'archived') return project
-      const status = paused ? 'paused' as const : 'active' as const
-      if (project.status === status) return project
-      const updated: ProjectProfile = { ...project, status, updatedAt: this.options.now?.() ?? new Date().toISOString() }
-      this.repo.projects.save(updated)
-      return updated
+      const at = this.options.now?.() ?? new Date().toISOString()
+      if (!paused) {
+        if (project.status !== 'paused') return project
+        const active: ProjectProfile = { ...project, status: 'active', updatedAt: at }
+        delete active.pauseMode
+        if (project.pauseMode === 'hard') {
+          const note: ProjectNote = { id: key('project-note', project.id, 'resumedFromHard', at), at, kind: 'resumedFromHard',
+            sessionId: project.pmSessionId,
+            text: 'The Project resumed from a hard pause. Read the Project and its Tickets and synchronize their state before '
+              + 'continuing; interrupted Assignments were not retried.' }
+          active.pendingNotes = [...project.pendingNotes ?? [], note]
+        }
+        this.repo.projects.save(active)
+        return active
+      }
+      // A hard pause is not downgraded by a later soft request; it ends only on resume.
+      if (project.status === 'paused' && project.pauseMode === 'hard' && mode === 'soft') return project
+      if (project.status === 'paused' && project.pauseMode === mode) return project
+      const pausedProject: ProjectProfile = { ...project, status: 'paused', pauseMode: mode, updatedAt: at }
+      this.repo.projects.save(pausedProject)
+      if (mode === 'hard') {
+        for (const ticket of this.repo.tickets.open()) {
+          if (ticket.projectId !== projectId) continue
+          for (const assignment of ticket.assignments) {
+            if (assignment.state === 'ended') continue
+            assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'projectPaused'
+            this.options.executor.stop(ticket, assignment, 'projectPaused')
+          }
+          ticket.updatedAt = at
+          this.repo.tickets.save(ticket)
+        }
+      }
+      return pausedProject
     })
   }
   /**

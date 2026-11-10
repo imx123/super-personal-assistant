@@ -334,8 +334,13 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'POST projects/:id/pause': { body: true, answer: ({ params, body }) => {
     const project = server.projects.find(item => item.id === params.id)
     if (!project) return refuse(404, 'Project not found')
-    if (project.status !== 'ended') project.status = body.paused ? 'paused' : 'active'
-    return { paused: project.status === 'paused' }
+    if (project.status !== 'ended' && project.status !== 'archived') {
+      project.status = body.paused ? 'paused' : 'active'
+      if (body.paused) project.pauseMode = body.mode ?? 'soft'
+      else delete project.pauseMode
+    }
+    return { paused: project.status === 'paused', mode: project.pauseMode ?? null,
+      sessions: { delivered: false, cancelled: [], notLoaded: [], failures: [] } }
   } },
   'POST projects/:id/stop': { answer: ({ params }) => {
     const project = server.projects.find(item => item.id === params.id)

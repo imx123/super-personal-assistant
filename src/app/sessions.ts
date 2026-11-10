@@ -21,6 +21,17 @@ import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
 
+/** Outcome of pausing or resuming a Project's Sessions: a soft notice, or hard cancellations of loaded agents. */
+export interface ProjectPauseResult {
+  /** True when a soft-pause notice was delivered to the PM (false when it was already delivered or the PM is unavailable). */
+  delivered: boolean
+  /** Loaded Sessions whose current turn was cancelled on a hard pause. */
+  cancelled: string[]
+  /** Project Sessions not loaded in this process; there was no turn to cancel, and a later prompt sees the paused state. */
+  notLoaded: string[]
+  /** Failures that leave the Project status authoritative; each is also logged. */
+  failures: { sessionId: string; error: string }[]
+}
 /** Outcome of asking the host to archive or unarchive a Project's PM and child Sessions. */
 export interface SessionArchiveResult {
   /** Session ids the host accepted, in call order. */
@@ -194,6 +205,47 @@ export class Sessions {
   /** Unarchive the Project's PM and every child Ticket's Session; no Assignment is restarted. */
   unarchiveProject(project: ProjectProfile): Promise<SessionArchiveResult> {
     return this.changeProjectSessions(project, false)
+  }
+  /**
+   * Apply a soft or hard pause to a Project's Sessions. Soft queues one structured notice to the PM asking it to finish its
+   * report and stop; it cancels no turn. Hard cancels every loaded PM/child agent turn and leaves unloaded Sessions to the
+   * paused Project state. The Project transaction has already run; failures are logged and returned, never thrown.
+   */
+  async pauseProject(project: ProjectProfile, mode: 'soft' | 'hard'): Promise<ProjectPauseResult> {
+    const result: ProjectPauseResult = { delivered: false, cancelled: [], notLoaded: [], failures: [] }
+    const actual = project.pauseMode ?? mode
+    if (actual === 'hard') {
+      for (const sessionId of this.projectSessions(project)) {
+        const agent = this.ctx.agents.get(sessionId as SessionId)
+        if (!agent) { result.notLoaded.push(sessionId); continue }
+        try {
+          agent.cancel({ kind: 'user' }, { keepInbox: true })
+          result.cancelled.push(sessionId)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          this.ctx.logger.warn('dsh-superagent could not stop Session %s for a hard pause: %s', sessionId, message)
+          result.failures.push({ sessionId, error: message })
+        }
+      }
+      return result
+    }
+    const requestId = key('project-pause', project.id, project.updatedAt)
+    if (await this.holds(project.pmSessionId, requestId)) return result
+    const payload = { kind: 'project_pause', project_id: project.id, mode: 'soft',
+      instruction: 'Finish the current round with orchestrator_project_report, then stop. Do not create Tickets or start new Assignments.' }
+    try {
+      await this.prompt(project.pmSessionId, requestId, JSON.stringify(payload), 'queue')
+      result.delivered = true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.ctx.logger.warn('dsh-superagent could not deliver the soft-pause notice for Project %s: %s', project.id, message)
+      result.failures.push({ sessionId: project.pmSessionId, error: message })
+    }
+    return result
+  }
+  /** Resume a Project's Sessions: no Assignment is restarted and no message is sent; the PM reads the Engine's note. */
+  async resumeProject(_project: ProjectProfile): Promise<ProjectPauseResult> {
+    return { delivered: false, cancelled: [], notLoaded: [], failures: [] }
   }
   /** The PM Session and every child Ticket Session of a Project, without duplicates. */
   private projectSessions(project: ProjectProfile): string[] {

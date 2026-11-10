@@ -160,13 +160,13 @@ export interface PMMandate extends Mandate {
 }
 /** A PM's latest report on its Project, kept until its next report. */
 export interface ProjectReport { summary: string; at: string }
-/** A Project-level note for its PM's next turn: a child Worker Session was archived or restored outside the Project's own commands. */
+/** A Project-level note for its PM's next turn: a child Worker Session archive/restore, or recovery from a hard pause. */
 export interface ProjectNote {
   id: string
   at: string
-  kind: 'workerArchived' | 'workerRestored'
-  ticketId: string
-  sessionId: string
+  kind: 'workerArchived' | 'workerRestored' | 'resumedFromHard'
+  ticketId?: string
+  sessionId?: string
   text: string
 }
 /**
@@ -179,6 +179,8 @@ export interface ProjectProfile {
   goal: string
   /** Active Projects create Tickets; paused ones keep their existing Tickets but create no new one; ended ones are read-only history. */
   status: 'active' | 'paused' | 'ended' | 'archived'
+  /** How a paused Project stops work: soft lets running Assignments finish, hard stops them now. */
+  pauseMode?: 'soft' | 'hard'
   /** The status an archived Project returns to when it is unarchived. */
   archivedFrom?: 'active' | 'paused'
   /** The `project` Decision that created it. */

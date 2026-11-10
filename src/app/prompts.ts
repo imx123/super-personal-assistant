@@ -128,7 +128,10 @@ export function pmProjectSection(project: ProjectProfile): string {
   const report = project.latestReport
   const notes = project.pendingNotes ?? []
   return ['## Project', `Project: ${project.title} (${project.id})`, `Goal: ${project.goal}`,
-    `Status: ${project.status}; mandate strength: ${project.mandate.strength}; mandate scope: ${project.mandate.scope}`,
+    `Status: ${project.status}${project.pauseMode ? ` (${project.pauseMode} pause)` : ''}; mandate strength: ${project.mandate.strength}; mandate scope: ${project.mandate.scope}`,
+    ...project.status === 'paused' ? [project.pauseMode === 'hard'
+      ? 'This Project is hard-paused: all work is stopped. Wait for a person to resume it; do not start work. After a resume, first read the Project and its Tickets and synchronize their state.'
+      : 'This Project is soft-paused: finish this round with orchestrator_project_report and then stop. Do not create Tickets or start new Assignments.'] : [],
     report ? `Latest report (${report.at}): ${report.summary}` : 'No report yet.',
     ...notes.length ? ['Pending notes:', ...notes.map(note => `- ${note.kind}: ${note.text}`)] : [],
     'Manage this Project and record progress with orchestrator_project_report. Create its Tickets with '

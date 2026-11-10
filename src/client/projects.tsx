@@ -38,8 +38,14 @@ function ProjectPage({ id }: { id: string }) {
   const reportArchive = (sessions: { failures: { sessionId: string; error: string }[] }, label: string) => {
     if (sessions.failures.length) notify(t('projectSessionsFailed', { action: label, count: String(sessions.failures.length) }))
   }
-  const pause = useAction(async () => {
-    await call('POST projects/:id/pause', { id, body: { paused: data?.status === 'active' } })
+  const pauseSoft = useAction(async () => {
+    await call('POST projects/:id/pause', { id, body: { paused: true, mode: 'soft' } })
+  }, { reload })
+  const pauseHard = useAction(async () => {
+    await call('POST projects/:id/pause', { id, body: { paused: true, mode: 'hard' } })
+  }, { reload })
+  const resume = useAction(async () => {
+    await call('POST projects/:id/pause', { id, body: { paused: false } })
   }, { reload })
   const stop = useAction(async () => { await call('POST projects/:id/stop', { id }) }, { reload })
   const archive = useAction(async () => {
@@ -63,10 +69,12 @@ function ProjectPage({ id }: { id: string }) {
         : data.status !== 'ended' && <Button variant="outline" size="sm" icon={<Icon name="inbox" size={14} />}
           disabled={archive.busy} onClick={() => { void archive.run() }}>{t('archiveProject')}</Button>}
       {(data.status === 'active' || data.status === 'paused') && <>
-        <Button variant="outline" size="sm" icon={<Icon name={data.status === 'paused' ? 'play' : 'pause'} size={14} />}
-          disabled={pause.busy} onClick={() => { void pause.run() }}>
-          {t(data.status === 'paused' ? 'resumeProject' : 'pauseProject')}
-        </Button>
+        {data.status === 'active' && <Button variant="outline" size="sm" icon={<Icon name="pause" size={14} />}
+          disabled={pauseSoft.busy} onClick={() => { void pauseSoft.run() }}>{t('pauseProjectSoft')}</Button>}
+        {data.status === 'paused' && <Button variant="outline" size="sm" icon={<Icon name="play" size={14} />}
+          disabled={resume.busy} onClick={() => { void resume.run() }}>{t('resumeProject')}</Button>}
+        {data.pauseMode !== 'hard' && <ConfirmButton variant="outline" icon="alert" label={t('pauseProjectHard')}
+          title={t('pauseProjectHardTitle')} message={t('pauseProjectHardConfirm', { title: data.title })} onConfirm={pauseHard.run} />}
         <ConfirmButton variant="outline" icon="stop" label={t('stopProject')} title={t('stopProjectTitle')}
           message={t('stopProjectConfirm', { title: data.title })} onConfirm={stop.run} />
       </>}
@@ -74,6 +82,7 @@ function ProjectPage({ id }: { id: string }) {
     </PageHead>
     <div className="dt-row-meta dt-status-line">
       <span className="dt-status-text" data-state={projectTone(data.status)}>{valueLabel(t, 'projectStatus', data.status)}</span>
+      {data.status === 'paused' && data.pauseMode && <span className="dt-status-text">{t(`pauseMode.${data.pauseMode}`)}</span>}
     </div>
     <Section title={t('projectGoal')}><p>{data.goal}</p></Section>
     <Section title={t('projectTickets')}>

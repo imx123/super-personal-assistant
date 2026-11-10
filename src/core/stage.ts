@@ -22,9 +22,10 @@ export function ticketStage(ticket: Ticket): TicketStage {
   return { stage: 'working' }
 }
 
-/** True when an open ticket was stopped by an operator, archived and restored, stalled on a report, or has a failed input delivery. */
+/** True when an open ticket was stopped by an operator, archived or hard-paused and restored, stalled on a report, or has a failed input delivery. */
 export function canRetry(ticket: Ticket): boolean {
   const assignment = latestAssignment(ticket)
-  return !ticket.ended && !ticket.archived && (assignmentStopped(assignment) || assignment?.endedReason === 'projectArchived'
+  return !ticket.ended && !ticket.archived && (assignmentStopped(assignment)
+    || assignment?.endedReason === 'projectArchived' || assignment?.endedReason === 'projectPaused'
     || waitsForPerson(ticket) || !!ticket.delivery)
 }

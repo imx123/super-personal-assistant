@@ -8,6 +8,7 @@ export const USER_ERRORS = {
   notProjectPm: ['refused', 'Only this Project\'s PM Session may create its Tickets'],
   projectEnded: ['refused', 'This Project has ended; no new Ticket can be created'],
   projectPaused: ['refused', 'This Project is paused; resume it before creating more Tickets'],
+  projectPauseMode: ['refused', 'Pause mode must be soft or hard'],
   projectArchived: ['refused', 'This Project is archived; unarchive it before creating more Tickets'],
   invalidProjectTask: ['refused', 'Invalid Project ticket task: {reason}'],
   invalidThread: ['refused', 'Invalid thread reference: {thread}'],

@@ -35,7 +35,8 @@ export interface HttpHost {
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'archiveProject' | 'unarchiveProject'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'archiveProject' | 'unarchiveProject'
+    | 'pauseProject' | 'resumeProject'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
@@ -198,8 +199,14 @@ function routes(runtime: HttpHost): Routes {
       return project
     },
     'POST projects/:id/pause': async ({ params, body }) => {
-      const { paused } = z.object({ paused: z.boolean() }).strict().parse(await body())
-      return { paused: runtime.engine.pauseProject(params.id, paused).status === 'paused' }
+      const { paused, mode = 'soft' } = z.object({ paused: z.boolean(), mode: z.enum(['soft', 'hard']).optional() }).strict()
+        .parse(await body())
+      const project = runtime.engine.pauseProject(params.id, paused, mode)
+      const sessions = paused
+        ? project.status === 'paused' ? await runtime.sessions.pauseProject(project, mode)
+          : { delivered: false, cancelled: [], notLoaded: [], failures: [] }
+        : await runtime.sessions.resumeProject(project)
+      return { paused: project.status === 'paused', mode: project.pauseMode ?? null, sessions }
     },
     'POST projects/:id/stop': ({ params }) => { runtime.engine.stopProject(params.id); return { stopped: true } },
     'POST projects/:id/archive': async ({ params }) => {

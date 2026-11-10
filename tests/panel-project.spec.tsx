@@ -40,12 +40,24 @@ it('pauses, resumes and stops a Project from its page, keeping the page readable
   await mount()
   await click(tab(zh['tab.project']))
   await click(project.title)
-  await click(zh.pauseProject)
+  await click(zh.pauseProjectSoft)
   expect(server.projects[0]!.status).toBe('paused')
+  expect(server.projects[0]!.pauseMode).toBe('soft')
   expect(text()).toContain(zh['projectStatus.paused'])
-  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/pause', body: { paused: true } }))
+  expect(text()).toContain(zh['pauseMode.soft'])
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/pause',
+    body: { paused: true, mode: 'soft' } }))
+  // A soft pause can be upgraded to hard after confirmation.
+  await click(zh.pauseProjectHard)
+  expect(text()).toContain(zh.pauseProjectHardTitle)
+  await click(zh.confirm)
+  expect(server.projects[0]!.pauseMode).toBe('hard')
+  expect(text()).toContain(zh['pauseMode.hard'])
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/pause',
+    body: { paused: true, mode: 'hard' } }))
   await click(zh.resumeProject)
   expect(server.projects[0]!.status).toBe('active')
+  expect(server.projects[0]!.pauseMode).toBeUndefined()
   expect(text()).toContain(zh['projectStatus.active'])
   // Stop asks for confirmation first, then ends the Project and keeps its page readable.
   await click(zh.stopProject)

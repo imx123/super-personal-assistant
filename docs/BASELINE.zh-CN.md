@@ -170,6 +170,33 @@ P2.5-B 只做 DSH 原生 archive/unarchive 的应用联动与 PM pendingNotes；
 
 明确未做：Project/Ticket 删除、pause soft/hard、PM 独立模型、PM→Worker 消息、Project domain events、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
 
+## P2.6 当前范围：pause soft / hard
+
+P2.6 只做 Project pause 的 soft/hard 语义；不做删除、PM 模型、PM→Worker 消息或 Project domain events。
+
+已实现：
+
+- `ProjectProfile.pauseMode?: 'soft' | 'hard'`。`Engine.pauseProject(projectId, paused, mode = 'soft')` 保留旧 2 参 soft 语义；soft pause 阻止新 Ticket/新 Assignment 但让 running Assignment 继续；hard pause 额外把所有 open project Ticket 的 pending/running Assignment 置 ended `projectPaused` 并调用 `executor.stop`，不 archive、不结束 Ticket。
+- 所有新 Assignment 入口统一守卫：`Tickets.newAssignment` 抛 `projectPaused`，覆盖 PM 建单、retry、resume、attach；`Tickets.attachable`/`retry`/`wake` 也提前处理 paused。
+- `Sessions.pauseProject(project, mode)`：
+  - soft 向 PM 投一条结构化 `project_pause`，要求完成本轮 `orchestrator_project_report` 后停止；request id 幂等，不重复发；PM Session 不存在时返回 failure，不阻塞 Project 状态；不取消当前 turn。
+  - hard 取消 PM 和所有已加载 child Worker 的当前 turn，返回 `cancelled`/`notLoaded`；未加载 Session 没有 turn 可取消，后续 prompt 看到 paused 状态；不 archive、不删历史。
+  - `resumeProject` 不自动重启 Assignment；hard resume 的 `resumedFromHard` pendingNote 由 Engine 写入。
+- `pmProjectSection` 增加 paused 说明：soft 要求收尾汇报后停止；hard 表示所有工作已停止、等待 resume，恢复后需先重读 Project/Tickets 并同步状态。hard resume 的 note 通过同一 pendingNotes 机制进入 PM 下一次 prompt。
+- API `POST projects/:id/pause` body `{ paused, mode?: 'soft' | 'hard' }`（默认 soft），返回 `paused/mode/sessions`；Project 页提供 Pause（soft）、Hard pause（确认）和 Resume，显示 soft/hard，soft 可升级 hard，hard 后显示 Resume。没有新增 PM/Worker 工具。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/core/model.ts`、`engine.ts`、`tickets.ts`、`stage.ts`、`errors.ts` | pauseMode、hard pause 级联结束 Assignment、新 Assignment 守卫、hard resume note、`projectPauseMode` |
+| `src/app/sessions.ts`、`http.ts`、`api.ts`、`prompts.ts`、`views/projects.ts`、`cards.ts` | soft PM 消息、hard cancel、pause API/Read 模型、PM prompt paused 说明 |
+| `src/client/projects.tsx`、`locales.ts` | Pause soft/hard、Hard pause 确认、Resume、pause mode 文案 |
+| `tests/project-tickets.spec.ts`、`panel-project.spec.tsx`、`http.spec.ts` | soft/hard 行为、Assignment 守卫、PM notice/cancel、API/panel |
+| `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | soft/hard、新 Assignment 守卫、PM 收尾、hard resume 提示 |
+
+明确未做：Project/Ticket 删除、PM 独立模型、PM→Worker 消息、Project domain events、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
+
 ## 主入口的权限模型
 
 主入口现在是正式 Source：`main-session`（`src/sources/main-session.ts`）。
@@ -204,14 +231,15 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
-2026-11-10 在本机验证 P2.5-B：
+2026-11-10 在本机验证 P2.6：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- 新增 `tests/archive-reconcile.spec.ts` 3 项全通过：`workspace/session-activity` waterfall 会 `return next()` 并触发 reconcile；PM 原生归档 → Project/child Ticket/child Session 归档，PM 取消归档 → 恢复 active；worker 原生归档 → 只结束当前 Assignment `sessionArchived`、Ticket 仍 open、恰好一条 `workerArchived` note、不新增 PM 投递；PM 下一次 prompt 包含并清除 note，重复 reconcile 不重复；worker 取消归档不改 Assignment、不自动 retry 并加 `workerRestored`；snapshot 缺失时已归档 PM 被 reconcile；项目自身 archive 不循环。
-- `tests/project-tickets.spec.ts` 18 项、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项仍全通过（P2.5-A 的 archive/unarchive、Session 调用/失败、API/panel 与同源 403 保留）。
-- `tests/model-surface.spec.ts` 通过，orchestrator 预算 61,500 未再变化。
-- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`prompts`（除既有绝对路径 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
-- 全量 63 个测试文件、1239 项：1191 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- `tests/project-tickets.spec.ts` 20 项全通过：P2.5-A/B 的归档、原生 reconcile、pendingNotes、报告路由仍保留；新增 soft pause 不停止 running Assignment、hard pause 将 pending/running Assignment 置 `projectPaused` 并调用 `executor.stop`、soft→hard 升级、paused 下 PM 建单/retry 被 `projectPaused` 拒绝、hard resume 不自动重试且加 `resumedFromHard` note、archived/ended 不受 pause 影响；runtime 下 soft PM 只收到一次 `project_pause`，hard 取消 PM/worker loaded agent，resume 后 PM prompt 读取并清除 note。
+- `tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项全通过：Pause soft、Hard pause 确认、Resume、soft/hard 文案；pause API `{paused,mode}` 返回 `paused/mode/sessions`，同源 403 保留。
+- `tests/archive-reconcile.spec.ts` 3 项仍通过。
+- `model-surface` 通过，orchestrator 预算 61,500 未变。
+- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`archive-reconcile`、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
+- 全量 63 个测试文件、1241 项：1193 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -222,10 +250,11 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
 5. P2.4 Project 状态与控制（已完成；当时不做归档，归档见 P2.5）
 6. P2.5-A Project/Ticket 归档核心（已完成）
-7. P2.5-B DSH 原生归档联动 + pendingNotes（已完成；不做删除、pause soft/hard、PM 模型）
-8. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-9. 意外中断与恢复
-10. 再扩展新功能
+7. P2.5-B DSH 原生归档联动 + pendingNotes（已完成）
+8. P2.6 Project pause soft/hard（已完成；不做删除、PM 模型、PM→Worker 消息）
+9. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+10. 意外中断与恢复
+11. 再扩展新功能
 
 ## 文档说明
 

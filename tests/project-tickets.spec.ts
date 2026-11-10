@@ -168,15 +168,49 @@ describe('PM-created Project Tickets', () => {
   it('pauses and resumes a Project idempotently, refusing new Tickets only while paused', () => {
     const h = harness()
     const paused = h.engine.pauseProject(h.project.id, true)
-    expect(paused.status).toBe('paused')
+    expect(paused).toMatchObject({ status: 'paused', pauseMode: 'soft' })
     expect(h.engine.pauseProject(h.project.id, true)).toEqual(paused)
     expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectPaused'))
     expect(h.repo.tickets.list()).toEqual([])
     const resumed = h.engine.pauseProject(h.project.id, false)
     expect(resumed.status).toBe('active')
+    expect(resumed.pauseMode).toBeUndefined()
     expect(h.engine.pauseProject(h.project.id, false)).toEqual(resumed)
     expect(h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toHaveLength(2)
     expect(() => h.engine.pauseProject('missing', true)).toThrow(new UserError('unknownProject'))
+  })
+
+  it('soft pause lets running work finish; hard pause ends Assignments, and resume adds the hard-resume note', () => {
+    const h = harness()
+    const [first, second] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
+    h.engine.assignmentStarted(first!.id, first!.assignments[0]!.id)
+    const soft = h.engine.pauseProject(h.project.id, true)
+    expect(soft).toMatchObject({ status: 'paused', pauseMode: 'soft' })
+    expect(h.executor.stop).not.toHaveBeenCalled()
+    expect(h.repo.tickets.get(first!.id)?.assignments[0]?.state).toBe('running')
+    expect(() => h.engine.retryTicket(first!.id)).toThrow(new UserError('projectPaused'))
+    expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [{ title: 'Blocked', goal: 'Blocked' }]))
+      .toThrow(new UserError('projectPaused'))
+    // A soft pause can be upgraded to hard, which stops both the running and the pending Assignment now.
+    const hard = h.engine.pauseProject(h.project.id, true, 'hard')
+    expect(hard).toMatchObject({ status: 'paused', pauseMode: 'hard' })
+    for (const ticket of [first!, second!]) {
+      const stored = h.repo.tickets.get(ticket.id)!
+      expect(stored.archived).toBeUndefined()
+      expect(stored.ended).toBeUndefined()
+      expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'projectPaused')).toBe(true)
+    }
+    expect(h.executor.stop).toHaveBeenCalledWith(expect.objectContaining({ id: first!.id }),
+      expect.objectContaining({ id: first!.assignments[0]!.id }), 'projectPaused')
+    expect(() => h.engine.retryTicket(first!.id)).toThrow(new UserError('projectPaused'))
+    const resumed = h.engine.pauseProject(h.project.id, false)
+    expect(resumed).toMatchObject({ status: 'active' })
+    expect(resumed.pauseMode).toBeUndefined()
+    expect(resumed.pendingNotes).toEqual([expect.objectContaining({ kind: 'resumedFromHard', sessionId: h.project.pmSessionId })])
+    // Resume does not restart the old Assignment, but a person may retry it explicitly.
+    expect(h.repo.tickets.get(first!.id)?.assignments).toHaveLength(1)
+    expect(h.engine.retryTicket(first!.id).assignments.map(assignment => assignment.state)).toEqual(['ended', 'pending'])
+    expect(() => h.engine.pauseProject(h.project.id, true, 'bogus' as 'soft')).toThrow(new UserError('projectPauseMode'))
   })
 
   it('ends a Project and cascades its stop to open Project Tickets only, idempotently', () => {
@@ -196,6 +230,7 @@ describe('PM-created Project Tickets', () => {
     expect(h.repo.tickets.list().filter(ticket => ticket.projectId === h.project.id)).toHaveLength(2)
     expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectEnded'))
     expect(h.engine.pauseProject(h.project.id, true).status).toBe('ended')
+    expect(h.engine.pauseProject(h.project.id, true, 'hard').status).toBe('ended')
   })
 
   it('archives a Project and its child Tickets, ends running Assignments, and leaves Router-owned Tickets alone', () => {
@@ -207,6 +242,7 @@ describe('PM-created Project Tickets', () => {
       acknowledgement: 'ok', name: 'normal-work' })
     const archived = h.engine.archiveProject(h.project.id)
     expect(archived).toMatchObject({ status: 'archived', archivedFrom: 'active' })
+    expect(h.engine.pauseProject(h.project.id, true, 'hard').status).toBe('archived')
     for (const ticket of [first!, second!]) {
       const stored = h.repo.tickets.get(ticket.id)!
       expect(stored.archived).toMatchObject({ by: 'project', projectId: h.project.id })
@@ -258,6 +294,60 @@ describe('PM-created Project Tickets', () => {
 })
 
 describe('a Project PM Session through the runtime', () => {
+  it('soft-pauses with one PM notice, hard-pauses Sessions, and resumes with a note', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('30', 'Start a project for pause modes')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Pause modes', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      const result = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' }] }) as { tickets: { ticket_id: string }[] }
+      const ticket = host.runtime.store.tickets.get(result.tickets[0]!.ticket_id)!
+      const worker = workerSessionId(ticket.id)
+      await vi.waitFor(() => expect(host.tools.get(worker)).toBeDefined())
+      await vi.waitFor(() => expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.state).toBe('running'))
+      const pmCancel = host.agents.get(project.pmSessionId)!.cancel
+      const workerCancel = host.agents.get(worker)!.cancel
+      const pmPauses = () => host.deliveries.mock.calls.map(([call]) => call)
+        .filter(call => call.sessionId === project.pmSessionId && call.text.includes('"kind":"project_pause"'))
+      const soft = (await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'soft' })).body as
+        { paused: boolean; mode: string; sessions: { delivered: boolean } }
+      expect(soft).toMatchObject({ paused: true, mode: 'soft', sessions: { delivered: true } })
+      expect(pmPauses()).toHaveLength(1)
+      expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.state).toBe('running')
+      expect(pmCancel).not.toHaveBeenCalled()
+      expect(workerCancel).not.toHaveBeenCalled()
+      // Repeating the same soft pause sends no second notice.
+      await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'soft' })
+      expect(pmPauses()).toHaveLength(1)
+      // A soft pause can be upgraded to hard, which cancels loaded Sessions and ends the Assignment.
+      const hard = (await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'hard' })).body as
+        { paused: boolean; mode: string; sessions: { cancelled: string[] } }
+      expect(hard).toMatchObject({ paused: true, mode: 'hard' })
+      expect(hard.sessions.cancelled).toEqual(expect.arrayContaining([project.pmSessionId, worker]))
+      expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)).toMatchObject({ state: 'ended',
+        endedReason: 'projectPaused' })
+      expect(host.runtime.store.tickets.get(ticket.id)?.ended).toBeUndefined()
+      expect(host.runtime.store.tickets.get(ticket.id)?.archived).toBeUndefined()
+      expect(pmCancel).toHaveBeenCalled()
+      expect(workerCancel).toHaveBeenCalled()
+      const before = host.runtime.store.tickets.get(ticket.id)!.assignments.length
+      const resumed = (await host.api('POST', `projects/${project.id}/pause`, { paused: false })).body as
+        { paused: boolean; mode: null; sessions: { delivered: boolean } }
+      expect(resumed).toMatchObject({ paused: false, mode: null, sessions: { delivered: false } })
+      expect(host.runtime.store.projects.get(project.id)).toMatchObject({ status: 'active' })
+      expect(host.runtime.store.projects.get(project.id)?.pauseMode).toBeUndefined()
+      expect(host.runtime.store.tickets.get(ticket.id)?.assignments).toHaveLength(before)
+      expect(host.runtime.store.projects.get(project.id)?.pendingNotes?.[0]).toMatchObject({ kind: 'resumedFromHard' })
+      const prompt = host.sections.get(project.pmSessionId)!({})
+      expect(prompt).toContain('resumedFromHard')
+      expect(host.runtime.store.projects.get(project.id)?.pendingNotes).toBeUndefined()
+    } finally { await host.stop() }
+  })
+
   it('creates its Tickets, starts a worker Assignment for each, and reads only Tickets inside its Project', async () => {
     const host = await startRuntime()
     try {

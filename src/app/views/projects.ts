@@ -15,6 +15,7 @@ function ticketThreads(ticket: Ticket, threads: readonly Thread[]): ProjectTicke
 export function projectRow(project: ProjectProfile, tickets: readonly Ticket[] = [], threads: readonly Thread[] = []) {
   const report = project.latestReport
   return { id: project.id, title: project.title, goal: project.goal, status: project.status,
+    ...(project.pauseMode ? { pauseMode: project.pauseMode } : {}),
     ...(project.archivedFrom ? { archivedFrom: project.archivedFrom } : {}),
     pmSessionId: project.pmSessionId,
     decisionId: project.decisionId, mandate: mandateOf(project.mandate),
