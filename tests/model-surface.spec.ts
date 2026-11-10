@@ -37,9 +37,10 @@ interface Skill { name: string; description: string; content: string }
  * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
  * P2.1 adds the main Session's `orchestrator_project_create` tool and the `projects` / `project/<id>` read resources,
- * so the orchestrator limit moved from 59,000 to 60,000.
+ * so the orchestrator limit moved from 59,000 to 60,000. P2.5-A adds `orchestrator_project_archive` and
+ * `orchestrator_project_unarchive`, so it moves to 61,500.
  */
-const BUDGET: Record<Role, number> = { orchestrator: 60_000, worker: 40_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 61_500, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'

@@ -8,6 +8,7 @@ export interface Mark { label: string; tone: TagTone; dot: DotState; icon: IconN
 
 export function ticketMark(t: T, ticket: TicketStage & Pick<TicketSummary, 'ended'>): Mark {
   switch (ticket.stage) {
+    case 'archived': return { label: t('stage.archived'), tone: 'neutral', dot: 'idle', icon: 'inbox' }
     case 'ended': return { label: valueLabel(t, 'outcome', ticket.ended?.outcome), tone: 'neutral', dot: 'idle', icon: 'stop' }
     case 'person': {
       const action = ticket.action

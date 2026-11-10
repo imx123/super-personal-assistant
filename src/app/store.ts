@@ -29,10 +29,10 @@ export interface SettingsVersion {
  */
 const SETS: Record<string, Record<string, string>> = {
   ticket: {
-    open: "INTEGER AS (CASE WHEN value -> '$.ended' IS NULL THEN 1 END)",
+    open: "INTEGER AS (CASE WHEN value -> '$.ended' IS NULL AND value -> '$.archived' IS NULL THEN 1 END)",
     // Only the latest assignment can be pending or running because the Engine closes one before adding the next.
-    active: `INTEGER AS (CASE WHEN json_array_length(value, '$.undelivered') > 0
-      OR value ->> '$.assignments[#-1].state' IN ('pending', 'running') THEN 1 END)`,
+    active: `INTEGER AS (CASE WHEN value -> '$.archived' IS NULL AND (json_array_length(value, '$.undelivered') > 0
+      OR value ->> '$.assignments[#-1].state' IN ('pending', 'running')) THEN 1 END)`,
   },
   thread: {
     active: "INTEGER AS (CASE WHEN json_array_length(value, '$.pending') > 0 OR value -> '$.evaluating' IS NOT NULL THEN 1 END)",

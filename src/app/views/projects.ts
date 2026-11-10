@@ -14,7 +14,9 @@ function ticketThreads(ticket: Ticket, threads: readonly Thread[]): ProjectTicke
 /** One Project row: its goal and state, its PM Session, the creating Decision, latest report, and child Tickets. */
 export function projectRow(project: ProjectProfile, tickets: readonly Ticket[] = [], threads: readonly Thread[] = []) {
   const report = project.latestReport
-  return { id: project.id, title: project.title, goal: project.goal, status: project.status, pmSessionId: project.pmSessionId,
+  return { id: project.id, title: project.title, goal: project.goal, status: project.status,
+    ...(project.archivedFrom ? { archivedFrom: project.archivedFrom } : {}),
+    pmSessionId: project.pmSessionId,
     decisionId: project.decisionId, mandate: mandateOf(project.mandate),
     tickets: tickets.map(ticket => ({ id: ticket.id, title: ticket.title, threads: ticketThreads(ticket, threads) })),
     ...(report ? { latestReport: { summary: report.summary, at: report.at } } : {}),

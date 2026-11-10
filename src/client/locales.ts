@@ -123,6 +123,11 @@ const TEXT = {
   'projectStatus.active': ['进行中', 'Active'],
   'projectStatus.paused': ['已暂停', 'Paused'],
   'projectStatus.ended': ['已结束', 'Ended'],
+  'projectStatus.archived': ['已归档', 'Archived'],
+  archiveProject: ['归档项目', 'Archive Project'],
+  unarchiveProject: ['取消归档', 'Unarchive Project'],
+  projectSessionsFailed: ['{action}完成，但有 {count} 个 Session 未能归档或取消归档；Project 状态已更新，详情见运行日志。',
+    '{action} completed, but {count} Session(s) could not be archived or unarchived; the Project state was updated. See the runtime log for details.'],
   pauseProject: ['暂停项目', 'Pause Project'],
   resumeProject: ['恢复项目', 'Resume Project'],
   stopProject: ['停止项目', 'Stop Project'],
@@ -382,6 +387,7 @@ const TEXT = {
   'stage.queued': ['排队中', 'Queued'],
   'stage.working': ['执行中', 'Working'],
   'stage.idle': ['等待新触发', 'Waiting for a Trigger'],
+  'stage.archived': ['项目已归档', 'Archived with its Project'],
   deliveredInputs: ['已送达的输入 · {count}', 'Delivered Inputs · {count}'],
   endedAtShort: ['{time} {outcome}', '{time} {outcome}'],
   legacyAssignment: ['原始说明', 'Original brief'],
@@ -627,6 +633,7 @@ const TEXT = {
   'reason.observed': ['观察模式：本会接单（{text}）', 'Observe mode: would accept ({text})'],
   'reason.projectCreated': ['已创建项目 {project}', 'Created Project {project}'],
   'reason.projectTicketCreated': ['项目 PM 派工，已建项目工单 {project}', 'Delegated by the Project PM for Project {project}'],
+  'reason.projectArchived': ['项目已归档', 'Project archived'],
   'reason.explicitRouted': ['名单里的人明确请求，由主 Session 接单', 'Explicit request from someone on the list, accepted by the main Session'],
   'reason.legacyImport': ['从旧版工单记录导入', 'Imported from a legacy Ticket record'],
   'reason.channelGone': ['对话已无法接收消息', 'The conversation can no longer receive messages'],
@@ -722,6 +729,8 @@ const TEXT = {
   'userError.notProjectPm': ['只有这个项目自己的 PM Session 才能创建项目内工单。', USER_ERRORS.notProjectPm[1]],
   'userError.projectEnded': ['这个项目已结束，不能再创建工单。', USER_ERRORS.projectEnded[1]],
   'userError.projectPaused': ['这个项目已暂停；恢复后才能继续创建工单。', USER_ERRORS.projectPaused[1]],
+  'userError.projectArchived': ['这个项目已归档；取消归档后才能继续创建工单。', USER_ERRORS.projectArchived[1]],
+  'userError.ticketArchived': ['这个工单随项目归档了；取消归档后才能继续工作。', USER_ERRORS.ticketArchived[1]],
   'userError.invalidProjectTask': ['项目工单任务无效：{reason}', USER_ERRORS.invalidProjectTask[1]],
   'userError.invalidThread': ['线程引用无效：{thread}', USER_ERRORS.invalidThread[1]],
   'userError.duplicateWorktree': ['同一请求里的 worktree 名称重复：{name}', USER_ERRORS.duplicateWorktree[1]],
@@ -803,9 +812,9 @@ export const GLOSSARY = {
 } as const
 export const GLOSSARY_VALUES = {
   decision: ['decision.accept', 'decision.reopen', 'decision.stop', 'decision.ignore', 'decision.project', 'decision.delegated', 'decision.unavailable'], strength: ['strength.explicit', 'strength.inferred'],
-  ticket: ['stage.answer', 'stage.review', 'stage.blocked', 'stage.failed', 'stage.delivery', 'stage.queued', 'stage.working', 'stage.idle', 'ticket.ended'],
+  ticket: ['stage.answer', 'stage.review', 'stage.blocked', 'stage.failed', 'stage.delivery', 'stage.queued', 'stage.working', 'stage.idle', 'stage.archived', 'ticket.ended'],
   assignment: ['assignment.pending', 'assignment.running', 'assignment.ended'], report: ['report.progress', 'report.waiting', 'report.ready', 'report.blocked', 'report.failed', 'report.dropped'],
-  projectStatus: ['projectStatus.active', 'projectStatus.paused', 'projectStatus.ended'],
+  projectStatus: ['projectStatus.active', 'projectStatus.paused', 'projectStatus.ended', 'projectStatus.archived'],
 } as const
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {

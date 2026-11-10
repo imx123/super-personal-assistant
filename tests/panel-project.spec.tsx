@@ -57,3 +57,22 @@ it('pauses, resumes and stops a Project from its page, keeping the page readable
   expect(find(zh.openPmSession).textContent).toContain(zh.openPmSession)
   expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/stop' }))
 })
+
+it('archives and unarchives a Project from its page', async () => {
+  server.projects = [{ ...project, tickets: [...project.tickets] }]
+  await mount()
+  await click(tab(zh['tab.project']))
+  await click(project.title)
+  await click(zh.archiveProject)
+  expect(server.projects[0]!.status).toBe('archived')
+  expect(server.projects[0]!.archivedFrom).toBe('active')
+  expect(text()).toContain(zh['projectStatus.archived'])
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/archive' }))
+  // The archived page offers Unarchive instead of Pause/Stop and stays readable.
+  expect(text()).toContain(project.goal)
+  await click(zh.unarchiveProject)
+  expect(server.projects[0]!.status).toBe('active')
+  expect(server.projects[0]!.archivedFrom).toBeUndefined()
+  expect(text()).toContain(zh['projectStatus.active'])
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/unarchive' }))
+})

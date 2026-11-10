@@ -198,6 +198,52 @@ describe('PM-created Project Tickets', () => {
     expect(h.engine.pauseProject(h.project.id, true).status).toBe('ended')
   })
 
+  it('archives a Project and its child Tickets, ends running Assignments, and leaves Router-owned Tickets alone', () => {
+    const h = harness()
+    const [first, second] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
+    h.engine.assignmentStarted(first!.id, first!.assignments[0]!.id)
+    h.engine.recordTriggerForRouting(trigger('p3'))
+    const normal = h.engine.decide('p3', { kind: 'accept', title: 'Normal work', scope: 'normal', reason: 'requested',
+      acknowledgement: 'ok', name: 'normal-work' })
+    const archived = h.engine.archiveProject(h.project.id)
+    expect(archived).toMatchObject({ status: 'archived', archivedFrom: 'active' })
+    for (const ticket of [first!, second!]) {
+      const stored = h.repo.tickets.get(ticket.id)!
+      expect(stored.archived).toMatchObject({ by: 'project', projectId: h.project.id })
+      expect(stored.ended).toBeUndefined()
+      expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'projectArchived')).toBe(true)
+    }
+    expect(h.repo.tickets.open().map(ticket => ticket.id)).toEqual([normal.ticketId])
+    expect(h.repo.tickets.get(normal.ticketId!)!.archived).toBeUndefined()
+    expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectArchived'))
+    expect(h.engine.archiveProject(h.project.id)).toEqual(archived)
+    const restored = h.engine.unarchiveProject(h.project.id)
+    expect(restored.status).toBe('active')
+    expect(restored.archivedFrom).toBeUndefined()
+    for (const ticket of [first!, second!]) {
+      const stored = h.repo.tickets.get(ticket.id)!
+      expect(stored.archived).toBeUndefined()
+      expect(stored.ended).toBeUndefined()
+      expect(stored.assignments).toHaveLength(1)
+      expect(stored.assignments[0]!.state).toBe('ended')
+    }
+    // Unarchive does not start work, but a person may retry the ended Assignment explicitly.
+    expect(h.engine.retryTicket(first!.id).assignments.map(assignment => assignment.state)).toEqual(['ended', 'pending'])
+    expect(h.engine.unarchiveProject(h.project.id).status).toBe('active')
+  })
+
+  it('restores a paused Project after unarchive, and refuses to archive an ended one', () => {
+    const h = harness()
+    const paused = h.engine.pauseProject(h.project.id, true)
+    const archived = h.engine.archiveProject(h.project.id)
+    expect(archived).toMatchObject({ status: 'archived', archivedFrom: 'paused' })
+    expect(h.engine.unarchiveProject(h.project.id).status).toBe('paused')
+    expect(h.engine.pauseProject(h.project.id, false).status).toBe('active')
+    h.engine.stopProject(h.project.id)
+    expect(() => h.engine.archiveProject(h.project.id)).toThrow(new UserError('projectEnded'))
+    expect(paused.status).toBe('paused')
+  })
+
   it('revalidates a delegated Mandate without an external allowed list', () => {
     const h = harness()
     const settings = SettingsSchema.parse({})
@@ -329,6 +375,75 @@ describe('a Project PM Session through the runtime', () => {
       await host.runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'The Project ended.' })
       await vi.waitFor(() => expect(host.deliveries.mock.calls.some(([call]) => call.sessionId === host.runtime.masterId
         && call.text.includes(ticket.id) && call.text.includes('"kind":"worker_report"'))).toBe(true))
+    } finally { await host.stop() }
+  })
+
+  it('archives through the API and unarchives through the Router tools, keeping history and stopping Assignments', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('61', 'Start a project to archive')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Settings site', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      const result = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' },
+        { title: 'Footer', goal: 'Fix the footer links', worktree_name: 'fix-footer' },
+      ] }) as { tickets: { ticket_id: string }[] }
+      const children = result.tickets.map(card => host.runtime.store.tickets.get(card.ticket_id)!)
+      for (const ticket of children) await vi.waitFor(() => expect(host.tools.get(workerSessionId(ticket.id))).toBeDefined())
+      const normal = await host.acceptedTicket(feishu('62', '@bot fix a normal ticket'))
+      const archived = (await host.api('POST', `projects/${project.id}/archive`)).body as { archived: boolean;
+        sessions: { ids: string[]; failures: unknown[] } }
+      expect(archived).toMatchObject({ archived: true, sessions: { failures: [] } })
+      expect(host.runtime.store.projects.get(project.id)).toMatchObject({ status: 'archived', archivedFrom: 'active' })
+      for (const ticket of children) {
+        const stored = host.runtime.store.tickets.get(ticket.id)!
+        expect(stored.archived).toMatchObject({ by: 'project', projectId: project.id })
+        expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'projectArchived')).toBe(true)
+      }
+      expect(host.runtime.store.tickets.get(normal.ticket.id)?.archived).toBeUndefined()
+      expect(host.workspace.archiveSession.mock.calls.map(([sessionId]) => sessionId)).toEqual(expect.arrayContaining(
+        [project.pmSessionId, ...children.map(ticket => workerSessionId(ticket.id))]))
+      for (const [sessionId, options] of host.workspace.archiveSession.mock.calls)
+        expect({ sessionId, options }).toEqual({ sessionId, options: { stopActivity: true } })
+      await expect(host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Later', goal: 'Must not be created', worktree_name: 'later' }] })).rejects.toThrow(/archived/i)
+      // The Router unarchives through its own tool: status, Ticket flags and Sessions, with no new Assignment.
+      const before = host.runtime.store.tickets.get(children[0]!.id)!.assignments.length
+      const restored = await host.runTool(host.runtime.masterId, 'orchestrator_project_unarchive', { project_id: project.id }) as
+        { project: { status: string } }
+      expect(restored.project.status).toBe('active')
+      expect(host.runtime.store.projects.get(project.id)?.status).toBe('active')
+      for (const ticket of children) {
+        const stored = host.runtime.store.tickets.get(ticket.id)!
+        expect(stored.archived).toBeUndefined()
+        expect(stored.ended).toBeUndefined()
+        expect(stored.assignments).toHaveLength(before)
+        expect(stored.assignments.every(assignment => assignment.state === 'ended')).toBe(true)
+      }
+      expect(host.workspace.unarchiveSession.mock.calls.map(([sessionId]) => sessionId)).toEqual(expect.arrayContaining(
+        [project.pmSessionId, ...children.map(ticket => workerSessionId(ticket.id))]))
+      const again = await host.runTool(host.runtime.masterId, 'orchestrator_project_archive', { project_id: project.id }) as
+        { project: { status: string } }
+      expect(again.project.status).toBe('archived')
+    } finally { await host.stop() }
+  })
+
+  it('reports Session archive failures without rolling back the Project archive', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('63', 'Start a project whose Session archive fails')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Settings site', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      host.workspace.archiveSession.mockRejectedValueOnce(new Error('archive denied'))
+      const result = (await host.api('POST', `projects/${project.id}/archive`)).body as { sessions: { failures: { sessionId: string; error: string }[] } }
+      expect(result.sessions.failures).toEqual([{ sessionId: project.pmSessionId, error: 'archive denied' }])
+      expect(host.runtime.store.projects.get(project.id)?.status).toBe('archived')
     } finally { await host.stop() }
   })
 })

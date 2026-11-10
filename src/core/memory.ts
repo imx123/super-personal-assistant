@@ -40,8 +40,9 @@ export class MemoryRepositories implements Repositories {
     save: (ticket: Ticket) => { this.ticketRows.set(ticket.id, clone(ticket)) },
     /** Newest first, matching the SQLite Store's order. */
     list: () => [...this.ticketRows.values()].reverse().map(clone),
-    open: () => this.tickets.list().filter(ticket => !ticket.ended),
-    active: () => this.tickets.list().filter(ticket => ticket.undelivered.length > 0 || ['pending', 'running'].includes(latestAssignment(ticket)?.state ?? '')),
+    open: () => this.tickets.list().filter(ticket => !ticket.ended && !ticket.archived),
+    active: () => this.tickets.list().filter(ticket => !ticket.archived
+      && (ticket.undelivered.length > 0 || ['pending', 'running'].includes(latestAssignment(ticket)?.state ?? ''))),
   }
   readonly decisions = {
     get: (id: string) => clone(this.decisionRows.get(id)),

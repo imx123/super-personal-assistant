@@ -36,7 +36,9 @@ export function basisFacts(basis: MandateBasis, rule: Snapshot['rule']): { facts
 export function ticketList(host: ViewHost, stage: 'open' | TicketStage['stage'], offset: number, limit: number) {
   const view = snapshot(host)
   const { store } = view
-  const shown = (ticket: Ticket) => stage === 'open' ? liveTicket(ticket) : ticketStage(ticket).stage === stage
+  const shown = (ticket: Ticket) => stage === 'open' ? liveTicket(ticket)
+    : stage === 'ended' ? ['ended', 'archived'].includes(ticketStage(ticket).stage)
+      : ticketStage(ticket).stage === stage
   const tickets = (stage === 'ended' ? store.tickets.list() : store.tickets.open()).filter(shown).sort(newestFirst)
   const result = page(tickets, offset, limit)
   return { ...result, items: result.items.map(ticket => ticketRow(view, ticket)) }

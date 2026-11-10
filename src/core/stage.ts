@@ -1,12 +1,13 @@
 /** Ticket stage classification and retry eligibility (docs/003). */
 import { assignmentStopped, latestAssignment, waitsForPerson, type Ticket } from './model.ts'
 
-/** High-level execution stage of a ticket: waiting on a person, actively working or queued, idle between turns, or ended. */
+/** High-level execution stage of a ticket: waiting on a person, actively working or queued, idle between turns, ended, or archived with its Project. */
 export type TicketStage = { stage: 'person'; action: 'delivery' | 'answer' | 'review' | 'blocked' | 'failed' }
-  | { stage: 'working'; action?: 'queued' } | { stage: 'idle' } | { stage: 'ended' }
+  | { stage: 'working'; action?: 'queued' } | { stage: 'idle' } | { stage: 'ended' } | { stage: 'archived' }
 
 /** Classifies a ticket's stage; the rules follow the table in docs/003 in order, where the first matching row wins. */
 export function ticketStage(ticket: Ticket): TicketStage {
+  if (ticket.archived) return { stage: 'archived' }
   if (ticket.ended) return { stage: 'ended' }
   const assignment = latestAssignment(ticket)
   if (assignmentStopped(assignment) || assignment?.interruptedAt) return { stage: 'idle' }
@@ -21,7 +22,9 @@ export function ticketStage(ticket: Ticket): TicketStage {
   return { stage: 'working' }
 }
 
-/** True when an open ticket was stopped by an operator, stalled on a report, or has a failed input delivery. */
+/** True when an open ticket was stopped by an operator, archived and restored, stalled on a report, or has a failed input delivery. */
 export function canRetry(ticket: Ticket): boolean {
-  return !ticket.ended && (assignmentStopped(latestAssignment(ticket)) || waitsForPerson(ticket) || !!ticket.delivery)
+  const assignment = latestAssignment(ticket)
+  return !ticket.ended && !ticket.archived && (assignmentStopped(assignment) || assignment?.endedReason === 'projectArchived'
+    || waitsForPerson(ticket) || !!ticket.delivery)
 }

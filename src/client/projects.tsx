@@ -5,9 +5,9 @@ import { useAction, usePanel } from './provider.tsx'
 import { valueLabel } from './text.ts'
 import { ConfirmButton, Hint, KeyValues, LoadState, MarkdownLite, PageHead, Section, SessionButton, When } from './widgets.tsx'
 
-/** The status dot tone for a Project state: running, paused, or ended history. */
+/** The status dot tone for a Project state: running, paused, or archived/ended history. */
 const projectTone = (status: ProjectRow['status']): 'ongoing' | 'warning' | 'idle' =>
-  status === 'paused' ? 'warning' : status === 'ended' ? 'idle' : 'ongoing'
+  status === 'paused' ? 'warning' : status === 'ended' || status === 'archived' ? 'idle' : 'ongoing'
 
 function ProjectList() {
   const { t, call, navigate } = usePanel()
@@ -33,12 +33,23 @@ function ProjectList() {
 }
 
 function ProjectPage({ id }: { id: string }) {
-  const { t, call, navigate } = usePanel()
+  const { t, call, navigate, notify } = usePanel()
   const { data, error, reload } = usePoll(() => call('GET projects/:id', { id }), [id])
+  const reportArchive = (sessions: { failures: { sessionId: string; error: string }[] }, label: string) => {
+    if (sessions.failures.length) notify(t('projectSessionsFailed', { action: label, count: String(sessions.failures.length) }))
+  }
   const pause = useAction(async () => {
     await call('POST projects/:id/pause', { id, body: { paused: data?.status === 'active' } })
   }, { reload })
   const stop = useAction(async () => { await call('POST projects/:id/stop', { id }) }, { reload })
+  const archive = useAction(async () => {
+    const result = await call('POST projects/:id/archive', { id })
+    reportArchive(result.sessions, t('archiveProject'))
+  }, { reload })
+  const unarchive = useAction(async () => {
+    const result = await call('POST projects/:id/unarchive', { id })
+    reportArchive(result.sessions, t('unarchiveProject'))
+  }, { reload })
   if (!data) return <>
     <PageHead title={t('term.project')} />
     {error instanceof ApiError && error.missing ? <Hint>{t('projectNotFound')}</Hint> : <LoadState error={error} loading />}
@@ -46,7 +57,12 @@ function ProjectPage({ id }: { id: string }) {
   const report = data.latestReport
   return <>
     <PageHead title={data.title}>
-      {data.status !== 'ended' && <>
+      {data.status === 'archived'
+        ? <Button variant="outline" size="sm" icon={<Icon name="history" size={14} />} disabled={unarchive.busy}
+          onClick={() => { void unarchive.run() }}>{t('unarchiveProject')}</Button>
+        : data.status !== 'ended' && <Button variant="outline" size="sm" icon={<Icon name="inbox" size={14} />}
+          disabled={archive.busy} onClick={() => { void archive.run() }}>{t('archiveProject')}</Button>}
+      {(data.status === 'active' || data.status === 'paused') && <>
         <Button variant="outline" size="sm" icon={<Icon name={data.status === 'paused' ? 'play' : 'pause'} size={14} />}
           disabled={pause.busy} onClick={() => { void pause.run() }}>
           {t(data.status === 'paused' ? 'resumeProject' : 'pauseProject')}

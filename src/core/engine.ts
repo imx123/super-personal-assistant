@@ -210,6 +210,7 @@ export class Engine {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
       if (project.status === 'paused') throw new UserError('projectPaused')
       if (project.status !== 'active') throw new UserError('projectEnded')
       if (!tasks || !Array.isArray(tasks) || !tasks.length) throw new UserError('invalidProjectTask', { reason: 'give 1 to 5 tasks' })
@@ -258,7 +259,7 @@ export class Engine {
   }
 
   /**
-   * Pause or resume a Project: active ↔ paused only. An ended Project ignores the change and stays ended.
+   * Pause or resume a Project: active ↔ paused only. An ended or archived Project ignores the change.
    * Existing child Tickets continue; only new Tickets are blocked while paused.
    * @throws UserError when the Project is unknown.
    */
@@ -266,7 +267,7 @@ export class Engine {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
-      if (project.status === 'ended') return project
+      if (project.status === 'ended' || project.status === 'archived') return project
       const status = paused ? 'paused' as const : 'active' as const
       if (project.status === status) return project
       const updated: ProjectProfile = { ...project, status, updatedAt: this.options.now?.() ?? new Date().toISOString() }
@@ -276,19 +277,70 @@ export class Engine {
   }
   /**
    * End a Project and cascade-stop every still-open Ticket it owns, using the ordinary Ticket stop semantics so history,
-   * Sessions and directories stay. It is idempotent: an ended Project returns unchanged.
+   * Sessions and directories stay. It is idempotent: an ended or archived Project returns unchanged.
    * @throws UserError when the Project is unknown.
    */
   stopProject(projectId: string, reason?: string): ProjectProfile {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
-      if (project.status === 'ended') return project
+      if (project.status === 'ended' || project.status === 'archived') return project
       const updated: ProjectProfile = { ...project, status: 'ended', updatedAt: this.options.now?.() ?? new Date().toISOString() }
       this.repo.projects.save(updated)
       // The Project is ended first, so child lifecycle notices and relays fall back instead of pretending it is active.
       for (const ticket of this.repo.tickets.open()) if (ticket.projectId === projectId) this.tickets.stop(ticket.id, reason)
       return updated
+    })
+  }
+  /**
+   * Archive a Project: save its active/paused status in `archivedFrom`, mark every child Ticket archived, and end any
+   * Assignment that still ran with `projectArchived`. Session archiving happens after this transaction, in the application
+   * service. Idempotent; an ended Project cannot be archived.
+   * @throws UserError when the Project is unknown or ended.
+   */
+  archiveProject(projectId: string): ProjectProfile {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.status === 'archived') return project
+      if (project.status === 'ended') throw new UserError('projectEnded')
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const archived: ProjectProfile = { ...project, status: 'archived', archivedFrom: project.status, updatedAt: at }
+      this.repo.projects.save(archived)
+      for (const ticket of this.repo.tickets.list()) {
+        if (ticket.projectId !== projectId) continue
+        for (const assignment of ticket.assignments) {
+          if (assignment.state === 'ended') continue
+          assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'projectArchived'
+        }
+        ticket.archived = { at, by: 'project', projectId }
+        ticket.updatedAt = at
+        this.repo.tickets.save(ticket)
+      }
+      return archived
+    })
+  }
+  /**
+   * Unarchive a Project: restore its `archivedFrom` status and clear the project's archive marker from its child Tickets.
+   * No Assignment is restarted; a still-open Ticket waits for a person or the PM to retry. Idempotent.
+   * @throws UserError when the Project is unknown.
+   */
+  unarchiveProject(projectId: string): ProjectProfile {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.status !== 'archived') return project
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const restored: ProjectProfile = { ...project, status: project.archivedFrom ?? 'active', updatedAt: at }
+      delete restored.archivedFrom
+      this.repo.projects.save(restored)
+      for (const ticket of this.repo.tickets.list()) {
+        if (ticket.projectId !== projectId || ticket.archived?.projectId !== projectId) continue
+        delete ticket.archived
+        ticket.updatedAt = at
+        this.repo.tickets.save(ticket)
+      }
+      return restored
     })
   }
 
@@ -479,7 +531,7 @@ export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'cre
 export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
-  | 'pauseProject' | 'stopProject'>
+  | 'pauseProject' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */

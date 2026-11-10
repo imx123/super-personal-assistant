@@ -8,7 +8,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import { assignmentStopped, key, latestAssignment, liveTicket, projectOfSession, WORK_TOOLS, type ProjectProfile, type Ticket } from '../core/index.ts'
-import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
+import { mandateInstructions, ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId, type DeliveryMode } from './delivery.ts'
 import type { Effects } from './effects.ts'
@@ -20,6 +20,16 @@ import { pmProjectSection, projectInitMessage, SKILL_PREFIX, type PromptVersion,
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
+
+/** Outcome of asking the host to archive or unarchive a Project's PM and child Sessions. */
+export interface SessionArchiveResult {
+  /** Session ids the host accepted, in call order. */
+  ids: string[]
+  /** Sessions the host refused or failed to change; the Project state remains authoritative. */
+  failures: { sessionId: string; error: string }[]
+  /** True when the host offers no session archive API, so no call was made. */
+  unavailable?: true
+}
 
 /** Host dependencies used by `Sessions`. */
 export interface SessionsHost {
@@ -177,6 +187,48 @@ export class Sessions {
     await this.prompt(project.pmSessionId, `project-init:${project.id}`, projectInitMessage(project), 'queue')
     return project.pmSessionId
   }
+  /** Archive the Project's PM and every child Ticket's Session, with `stopActivity`, after the Project transaction committed. */
+  archiveProject(project: ProjectProfile): Promise<SessionArchiveResult> {
+    return this.changeProjectSessions(project, true)
+  }
+  /** Unarchive the Project's PM and every child Ticket's Session; no Assignment is restarted. */
+  unarchiveProject(project: ProjectProfile): Promise<SessionArchiveResult> {
+    return this.changeProjectSessions(project, false)
+  }
+  /** The PM Session and every child Ticket Session of a Project, without duplicates. */
+  private projectSessions(project: ProjectProfile): string[] {
+    const child = this.host.store.tickets.list().filter(ticket => ticket.projectId === project.id).map(ticket => workerSessionId(ticket.id))
+    return [...new Set([project.pmSessionId, ...child])]
+  }
+  /**
+   * Ask the host to archive or unarchive a Project's Sessions. A host without the API is reported as unavailable; each
+   * failure is logged and returned so the Project state, which stays authoritative, does not hide it.
+   */
+  private async changeProjectSessions(project: ProjectProfile, archive: boolean): Promise<SessionArchiveResult> {
+    const registry = this.ctx.get('workspaceRegistry') as {
+      archiveSession?: (sessionId: SessionId, options?: { stopActivity?: boolean }) => Promise<void>
+      unarchiveSession?: (sessionId: SessionId) => Promise<void>
+    } | undefined
+    const method = archive ? registry?.archiveSession : registry?.unarchiveSession
+    if (typeof method !== 'function') {
+      this.ctx.logger.warn('dsh-superagent: the host offers no %s; Project %s Sessions were not changed', archive ? 'archiveSession'
+        : 'unarchiveSession', project.id)
+      return { ids: [], failures: [], unavailable: true }
+    }
+    const ids: string[] = [], failures: { sessionId: string; error: string }[] = []
+    for (const sessionId of this.projectSessions(project)) {
+      try {
+        if (archive) await registry!.archiveSession!(sessionId as SessionId, { stopActivity: true })
+        else await registry!.unarchiveSession!(sessionId as SessionId)
+        ids.push(sessionId)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn('dsh-superagent could not %s Session %s: %s', archive ? 'archive' : 'unarchive', sessionId, message)
+        failures.push({ sessionId, error: message })
+      }
+    }
+    return { ids, failures }
+  }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
@@ -333,6 +385,7 @@ export class Sessions {
     const allow = WORK_TOOLS.filter(name => (!allowed?.length || allowed.includes(name)) && agent.ctx.tools.get(name, parent))
     return [agent.ctx.tools.restrict({ allow }), agent.ctx.tools.guard(() => {
       const current = store.tickets.get(ticketId)
+      if (current?.archived) return 'Ticket is archived with its Project; unarchive the Project before continuing work'
       if (!current || !liveTicket(current)) return 'Ticket ended; new work needs a new authorized ticket'
       return assignmentStopped(latestAssignment(current)) ? 'Assignment stopped by the operator; use Retry before continuing work' : undefined
     })]

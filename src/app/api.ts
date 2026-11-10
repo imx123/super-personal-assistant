@@ -2,6 +2,7 @@
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { PromptConfig, Prompts } from './prompts.ts'
 import type { PromptsView, StateView, TicketPageView } from './http.ts'
+import type { SessionArchiveResult } from './sessions.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
 import type { ProjectListView, ProjectRow } from './views/projects.ts'
@@ -37,6 +38,8 @@ export interface Api {
   'GET projects/:id': { response: ProjectRow }
   'POST projects/:id/pause': { body: { paused: boolean }; response: { paused: boolean } }
   'POST projects/:id/stop': { response: { stopped: true } }
+  'POST projects/:id/archive': { response: { archived: true; sessions: SessionArchiveResult } }
+  'POST projects/:id/unarchive': { response: { archived: false; sessions: SessionArchiveResult } }
   'POST tickets/:id/retry': { response: { retried: true } }
   'POST tickets/:id/stop': { response: { stopped: true } }
   'POST tickets/:id/assignment/stop': { body: { assignmentId: string }; response: { stopped: true } }

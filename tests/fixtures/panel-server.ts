@@ -343,6 +343,24 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     project.status = 'ended'
     return { stopped: true }
   } },
+  'POST projects/:id/archive': { answer: ({ params }) => {
+    const project = server.projects.find(item => item.id === params.id)
+    if (!project) return refuse(404, 'Project not found')
+    if (project.status === 'active' || project.status === 'paused') {
+      project.archivedFrom = project.status
+      project.status = 'archived'
+    }
+    return { archived: true as const, sessions: { ids: [], failures: [] } }
+  } },
+  'POST projects/:id/unarchive': { answer: ({ params }) => {
+    const project = server.projects.find(item => item.id === params.id)
+    if (!project) return refuse(404, 'Project not found')
+    if (project.status === 'archived') {
+      project.status = project.archivedFrom ?? 'active'
+      delete project.archivedFrom
+    }
+    return { archived: false as const, sessions: { ids: [], failures: [] } }
+  } },
   'POST tickets/:id/retry': { answer: ({ params }) => {
     const ticket = ticketOf(params.id)
     if (!ticket) return refuse(404, 'Ticket not found')

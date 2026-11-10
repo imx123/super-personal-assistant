@@ -85,6 +85,11 @@ it('protects the Project control routes with the same-origin rule and calls thei
   const call = serve({ engine: {
     pauseProject: (id: string, paused: boolean) => { calls.push(['pause', id, paused]); return { status: paused ? 'paused' : 'active' } },
     stopProject: (id: string) => { calls.push(['stop', id]); return { status: 'ended' } },
+    archiveProject: (id: string) => { calls.push(['archive', id]); return { id, status: 'archived' } },
+    unarchiveProject: (id: string) => { calls.push(['unarchive', id]); return { id, status: 'active' } },
+  }, sessions: {
+    archiveProject: async () => { calls.push(['archiveSessions']); return { ids: ['pm-p1'], failures: [] } },
+    unarchiveProject: async () => { calls.push(['unarchiveSessions']); return { ids: ['pm-p1'], failures: [] } },
   } })
   const body = { paused: true }
   for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { origin: 'http://evil.example' }]) {
@@ -92,11 +97,20 @@ it('protects the Project control routes with the same-origin rule and calls thei
       body: { error: 'Same-origin management request required' } })
     expect(await call('POST', 'projects/p1/stop', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
+    expect(await call('POST', 'projects/p1/archive', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
+      body: { error: 'Same-origin management request required' } })
+    expect(await call('POST', 'projects/p1/unarchive', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
+      body: { error: 'Same-origin management request required' } })
   }
   const allowed = { host: 'localhost:3082', origin: 'http://localhost:3082' }
   expect(await call('POST', 'projects/p1/pause', body, allowed)).toEqual({ status: 200, body: { paused: true } })
   expect(await call('POST', 'projects/p1/stop', undefined, allowed)).toEqual({ status: 200, body: { stopped: true } })
-  expect(calls).toEqual([['pause', 'p1', true], ['stop', 'p1']])
+  expect(await call('POST', 'projects/p1/archive', undefined, allowed)).toEqual({ status: 200,
+    body: { archived: true, sessions: { ids: ['pm-p1'], failures: [] } } })
+  expect(await call('POST', 'projects/p1/unarchive', undefined, allowed)).toEqual({ status: 200,
+    body: { archived: false, sessions: { ids: ['pm-p1'], failures: [] } } })
+  expect(calls).toEqual([['pause', 'p1', true], ['stop', 'p1'], ['archive', 'p1'], ['archiveSessions'],
+    ['unarchive', 'p1'], ['unarchiveSessions']])
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {

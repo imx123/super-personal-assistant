@@ -74,8 +74,10 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 | Main Session | `createProject(triggerId, title, goal)` | Creates a Project from a Trigger in one transaction: a gate-only `project` Decision with a real Eval id (no assessor and no candidate), the Project Profile, and the PM Mandate, which the Decision also records. It is idempotent by Trigger (`key('project', triggerId)`), and creates no Ticket |
 | Project PM | `createProjectTickets(projectId, pmSessionId, tasks)` | Delegates 1–5 Tickets inside one active Project in one transaction. It requires and validates the caller as the Project's PM, then for each task records an `internal` Trigger, a record-only Eval and `delegated` Decision with a real Eval id, and a Ticket whose Mandate copies the PM Mandate's strength, Policy version and actor. A task's `allow_tools` becomes the Ticket Mandate's `allowTools`: it must name known Work tools once each, may only narrow the PM Mandate's list, and otherwise the field is absent (every Work tool). No assessor runs. Explicit external Threads are subscribed, context-only ones recorded in `Thread.context`. It is atomic and idempotent per task position |
 | Project PM | `projectReport(projectId, summary)` | Records the PM Session's latest report on its Project, which the Project reads show |
-| People | `pauseProject(projectId, paused)` | Sets an active or paused Project to paused or active, idempotently; an ended Project stays ended. Existing child Tickets keep running; only new Tickets are blocked while paused |
-| People | `stopProject(projectId, reason?)` | Ends an active or paused Project idempotently and stops every still-open Ticket it owns with the ordinary Ticket stop semantics, keeping their history, Sessions and directories; an ended Project returns unchanged |
+| People | `pauseProject(projectId, paused)` | Sets an active or paused Project to paused or active, idempotently; an ended or archived Project stays as it is. Existing child Tickets keep running; only new Tickets are blocked while paused |
+| People | `stopProject(projectId, reason?)` | Ends an active or paused Project idempotently and stops every still-open Ticket it owns with the ordinary Ticket stop semantics, keeping their history, Sessions and directories; an ended or archived Project returns unchanged |
+| People | `archiveProject(projectId)` | Saves the active/paused status in `archivedFrom`, sets the Project archived, marks every child Ticket `archived`, and ends every still-running Assignment with `projectArchived`; Session archiving follows after the transaction. Idempotent; an ended Project is refused |
+| People | `unarchiveProject(projectId)` | Restores `archivedFrom`, clears the archive marker from the Project's child Tickets, and leaves Assignments as they are; Session unarchiving follows. Idempotent |
 | Main Session | `attach(ticketId, triggerId, note?)` | Routes a Trigger to a Ticket it points at, whose Executor then decides it as a follow-up, and ends the Eval that holds it, whose other Triggers wait for a fresh Eval; an ended Ticket resumes under its Mandate at once unless processing is paused. A follow-up an Executor still decides is refused, as is one routed back to the Ticket that handed it back |
 | Main Session | `requestStatus(ticketId)` | Asks a waiting Executor Session for its status, and answers whether it asked |
 | Main Session | `note(ticketId, text)` | Gives a Ticket's Executor a fact from other work as a text Input, which grants nothing |
@@ -323,7 +325,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
 | `src/app/notices.ts` | The notices and relays for the main Session or a Project PM: `eventNotice`, `reportRelay`, `resultRelay`, `followupRelay` and `relaySession` |
-| `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
+| `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox; its generated `open`/`active` Ticket sets exclude archived Tickets |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects, including a `relay` payload that names its target Session |
@@ -334,7 +336,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override (including the PM role), and `promptParts`, the order of a role's prompt sections and a PM's Project section |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
-| `src/app/sessions.ts` | Sessions: the main, worker and Project PM Session roles, their prompts, tools and presets; `workOnly` narrows an Executor's `WORK_TOOLS` by its Ticket Mandate's `allowTools`, and a subagent inherits the same restriction |
+| `src/app/sessions.ts` | Sessions: the main, worker and Project PM Session roles, their prompts, tools and presets; `workOnly` narrows an Executor's `WORK_TOOLS` by its Ticket Mandate's `allowTools`, and a subagent inherits the same restriction; `archiveProject`/`unarchiveProject` change the PM and child Sessions through `workspaceRegistry` and report failures |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
@@ -345,15 +347,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Projects, Project Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role, including Projects and a Project's Tickets |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
-| `src/app/tools/main.ts` | The main Session's tools, and the Project PM's read, Ticket-creation and report tools |
+| `src/app/tools/main.ts` | The main Session's tools, including Project archive/unarchive, and the Project PM's read, Ticket-creation and report tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools, whose reports route to its Project PM or the main Session |
-| `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
+| `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure, including Project `pause`, `stop`, `archive` and `unarchive` |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
 | `src/app/views/tickets.ts` | The Ticket lists by stage, a Ticket's page, the Mandate basis facts and the Executor's load |
-| `src/app/views/projects.ts` | The Project list and detail reads: goal, status, PM Session, creating Decision, PM Mandate, latest report and child Tickets with their Threads |
-| `src/app/api.ts` / `src/app/http.ts` | The typed management API and its same-origin routes, including `POST projects/:id/pause` and `POST projects/:id/stop` |
+| `src/app/views/projects.ts` | The Project list and detail reads: goal, status (including `archivedFrom`), PM Session, creating Decision, PM Mandate, latest report and child Tickets with their Threads |
 | `src/app/views/threads.ts` | The Thread lists, a Thread's timeline, the search and the Decision list |
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
@@ -385,7 +386,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
-| `src/client/projects.tsx` | The Project tab: the Project list, one Project's goal, status, PM Session, latest report and child Tickets, its **Open PM Session** action, and the **Pause/Resume** and confirmed **Stop** controls |
+| `src/client/projects.tsx` | The Project tab: the Project list, one Project's goal, status, PM Session, latest report and child Tickets, its **Open PM Session** action, and the **Pause/Resume**, confirmed **Stop**, and **Archive/Unarchive** controls |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads (including a Project's detail), and the route memory with the settings group opened last |
@@ -431,7 +432,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/projects.spec.ts` | Project creation through the Engine and the main Session tool: the gate-only `project` Decision with a real Eval id, the PM Mandate and PM Session, idempotency, the Project read view and routes |
-| `tests/project-tickets.spec.ts` | PM-created Project Tickets through the Engine and the runtime: internal Triggers, record-only `delegated` Decisions with real Eval ids, Mandates, external Thread subscriptions and context-only ones, no assessor, no automatic Project Thread subscription, the optional worker tool allowlist (narrowing, inheritance, rejection), idempotency, whole-batch rollback, PM-only creation, delegated revalidation, Project pause/resume/stop and cascade-stop, the PM's read scope over its Project and its Tickets, and report routing to the PM or the Router with the PM's project_report |
+| `tests/project-tickets.spec.ts` | PM-created Project Tickets through the Engine and the runtime: internal Triggers, record-only `delegated` Decisions with real Eval ids, Mandates, external Thread subscriptions and context-only ones, no assessor, no automatic Project Thread subscription, the optional worker tool allowlist (narrowing, inheritance, rejection), idempotency, whole-batch rollback, PM-only creation, delegated revalidation, Project pause/resume/stop, archive/unarchive with Session calls and cascade, the PM's read scope over its Project and its Tickets, and report routing to the PM or the Router with the PM's project_report |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
@@ -502,12 +503,13 @@ Nothing deletes old records yet, so these grow without bound: the `trigger`, `di
 
 ### Main Session tools
 
-The main Session has 16 application tools:
+The main Session has 18 application tools:
 
 | Purpose | Tools |
 | --- | --- |
 | Read, register and route | `orchestrator_read`, `orchestrator_user_trigger_create`, `orchestrator_route` |
 | Create a Project | `orchestrator_project_create` |
+| Archive a Project | `orchestrator_project_archive`, `orchestrator_project_unarchive` |
 | Manage Tickets | `orchestrator_ticket_retry`, `orchestrator_ticket_request_status`, `orchestrator_ticket_note` |
 | Re-evaluate | `orchestrator_trigger_requeue` |
 | Assess proactive work | `orchestrator_eval`, `orchestrator_eval_read`, `orchestrator_eval_decide` |
@@ -538,9 +540,15 @@ Existing main Sessions on `standard` also need explicit timeouts for foreground 
 
 ### Project status and controls
 
-A Project Profile's `status` is `active`, `paused` or `ended`. `createProjectTickets` accepts only `active`, refusing `paused` with `projectPaused` and `ended` with `projectEnded`, in both cases without creating any Ticket. Pausing leaves existing child Tickets and their PM reports running; only new Tickets are blocked.
+A Project Profile's `status` is `active`, `paused`, `ended` or `archived`. `createProjectTickets` accepts only `active`, refusing `paused` with `projectPaused`, `archived` with `projectArchived` and `ended` with `projectEnded`, without creating any Ticket. Pausing leaves existing child Tickets and their PM reports running; only new Tickets are blocked.
 
-`pauseProject` toggles active ↔ paused idempotently and ignores an ended Project. `stopProject` marks the Project ended idempotently and cascades to every still-open Ticket whose `projectId` names it through `Tickets.stop`, so each ends as stopped by a person with its history, Session and directory intact; the Project is never deleted and its page and PM Session remain readable. Both are management commands only: the HTTP routes `POST projects/:id/pause` and `POST projects/:id/stop` are same-origin panel routes, and neither the PM nor a Worker has a tool that calls them.
+`pauseProject` toggles active ↔ paused idempotently and ignores an ended or archived Project. `stopProject` marks the Project ended idempotently and cascades to every still-open Ticket whose `projectId` names it through `Tickets.stop`, so each ends as stopped by a person with its history, Session and directory intact. `archiveProject` saves the previous status in `archivedFrom`, marks every child Ticket `archived` with `{at, by: 'project', projectId}`, and ends every pending or running Assignment with `projectArchived`; `unarchiveProject` restores `archivedFrom`, clears each child's archive marker, and leaves the ended Assignments in place, so a Ticket returned to open waits for a person or its PM to retry. Both are idempotent, and an ended Project cannot be archived.
+
+Marking a Ticket archived makes `liveTicket` false, removes it from `Store.tickets.open()`/`active`, gives `ticketStage` the `archived` stage, and blocks launch, report, reply, attach and fan-out paths; `Tickets.wake` and `followupOwners` also ignore it. Unarchiving restores an open Ticket to open, and an ended one to ended, without resuming work.
+
+The Project transaction runs first. After it commits, `Sessions.archiveProject`/`unarchiveProject` call the host's `workspaceRegistry.archiveSession(id, { stopActivity: true })` or `unarchiveSession(id)` for the PM Session and every child Ticket Session, and return `{ ids, failures, unavailable? }`; failures are logged and returned, and the Project state remains authoritative. The management routes are `POST projects/:id/pause`, `/stop`, `/archive` and `/unarchive`; only the Router's main Session has `orchestrator_project_archive` and `orchestrator_project_unarchive`, and neither the PM nor a Worker has these controls.
+
+The Project is never deleted; its page, Ticket history and PM Session remain readable after archive or end.
 
 ### Project PM Session
 

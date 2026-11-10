@@ -82,7 +82,7 @@ export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'
   if (!reached.length || records.threads.get(threadKey(trigger.threads[0]!))?.evaluating?.triggerIds.includes(trigger.id)) return []
   return reached.filter(id => {
     const ticket = records.tickets.get(id)
-    return !!ticket && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
+    return !!ticket && !ticket.archived && (liveTicket(ticket) || (ticket.ended?.by !== 'human'
       && ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id && ticket.undelivered.includes(input.id))))
   })
 }
@@ -169,7 +169,9 @@ export interface ProjectProfile {
   title: string
   goal: string
   /** Active Projects create Tickets; paused ones keep their existing Tickets but create no new one; ended ones are read-only history. */
-  status: 'active' | 'paused' | 'ended'
+  status: 'active' | 'paused' | 'ended' | 'archived'
+  /** The status an archived Project returns to when it is unarchived. */
+  archivedFrom?: 'active' | 'paused'
   /** The `project` Decision that created it. */
   decisionId: string
   /** The Session id of its PM, `pm-<projectId>`. */
@@ -349,6 +351,8 @@ export type TicketEndBy = 'executor' | 'human'
 export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'stopped'
 /** A question for a person; `triggerId` is the human message that raised it, whose conversation it goes back to. */
 export interface Attention { id: string; question: string; triggerId?: string }
+/** Set when its Project's archive made a Ticket non-executable; unarchiving the Project clears it. */
+export interface TicketArchive { at: string; by: 'project'; projectId: string }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -361,6 +365,8 @@ export interface Ticket {
   channels: ChannelRef[]
   /** When, by whom, and how the ticket ended, with a person's or the host's reason beyond the outcome; an open ticket has none. */
   ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
+  /** Its Project archived it: it is not executable and not open until the Project is unarchived. */
+  archived?: TicketArchive
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]
@@ -392,8 +398,9 @@ export interface Ticket {
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
 export interface Execution { name: string; directory: string; assignment: string }
 
-/** Whether a ticket is open: it has not ended. */
-export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended
+/** Whether a ticket is open: it has not ended and is not archived. */
+export const liveTicket = (ticket: Pick<Ticket, 'ended'> & Partial<Pick<Ticket, 'archived'>>): boolean =>
+  !ticket.ended && !ticket.archived
 /** How a ticket ended. */
 export const ticketOutcome = (ticket: Pick<Ticket, 'ended'>): TicketOutcome | undefined => ticket.ended?.outcome
 export const runningAssignment = (ticket: Ticket): Assignment | undefined => ticket.assignments.find(assignment => assignment.state === 'running')

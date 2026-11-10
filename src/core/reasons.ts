@@ -25,6 +25,7 @@ export const REASONS = {
   observed: 'Observe mode: would accept ({text})',
   projectCreated: 'Created Project {project}',
   projectTicketCreated: 'Delegated Ticket for Project {project}',
+  projectArchived: 'Project archived',
 } as const
 export type ReasonCode = keyof typeof REASONS
 /** Reason code and template values; `triggerId` identifies the trigger in a batch that the reason applies to. */

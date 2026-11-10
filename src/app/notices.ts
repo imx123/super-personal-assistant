@@ -76,11 +76,12 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
 /** Steering relay payload for a Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string; summary?: string }
 /**
- * The Session a relay about `ticket` belongs to: its active or paused Project's PM. A Router-owned Ticket or an ended
- * Project falls back to the main Session. The PM Session need not be loaded yet: the relay handler resolves it through DSH.
+ * The Session a relay about `ticket` belongs to: its active or paused Project's PM. A Router-owned Ticket, an ended
+ * Project or an archived Project falls back to the main Session. The PM Session need not be loaded yet: the relay handler
+ * resolves it through DSH.
  */
 export function relaySession(ticket: Pick<Ticket, 'projectId'> | undefined, project: ProjectProfile | undefined): string | undefined {
-  return ticket?.projectId && project && project.status !== 'ended' ? project.pmSessionId : undefined
+  return ticket?.projectId && project && (project.status === 'active' || project.status === 'paused') ? project.pmSessionId : undefined
 }
 /** An operator action is an execution receipt, not a Worker-authored report. */
 export function executionStatus(ticket: Ticket, action: 'interrupt_turn' | 'stop_assignment' | 'cancel_ticket',

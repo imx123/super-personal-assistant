@@ -35,7 +35,7 @@ export interface HttpHost {
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'archiveProject' | 'unarchiveProject'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
@@ -202,6 +202,14 @@ function routes(runtime: HttpHost): Routes {
       return { paused: runtime.engine.pauseProject(params.id, paused).status === 'paused' }
     },
     'POST projects/:id/stop': ({ params }) => { runtime.engine.stopProject(params.id); return { stopped: true } },
+    'POST projects/:id/archive': async ({ params }) => {
+      const project = runtime.engine.archiveProject(params.id)
+      return { archived: true as const, sessions: await runtime.sessions.archiveProject(project) }
+    },
+    'POST projects/:id/unarchive': async ({ params }) => {
+      const project = runtime.engine.unarchiveProject(params.id)
+      return { archived: false as const, sessions: await runtime.sessions.unarchiveProject(project) }
+    },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST tickets/:id/assignment/stop': async ({ params, body }) => {

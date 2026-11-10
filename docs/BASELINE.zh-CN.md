@@ -116,6 +116,32 @@ P2.4 只做 Project 的 active/paused/ended 状态、暂停/恢复、结束与�
 
 明确未做：Project 删除/归档、暂停项目内运行中的 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
+## P2.5-A 当前范围：Project/Ticket 归档核心
+
+P2.5-A 只做 Project/Ticket 的归档与取消归档、级联、管理 API/面板和 Router 工具；不做删除，不做 DSH 原生 archive 事件检测/pendingNotes（P2.5-B），不做 pause 新模式、PM 模型、PM→Worker 消息或 Project domain events。
+
+已实现：
+
+- `ProjectProfile.status` 加 `archived`，并增加 `archivedFrom?: 'active' | 'paused'`；`Ticket` 增加 `archived?: { at; by: 'project'; projectId }`。
+- `liveTicket` 同时要求未结束、未归档；`Store.tickets.open()`/`active` 和 `MemoryRepositories` 排除 archived；`ticketStage` 增加 `archived`；`canRetry`、`Sessions.workOnly` guard、intake fan-out/resume、`Tickets.wake`、`followupOwners`、`Tickets.attachable` 都拒绝或跳过 archived。
+- `Engine.archiveProject`：只能归档 active/paused（ended 拒绝，archived 幂等）；保存 `archivedFrom`，Project 置 archived，所有 child Ticket 写 archived，所有 pending/running Assignment 置 ended、`endedReason='projectArchived'`，不新建 Assignment。`Engine.unarchiveProject`：恢复 `archivedFrom`、清除 Ticket archived，不自动恢复/重试 Assignment；人可显式 retry 已结束的 Assignment。两者幂等。
+- `Sessions.archiveProject`/`unarchiveProject`：在 Engine 事务提交后，通过宿主 `workspaceRegistry.archiveSession(id, { stopActivity: true })` / `unarchiveSession(id)` 处理 PM 和所有 child Ticket Session；API 缺失记为 `unavailable`，单个失败记录日志并放进返回的 `failures`，Project 状态仍以应用记录为准。
+- 控制入口：management API `POST projects/:id/archive`、`POST projects/:id/unarchive`；面板 Project 页 Archive/Unarchive；主 Session/Router 工具 `orchestrator_project_archive` / `orchestrator_project_unarchive`。PM/Worker 没有这些工具。
+- archived Project 不能建 Ticket（`projectArchived`）；archived Ticket 不可执行、非 open，但历史、Session、Ticket 记录都保留。Project 页归档后仍可读，PM/child Session 保留（被 DSH 归档）。
+- Ticket 面板状态增加 archived（`TICKET_STATES`/`stage.archived`/mark），Ended 筛选也包含归档 Ticket；Project 状态文案增加 archived。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/core/model.ts`、`stage.ts`、`memory.ts`、`engine.ts`、`intake.ts`、`tickets.ts`、`errors.ts` | archived 类型、live/open/stage 语义、archive/unarchive、级联结束 Assignment、守卫 |
+| `src/app/store.ts`、`sessions.ts`、`http.ts`、`api.ts`、`views/projects.ts` | SQLite 生成列、Session archive API 与失败结果、management routes、Project 读模型 |
+| `src/app/tools/main.ts`、`src/client/projects.tsx`、`locales.ts`、`cards.ts`、`marks.ts`、`views/tickets.ts` | Router archive/unarchive 工具、面板控件、archived 文案/标记、筛选 |
+| `tests/fixtures/host.ts`、`panel-server.ts`、`tests/project-tickets.spec.ts`、`panel-project.spec.tsx`、`http.spec.ts`、`model-surface.spec.ts` | Session archive fake、API/panel 控件、归档/取消归档/失败/幂等、预算 |
+| `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 状态、归档/取消归档、Session 与级联语义 |
+
+明确未做：Project/Ticket 删除、DSH 原生 archive 事件检测/pendingNotes、pause 新模式、Project 暂停运行中 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+
 ## 主入口的权限模型
 
 主入口现在是正式 Source：`main-session`（`src/sources/main-session.ts`）。
@@ -150,13 +176,13 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
-2026-11-10 在本机验证 P2.4：
+2026-11-10 在本机验证 P2.5-A：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 14 项全通过：P2.2/P2.3 的建单、thread、幂等、回滚、身份、读范围、allow_tools、报告路由全部保留；新增 pause/resume 幂等、paused 建单 `projectPaused`、resume 后可建、paused 时 child 报告仍到 PM、stop 置 ended 并级联停止全部 open child Ticket、重复 stop 幂等、ended 不能建单、Router-owned Ticket 不受影响、ended 时报告 fallback。
-- `tests/panel-project.spec.tsx` 2 项、`tests/http.spec.ts` 5 项全通过：面板 Pause/Resume/Stop（Stop 确认）、状态文案；Project pause/stop 管理 API 走 Engine，非允许来源/缺 header 仍 403。
-- 定向回归：`runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
-- 全量 62 个测试文件、1231 项：1183 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- `tests/project-tickets.spec.ts` 18 项全通过：P2.2/P2.3/P2.4 的建单、thread、幂等、回滚、身份、读范围、allow_tools、报告路由、pause/stop 全部保留；新增 archive 保存 `archivedFrom`、Project/Ticket archived、pending/running Assignment 置 ended `projectArchived`、archived 不能建单、unarchive 恢复 active/paused、清 Ticket archived 且不重试、结束后不能 archive、Router-owned Ticket 不受影响、PM/child Session archive/unarchive 调用（含 `stopActivity: true`）及失败结果。
+- `tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项全通过：面板 Archive/Unarchive、Pause/Resume/Stop 与确认；Project archive/unarchive 管理 API 走 Engine 并调用 Sessions，非允许来源/缺 header 仍 403。
+- 定向回归：`runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue`、`model-surface`（orchestrator 预算因两个归档工具调到 61,500，实测 60,840）通过。
+- 全量 62 个测试文件、1236 项：1188 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -166,9 +192,10 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
 4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
 5. P2.4 Project 状态与控制（已完成；不做删除/归档、不暂停项目内 Worker）
-6. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-7. 意外中断与恢复
-8. 再扩展新功能
+6. P2.5-A Project/Ticket 归档核心（已完成；不做删除、原生 archive 事件检测、pendingNotes）
+7. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+8. 意外中断与恢复
+9. 再扩展新功能
 
 ## 文档说明
 

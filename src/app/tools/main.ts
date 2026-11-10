@@ -42,7 +42,8 @@ export interface MainToolsHost {
     & EngineForPM & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'projects' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject' | 'relay'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject' | 'relay'
+    | 'archiveProject' | 'unarchiveProject'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -262,6 +263,25 @@ function projectTicketCreateTool(host: MainToolsHost, project: ProjectProfile): 
     },
   })
 }
+/**
+ * `orchestrator_project_archive` / `orchestrator_project_unarchive`: the Router archives a Project and its child Sessions,
+ * or restores the status recorded before archiving, without deleting either. PM and Worker Sessions get no such tool.
+ */
+function projectArchiveTool(host: MainToolsHost, archive: boolean): Tool {
+  return tool({
+    name: archive ? 'orchestrator_project_archive' : 'orchestrator_project_unarchive',
+    description: archive
+      ? 'Archive a Project and every child Ticket with it: the Project keeps its records, its Tickets stop being executable, and its PM and child Sessions are archived. It deletes nothing and no Assignment restarts.'
+      : 'Unarchive a Project: restore the active or paused status it had before archiving, clear its child Tickets\' archive markers, and unarchive their Sessions. It does not restart or retry an Assignment.',
+    schema: z.object({ project_id: z.string().min(1).max(200) }).strict(),
+    execute: async args => {
+      const project = host.quietly(() => archive ? host.engine.archiveProject(args.project_id) : host.engine.unarchiveProject(args.project_id))
+      const sessions = archive ? await host.sessions.archiveProject(project) : await host.sessions.unarchiveProject(project)
+      host.requestPass()
+      return { project: projectCard(project), sessions, read: `project/${project.id}` }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -270,6 +290,8 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     userTriggerTool(host, agent),
     projectCreateTool(host),
+    projectArchiveTool(host, true),
+    projectArchiveTool(host, false),
     routeTool(host),
     tool({
       name: 'orchestrator_ticket_retry',
