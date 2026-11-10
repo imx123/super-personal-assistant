@@ -203,9 +203,10 @@ P2.7 只做 PM 给 child Ticket 的协调消息；不做删除、PM 模型、Pro
 
 已实现：
 
-- `Engine.messageTicket(ticketId, text, wake = false)`：把消息写成 child Ticket 的 `note` Input（确定性 id，同 Ticket/同文本只加一次），进入 Ticket 历史；只授予上下文，不授予新权限。返回 `{ delivered: 'running'|'started'|'queued'|'not_started', ticket }`。
+- `Engine.messageTicket(ticketId, text, wake = false, queueOnly = false)`：把消息写成 child Ticket 的 `note` Input（确定性 id，同 Ticket/同文本只加一次），进入 Ticket 历史；只授予上下文，不授予新权限。返回 `{ delivered: 'running'|'started'|'queued'|'not_started', ticket }`。`queueOnly` 只入队，不投递/不启动。
 - 校验：Ticket 存在、属于 Project、Project `active`；paused/archived/ended 分别 `projectPaused`/`projectArchived`/`projectEnded`，Router-owned `notProjectTicket`，ended Ticket `ticketEnded`。
 - 投递：running Assignment 走 `addInput` 的 `executor.deliver`，pending 走现有启动；没有 running/pending 且 `wake=true` 时，只有 `canRetry` 才通过 retry 启动新 Assignment，否则结 `not_started`，note 仍保留；`wake=false` 只投递/排队，不创建新 Assignment。
+- PM 消息可以穿过 `waitsForPerson` 的 automatic-input hold，因此 child 在等 attention 时 PM 仍能回答；普通 note 继续保持原 hold 语义。
 - PM 工具 `orchestrator_project_ticket_message`：schema `{ ticket_id, text(1..4000), wake?: boolean }`，只在 PM Session 注册；只能发自己 Project 内 Ticket，不能发 Router-owned；`wake` 默认 false。PM restrict 允许列表和 `prompts/pm.md`/`pmProjectSection` 已补该工具。
 - worker Session 已归档时：PM 工具读 `workspaceRegistry.archivedSessionIds`，把 note 入队但不投递/不启动，返回 `not_started`；宿主不能报告 archived Session 时，`wake=true` 返回 `queued`，不声称已送达。
 - 主 Session 的 `orchestrator_ticket_note` 保持原样；Worker 没有这个 PM 工具。
@@ -245,7 +246,7 @@ P2.8 只做 PM Session 的独立模型设置；不做 Project events、删除、
 
 明确未做：Project events、删除、pause 新行为、PM→Worker 消息改动、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、其他模型设置重构。
 
-## P2.9 当前范围：Project 状态变更 domain events
+## 已完成的 P2.9：Project 状态变更 domain events
 
 P2.9 只加 Project 状态变更的审计/测试 domain events；不 relay/通知主 Session 或 PM，不改 UI，不做删除、pause 新行为、PM→Worker 消息或 PM 模型改动。
 
