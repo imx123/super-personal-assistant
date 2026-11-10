@@ -342,9 +342,11 @@ export class Evals extends EnginePart {
   }
   /** The `project` Decision a Trigger created, if any: one Trigger routes to one Project (P2-A03). */
   private projectDecision(triggerId: string): Decision | undefined {
-    const decisionId = this.repo.triggers.disposition(triggerId)?.decisionId
-    const decision = decisionId ? this.repo.decisions.get(decisionId) : undefined
-    return decision?.kind === 'project' ? decision : undefined
+    // Do not trust the latest disposition: a later ignore/stop Decision would overwrite its decisionId while the Project
+    // Decision remains in the Thread's history (the P2-A03 follow-up bypass).
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger?.threads[0]) return undefined
+    return this.projectRoute(this.thread(trigger.threads[0]), triggerId)
   }
   /** The `project` Decision on `thread` for `triggerId`, if any: one Trigger routes to one Project (P2-A03). */
   private projectRoute(thread: Thread, triggerId: string): Decision | undefined {

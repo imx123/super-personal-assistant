@@ -41,10 +41,12 @@ describe('native DSH archive reconciliation', () => {
       const result = await host.runtime.sessions.archiveProject(project)
       expect(result.failures).toEqual([])
       expect(result.ids).toContain(absent)
-      expect(host.runtime.sessions.archivedSession(absent)).toBe(true)
-      // A second call is a no-op for the absent Session, not another host failure.
+      expect(host.runtime.sessions.archivedSession(absent)).toBe(false)
+      // The Session may exist on a later archive; absent must not skip it forever.
+      host.workspace.archiveSession.mockImplementation(original)
       const again = await host.runtime.sessions.archiveProject(project)
       expect(again.failures).toEqual([])
+      expect(host.runtime.sessions.archivedSession(absent)).toBe(true)
     } finally { await host.stop() }
   })
 

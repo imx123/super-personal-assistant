@@ -122,6 +122,8 @@ describe('Project creation', () => {
     const shared = { source: 'main-session', id: 'shared' }
     h.engine.recordTriggerForRouting(trigger('p1', { threads: [shared] }))
     h.engine.createProject('p1', 'Website', 'Ship the new site')
+    // A later non-accept Decision must not hide the historical Project route.
+    h.engine.decide('p1', { kind: 'ignore', reason: 'later decision' })
     expect(h.engine.reevaluate('p1')).toBe(false)
     h.engine.recordTriggerForRouting(trigger('p2', { threads: [shared] }))
     const decision = h.engine.decide('p2', { kind: 'accept', title: 'Normal work', scope: 'normal', reason: 'requested' })

@@ -300,9 +300,11 @@ export class Sessions {
       try {
         if (archive) {
           // A retried archive must reach only the Sessions an earlier attempt missed; DSH reports the archived set, so an
-          // already archived Session is recorded as done without another host call.
-          if (this.archivedSession(sessionId) === true) { ids.push(sessionId); continue }
+          // already archived Session is recorded as done without another host call. A Session previously absent is retried,
+          // because it may exist now (P2-A04).
+          if (!this.absentSessions.has(sessionId) && this.archivedSession(sessionId) === true) { ids.push(sessionId); continue }
           await registry!.archiveSession!(sessionId as SessionId, { stopActivity: true })
+          this.absentSessions.delete(sessionId)
         } else await registry!.unarchiveSession!(sessionId as SessionId)
         ids.push(sessionId)
       } catch (error) {
@@ -323,7 +325,6 @@ export class Sessions {
   }
   /** Whether the host reports `sessionId` archived; undefined when the host offers no archived Session ids. */
   archivedSession(sessionId: string): boolean | undefined {
-    if (this.absentSessions.has(sessionId)) return true
     const registry = this.ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
     if (!registry || !Array.isArray(registry.archivedSessionIds)) return undefined
     return registry.archivedSessionIds.map(String).includes(sessionId)
