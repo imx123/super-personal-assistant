@@ -9,6 +9,7 @@ import { ticketMark } from './marks.ts'
 import { GLOSSARY, GLOSSARY_VALUES, en, zh, type DshSuperagentKey } from './locales.ts'
 import { OverviewPage } from './overview.tsx'
 import { PanelProvider, usePanel, usePanelData } from './provider.tsx'
+import { ProjectsPage } from './projects.tsx'
 import { HOME, TABS, initialLocation, lastSettingsGroup, remember, routeLabel, settingsRoute, type Location, type Route,
   type Tab } from './route.ts'
 import { SettingsPage } from './settings.tsx'
@@ -154,6 +155,7 @@ function Pages({ route, openTab, deploymentForm }: { route: Route; openTab: (tab
         paused={!!state?.paused} />
       case 'execution': return route.id !== undefined ? <TicketPage key={route.id} id={route.id} />
         : state ? <ExecutionStatus filter={route.query?.filter ?? 'open'} state={state} reload={reload} /> : waiting
+      case 'project': return <ProjectsPage key={route.id ?? 'projects'} id={route.id} />
       case 'settings': return state ? <SettingsPage key={state.masterId} group={route.query.group} query={route.query} state={state}
         deploymentForm={deploymentForm} /> : waiting
     }

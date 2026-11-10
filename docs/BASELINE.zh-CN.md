@@ -19,9 +19,9 @@ P2.1 只做 Project 的最小闭环，不做 Project Ticket，也不做 child ti
 - Store 增加 `project` 表和 `projects` repository（`get` / `save` / `list`），Runtime 的 SQLite 与测试用 `MemoryRepositories` 同步实现。
 - Engine 新增 `createProject(triggerId, title, goal)`：校验 Trigger、按 Trigger 幂等、走 gate-only Eval（真实 `evalId`，不调 assessor、不投 candidate），同一事务写入 Project Profile、PM Mandate 与 `project` Decision，并 emit `project.created`。另加最小的 `projectReport`，把 PM 的汇报写回 Project。
 - 主 Session 新增独立工具 `orchestrator_project_create`：不放进 `orchestrator_route`，不创建 Ticket、不启动 Worker；创建后 `Sessions.ensure` 建 PM Session 并只发一条初始化消息（幂等）。
-- PM Session：`Sessions` role 增加 `pm`，新增 `PM_PRESET = 'dsh-superagent-pm'` 与 `cordis.patch.yml` 中对应的 preset；PM 只有 `orchestrator_read`、`orchestrator_project_report`，没有 shell、文件写入、web、子代理。新增 `prompts/pm.md`，提示词组装识别 PM 角色并附加当前 Project 摘要。
+- PM Session：`Sessions` role 增加 `pm`，新增 `PM_PRESET = 'dsh-superagent-pm'` 与 `cordis.patch.yml` 中对应的 preset；PM 只有 `orchestrator_read`、`orchestrator_project_report`，没有 shell、文件写入、web、子代理；权限优先 `workspace-write`，宿主没有时才退到 `read-only`/完整权限。`orchestrator_read` 只能读自己的 `project/<id>`。新增 `prompts/pm.md`，提示词组装识别 PM 角色并附加当前 Project 摘要。
 - 读模型：`src/app/views/projects.ts` 提供 Project 列表/详情；API 增加 `GET projects`、`GET projects/:id`；`orchestrator_read` 增加 `projects`、`project/<id>` 资源。
-- 未做 Web 面板的新 Project Tab：P2.1 只提供 view、API 和读资源。面板仍可通过现有 Decision 列表看到 `project` Decision。
+- 面板新增最小的 Project Tab：列表、详情（goal/status/PM Session/latest report）和“打开 PM Session”；不做创建、暂停、停止。`Decision` 的 `project` kind 在面板中也有标记和文案。
 
 明确未做：PM 创建 Ticket、`orchestrator_project_ticket_create`、child ticket 外部 thread 订阅、Project 暂停/停止、Memory/RAG、Fast Router 拆分、父 Ticket 或 `Ticket.parentId`。主窗口 active dispatch 的 directEval 路线保持原样（仍是 gate-only），没有改动。
 
@@ -33,8 +33,9 @@ P2.1 只做 Project 的最小闭环，不做 Project Ticket，也不做 child ti
 | `src/app/store.ts`、`views/projects.ts`、`cards.ts`、`resources.ts`、`api.ts`、`http.ts` | `project` 表、Project 读模型、卡片与读资源、两条 API |
 | `src/app/tools/main.ts`、`sessions.ts`、`prompts.ts`、`context.ts`、`runtime.ts` | 主 Session 工具、PM Session、PM preset、PM prompt 与初始化 |
 | `cordis.patch.yml`、`prompts/pm.md`、`src/client/marks.ts`、`src/client/locales.ts` | PM preset、PM 角色提示词、`project` Decision 的前端标记与文案 |
-| `docs/001`、`docs/002`、`docs/007`、本文件 | 领域、授权、架构与基线范围 |
-| `tests/projects.spec.ts`、`tests/bundle-patch.spec.ts`、`tests/model-surface.spec.ts`、`tests/fixtures/panel-server.ts` | Project 定向测试、PM preset 断言、模型可见预算调整、面板假路由 |
+| `src/client/route.ts`、`app.tsx`、`projects.tsx` | Project Tab 的路由、页面渲染、列表/详情与“打开 PM Session” |
+| `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 领域、授权、面板、架构与基线范围 |
+| `tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/navigation.spec.ts`、`tests/bundle-patch.spec.ts`、`tests/model-surface.spec.ts`、`tests/fixtures/host.ts`、`tests/fixtures/panel-server.ts` | Project 定向与面板测试、PM 权限/读范围、路由、PM preset 断言、模型可见预算调整、假路由 |
 
 ## 主入口的权限模型
 

@@ -39,8 +39,9 @@ describe('Project creation', () => {
     const decision = h.repo.decisions.get(project.decisionId)!
     expect(project).toMatchObject({ id: key('project', 'p1'), title: 'Website', goal: 'Ship the new site', status: 'active',
       pmSessionId: `pm-${key('project', 'p1')}`, mandate: { projectId: key('project', 'p1'), goal: 'Ship the new site', strength: 'explicit',
-        scope: 'Website', actor } })
-    expect(decision).toMatchObject({ kind: 'project', projectId: project.id, triggerIds: ['p1'], strength: 'explicit' })
+        scope: 'Ship the new site', actor } })
+    expect(decision).toMatchObject({ kind: 'project', projectId: project.id, triggerIds: ['p1'], strength: 'explicit',
+      mandate: { projectId: project.id, goal: 'Ship the new site', scope: 'Ship the new site' } })
     expect(decision.ticketId).toBeUndefined()
     // A real Eval id, not a fabricated one, while the assessor was never asked and no ticket exists.
     expect(decision.evalId).toBe(key('eval', 'main-session:p1', 'direct', 'p1', 'project', '2026-11-10T00:00:00.000Z'))
@@ -126,16 +127,20 @@ describe('Project persistence and read views', () => {
       const project = host.runtime.store.projects.get(result.project.project_id)!
       expect(result).toMatchObject({ read: `project/${project.id}`, note: expect.stringContaining('no Ticket or worker') })
       expect(project).toMatchObject({ title: 'Settings site', goal: 'Ship a clearer settings site', pmSessionId: `pm-${project.id}` })
+      expect(project.mandate.scope).toBe('Ship a clearer settings site')
       expect(projectOfSession(project.pmSessionId)).toBe(project.id)
-      // Only the PM's read and report tools, and only the first message was sent.
+      // The PM has only its read and report tools, and never full machine access while workspace-write is offered.
       expect([...host.tools.get(project.pmSessionId)!.keys()].sort()).toEqual(['orchestrator_project_report', 'orchestrator_read'])
+      expect(host.permissions.set).toHaveBeenCalledWith(expect.objectContaining({ id: project.pmSessionId }), 'workspace-write')
       const messages = host.deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === project.pmSessionId)
       expect(messages).toHaveLength(1)
       expect(JSON.parse(messages[0]!.text)).toMatchObject({ kind: 'project_created',
         project: { project_id: project.id, title: 'Settings site', goal: 'Ship a clearer settings site' } })
-      // The PM reads its Project and reports; the read routes show the report.
+      // The PM reads its Project and nothing else, and reports; the read routes show the report.
       expect(await host.runTool(project.pmSessionId, 'orchestrator_read', { resource: `project/${project.id}` }))
         .toMatchObject({ project_id: project.id, title: 'Settings site' })
+      await expect(host.runTool(project.pmSessionId, 'orchestrator_read', { resource: 'tickets' }))
+        .rejects.toThrow('only its own Project')
       await host.runTool(project.pmSessionId, 'orchestrator_project_report', { summary: 'Kickoff done.' })
       expect((await host.api('GET', 'projects')).body).toMatchObject({ total: 1, items: [{ id: project.id, latestReport: { summary: 'Kickoff done.' } }] })
       expect((await host.api('GET', `projects/${project.id}`)).body).toMatchObject({ id: project.id, goal: 'Ship a clearer settings site' })

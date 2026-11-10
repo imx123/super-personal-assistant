@@ -12,7 +12,7 @@ Opening the panel answers three questions, in this order:
 
 ## Tabs
 
-The tabs follow the workflow: **Overview**, **Source**, **Trigger**, **Eval**, **Execution**, and **Settings**. Until repository and account setup succeeds, Overview shows what is missing and links to the relevant setting.
+The tabs follow the workflow: **Overview**, **Source**, **Trigger**, **Eval**, **Execution**, **Project**, and **Settings**. Until repository and account setup succeeds, Overview shows what is missing and links to the relevant setting.
 
 | Tab | Shows |
 | --- | --- |
@@ -21,6 +21,7 @@ The tabs follow the workflow: **Overview**, **Source**, **Trigger**, **Eval**, *
 | Trigger | Threads filtered by Subscribed, Evaluating, New Triggers in 24 h, or All Threads. Each Thread shows its Triggers newest first, Decisions and Subscriptions |
 | Eval | Decisions with their reason and matched rules |
 | Execution | Executor state, Pause processing, and Tickets filtered by Open, Pending, Working, Waiting for a Trigger or Ended. Ticket details show actions, authorization, waiting Inputs, Subscriptions and Assignments |
+| Project | The Projects the Router created, newest first. A Project shows its goal, status, PM Session, creating Decision and latest PM report, with **Open PM Session**. P2.1 offers no create, pause or stop action |
 | Settings | Sources, Eval, Execution, Prompts and Deployment. Each group includes its save history |
 
 ### Reading individual records

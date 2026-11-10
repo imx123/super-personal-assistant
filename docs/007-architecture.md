@@ -71,7 +71,7 @@ Callers receive only their role's `Pick` of the Engine: `EngineForSources`, `Eng
 | Main Session | `candidate(triggerId)` | The Eval that holds a Trigger, as its assessor sees it |
 | Main Session | `candidateDelivered(evalId)` | The Eval's candidate reached the main Session: its deadline counts from now |
 | Main Session | `decide(triggerId, outcome)` | Records an Eval Decision, or a direct Decision for an explicit request. Accept creates the Ticket, Mandate, Assignment, Subscriptions and acknowledgement atomically. An inferred candidate ignored from its card records `ignoredFromCard` before the supplied reason. While `followupOwners` still owns a human follow-up, only stop is allowed |
-| Main Session | `createProject(triggerId, title, goal)` | Creates a Project from a Trigger in one transaction: a gate-only `project` Decision with a real Eval id (no assessor and no candidate), the Project Profile, and the PM Mandate. It is idempotent by Trigger (`key('project', triggerId)`), and creates no Ticket |
+| Main Session | `createProject(triggerId, title, goal)` | Creates a Project from a Trigger in one transaction: a gate-only `project` Decision with a real Eval id (no assessor and no candidate), the Project Profile, and the PM Mandate, which the Decision also records. It is idempotent by Trigger (`key('project', triggerId)`), and creates no Ticket |
 | Project PM | `projectReport(projectId, summary)` | Records the PM Session's latest report on its Project, which the Project reads show |
 | Main Session | `attach(ticketId, triggerId, note?)` | Routes a Trigger to a Ticket it points at, whose Executor then decides it as a follow-up, and ends the Eval that holds it, whose other Triggers wait for a fresh Eval; an ended Ticket resumes under its Mandate at once unless processing is paused. A follow-up an Executor still decides is refused, as is one routed back to the Ticket that handed it back |
 | Main Session | `requestStatus(ticketId)` | Asks a waiting Executor Session for its status, and answers whether it asked |
@@ -380,9 +380,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu-image.ts` | Reads a Feishu message's image as an attachment for the assessing Session |
 | `src/client/index.tsx` | The client plugin entry: the sidebar entry, the main panel and the page in DeepSeek Harness's Plugin Manager |
 | `src/client/app.tsx` | The panel: header, search, glossary, tabs and the page of the current route |
+| `src/client/projects.tsx` | The Project tab: the Project list, one Project's goal, status, PM Session and latest report, and its **Open PM Session** action |
 | `src/client/provider.tsx` | What every page reads from its host: copy, calls, navigation, notices, the state poll, and `restart`, which reads the state quickly while dsh-superagent restarts |
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
-| `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
+| `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads (including a Project's detail), and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
@@ -443,7 +444,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
-| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx` | Each page of the panel, against a fake management API answered by route |
+| `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx`, `panel-project.spec.tsx` | Each page of the panel, against a fake management API answered by route |
 | `tests/panel-settings.spec.tsx`, `panel-prompts.spec.tsx`, `panel-deployment.spec.tsx`, `panel-panel.spec.tsx` | The settings groups, drafts and history, the prompts, the Deployment page, and the panel's search, glossary and route memory |
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
@@ -523,7 +524,7 @@ The main Session also has DeepSeek Harness's `skill`, `bash`, `read`, `read_imag
 
 New main Sessions use `dsh-superagent-router` (`ROUTER_PRESET`). Shell commands and job waits return after 5 seconds. If the Web UI selects another preset before the first turn, `Sessions` restores this preset, or `WORKER_PRESET` for a worker.
 
-New PM Sessions use `dsh-superagent-pm` (`PM_PRESET`): time context and compaction only, with no shell, file, web, skill, todo, scheduling, goal, workflow or subagent tool. The PM's own application tools are `orchestrator_read` and `orchestrator_project_report`; its Session id is `pm-<projectId>` and it works in a directory under the state directory, since it does no file work.
+New PM Sessions use `dsh-superagent-pm` (`PM_PRESET`): time context and compaction only, with no shell, file, web, skill, todo, scheduling, goal, workflow or subagent tool. The PM's own application tools are `orchestrator_read` and `orchestrator_project_report`; its Session id is `pm-<projectId>` and it works in a directory under the state directory, since it does no file work. It takes the `workspace-write` permission preset when the host offers it, else `read-only`, and full access only when neither exists. Its `orchestrator_read` accepts only its own `project/<id>` and refuses every other resource.
 
 The `noWait` guard in `src/app/sessions.ts` refuses main-Session shell commands that invoke `sleep` at a command position, shell `timeoutMs` above 30 seconds, and `job_output` waits above 5 seconds. Reports and job results arrive automatically, so waiting only delays incoming candidates.
 
@@ -569,7 +570,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | Resources | Content |
 | --- | --- |
 | `tickets`, `triggers`, `threads`, `decisions` | Paged lists as `{items, next_offset}`; activity lists put newest first |
-| `projects`, `project/<id>` | Project Profiles, newest first, and one Project Profile |
+| `projects`, `project/<id>` | Project Profiles, newest first, and one Project Profile; a Project PM may read only its own `project/<id>` |
 | `decision/<id>` | One Decision |
 | `thread/<key>` | Label, Tickets, recent Decisions and a page of Triggers |
 | `trigger/<id>` | Message text, replied-to Trigger and neighboring messages, excluding CI runs |

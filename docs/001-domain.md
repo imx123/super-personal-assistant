@@ -43,7 +43,7 @@ The Executor, with its Sessions and directories, is outside the domain and conne
 
 Aggregates: a Source holds its read position. A Thread holds its Subscriptions, its running Eval, which runs serially and merges Triggers that arrive meanwhile into the next batch, and its Decision history. A Ticket holds its Assignments, Channels and Inputs, and refers to Decisions by id.
 
-A Project is created by a Decision of kind `project`, which names its `projectId` and no `ticketId`; the Eval that produces it never asks the assessor. Its `PMMandate` has the shape of a Mandate but delegates project-level management to `pm-<projectId>` and names the Project's goal. Tickets created for a Project, which arrive in a later phase, carry its `projectId`; none exist yet.
+A Project is created by a Decision of kind `project`, which names its `projectId` and no `ticketId`; the Eval that produces it never asks the assessor. Its `PMMandate` has the shape of a Mandate but delegates project-level management to `pm-<projectId>`, names the Project's goal and uses that goal as its scope; the Decision records the same PM Mandate for audit. Tickets created for a Project, which arrive in a later phase, carry its `projectId`; none exist yet.
 
 ## Rejected concepts
 

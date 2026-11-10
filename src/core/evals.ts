@@ -160,7 +160,7 @@ export class Evals extends EnginePart {
    * Project's PM works under.
    * @throws UserError when the Trigger is unknown or the gate does not admit it.
    */
-  project(triggerId: string, projectId: string, title: string, goal: string): { decision: Decision; mandate: PMMandate } {
+  project(triggerId: string, projectId: string, goal: string): { decision: Decision; mandate: PMMandate } {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     // An Eval that holds the Trigger would otherwise ask the assessor to decide work this Project already took.
@@ -172,9 +172,9 @@ export class Evals extends EnginePart {
     }
     const thread = held ?? this.thread(trigger.threads[0]!)
     const evaluation = this.directEval(thread, trigger, 'project')
-    const decision = this.finish(thread, evaluation, { kind: 'project', reason: [reason], projectId })
     const mandate: PMMandate = { strength: evaluation.strength, policyVersion: evaluation.policyVersion, basis: evaluation.basis,
-      actor: evaluation.actor, scope: title, projectId, goal }
+      actor: evaluation.actor, scope: goal, projectId, goal }
+    const decision = this.finish(thread, evaluation, { kind: 'project', reason: [reason], projectId, mandate })
     return { decision, mandate }
   }
   /**

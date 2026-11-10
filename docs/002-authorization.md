@@ -61,7 +61,7 @@ Creating a Project is not an accept and does not go through `orchestrator_route`
 - The same transaction creates the `project` Decision (with `projectId` and no `ticketId`), the Project Profile and the Project PM Mandate. The Project id is `key('project', triggerId)`, so a repeated call returns the Project created first and records no second Decision or PM Session.
 - No Ticket is accepted and no worker starts. The main Session receives the Project card and only acknowledges it.
 - The `PMMandate` carries the gate's strength, Policy version, basis and actor, as a Ticket Mandate does, plus the Project and its goal. It authorizes managing the Project, not arbitrary file or repository work.
-- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm`, with `orchestrator_read` and `orchestrator_project_report` only. It is a small Router: it keeps the Project's goal in view and reports to the Project. P2.1 gives it no tool that creates Tickets; that arrives with the Project Ticket tools.
+- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm`, with `orchestrator_read` and `orchestrator_project_report` only. It is a small Router: it keeps the Project's goal in view and reports to the Project. Its read tool accepts only its own `project/<id>`; every other resource is refused. Its permission preset is `workspace-write` when offered, else `read-only`, and full access only when neither exists. P2.1 gives it no tool that creates Tickets; that arrives with the Project Ticket tools.
 
 The Project Profiles and their latest reports are read through `GET projects` and `GET projects/:id`, and through the `projects` and `project/<id>` read resources.
 

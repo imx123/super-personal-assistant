@@ -102,7 +102,7 @@ export class Engine {
       const existing = this.repo.projects.get(projectId)
       if (existing) return existing
       if (!this.repo.triggers.get(triggerId)) throw new UserError('unknownTrigger')
-      const { decision, mandate } = this.evals.project(triggerId, projectId, title, goal)
+      const { decision, mandate } = this.evals.project(triggerId, projectId, goal)
       const project: ProjectProfile = { id: projectId, title, goal, status: 'active', decisionId: decision.id,
         pmSessionId: pmSessionId(projectId), mandate, createdAt: decision.at, updatedAt: decision.at }
       this.repo.projects.save(project)

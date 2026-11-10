@@ -118,6 +118,19 @@ const TEXT = {
   'tab.trigger': ['触发', 'Trigger'],
   'tab.eval': ['评估', 'Eval'],
   'tab.execution': ['执行', 'Execution'],
+  'tab.project': ['项目', 'Projects'],
+  'projectStatus.active': ['进行中', 'Active'],
+  projectsIntro: ['主 Session 委派给项目 PM 管理的工作。', 'Work the main Session delegated to a Project PM.'],
+  projectsEmpty: ['还没有项目。', 'No Projects yet.'],
+  projectNotFound: ['找不到这个项目。', 'Project not found.'],
+  projectGoal: ['项目目标', 'Goal'],
+  projectStatus: ['状态', 'Status'],
+  projectPmSession: ['PM Session', 'PM Session'],
+  projectLatestReport: ['最新汇报', 'Latest report'],
+  projectNoReport: ['项目 PM 还没有汇报。', 'The Project PM has not reported yet.'],
+  projectCreated: ['创建时间', 'Created'],
+  projectUpdated: ['更新时间', 'Updated'],
+  openPmSession: ['打开 PM Session', 'Open PM Session'],
   // Overview
   sourceError: ['{source} 来源异常', '{source} Source failing'],
   needsYouNone: ['没有待处理的工单。', 'No pending Tickets.'],
@@ -638,6 +651,7 @@ const TEXT = {
   'term.decision': ['决定', 'Decision'],
   'term.mandate': ['授权', 'Mandate'],
   'term.ticket': ['工单', 'Ticket'],
+  'term.project': ['项目', 'Project'],
   'term.assignment': ['派工', 'Assignment'],
   'term.subscription': ['订阅', 'Subscription'],
   'term.fanout': ['扇出', 'Fan-out'],
@@ -772,6 +786,7 @@ export const GLOSSARY_VALUES = {
   decision: ['decision.accept', 'decision.reopen', 'decision.stop', 'decision.ignore', 'decision.project', 'decision.unavailable'], strength: ['strength.explicit', 'strength.inferred'],
   ticket: ['stage.answer', 'stage.review', 'stage.blocked', 'stage.failed', 'stage.delivery', 'stage.queued', 'stage.working', 'stage.idle', 'ticket.ended'],
   assignment: ['assignment.pending', 'assignment.running', 'assignment.ended'], report: ['report.progress', 'report.waiting', 'report.ready', 'report.blocked', 'report.failed', 'report.dropped'],
+  projectStatus: ['projectStatus.active'],
 } as const
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {

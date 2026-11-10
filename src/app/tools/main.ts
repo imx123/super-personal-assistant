@@ -366,14 +366,18 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   ]
 }
 /**
- * A Project PM Session's tools: read records and report on its Project. It gets no routing, Ticket, settings, shell,
- * file, web or subagent tool. `project` scopes its report and the Project resource it is told to read.
+ * A Project PM Session's tools: read its own Project Profile and report on it. It gets no routing, Ticket, settings,
+ * shell, file, web or subagent tool, and no other record of the installation.
  */
 export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
+  const own = `project/${project.id}`
   return [
-    readTool(`Read one page of a resource the resource parameter lists. This Project is project/${project.id}; read it first, then the records it names. Follow next_offset, and next_resource where a page names one.`,
-      false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    readTool(`Read this Project's Profile, ${own}. A PM reads no other record.`, false,
+      (resource, offset, limit, signal) => {
+        if (resource !== own) throw new Error(`A Project PM may read only its own Project (${own}); ${resource} is outside it`)
+        return readResource(resources, resource, offset, limit, undefined, signal)
+      }, `${own}: this Project's goal, status, PM Session, mandate and latest report`),
     tool({
       name: 'orchestrator_project_report',
       description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',
