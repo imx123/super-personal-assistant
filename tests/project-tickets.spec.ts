@@ -213,6 +213,11 @@ describe('PM-created Project Tickets', () => {
       expect(stored.ended).toBeUndefined()
       expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'projectArchived')).toBe(true)
     }
+    // Archiving must stop the workers, not only mark their Assignments ended.
+    expect(h.executor.stop).toHaveBeenCalledWith(expect.objectContaining({ id: first!.id }),
+      expect.objectContaining({ id: first!.assignments[0]!.id }), 'projectArchived')
+    expect(h.executor.stop).toHaveBeenCalledWith(expect.objectContaining({ id: second!.id }),
+      expect.objectContaining({ id: second!.assignments[0]!.id }), 'projectArchived')
     expect(h.repo.tickets.open().map(ticket => ticket.id)).toEqual([normal.ticketId])
     expect(h.repo.tickets.get(normal.ticketId!)!.archived).toBeUndefined()
     expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectArchived'))

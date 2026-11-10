@@ -312,6 +312,7 @@ export class Engine {
         for (const assignment of ticket.assignments) {
           if (assignment.state === 'ended') continue
           assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'projectArchived'
+          this.options.executor.stop(ticket, assignment, 'projectArchived')
         }
         ticket.archived = { at, by: 'project', projectId }
         ticket.updatedAt = at
