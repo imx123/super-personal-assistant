@@ -297,11 +297,11 @@ export class Tickets extends EnginePart {
    * Add an Input once (idempotently) and ask the Executor to deliver it, or to launch again a pending Assignment whose launch
    * failed once no person is waited for: a Policy change alone does not launch it again.
    */
-  addInput(ticket: Ticket, input: TicketInput): void {
+  addInput(ticket: Ticket, input: TicketInput, deliverWhileWaiting = false): void {
     if (ticket.inputs.some(existing => existing.id === input.id)) return
     ticket.inputs.push(input); ticket.updatedAt = this.now()
-    // Hold back automated inputs while the worker is waiting on a person.
-    const held = liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
+    // Hold back automated inputs while the worker is waiting on a person, unless a Project PM is answering that question.
+    const held = !deliverWhileWaiting && liveTicket(ticket) && automatic(input) && waitsForPerson(ticket)
     if (!held) ticket.undelivered.push(input.id)
     this.repo.tickets.save(ticket)
     if (!liveTicket(ticket) || held) return
@@ -479,10 +479,10 @@ export class Tickets extends EnginePart {
    * Add a note Input under a caller-chosen deterministic id, so a repeated request with the same text adds it once.
    * @throws UserError when the ticket is unknown or has ended.
    */
-  noteWithId(ticketId: string, text: string, id: string): Ticket {
+  noteWithId(ticketId: string, text: string, id: string, deliverWhileWaiting = false): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
-    this.addInput(ticket, { id, kind: 'note', text, at: this.now() })
+    this.addInput(ticket, { id, kind: 'note', text, at: this.now() }, deliverWhileWaiting)
     return this.require(ticketId)
   }
   /**

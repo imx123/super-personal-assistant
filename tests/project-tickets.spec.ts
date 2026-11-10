@@ -1,6 +1,6 @@
 /** P2.2a/P2.2b: PM-created Project Tickets, delegated Decisions, external Threads, and their optional worker tool allowlist. */
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, key, type Assessor, type Candidate, type DomainEvent, type Executor,
+import { Engine, MemoryRepositories, UserError, key, waitsForPerson, type Assessor, type Candidate, type DomainEvent, type Executor,
   type Mandate, type Policy, type ProjectProfile, type ProjectTicketTask, type Ticket, type Trigger } from '../src/core/index.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
@@ -248,6 +248,19 @@ describe('PM-created Project Tickets', () => {
     const inputs = stored.inputs.length
     h.engine.messageTicket(first!.id, 'Header coordination note')
     expect(h.repo.tickets.get(first!.id)!.inputs).toHaveLength(inputs)
+  })
+
+  it('delivers a PM message to a child that is waiting for a person', () => {
+    const h = harness()
+    const [first] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [tasks[0]!])
+    h.engine.assignmentStarted(first!.id, first!.assignments[0]!.id)
+    h.engine.report(first!.id, { state: 'blocked', summary: 'Need a decision', question: 'Which header?' })
+    expect(waitsForPerson(h.repo.tickets.get(first!.id)!)).toBe(true)
+    expect(h.engine.messageTicket(first!.id, 'Use the compact header.').delivered).toBe('running')
+    const note = h.repo.tickets.get(first!.id)!.inputs.find(input => input.kind === 'note')!
+    expect(h.repo.tickets.get(first!.id)!.undelivered).toContain(note.id)
+    expect(h.executor.deliver).toHaveBeenCalledWith(expect.objectContaining({ id: first!.id }),
+      expect.objectContaining({ id: first!.assignments[0]!.id }))
   })
 
   it('starts a new Assignment only for wake=true and a retryable Ticket', () => {

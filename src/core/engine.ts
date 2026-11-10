@@ -593,7 +593,7 @@ export class Engine {
         this.tickets.queueNoteWithId(ticketId, text, id)
         return { delivered: 'not_started', ticket: this.repo.tickets.get(ticketId)! }
       }
-      this.tickets.noteWithId(ticketId, text, id)
+      this.tickets.noteWithId(ticketId, text, id, true)
       let delivered: TicketMessageDelivery
       if (running) delivered = 'running'
       else if (pending) delivered = 'started'
