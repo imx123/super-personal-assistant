@@ -101,6 +101,22 @@ describe('Project creation', () => {
     expect(h.repo.decisions.byThread('main-session:p1')).toHaveLength(1)
   })
 
+  it('drops a Project-routed Trigger from a queued batch before it starts (P2-A03)', () => {
+    const h = harness()
+    const shared = { source: 'main-session', id: 'shared' }
+    h.engine.recordTriggerForRouting(trigger('p1', { threads: [shared] }))
+    h.engine.createProject('p1', 'Website', 'Ship the new site')
+    const thread = h.repo.threads.get('main-session:shared')!
+    thread.pending.push('p1')
+    h.repo.threads.save(thread)
+    h.engine.recordTriggerForRouting(trigger('p2', { threads: [shared] }))
+    expect(h.engine.reevaluate('p2')).toBe(true)
+    h.engine.evaluateDue()
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['p2'])
+    const decision = h.engine.decide('p2', { kind: 'accept', title: 'Normal work', scope: 'normal', reason: 'requested' })
+    expect(decision.triggerIds).toEqual(['p2'])
+  })
+
   it('keeps a Project-routed Trigger out of a later batch accept (P2-A03)', () => {
     const h = harness()
     const shared = { source: 'main-session', id: 'shared' }
