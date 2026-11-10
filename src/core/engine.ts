@@ -289,6 +289,7 @@ export class Engine {
           active.pendingNotes = [...project.pendingNotes ?? [], note]
         }
         this.repo.projects.save(active)
+        this.options.emit?.({ type: 'project.resumed', at, data: { projectId, ...(project.pauseMode ? { mode: project.pauseMode } : {}) } })
         return active
       }
       // A hard pause is not downgraded by a later soft request; it ends only on resume.
@@ -296,6 +297,8 @@ export class Engine {
       if (project.status === 'paused' && project.pauseMode === mode) return project
       const pausedProject: ProjectProfile = { ...project, status: 'paused', pauseMode: mode, updatedAt: at }
       this.repo.projects.save(pausedProject)
+      this.options.emit?.({ type: 'project.paused', at, data: { projectId, mode,
+        ...(project.status === 'paused' && project.pauseMode ? { from: project.pauseMode } : {}) } })
       if (mode === 'hard') {
         for (const ticket of this.repo.tickets.open()) {
           if (ticket.projectId !== projectId) continue
@@ -323,6 +326,7 @@ export class Engine {
       if (project.status === 'ended' || project.status === 'archived') return project
       const updated: ProjectProfile = { ...project, status: 'ended', updatedAt: this.options.now?.() ?? new Date().toISOString() }
       this.repo.projects.save(updated)
+      this.options.emit?.({ type: 'project.ended', at: updated.updatedAt, data: { projectId, ...(reason !== undefined ? { reason } : {}) } })
       // The Project is ended first, so child lifecycle notices and relays fall back instead of pretending it is active.
       for (const ticket of this.repo.tickets.open()) if (ticket.projectId === projectId) this.tickets.stop(ticket.id, reason)
       return updated
@@ -343,6 +347,7 @@ export class Engine {
       const at = this.options.now?.() ?? new Date().toISOString()
       const archived: ProjectProfile = { ...project, status: 'archived', archivedFrom: project.status, updatedAt: at }
       this.repo.projects.save(archived)
+      this.options.emit?.({ type: 'project.archived', at, data: { projectId, from: project.status as 'active' | 'paused' } })
       for (const ticket of this.repo.tickets.list()) {
         if (ticket.projectId !== projectId) continue
         for (const assignment of ticket.assignments) {
@@ -371,6 +376,7 @@ export class Engine {
       const restored: ProjectProfile = { ...project, status: project.archivedFrom ?? 'active', updatedAt: at }
       delete restored.archivedFrom
       this.repo.projects.save(restored)
+      this.options.emit?.({ type: 'project.unarchived', at, data: { projectId, status: restored.status as 'active' | 'paused' } })
       for (const ticket of this.repo.tickets.list()) {
         if (ticket.projectId !== projectId || ticket.archived?.projectId !== projectId) continue
         delete ticket.archived

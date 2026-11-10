@@ -51,6 +51,45 @@ describe('Project creation', () => {
       data: { projectId: project.id, decisionId: project.decisionId, pmSessionId: project.pmSessionId } }))
   })
 
+  it('emits one Project state event per real transition, including pause mode upgrades, and none for no-ops', () => {
+    const h = harness()
+    h.engine.recordTriggerForRouting(trigger('p1'))
+    const first = h.engine.createProject('p1', 'Website', 'Ship the new site')
+    const at = '2026-11-10T00:00:00.000Z'
+    const projectEvents = () => h.events.filter(event => event.type.startsWith('project.'))
+    expect(projectEvents()).toEqual([{ type: 'project.created', at, data: { projectId: first.id, decisionId: first.decisionId,
+      pmSessionId: first.pmSessionId } }])
+    // Active -> soft, a repeated soft call, then soft -> hard and a hard no-op that must not add events.
+    h.engine.pauseProject(first.id, true)
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.paused', at, data: { projectId: first.id, mode: 'soft' } })
+    h.engine.pauseProject(first.id, true)
+    expect(projectEvents()).toHaveLength(2)
+    h.engine.pauseProject(first.id, true, 'hard')
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.paused', at, data: { projectId: first.id, mode: 'hard', from: 'soft' } })
+    h.engine.pauseProject(first.id, true, 'hard')
+    h.engine.pauseProject(first.id, true, 'soft')
+    expect(projectEvents()).toHaveLength(3)
+    // Resume from hard, then end with a reason; repeated calls add nothing.
+    h.engine.pauseProject(first.id, false)
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.resumed', at, data: { projectId: first.id, mode: 'hard' } })
+    h.engine.pauseProject(first.id, false)
+    h.engine.stopProject(first.id, 'finished')
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.ended', at, data: { projectId: first.id, reason: 'finished' } })
+    h.engine.stopProject(first.id, 'again')
+    expect(projectEvents()).toHaveLength(5)
+    // Archive restores the previous status; a second archive and unarchive are no-ops after their transitions.
+    h.engine.recordTriggerForRouting(trigger('p2'))
+    const second = h.engine.createProject('p2', 'Docs', 'Write the docs')
+    h.engine.archiveProject(second.id)
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.archived', at, data: { projectId: second.id, from: 'active' } })
+    h.engine.archiveProject(second.id)
+    h.engine.unarchiveProject(second.id)
+    expect(projectEvents().at(-1)).toEqual({ type: 'project.unarchived', at, data: { projectId: second.id, status: 'active' } })
+    h.engine.unarchiveProject(second.id)
+    expect(projectEvents().map(event => event.type)).toEqual(['project.created', 'project.paused', 'project.paused', 'project.resumed',
+      'project.ended', 'project.created', 'project.archived', 'project.unarchived'])
+  })
+
   it('is idempotent per trigger: a repeated call returns the first Project and records no second Decision', () => {
     const h = harness()
     h.engine.recordTriggerForRouting(trigger())
@@ -146,6 +185,26 @@ describe('Project persistence and read views', () => {
       expect((await host.api('GET', 'projects')).body).toMatchObject({ total: 1, items: [{ id: project.id, latestReport: { summary: 'Kickoff done.' } }] })
       expect((await host.api('GET', `projects/${project.id}`)).body).toMatchObject({ id: project.id, goal: 'Ship a clearer settings site' })
       expect((await host.api('GET', 'projects/missing')).status).toBe(404)
+    } finally { await host.stop() }
+  })
+
+  it('does not relay Project state events to the main Session or the PM', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('32', 'Start a project for quiet events')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const result = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Quiet events', goal: 'Keep state events for audit only' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(result.project.project_id)!
+      const deliveries = host.deliveries.mock.calls.length
+      host.runtime.engine.pauseProject(project.id, true)
+      host.runtime.engine.pauseProject(project.id, true, 'hard')
+      host.runtime.engine.pauseProject(project.id, false)
+      host.runtime.engine.archiveProject(project.id)
+      host.runtime.engine.unarchiveProject(project.id)
+      host.runtime.engine.stopProject(project.id, 'audit only')
+      expect(host.deliveries.mock.calls).toHaveLength(deliveries)
     } finally { await host.stop() }
   })
 })

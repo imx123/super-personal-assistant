@@ -221,7 +221,7 @@ P2.7 只做 PM 给 child Ticket 的协调消息；不做删除、PM 模型、Pro
 
 明确未做：Project/Ticket 删除、PM 独立模型、Project domain events、pause 新行为、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
 
-## P2.8 当前范围：eval.pmModel 独立 PM 模型
+## 已完成的 P2.8：eval.pmModel 独立 PM 模型
 
 P2.8 只做 PM Session 的独立模型设置；不做 Project events、删除、pause 新行为、PM→Worker 消息改动或模型设置重构。
 
@@ -244,6 +244,37 @@ P2.8 只做 PM Session 的独立模型设置；不做 Project events、删除、
 | `docs/002`、`docs/007`、本文件 | PM 继承语义、只影响新 Session、roles.pm |
 
 明确未做：Project events、删除、pause 新行为、PM→Worker 消息改动、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、其他模型设置重构。
+
+## P2.9 当前范围：Project 状态变更 domain events
+
+P2.9 只加 Project 状态变更的审计/测试 domain events；不 relay/通知主 Session 或 PM，不改 UI，不做删除、pause 新行为、PM→Worker 消息或 PM 模型改动。
+
+已实现：
+
+- `DomainEvents` 新增：
+  - `project.paused`：`{projectId, mode:'soft'|'hard', from?:'soft'|'hard'}`
+  - `project.resumed`：`{projectId, mode?:'soft'|'hard'}`
+  - `project.ended`：`{projectId, reason?:string}`
+  - `project.archived`：`{projectId, from:'active'|'paused'}`
+  - `project.unarchived`：`{projectId, status:'active'|'paused'}`
+  - 保留 `project.created`。
+- Engine 只在状态真正变化时 emit：
+  - active→paused soft/hard 发 `paused`（带 mode）；paused soft→hard 发 `paused`（mode hard、from soft）；paused→active 发 `resumed`（带之前的 mode）。
+  - active/paused→ended 发 `ended`（reason 透传）；active/paused→archived 发 `archived`（from）。
+  - archived→恢复发 `unarchived`（恢复后 status）。
+  - 幂等 no-op、archived/ended 的 pause/resume、重复 archive/unarchive 都不 emit。
+  - `at` 用状态变更时间；data 无敏感信息。
+- Runtime 的 `eventNotice` 不处理这些事件，因此不产生 Session relay/notice。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/core/ports.ts`、`src/core/engine.ts` | 事件类型、四个状态方法的 emit |
+| `tests/projects.spec.ts` | 事件序列、幂等 no-op、无主/PM 投递 |
+| `docs/001`、`docs/007`、本文件 | 事件列表、审计/测试边界、no relay |
+
+明确未做：relay/notice、UI、删除、pause 新行为、PM→Worker 消息、PM 模型、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
 
 ## 主入口的权限模型
 
@@ -279,16 +310,14 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
-2026-11-10 在本机验证 P2.8：
+2026-11-10 在本机验证 P2.9：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 26 项全通过：P2.5/P2.6/P2.7 的归档、reconcile、pause、PM 消息仍保留；新增 runtime 下 `eval.pmModel` 用于新 PM Session、清空后继承 `eval.model`、worker 仍用 `executor.model`。
-- `tests/settings.spec.ts` 5 项、`tests/panel-settings.spec.tsx` 通过：非法 pmModel 返回 `modelUnavailable`（block=`eval`）、合法保存、清空回退；Eval 设置区渲染/编辑 PM 模型，history 显示“PM 模型”变更。
-- `tests/policy.spec.ts` 通过：`SettingsSchema.parse({})` 的 `eval.pmModel` 默认 null；`settings/model` 迁移期待已同步。
-- `tests/projects.spec.ts` 6 项、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项、`tests/archive-reconcile.spec.ts` 3 项仍通过。
+- `tests/projects.spec.ts` 8 项全通过：新增一个 Project 的 `created → paused(soft) → paused(hard, from soft) → resumed(mode hard) → ended(reason)` 事件序列，另一 Project 的 `created → archived(from active) → unarchived(status active)`；重复 pause/resume/stop/archive/unarchive 不追加；Runtime 直接执行这些状态变更时 main/PM 投递数不变。
+- `tests/project-tickets.spec.ts` 26 项、`tests/settings.spec.ts` 5 项、`tests/panel-settings.spec.tsx`、`tests/policy.spec.ts`、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项、`tests/archive-reconcile.spec.ts` 3 项仍通过。
 - `model-surface` 通过，orchestrator 预算 61,500 未变。
-- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`role-models`、`settings`、`panel-settings`、`projects`、`project-tickets` 通过。
-- 全量 63 个测试文件、1249 项：1201 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`project-tickets`、`settings`、`panel-settings`、`role-models` 通过。
+- 全量 63 个测试文件、1251 项：1203 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -303,9 +332,10 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 8. P2.6 Project pause soft/hard（已完成）
 9. P2.7 PM→Worker 协调消息（已完成）
 10. P2.8 eval.pmModel 独立 PM 模型（已完成；只影响新 PM Session）
-11. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-12. 意外中断与恢复
-13. 再扩展新功能
+11. P2.9 Project 状态变更 domain events（已完成；仅审计/测试，不 relay）
+12. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+13. 意外中断与恢复
+14. 再扩展新功能
 
 ## 文档说明
 

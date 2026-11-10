@@ -54,6 +54,21 @@ A paused Project has a `pauseMode`. Soft pause lets running Assignments finish a
 
 A PM may send one of its child Tickets a coordination message. The message becomes a `note` Ticket Input in that Ticket's history, so it is context and grants no authority, no new tools and no new Mandate. A running Assignment receives it as an Input; a pending Assignment is started; with `wake` a retryable Ticket may get a new Assignment, but `wake` never bypasses a paused/archived/ended Project, and a Ticket whose worker Session is archived only queues the note without claiming delivery.
 
+## Project domain events
+
+The Engine reports a Project lifecycle event only when its state really changes. They are audit and test records; the Router is not relayed or notified by them.
+
+| Event | Data |
+| --- | --- |
+| `project.created` | `projectId`, `decisionId`, `pmSessionId` |
+| `project.paused` | `projectId`, `mode` (`soft`/`hard`), and `from` when upgrading soft→hard |
+| `project.resumed` | `projectId`, and the previous `mode` when it had one |
+| `project.ended` | `projectId`, optional `reason` |
+| `project.archived` | `projectId`, `from` (`active`/`paused`) |
+| `project.unarchived` | `projectId`, restored `status` (`active`/`paused`) |
+
+An idempotent no-op emits nothing; archived and ended Projects ignore pause/resume; an ended Project cannot be archived.
+
 ## Rejected concepts
 
 | Rejected | Reason |

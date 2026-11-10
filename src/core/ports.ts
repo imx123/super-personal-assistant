@@ -90,6 +90,16 @@ export interface DomainEvents {
   'ticket.created': { ticketId: string; decisionId: string; strength: Strength }
   /** The Router created a Project from a Trigger, with the PM Session that manages it. */
   'project.created': { projectId: string; decisionId: string; pmSessionId: string }
+  /** A Project became paused, newly or by upgrading soft to hard. */
+  'project.paused': { projectId: string; mode: 'soft' | 'hard'; from?: 'soft' | 'hard' }
+  /** A paused Project returned to active. */
+  'project.resumed': { projectId: string; mode?: 'soft' | 'hard' }
+  /** A Project ended, optionally with the reason the person gave. */
+  'project.ended': { projectId: string; reason?: string }
+  /** A Project was archived from active or paused. */
+  'project.archived': { projectId: string; from: 'active' | 'paused' }
+  /** An archived Project returned to its previous status. */
+  'project.unarchived': { projectId: string; status: 'active' | 'paused' }
   'ticket.resumed': { ticketId: string; triggerId: string }
   'ticket.ended': { ticketId: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
   'assignment.started': { ticketId: string; assignmentId: string }
