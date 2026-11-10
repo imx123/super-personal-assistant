@@ -118,6 +118,7 @@ node node_modules/vitest/vitest.mjs run --pool=threads
 
 - [BASELINE.zh-CN.md](docs/BASELINE.zh-CN.md)：当前基线、完成项、验证记录、已知问题。
 - [P2_ACCEPTANCE.zh-CN.md](docs/P2_ACCEPTANCE.zh-CN.md)：P2 场景与验收边界。
+- [P3_HANDOFF.zh-CN.md](docs/P3_HANDOFF.zh-CN.md)：P3 任务交接设计讨论稿（同 Project 换执行者、跨 Project 新 Ticket、人工暂停边界）。
 - [001-domain.md](docs/001-domain.md)：领域对象、状态与事件。
 - [002-authorization.md](docs/002-authorization.md)：Source、Policy、Mandate、Project/PM 权限。
 - [005-panel.md](docs/005-panel.md)：面板页面、API 与 Project Tab 控件。

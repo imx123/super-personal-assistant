@@ -368,7 +368,8 @@ export class DshExecutor implements Executor {
       if (!ownTurn) agent?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
       const cleanup = this.stopWork(ticket.id, reason)
-      if (reason === OPERATOR_STOP || cancelledByOperator) {
+      // A Project hard pause reports its Workers in one aggregate Router notice, not one relay per stopped Worker.
+      if ((reason === OPERATOR_STOP || cancelledByOperator) && ticket.manualStop?.scope !== 'project') {
         const action = cancelledByOperator ? 'cancel_ticket' : 'stop_assignment'
         const finished = Promise.all([agent?.whenIdle(), cleanup]).then(
           () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id), ticket),

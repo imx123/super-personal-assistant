@@ -36,7 +36,7 @@ export function actor(source: string, id: string, human = true): Actor {
 }
 type TicketFields = Omit<TicketRow, 'stage' | 'action'>
 const TICKET = {
-  id: 't1', title: '修复回归', state: 'open', actions: { retry: false, stop: true }, strength: 'explicit', ended: undefined,
+  id: 't1', title: '修复回归', state: 'open', actions: { retry: false, stop: true, allowResume: false }, strength: 'explicit', ended: undefined,
   attention: undefined, assignments: 1, inputs: 2, undelivered: 0, deliveryError: undefined, sessionId: 'worker-t1', directory: '/w/t1',
   summary: 'working on it', createdAt: '2026-09-22T00:00:00Z', updatedAt: '2026-09-23T00:00:00Z',
   threads: [{ key: 'github:42', source: 'github', title: '#42 Fix login', url: 'https://github.com/acme/widgets/pull/42',
@@ -245,7 +245,7 @@ function initial(): PanelServer {
       github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent' } } },
     executor: { blockedCommands: ['gh-personal'] },
   })
-  const ended = ticketSummary({ id: 't0', title: '旧工单', state: 'ended', actions: { retry: false, stop: false },
+  const ended = ticketSummary({ id: 't0', title: '旧工单', state: 'ended', actions: { retry: false, stop: false, allowResume: false },
     ended: { at: '2026-09-21T00:00:00Z', by: 'human', reason: 'Human asked to stop', outcome: 'stopped' } }, { stage: 'ended' })
   const reply = { source: 'feishu', url: 'https://applink.feishu.cn/client/chat/open?openChatId=oc_1', label: { zh: '飞书消息',
     en: 'Feishu message' } }
@@ -264,7 +264,7 @@ function initial(): PanelServer {
     threads: [threadSummary()], threadPages: threadPage,
     person: [ticketSummary({ attention: { id: 'q1', question: '需要确认按钮颜色' }, note: { text: '需要确认按钮颜色', error: false }, reply },
       { stage: 'person', action: 'answer' }),
-      ticketSummary({ id: 't4', title: '截图工具', actions: { retry: true, stop: true }, sessionId: 'worker-t4',
+      ticketSummary({ id: 't4', title: '截图工具', actions: { retry: true, stop: true, allowResume: false }, sessionId: 'worker-t4',
         summary: 'LlmError: no adapter registered for provider "provider-a"',
         note: { text: 'LlmError: no adapter registered for provider "provider-a"', error: true } }, { stage: 'person', action: 'failed' })],
     search: { items: [], threads: [] },
@@ -342,7 +342,7 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
       else delete project.pauseMode
     }
     return { paused: project.status === 'paused', mode: project.pauseMode ?? null,
-      sessions: { delivered: false, cancelled: [], notLoaded: [], failures: [] } }
+      sessions: { delivered: false, cancelled: [], notLoaded: [], failures: [] }, workers: { stopped: [], failures: [] } }
   } },
   'POST projects/:id/stop': { answer: ({ params }) => {
     const project = server.projects.find(item => item.id === params.id)
@@ -379,6 +379,17 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     if (!ticket) return refuse(404, 'Ticket not found')
     return ticket.actions.retry ? { retried: true } : refuse(400, 'Only an open ticket can be retried, and only when its worker last reported failed or blocked and no person has sent a message since, or when delivering an Input to its worker failed',
       { code: 'notRetryable', values: {} })
+  } },
+  'POST tickets/:id/allow-resume': { answer: ({ params }) => {
+    const ticket = ticketOf(params.id)
+    if (!ticket) return refuse(404, 'Ticket not found')
+    for (const project of server.projects) {
+      const child = project.tickets.find(item => item.id === params.id)
+      if (child) { delete child.manualStop; child.actions.allowResume = false }
+    }
+    if ('manualStop' in ticket) delete (ticket as { manualStop?: unknown }).manualStop
+    if ('actions' in ticket) ticket.actions.allowResume = false
+    return { allowed: true as const }
   } },
   'POST tickets/:id/assignment/stop': { body: true, answer: ({ params }) =>
     ticketOf(params.id) ? { stopped: true } : refuse(404, 'Ticket not found') },

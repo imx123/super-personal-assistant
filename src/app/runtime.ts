@@ -34,7 +34,7 @@ import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
-import { eventNotice, executionStatus, followupNotice, relaySession } from './notices.ts'
+import { eventNotice, executionStatus, followupNotice, projectPauseRelay, relaySession } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
@@ -168,6 +168,15 @@ export class Runtime extends Service implements SourceHost {
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           const notice = this.quiet || ended?.projectId ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
+          // A person's Project pause is reported to the Router once, durably, with the Workers stopped and any failure; the
+          // individual Worker stops are not relayed to the PM that the pause also stopped.
+          if (event.type === 'project.pausedByUser') {
+            const paused = store.projects.get(event.data.projectId)
+            if (paused) {
+              const relay = projectPauseRelay(paused, event.data)
+              sessions.relay(relay.id, relay.text, relay.summary)
+            }
+          }
           // A person's message that reached an open ticket is the ticket's; the main Session hears of it in the same transaction,
           // and of one for an ended ticket once it resumes, unless it routed the message there itself.
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')

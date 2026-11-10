@@ -225,10 +225,11 @@ describe('PM-created Project Tickets', () => {
       const stored = h.repo.tickets.get(ticket.id)!
       expect(stored.archived).toBeUndefined()
       expect(stored.ended).toBeUndefined()
-      expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'projectPaused')).toBe(true)
+      expect(stored.assignments.every(assignment => assignment.state === 'ended' && assignment.endedReason === 'stoppedByOperator')).toBe(true)
+      expect(stored.manualStop).toMatchObject({ scope: 'project' })
     }
     expect(h.executor.stop).toHaveBeenCalledWith(expect.objectContaining({ id: first!.id }),
-      expect.objectContaining({ id: first!.assignments[0]!.id }), 'projectPaused')
+      expect.objectContaining({ id: first!.assignments[0]!.id }), 'stoppedByOperator')
     expect(() => h.engine.retryTicket(first!.id)).toThrow(new UserError('projectPaused'))
     const resumed = h.engine.pauseProject(h.project.id, false)
     expect(resumed).toMatchObject({ status: 'active' })
@@ -500,7 +501,8 @@ describe('a Project PM Session through the runtime', () => {
       expect(hard).toMatchObject({ paused: true, mode: 'hard' })
       expect(hard.sessions.cancelled).toEqual(expect.arrayContaining([project.pmSessionId, worker]))
       expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)).toMatchObject({ state: 'ended',
-        endedReason: 'projectPaused' })
+        endedReason: 'stoppedByOperator' })
+      expect(host.runtime.store.tickets.get(ticket.id)?.manualStop).toMatchObject({ scope: 'project' })
       expect(host.runtime.store.tickets.get(ticket.id)?.ended).toBeUndefined()
       expect(host.runtime.store.tickets.get(ticket.id)?.archived).toBeUndefined()
       expect(pmCancel).toHaveBeenCalled()

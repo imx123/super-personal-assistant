@@ -307,6 +307,24 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 `src/executor/dsh.ts` 和 `src/app/runtime.ts` 里按 `source === 'main-session'` 走的回执分支仍在；主入口重新启用后会用到它们。
 
+## 已完成的 P3-A：人工停止标签、Project hard pause 与 PM revive
+
+P3-A 把人停止 Worker 与 Project hard pause 收拢到同一个 `Tickets.hardStopWorker` 原语，并加上恢复守卫；不做同 Project/跨 Project handoff（P3-B）。
+
+已实现：
+
+- `Ticket.manualStop?: { at, scope: 'worker' | 'project', by, sessionId?, reason? }`。单 Worker 停止写 `worker`；Project hard pause 写 `project`，若已有 `worker` 标签则保留不覆盖。
+- `Tickets.hardStopWorker(ticketId, options)`：结束当前 Assignment（`endedReason: 'stoppedByOperator'`）、回填未被步骤取走的 Input、清 attention/delivery、写标签、调用 `executor.stop`（取消当前 turn 并停止后台任务）。单 Worker 停止 `Engine.stopAssignment` 与 Project hard pause 的逐 Worker 循环都只调用它，因此两条路径的 Assignment/Session/Ticket 结果一致，只有标签 scope 不同。
+- `Engine.pauseProjectReport(projectId, paused, mode)`：hard 先置 paused，再对每个 open project Ticket 在自己的 savepoint 中调用原语；单个失败被收集、其余继续，返回 `workers.stopped/failures`；随后发出 `project.pausedByUser`（含 stopped/failures）。`pauseProject` 仍返回 ProjectProfile，保持旧调用兼容。
+- Runtime 把 `project.pausedByUser` 转成发给 Router 的 durable `projectPausedByUser` relay；hard pause 的逐 Worker `execution_status` 回执被抑制，不向已被暂停的 PM 逐个投递。单 Worker 停止仍发 execution_status，并附 `manual_stop` 与 `needs_user_approval`。
+- Resume 只清除本 Project 的 `scope: 'project'` 标签，不清 `worker`；不自动重启任何 Worker；hard resume 仍写 `resumedFromHard` pendingNote。
+- `Tickets.newAssignment`/`retry`/`wake` 统一拒绝带标签的自动恢复：worker 标签抛 `manualStopNeedsUserApproval`，project 标签抛 `manualStopProjectPaused`。
+- PM 新工具 `orchestrator_project_ticket_revive`，只在 Project active、Ticket 属于本 Project 且最新 Assignment 已结束时恢复；沿用原 Mandate/worktree，不建 Decision，只起一个新 Assignment。worker 标签拒绝并提示需要用户批准；project 标签（或已由 resume/用户批准清除）可恢复。工具加入 `PM_TOOLS` 和 PM 工具 guard。
+- 用户批准入口 `POST tickets/:id/allow-resume`（同源管理 API）只清除 `worker` 标签，不自动恢复；清除后 PM 的下一次 revive 才生效。PM/Worker 都没有该入口。
+- 面板：Project 页按钮改名为“项目暂停（soft）/项目强制暂停（hard）”，确认文案明确是 Project 范围、逐个 Worker 走同一停止路径，并提示单 Worker 停止去工单页；Project 子工单与 Ticket 页显示 `worker`/`project` 标签，`worker` 标签提供“允许恢复”确认按钮。
+
+改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/notices.ts`、`runtime.ts`、`http.ts`、`api.ts`、`sessions.ts`、`tools/main.ts`、`views/records.ts`、`views/projects.ts`；`src/client/projects.tsx`、`ticket.tsx`、`locales.ts`；`docs/002`、`docs/005`、`docs/007`、本文件；`tests/manual-stop.spec.ts` 及既有 projects/project-tickets/http/panel-project/runtime 定向测试。
+
 ## 验证
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
@@ -321,6 +339,13 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - 全量 63 个测试文件、1251 项：1203 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
+2026-11-10 在本机验证 P3-A：
+
+- `tsc --noEmit` 通过，`tsdown` 打包通过。
+- 新增 `tests/manual-stop.spec.ts` 13 项全通过：单 Worker 停止与 Project hard pause 对同一 Worker 的 Assignment/Ticket/executor.stop 结果一致；worker/project/混合标签；resume 只清 project；retry 与 revive 守卫；用户批准后 revive；PM 越权/暂停/归档/结束拒绝；部分失败与聚合事件；幂等；视图中的标签与 Allow resume；Runtime 下的标签、单 Worker 回执、聚合 `projectPausedByUser`、Session cancel、revive 保持 Mandate/worktree，以及 PM 工具边界。
+- `projects` 15 项、`project-tickets` 27 项、`http` 5 项、`panel-project` 4 项，以及 `tickets`、`executor`、`archive-reconcile`、`pm-tools` 定向通过。
+- `runtime` 定向除既有 Windows Git 配置路径转义 1 项外通过；该失败与本改动无关。
+
 ## 后续顺序
 
 1. 权限控制（初版已完成）
@@ -334,9 +359,10 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 9. P2.7 PM→Worker 协调消息（已完成）
 10. P2.8 eval.pmModel 独立 PM 模型（已完成；只影响新 PM Session）
 11. P2.9 Project 状态变更 domain events（已完成；仅审计/测试，不 relay）
-12. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-13. 意外中断与恢复
-14. 再扩展新功能
+12. 任务交接 P3-A 人工停止标签 / Project hard pause / PM revive / 用户批准（已完成）
+13. 任务交接 P3-B 同 Project 换执行者、跨 Project 新 Ticket（下一步；设计见 [P3_HANDOFF.zh-CN.md](P3_HANDOFF.zh-CN.md)）；PM 直接回答 child attention 仍留待后续
+14. 意外中断与恢复
+15. 再扩展新功能
 
 ## 文档说明
 

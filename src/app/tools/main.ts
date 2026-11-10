@@ -319,6 +319,28 @@ function projectTicketMessageTool(host: MainToolsHost, project: ProjectProfile):
     },
   })
 }
+/**
+ * `orchestrator_project_ticket_revive`: the PM restores one of its Workers that a Project hard pause stopped, after the
+ * Project is active again. The Ticket keeps its Mandate and worktree; a person's single-Worker stop is refused until a
+ * person approves it in the panel.
+ */
+function projectTicketReviveTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_revive',
+    description: 'Revive one child Worker that a Project hard pause stopped, after this Project is active again. '
+      + 'The Ticket keeps its Mandate and worktree and gets a new Assignment; no new Decision or Ticket is created. '
+      + 'A Worker stopped individually by a person is refused with "needs user approval" until a person approves it; '
+      + 'a paused, ended or archived Project is refused. Only Tickets inside this Project are accepted.',
+    schema: z.object({ ticket_id: z.string().min(1).max(200) }).strict(),
+    execute: async args => {
+      const ticket = host.store.tickets.get(args.ticket_id)
+      if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
+      const revived = await host.quietly(() => host.engine.reviveProjectTicket(project.id, project.pmSessionId, args.ticket_id))
+      host.requestPass()
+      return { ticket: projectTicketCard(revived), note: 'A new Assignment was queued under the same Mandate; the worker starts separately.' }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -498,6 +520,7 @@ export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
         + 'ticket/<id>: one of those Tickets only'),
     projectTicketCreateTool(host, project),
     projectTicketMessageTool(host, project),
+    projectTicketReviveTool(host, project),
     tool({
       name: 'orchestrator_project_report',
       description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',

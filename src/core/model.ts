@@ -366,6 +366,20 @@ export type TicketOutcome = 'completed' | 'merged' | 'closed' | 'dropped' | 'sto
 export interface Attention { id: string; question: string; triggerId?: string }
 /** Set when its Project's archive made a Ticket non-executable; unarchiving the Project clears it. */
 export interface TicketArchive { at: string; by: 'project'; projectId: string }
+/**
+ * A person's stop of a Ticket's Worker, kept until the stop is cleared: `worker` for a stop of this Worker alone, which only
+ * a person may clear, and `project` for a Project hard pause, which the Project's resume clears so its PM may revive the
+ * Worker. A later `project` label leaves an earlier `worker` label in place (see `docs/002`).
+ */
+export interface ManualStop {
+  at: string
+  scope: 'worker' | 'project'
+  /** Who stopped it, such as `user` for the panel's operator. */
+  by: string
+  /** The Worker Session that was stopped, when it had one. */
+  sessionId?: string
+  reason?: string
+}
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
@@ -380,6 +394,11 @@ export interface Ticket {
   ended?: { at: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
   /** Its Project archived it: it is not executable and not open until the Project is unarchived. */
   archived?: TicketArchive
+  /**
+   * A person stopped this Ticket's Worker and it was not cleared since: a `worker` stop waits for a person's approval, and a
+   * `project` stop for the Project's PM to revive it once the Project is active again.
+   */
+  manualStop?: ManualStop
   /** Open question for a person; cleared by the executor or when the ticket ends. */
   attention?: Attention
   assignments: Assignment[]

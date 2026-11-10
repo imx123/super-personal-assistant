@@ -3,8 +3,8 @@ import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { assignmentStopped, latestAssignment, latestReport, liveTicket, OPERATOR_STOP, readUntil, runningAssignment, settled,
   threadKey, waitsForPerson } from './model.ts'
-import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
-  Trigger, TriggerDisposition } from './model.ts'
+import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, ManualStop, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput,
+  TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -20,6 +20,18 @@ export const automatic = (input: TicketInput | undefined): boolean => input?.kin
 const readBefore = (input: Extract<TicketInput, { kind: 'trigger' }>, until: string): boolean => input.readAt === undefined
   ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until : !!input.readAt && input.readAt < until
 const STATUS_REQUEST = 'Report the current ticket status with orchestrator_report. This is a status-only request: do not resume implementation or perform external actions.'
+/** What a stop of one Worker names: who stopped it, whether for that Worker alone or for its Project, and the Assignment a
+ * person selected. A Project stop names its Project and leaves the Assignment to the latest one. */
+export interface HardStopWorkerOptions {
+  scope: 'worker' | 'project'
+  by: string
+  sessionId?: string
+  reason?: string
+  /** The Assignment a person's single-Worker stop names. */
+  assignmentId?: string
+  /** The Project whose hard pause stops the Worker. */
+  projectId?: string
+}
 
 /**
  * Manages each ticket's lifecycle: creates the ticket for an accept decision with its Mandate, Subscriptions, and first
@@ -205,31 +217,126 @@ export class Tickets extends EnginePart {
     this.end(ticketId, 'human', 'stopped', this.now(), reason)
     return this.require(ticketId)
   }
-  /** Ends only the selected Assignment, leaving inputs and the open Ticket available for a manual retry. */
-  stopAssignment(ticketId: string, assignmentId: string): Ticket {
+  /**
+   * The single primitive that stops one Worker: end its active Assignment (unless it already ended) with the operator's
+   * reason, put back the messages no step took, clear its question and delivery error, record `ManualStop` on the Ticket, and
+   * ask the Executor to cancel the turn and stop its background work. A person's stop of one Worker and a Project hard
+   * pause's loop over its Workers both call it, so both leave the same state; only `manualStop.scope` differs, and a
+   * `project` stop never overwrites an earlier `worker` stop.
+   * @throws UserError when the ticket is unknown or ended, the assignment is not the Ticket's latest, or it already ended.
+   */
+  hardStopWorker(ticketId: string, options: HardStopWorkerOptions): Ticket {
     const ticket = this.require(ticketId)
-    const assignment = latestAssignment(ticket)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
-    if (!assignment || assignment.id !== assignmentId) throw new UserError('assignmentEnded')
-    if (assignmentStopped(assignment)) return ticket
-    if (assignment.state === 'ended') throw new UserError('assignmentEnded')
-    this.endAssignment(ticket, assignment, OPERATOR_STOP)
-    this.requeueUntaken(ticket, assignment)
+    const latest = latestAssignment(ticket)
+    let assignment: Assignment | undefined
+    let labelled = false
+    if (options.scope === 'worker') {
+      if (!latest || latest.id !== options.assignmentId) throw new UserError('assignmentEnded')
+      if (assignmentStopped(latest)) {
+        // A stop recorded before ManualStop existed gains its label without touching the ended Assignment.
+        if (!ticket.manualStop) { this.writeManualStop(ticket, options); labelled = true }
+      } else {
+        if (latest.state === 'ended') throw new UserError('assignmentEnded')
+        assignment = latest
+        this.writeManualStop(ticket, options)
+        labelled = true
+      }
+    } else {
+      if (options.projectId && ticket.projectId !== options.projectId) throw new UserError('notProjectTicket')
+      if (latest && latest.state !== 'ended') assignment = latest
+      if (!ticket.manualStop || ticket.manualStop.scope !== 'worker') { this.writeManualStop(ticket, options); labelled = true }
+    }
+    if (assignment) {
+      this.endAssignment(ticket, assignment, OPERATOR_STOP)
+      this.requeueUntaken(ticket, assignment)
+      if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
+      delete ticket.attention
+      delete ticket.delivery
+    }
+    if (!labelled && options.scope === 'worker') return this.require(ticketId)
     ticket.updatedAt = this.now()
-    if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
-    delete ticket.attention
-    delete ticket.delivery
+    if (assignment) this.options.executor.stop(ticket, assignment, OPERATOR_STOP)
     this.repo.tickets.save(ticket)
-    this.options.executor.stop(ticket, assignment, OPERATOR_STOP)
-    return ticket
+    if (labelled) this.emit('ticket.manualStopSet', { ticketId, scope: options.scope })
+    return this.require(ticketId)
+  }
+  /**
+   * Clear a `worker` stop on a person's explicit approval, or a `project` stop when its Project resumes. It starts or
+   * resumes nothing: the PM's next `revive` starts the new Assignment.
+   * @throws UserError when the ticket is unknown or carries no stop of that scope.
+   */
+  clearManualStop(ticketId: string, scope: ManualStop['scope'], by: 'user' | 'pm'): Ticket {
+    const ticket = this.require(ticketId)
+    if (ticket.manualStop?.scope !== scope) throw new UserError('notManuallyStopped')
+    delete ticket.manualStop
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    this.emit('ticket.manualStopCleared', { ticketId, scope, by })
+    return this.require(ticketId)
+  }
+  /**
+   * Clear every `project` stop a Project's hard pause left on its Tickets, keeping each `worker` stop. It starts nothing.
+   * @returns how many Tickets were cleared.
+   */
+  clearProjectManualStops(projectId: string, by: 'user' | 'pm' = 'pm'): number {
+    let cleared = 0
+    for (const ticket of this.repo.tickets.list()) {
+      if (ticket.projectId !== projectId || ticket.manualStop?.scope !== 'project') continue
+      delete ticket.manualStop
+      ticket.updatedAt = this.now()
+      this.repo.tickets.save(ticket)
+      this.emit('ticket.manualStopCleared', { ticketId: ticket.id, scope: 'project', by })
+      cleared++
+    }
+    return cleared
+  }
+  /**
+   * Revive a Worker that a Project hard pause stopped, or one a person already allowed to resume, under the Ticket's
+   * unchanged Mandate and worktree: it clears any `project` stop and starts one new Assignment, creating no Decision. A
+   * `worker` stop still in place is refused until a person clears it. With no stop left, only a Ticket whose latest
+   * Assignment an operator stopped is revivable, so a Ticket that consumed its only stop is not started twice.
+   * @throws UserError when the ticket is unknown or ended, is not the Project's, has no stop or operator stop, still has an
+   * active Assignment, or carries a `worker` stop.
+   */
+  revive(ticketId: string, projectId: string, pmSessionId: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+    const stop = ticket.manualStop
+    if (stop?.scope === 'worker') throw new UserError('manualStopNeedsUserApproval')
+    const latest = latestAssignment(ticket)
+    if (latest && latest.state !== 'ended') throw new UserError('workerRunning')
+    if (!stop && !assignmentStopped(latest)) throw new UserError('notManuallyStopped')
+    delete ticket.manualStop
+    const assignment = this.newAssignment(ticket)
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
+    this.options.executor.start(ticket, assignment)
+    this.emit('ticket.revived', { ticketId, assignmentId: assignment.id, pmSessionId })
+    return this.require(ticketId)
+  }
+  /** Record the stop that guards the Worker's automatic resume; a Project stop leaves an earlier `worker` stop in place. */
+  private writeManualStop(ticket: Ticket, options: HardStopWorkerOptions): void {
+    if (options.scope === 'project' && ticket.manualStop?.scope === 'worker') return
+    ticket.manualStop = { at: this.now(), scope: options.scope, by: options.by,
+      ...options.sessionId ? { sessionId: options.sessionId } : {}, ...options.reason ? { reason: options.reason } : {} }
+  }
+  /**
+   * A person's stop of the selected Worker alone: see `hardStopWorker`.
+   * @throws UserError when the ticket is unknown or ended, or the assignment is not its latest or already ended.
+   */
+  stopAssignment(ticketId: string, assignmentId: string): Ticket {
+    return this.hardStopWorker(ticketId, { scope: 'worker', by: 'user', assignmentId })
   }
   /**
    * Replaces the stalled or explicitly stopped assignment of a retryable open ticket.
-   * @throws UserError when the ticket is unknown, its Project is paused, or it is not retryable.
+   * @throws UserError when the ticket is unknown, its Project is paused, it carries a manual stop, or it is not retryable.
    */
   retry(ticketId: string): Ticket {
     const ticket = this.require(ticketId)
     if (this.projectPaused(ticket)) throw new UserError('projectPaused')
+    this.refuseManualStop(ticket)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
     const stopped = assignmentStopped(latest)
@@ -317,7 +424,7 @@ export class Tickets extends EnginePart {
    */
   wake(ticketId: string): void {
     const ticket = this.repo.tickets.get(ticketId)
-    if (!ticket || liveTicket(ticket) || ticket.archived || ticket.ended?.by === 'human' || !ticket.undelivered.length) return
+    if (!ticket || liveTicket(ticket) || ticket.archived || ticket.ended?.by === 'human' || ticket.manualStop || !ticket.undelivered.length) return
     // A paused Project accepts no new Assignment; the message waits for a person to resume it and retry explicitly.
     if (this.projectPaused(ticket)) return
     const policy = this.policy()
@@ -450,10 +557,20 @@ export class Tickets extends EnginePart {
     return !!ticket.projectId && this.repo.projects.get(ticket.projectId)?.status === 'paused'
   }
   /**
+   * Refuse to start work for a manually stopped Worker: a `worker` stop needs a person's approval, and a `project` stop its
+   * PM's revive once the Project is active.
+   */
+  private refuseManualStop(ticket: Ticket): void {
+    const stop = ticket.manualStop
+    if (!stop) return
+    throw new UserError(stop.scope === 'worker' ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+  }
+  /**
    * Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket.
-   * @throws UserError when the Ticket belongs to a paused Project.
+   * @throws UserError when the Ticket carries a manual stop or belongs to a paused Project.
    */
   private newAssignment(ticket: Ticket): Assignment {
+    this.refuseManualStop(ticket)
     if (this.projectPaused(ticket)) throw new UserError('projectPaused')
     const assignment: Assignment = { id: key('assignment', ticket.id, String(ticket.assignments.length)), state: 'pending', createdAt: this.now() }
     ticket.assignments.push(assignment)

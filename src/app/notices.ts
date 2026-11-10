@@ -95,8 +95,26 @@ export function executionStatus(ticket: Ticket, action: 'interrupt_turn' | 'stop
     ticket_id: ticket.id, title: ticket.title, assignment_id: assignmentId ?? null, session_id: sessionId,
     ticket_state: ticket.ended ? 'ended' : 'open', assignment_state: action === 'interrupt_turn' ? 'retained' : 'ended',
     result_available: report?.state === 'ready', ...(report ? { last_report: { state: report.state, summary: report.summary.slice(0, 600) } } : {}),
+    ...(ticket.manualStop ? { manual_stop: ticket.manualStop } : {}),
+    ...(ticket.manualStop?.scope === 'worker' ? { needs_user_approval: true,
+      note: 'This Worker will not restart automatically; a person must use Allow resume in the panel before the Project PM may revive it. Other Workers are unaffected.' } : {}),
     ...(cleanupError ? { cleanup_error: cleanupError.slice(0, 600) } : {}),
   }) }
+}
+/**
+ * The durable Router notice for a Project hard pause by a person: the Project and mode, the Workers stopped, and the ones
+ * that could not be stopped, so the Router never reads a partial stop as complete. Individual Worker stops are not relayed.
+ */
+export function projectPauseRelay(project: ProjectProfile, data: { stopped: string[]; failures: { ticketId: string; error: string }[] }): Relay {
+  const id = key('project-paused-by-user', project.id, project.updatedAt, data.stopped.join(','), JSON.stringify(data.failures))
+  return { id: `project-paused:${id}`, summary: `Project paused by a person: ${project.title}`
+    + (data.failures.length ? ` (${data.failures.length} Worker(s) failed to stop)` : ''),
+  text: JSON.stringify({ kind: 'projectPausedByUser', project_id: project.id, title: project.title, mode: 'hard',
+    paused_at: project.updatedAt, stopped_tickets: data.stopped, failures: data.failures,
+    note: data.failures.length
+      ? 'The Project is paused, but the failed Workers were not stopped. Retry their stop or handle them in the panel; do not report the whole Project as stopped.'
+      : 'Every Worker was stopped through the single-worker stop path and their Assignments ended. Resume the Project when a person asks; no Worker restarts automatically.',
+    read: `project/${project.id}` }) }
 }
 /** What a follow-up asks of the main Session: nothing but a stop the person asks for, since its ticket's worker decides it. */
 const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '

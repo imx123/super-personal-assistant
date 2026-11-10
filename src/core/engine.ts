@@ -22,6 +22,17 @@ export type { Reply, ReplyRequest } from './replies.ts'
 /** How a PM's message to a child Ticket reached its worker: routed to a running one, started an Assignment, queued only, or not started. */
 export type TicketMessageDelivery = 'running' | 'started' | 'queued' | 'not_started'
 
+/** What a Project pause did to its Workers: those stopped, and those a failure left running for a person to retry. */
+export interface ProjectPauseWorkers {
+  stopped: string[]
+  failures: { ticketId: string; error: string }[]
+}
+/** A Project pause or resume with the report of the Workers it stopped, which the panel shows beside the Project state. */
+export interface ProjectPauseReport {
+  project: ProjectProfile
+  workers: ProjectPauseWorkers
+}
+
 /** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
 export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300, tools: 32 } as const
 const WORKTREE_NAME = /^[a-z]+(?:-[a-z0-9]+){0,3}$/
@@ -286,20 +297,27 @@ export class Engine {
 
   /**
    * Pause or resume a Project: active ↔ paused only. An ended or archived Project ignores the change.
-   * A soft pause blocks new Tickets and Assignments while running Assignments finish; a hard pause also ends every pending
-   * or running child Assignment with `projectPaused` and asks the Executor to stop it. Resuming clears the mode and, from a
-   * hard pause, adds one `resumedFromHard` note for the PM; it never restarts work.
+   * A soft pause blocks new Tickets and Assignments while running Assignments finish; a hard pause stops the Project's
+   * Workers one by one through `Tickets.hardStopWorker`, so each ends exactly as a person's single stop would, records a
+   * `project` manual stop unless it already carries a `worker` one, and asks the Executor to stop it. A Worker that fails to
+   * stop is reported and the rest still stop; the Project is paused either way. Resuming clears only its Workers' `project`
+   * stops, never their `worker` stops, and adds one `resumedFromHard` note for the PM; it restarts nothing.
    * @throws UserError when the Project is unknown or the mode is not `soft`/`hard`.
    */
   pauseProject(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectProfile {
+    return this.pauseProjectReport(projectId, paused, mode).project
+  }
+  /** `pauseProject`, with the Workers a hard pause stopped and the ones it failed to stop. */
+  pauseProjectReport(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectPauseReport {
     if (mode !== 'soft' && mode !== 'hard') throw new UserError('projectPauseMode')
     return this.repo.atomic(() => {
+      const workers: ProjectPauseWorkers = { stopped: [], failures: [] }
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
-      if (project.status === 'ended' || project.status === 'archived') return project
+      if (project.status === 'ended' || project.status === 'archived') return { project, workers }
       const at = this.options.now?.() ?? new Date().toISOString()
       if (!paused) {
-        if (project.status !== 'paused') return project
+        if (project.status !== 'paused') return { project, workers }
         const active: ProjectProfile = { ...project, status: 'active', updatedAt: at }
         delete active.pauseMode
         if (project.pauseMode === 'hard') {
@@ -310,29 +328,61 @@ export class Engine {
           active.pendingNotes = [...project.pendingNotes ?? [], note]
         }
         this.repo.projects.save(active)
+        // Only the stops the hard pause wrote go: a person's stop of one Worker stays until a person approves its resume.
+        this.tickets.clearProjectManualStops(projectId, 'user')
         this.options.emit?.({ type: 'project.resumed', at, data: { projectId, ...(project.pauseMode ? { mode: project.pauseMode } : {}) } })
-        return active
+        return { project: this.repo.projects.get(projectId)!, workers }
       }
       // A hard pause is not downgraded by a later soft request; it ends only on resume.
-      if (project.status === 'paused' && project.pauseMode === 'hard' && mode === 'soft') return project
-      if (project.status === 'paused' && project.pauseMode === mode) return project
+      if (project.status === 'paused' && project.pauseMode === 'hard' && mode === 'soft') return { project, workers }
+      if (project.status === 'paused' && project.pauseMode === mode) return { project, workers }
       const pausedProject: ProjectProfile = { ...project, status: 'paused', pauseMode: mode, updatedAt: at }
       this.repo.projects.save(pausedProject)
       this.options.emit?.({ type: 'project.paused', at, data: { projectId, mode,
         ...(project.status === 'paused' && project.pauseMode ? { from: project.pauseMode } : {}) } })
       if (mode === 'hard') {
+        // Each Worker stops in its own transaction through the one primitive a person's stop uses, so its failure leaves the
+        // others stopping and the Project still pauses; the aggregate event tells the Router which ones failed.
         for (const ticket of this.repo.tickets.open()) {
           if (ticket.projectId !== projectId) continue
-          for (const assignment of ticket.assignments) {
-            if (assignment.state === 'ended') continue
-            assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'projectPaused'
-            this.options.executor.stop(ticket, assignment, 'projectPaused')
+          try {
+            this.repo.atomic(() => this.tickets.hardStopWorker(ticket.id, { scope: 'project', by: 'user', projectId,
+              reason: 'projectPausedByUser' }))
+            workers.stopped.push(ticket.id)
+          } catch (error) {
+            workers.failures.push({ ticketId: ticket.id, error: error instanceof Error ? error.message : String(error) })
           }
-          ticket.updatedAt = at
-          this.repo.tickets.save(ticket)
         }
+        this.options.emit?.({ type: 'project.pausedByUser', at, data: { projectId, mode: 'hard', stopped: workers.stopped,
+          failures: workers.failures } })
       }
-      return pausedProject
+      return { project: this.repo.projects.get(projectId)!, workers }
+    })
+  }
+  /**
+   * A person's explicit approval to make a Worker that a single stop ended resumable: clear its `worker` stop. It restarts
+   * nothing; the Project's PM revives the Worker on its next revive. A Project stop is not cleared here.
+   * @throws UserError when the Ticket is unknown or carries no `worker` stop.
+   */
+  allowResume(ticketId: string): Ticket {
+    return this.repo.atomic(() => this.tickets.clearManualStop(ticketId, 'worker', 'user'))
+  }
+  /**
+   * A Project PM revives one of its Workers that a hard pause stopped: the Project must be active, the Ticket must be its
+   * own and open, and the stop must be the Project's rather than a person's. The Ticket keeps its Mandate and worktree; one
+   * new Assignment starts and no Decision is created.
+   * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, the Ticket is not
+   * its own or is ended, it has no Project stop, still has an active Assignment, or carries a person's stop.
+   */
+  reviveProjectTicket(projectId: string, pmSessionId: string, ticketId: string): Ticket {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      return this.tickets.revive(ticketId, projectId, pmSessionId)
     })
   }
   /**
@@ -673,10 +723,10 @@ export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadCl
 export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'createProject' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply'
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
-export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket'>
+export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket' | 'reviveProjectTicket'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
-  | 'pauseProject' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>
+  | 'pauseProject' | 'pauseProjectReport' | 'allowResume' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */

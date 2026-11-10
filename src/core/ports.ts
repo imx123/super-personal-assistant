@@ -96,6 +96,17 @@ export interface DomainEvents {
   'project.resumed': { projectId: string; mode?: 'soft' | 'hard' }
   /** A Project ended, optionally with the reason the person gave. */
   'project.ended': { projectId: string; reason?: string }
+  /**
+   * A person hard-paused a Project: its Workers were stopped one by one through the single-worker primitive, and `failures`
+   * names those that could not be stopped, which the Router is told about.
+   */
+  'project.pausedByUser': { projectId: string; mode: 'hard'; stopped: string[]; failures: { ticketId: string; error: string }[] }
+  /** A person's stop of a Ticket's Worker was recorded with its scope. */
+  'ticket.manualStopSet': { ticketId: string; scope: 'worker' | 'project' }
+  /** A person cleared a Worker stop, or a PM revived a Project-paused Worker. */
+  'ticket.manualStopCleared': { ticketId: string; scope: 'worker' | 'project'; by: 'user' | 'pm' }
+  /** A Project's PM revived a Worker its Project's hard pause stopped, under the Ticket's unchanged Mandate. */
+  'ticket.revived': { ticketId: string; assignmentId: string; pmSessionId: string }
   /** A Project was archived from active or paused. */
   'project.archived': { projectId: string; from: 'active' | 'paused' }
   /** An archived Project returned to its previous status. */

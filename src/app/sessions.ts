@@ -75,12 +75,13 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions, the main Session, and a Project's PM are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PM_PRESET = 'dsh-superagent-pm'
-/** The tools a Project's PM may see and call: it reads its Project, creates and messages its Tickets, and reports on it. */
+/** The tools a Project's PM may see and call: it reads its Project, creates and messages its Tickets, revives hard-paused
+ * Workers, and reports on it. */
 export const PM_TOOLS = ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
-  'orchestrator_project_ticket_message'] as const
+  'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive'] as const
 /**
  * The tool boundary of a Project's PM. `tools.restrict` masks only the tools a Session inherits (DSH's global layer and its
- * preset's) and rejects scope-local names, so naming the PM's own four tools there fails with `names unknown global tools`
+ * preset's) and rejects scope-local names, so naming the PM's own tools there fails with `names unknown global tools`
  * (P2-A05). This instead hides every inherited tool with a deny mask and refuses, through a scope guard, any call outside
  * `PM_TOOLS`; the PM's own registrations stay visible because they belong to the Session's layer. Register the guard before
  * a Session's tools, and keep it if a visibility mask cannot be built, so execution stays bounded in every case.

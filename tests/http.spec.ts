@@ -83,12 +83,17 @@ it('answers only a same-origin request from the panel on the loopback address', 
 it('protects the Project control routes with the same-origin rule and calls their Engine commands', async () => {
   const calls: unknown[] = []
   const call = serve({ engine: {
+    pauseProjectReport: (id: string, paused: boolean, mode?: string) => { calls.push(['pause', id, paused, mode ?? 'soft'])
+      return { project: { status: paused ? 'paused' : 'active', ...(paused ? { pauseMode: mode ?? 'soft' } : {}) },
+        workers: { stopped: [], failures: [] } } },
     pauseProject: (id: string, paused: boolean, mode?: string) => { calls.push(['pause', id, paused, mode ?? 'soft'])
       return { status: paused ? 'paused' : 'active', ...(paused ? { pauseMode: mode ?? 'soft' } : {}) } },
+    allowResume: (id: string) => { calls.push(['allowResume', id]); return { id } },
     stopProject: (id: string) => { calls.push(['stop', id]); return { status: 'ended' } },
     archiveProject: (id: string) => { calls.push(['archive', id]); return { id, status: 'archived' } },
     unarchiveProject: (id: string) => { calls.push(['unarchive', id]); return { id, status: 'active' } },
-  }, store: { projects: { get: (id: string) => id === 'p1' ? { id: 'p1', status: 'active', pmSessionId: 'pm-p1' } : undefined } },
+  }, store: { projects: { get: (id: string) => id === 'p1' ? { id: 'p1', status: 'active', pmSessionId: 'pm-p1' } : undefined },
+    tickets: { get: (id: string) => id === 't1' ? { id: 't1' } : undefined } },
   sessions: {
     pauseProject: async (_project: unknown, mode: string) => { calls.push(['pauseSessions', mode])
       return { delivered: true, cancelled: [], notLoaded: [], failures: [] } },
@@ -113,11 +118,15 @@ it('protects the Project control routes with the same-origin rule and calls thei
   }
   const allowed = { host: 'localhost:3082', origin: 'http://localhost:3082' }
   expect(await call('POST', 'projects/p1/pause', body, allowed)).toEqual({ status: 200,
-    body: { paused: true, mode: 'soft', sessions: { delivered: true, cancelled: [], notLoaded: [], failures: [] } } })
+    body: { paused: true, mode: 'soft', sessions: { delivered: true, cancelled: [], notLoaded: [], failures: [] },
+      workers: { stopped: [], failures: [] } } })
   expect(await call('POST', 'projects/p1/pause', hard, allowed)).toEqual({ status: 200,
-    body: { paused: true, mode: 'hard', sessions: { delivered: true, cancelled: [], notLoaded: [], failures: [] } } })
+    body: { paused: true, mode: 'hard', sessions: { delivered: true, cancelled: [], notLoaded: [], failures: [] },
+      workers: { stopped: [], failures: [] } } })
   expect(await call('POST', 'projects/p1/pause', { paused: false }, allowed)).toEqual({ status: 200,
-    body: { paused: false, mode: null, sessions: { delivered: false, cancelled: [], notLoaded: [], failures: [] } } })
+    body: { paused: false, mode: null, sessions: { delivered: false, cancelled: [], notLoaded: [], failures: [] },
+      workers: { stopped: [], failures: [] } } })
+  expect(await call('POST', 'tickets/t1/allow-resume', undefined, allowed)).toEqual({ status: 200, body: { allowed: true } })
   expect(await call('POST', 'projects/p1/stop', undefined, allowed)).toEqual({ status: 200, body: { stopped: true } })
   expect(await call('POST', 'projects/p1/archive', undefined, allowed)).toEqual({ status: 200,
     body: { archived: true, sessions: { ids: ['pm-p1'], failures: [] } } })
@@ -127,8 +136,8 @@ it('protects the Project control routes with the same-origin rule and calls thei
     body: { started: true, sessionId: 'pm-p1' } })
   expect(await call('POST', 'projects/missing/pm', undefined, allowed)).toEqual({ status: 404, body: { error: 'Project not found' } })
   expect(calls).toEqual([['pause', 'p1', true, 'soft'], ['pauseSessions', 'soft'], ['pause', 'p1', true, 'hard'],
-    ['pauseSessions', 'hard'], ['pause', 'p1', false, 'soft'], ['resumeSessions'], ['stop', 'p1'], ['archive', 'p1'],
-    ['archiveSessions'], ['unarchive', 'p1'], ['unarchiveSessions'], ['openProject', 'p1']])
+    ['pauseSessions', 'hard'], ['pause', 'p1', false, 'soft'], ['resumeSessions'], ['allowResume', 't1'], ['stop', 'p1'],
+    ['archive', 'p1'], ['archiveSessions'], ['unarchive', 'p1'], ['unarchiveSessions'], ['openProject', 'p1']])
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {

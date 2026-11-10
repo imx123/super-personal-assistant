@@ -201,12 +201,13 @@ function routes(runtime: HttpHost): Routes {
     'POST projects/:id/pause': async ({ params, body }) => {
       const { paused, mode = 'soft' } = z.object({ paused: z.boolean(), mode: z.enum(['soft', 'hard']).optional() }).strict()
         .parse(await body())
-      const project = runtime.engine.pauseProject(params.id, paused, mode)
+      const result = runtime.engine.pauseProjectReport(params.id, paused, mode)
+      const project = result.project
       const sessions = paused
         ? project.status === 'paused' ? await runtime.sessions.pauseProject(project, mode)
           : { delivered: false, cancelled: [], notLoaded: [], failures: [] }
         : await runtime.sessions.resumeProject(project)
-      return { paused: project.status === 'paused', mode: project.pauseMode ?? null, sessions }
+      return { paused: project.status === 'paused', mode: project.pauseMode ?? null, sessions, workers: result.workers }
     },
     'POST projects/:id/stop': ({ params }) => { runtime.engine.stopProject(params.id); return { stopped: true } },
     // Recovery entry for a Project whose PM Session could not start at creation. It reopens the same deterministic PM
@@ -229,6 +230,8 @@ function routes(runtime: HttpHost): Routes {
       return { archived: false as const, sessions: await runtime.sessions.unarchiveProject(project) }
     },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
+    // A person's approval to make a Worker a single stop ended resumable. It clears the stop only; the PM revives it later.
+    'POST tickets/:id/allow-resume': ({ params }) => { const id = ticket(params.id); runtime.engine.allowResume(id); return { allowed: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST tickets/:id/assignment/stop': async ({ params, body }) => {
       const id = ticket(params.id)

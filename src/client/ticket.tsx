@@ -137,6 +137,9 @@ export function TicketPage({ id }: { id: string }) {
       {data.actions.stop && currentAssignment && currentAssignment.state !== 'ended' && <ConfirmButton variant="outline"
         label={t('stopAssignment')} title={t('stopAssignment')} message={t('stopAssignmentConfirm')}
         onConfirm={() => after(call('POST tickets/:id/assignment/stop', { id, body: { assignmentId: currentAssignment.id } }))} />}
+      {data.actions.allowResume && <ConfirmButton variant="outline" icon="play" label={t('allowResume')} title={t('allowResumeTitle')}
+        message={t('allowResumeConfirm', { title: data.title })}
+        onConfirm={() => after(call('POST tickets/:id/allow-resume', { id }))} />}
     </PageHead>
     {error && <LoadState error={error} loading={false} />}
     <div className="dt-row-meta dt-status-line">
@@ -153,6 +156,7 @@ export function TicketPage({ id }: { id: string }) {
       </div>}</div>}
     {/* Ordinary progress stays in the Session/Channels; only a report that halted work (blocked/failed) is shown here. */}
     {stoppedAssignment && !data.ended && <Hint>{t('assignmentStopped')}</Hint>}
+    {data.manualStop && !data.ended && <Hint>{t(data.manualStop.scope === 'worker' ? 'manualStopWorkerHint' : 'manualStopProjectHint')}</Hint>}
     {data.actions.retry && data.summary && !stoppedAssignment && <p className={`dt-banner${failed ? ' dt-danger' : ''}${failedText ? ' dt-mono' : ''}`}>
       <span className="dt-banner-label">{t(failed ? 'failedPrefix' : 'blockedPrefix')}</span>{data.summary}
     </p>}

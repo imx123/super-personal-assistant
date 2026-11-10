@@ -49,6 +49,9 @@ function ProjectPage({ id }: { id: string }) {
   }, { reload })
   const stop = useAction(async () => { await call('POST projects/:id/stop', { id }) }, { reload })
   const startPm = useAction(async () => { await call('POST projects/:id/pm', { id }) }, { reload })
+  const allowResume = useAction(async (ticketId: string) => {
+    await call('POST tickets/:id/allow-resume', { id: ticketId })
+  }, { reload })
   const archive = useAction(async () => {
     const result = await call('POST projects/:id/archive', { id })
     reportArchive(result.sessions, t('archiveProject'))
@@ -86,6 +89,7 @@ function ProjectPage({ id }: { id: string }) {
     <div className="dt-row-meta dt-status-line">
       <span className="dt-status-text" data-state={projectTone(data.status)}>{valueLabel(t, 'projectStatus', data.status)}</span>
       {data.status === 'paused' && data.pauseMode && <span className="dt-status-text">{t(`pauseMode.${data.pauseMode}`)}</span>}
+      <span className="dt-hint">{t('projectPauseScopeHint')}</span>
     </div>
     <Section title={t('projectGoal')}><p>{data.goal}</p></Section>
     <Section title={t('projectTickets')}>
@@ -96,8 +100,14 @@ function ProjectPage({ id }: { id: string }) {
           </div>
           <div className="dt-row-meta">
             {ticket.threads.map(thread => <span key={thread.thread}>{thread.thread}{thread.context ? ` (${t('contextOnly')})` : ''}</span>)}
+            {ticket.manualStop && <span className="dt-status-text" data-state="warning">{t(ticket.manualStop.scope === 'worker'
+              ? 'manualStopWorker' : 'manualStopProject')}</span>}
           </div>
         </div>
+        {ticket.actions.allowResume && <div className="dt-row-actions">
+          <ConfirmButton variant="outline" icon="play" label={t('allowResume')} title={t('allowResumeTitle')}
+            message={t('allowResumeConfirm', { title: ticket.title })} onConfirm={() => allowResume.run(ticket.id)} />
+        </div>}
       </li>)}</ul> : <Hint>{t('projectNoTickets')}</Hint>}
     </Section>
     <Section title={t('projectPmSession')}>

@@ -66,10 +66,13 @@ describe('Project creation', () => {
     h.engine.pauseProject(first.id, true)
     expect(projectEvents()).toHaveLength(2)
     h.engine.pauseProject(first.id, true, 'hard')
-    expect(projectEvents().at(-1)).toEqual({ type: 'project.paused', at, data: { projectId: first.id, mode: 'hard', from: 'soft' } })
+    // The Project state event, then the aggregate notice event for its Workers (none here).
+    expect(projectEvents().slice(-2)).toEqual([
+      { type: 'project.paused', at, data: { projectId: first.id, mode: 'hard', from: 'soft' } },
+      { type: 'project.pausedByUser', at, data: { projectId: first.id, mode: 'hard', stopped: [], failures: [] } }])
     h.engine.pauseProject(first.id, true, 'hard')
     h.engine.pauseProject(first.id, true, 'soft')
-    expect(projectEvents()).toHaveLength(3)
+    expect(projectEvents()).toHaveLength(4)
     // Resume from hard, then end with a reason; repeated calls add nothing.
     h.engine.pauseProject(first.id, false)
     expect(projectEvents().at(-1)).toEqual({ type: 'project.resumed', at, data: { projectId: first.id, mode: 'hard' } })
@@ -77,7 +80,7 @@ describe('Project creation', () => {
     h.engine.stopProject(first.id, 'finished')
     expect(projectEvents().at(-1)).toEqual({ type: 'project.ended', at, data: { projectId: first.id, reason: 'finished' } })
     h.engine.stopProject(first.id, 'again')
-    expect(projectEvents()).toHaveLength(5)
+    expect(projectEvents()).toHaveLength(6)
     // Archive restores the previous status; a second archive and unarchive are no-ops after their transitions.
     h.engine.recordTriggerForRouting(trigger('p2'))
     const second = h.engine.createProject('p2', 'Docs', 'Write the docs')
@@ -87,8 +90,8 @@ describe('Project creation', () => {
     h.engine.unarchiveProject(second.id)
     expect(projectEvents().at(-1)).toEqual({ type: 'project.unarchived', at, data: { projectId: second.id, status: 'active' } })
     h.engine.unarchiveProject(second.id)
-    expect(projectEvents().map(event => event.type)).toEqual(['project.created', 'project.paused', 'project.paused', 'project.resumed',
-      'project.ended', 'project.created', 'project.archived', 'project.unarchived'])
+    expect(projectEvents().map(event => event.type)).toEqual(['project.created', 'project.paused', 'project.paused', 'project.pausedByUser',
+      'project.resumed', 'project.ended', 'project.created', 'project.archived', 'project.unarchived'])
   })
 
   it('is idempotent per trigger: a repeated call returns the first Project and records no second Decision', () => {
@@ -269,9 +272,10 @@ describe('Project persistence and read views', () => {
       expect(project).toMatchObject({ title: 'Settings site', goal: 'Ship a clearer settings site', pmSessionId: `pm-${project.id}` })
       expect(project.mandate.scope).toBe('Ship a clearer settings site')
       expect(projectOfSession(project.pmSessionId)).toBe(project.id)
-      // The PM has only its read, create-Ticket, message and report tools, and takes the auto preset before the narrower ones.
+      // The PM has only its read, create-Ticket, message, revive and report tools, and takes the auto preset before the narrower ones.
       expect([...host.tools.get(project.pmSessionId)!.keys()].sort()).toEqual(['orchestrator_project_report',
-        'orchestrator_project_ticket_create', 'orchestrator_project_ticket_message', 'orchestrator_read'])
+        'orchestrator_project_ticket_create', 'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive',
+        'orchestrator_read'])
       expect(host.permissions.set).toHaveBeenCalledWith(expect.objectContaining({ id: project.pmSessionId }), 'auto')
       const messages = host.deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === project.pmSessionId)
       expect(messages).toHaveLength(1)
@@ -327,7 +331,7 @@ describe('Project persistence and read views', () => {
     } finally { await host.stop() }
   })
 
-  it('does not relay Project state events to the main Session or the PM', async () => {
+  it('relays only the aggregate hard-pause notice, not the other Project state events', async () => {
     const host = await startRuntime()
     try {
       const request = feishu('32', 'Start a project for quiet events')
@@ -336,14 +340,19 @@ describe('Project persistence and read views', () => {
       const result = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
         { trigger_id: request.id, title: 'Quiet events', goal: 'Keep state events for audit only' }) as { project: { project_id: string } }
       const project = host.runtime.store.projects.get(result.project.project_id)!
-      const deliveries = host.deliveries.mock.calls.length
       host.runtime.engine.pauseProject(project.id, true)
       host.runtime.engine.pauseProject(project.id, true, 'hard')
+      const notice = () => host.deliveries.mock.calls.map(([call]) => call)
+        .filter(call => (JSON.parse(call.text) as { kind?: string }).kind === 'projectPausedByUser')
+      await vi.waitFor(() => expect(notice()).toHaveLength(1))
+      expect(notice()[0]!.sessionId).toBe(host.runtime.masterId)
+      expect(JSON.parse(notice()[0]!.text)).toMatchObject({ project_id: project.id, mode: 'hard', stopped_tickets: [], failures: [] })
+      const delivered = host.deliveries.mock.calls.length
       host.runtime.engine.pauseProject(project.id, false)
       host.runtime.engine.archiveProject(project.id)
       host.runtime.engine.unarchiveProject(project.id)
       host.runtime.engine.stopProject(project.id, 'audit only')
-      expect(host.deliveries.mock.calls).toHaveLength(deliveries)
+      expect(host.deliveries.mock.calls).toHaveLength(delivered)
     } finally { await host.stop() }
   })
 })
