@@ -39,7 +39,7 @@ Shutdown cancels turns, waits for passes, effects and agents, restores the proce
 | Setup | `src/app/setup.ts` | Resolves the repository and the accounts by probing their CLIs the way worker shells run them, writes and applies the workers' environment and command shims, and keeps the setup problems; Settings checks a changed account through it, and restarts through it, which runs setup again |
 | Passes | `src/app/passes.ts` | One pass at a time, every two seconds and whenever a command asks: the due effects, then `Engine.evaluateDue`; a Source's Trigger reaches the Engine through it |
 | Outbox | `src/app/outbox.ts` | The Engine's `Outbox` port, and the only writer of the receipts: `send` keeps a message's receipt and queues its `reply` effect in one transaction, and the effect's handler sends it through `SourceRegistry.send`; a message waits while its Source is off, and is dropped when the conversation is gone or not listened to |
-| Notices | `src/app/notices.ts` | Converts domain events and worker activity into main-Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
+| Notices | `src/app/notices.ts` | Converts domain events and worker activity into Session messages. `eventNotice` handles domain notices; `reportRelay` forwards questions immediately, keeps ordinary progress on its Ticket, and relays other reports; `followupRelay` names the Tickets that own a human follow-up. `relaySession` chooses a Project Ticket's PM or the main Session; a main-Session relay may name another Session. Relays arriving during a turn are delivered together at its next step through the DeepSeek Harness inbox |
 
 ### Engine
 
@@ -199,7 +199,7 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 
 ### DshExecutor
 
-`DshExecutor` (`src/executor/dsh.ts`) provides one Session and directory per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker.
+`DshExecutor` (`src/executor/dsh.ts`) provides one Session and directory per Ticket. `start` and `deliver` enqueue `launch` and `delivery` effects. `stop` cancels the turn through `Store.afterCommit`, so a rolled-back end does not stop the worker. Report, failure, turn-end and stop relays go through `relay`, which sends a Project Ticket's relay to its active, loaded PM Session and every other Ticket's to the main Session.
 
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
 
@@ -237,7 +237,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 `Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` creates a Session with its role's model. `install` follows agent events and registers prompts, skills and tools for managed Sessions.
 
-`prompt` delivers once per request id. `relay` and `notify` enqueue main-Session messages handled by the `relay` and `notice` effects. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
+`prompt` delivers once per request id. `relay` and `notify` enqueue Session messages handled by the `relay` and `notice` effects; a relay may name a Project PM Session instead of the main Session. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
 Each model request binds the Session to the current prompt revision. The revisions it used are stored durably: `promptVersion` identifies the active one and `mayRead` restricts which versions a worker can inspect. Registrations are tracked in one map per agent.
 
@@ -248,8 +248,8 @@ Each model request binds the Session to the current prompt revision. The revisio
 | Glue | Translates |
 | --- | --- |
 | `src/app/runtime.ts` | The composition root: builds the parts with the interfaces they use, registers the routes and the Source host, and starts and stops dsh-superagent |
-| `src/app/notices.ts` | Domain events and worker reports into notices and relays for the main Session |
-| `src/app/tools/main.ts`, `src/app/tools/executor.ts` | Tool arguments of the main Session and the Executor Sessions into calls of the core classes, and their results into cards |
+| `src/app/notices.ts` | Domain events and worker reports into notices and relays for the main Session or a Project's PM, and `relaySession`, the routing rule |
+| `src/app/tools/main.ts`, `src/app/tools/executor.ts` | Tool arguments of the main Session, the Project PM and the Executor Sessions into calls of the core classes, and their results into cards; the PM's Project report is relayed to the Router here |
 | `src/app/http.ts`, `src/app/views/`, `src/app/api.ts` | HTTP requests into calls, and Store reads into the panel's views; `api.ts` types every route for the panel |
 | `src/app/resources.ts`, `src/app/links.ts`, `src/app/cards.ts` | Resource names into reads, source messages into links, records into compact cards for models |
 | `src/sources/github*.ts`, `src/sources/feishu*.ts`, `src/sources/poll.ts` | GitHub and Feishu payloads into Triggers and Thread facts, and messages into CLI calls |
@@ -320,11 +320,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/setup.ts` | Setup, and `setupChanged`, whether a save changes a field setup reads |
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
-| `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
+| `src/app/notices.ts` | The notices and relays for the main Session or a Project PM: `eventNotice`, `reportRelay`, `resultRelay`, `followupRelay` and `relaySession` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
-| `src/app/effects.ts` | Effects |
+| `src/app/effects.ts` | Effects, including a `relay` payload that names its target Session |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
 | `src/app/cache.ts` | `TextCache`: texts kept in memory within a size, the least recently used dropped first |
 | `src/app/settings.ts` | Settings |
@@ -344,7 +344,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role, including Projects and a Project's Tickets |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools, and the Project PM's read, Ticket-creation and report tools |
-| `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/executor.ts` | An Executor Session's tools, whose reports route to its Project PM or the main Session |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
@@ -355,7 +355,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/sources.ts` | The Source status: each Source instance's state, its last day's counts, and what it filtered and dropped in that day |
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
-| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions`; its `relay` routes a Ticket's report to its PM or the main Session |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -428,7 +428,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/queue.spec.ts` | The Runtime's work through the effect queue, and what earlier versions stored |
 | `tests/followups.spec.ts` | A person's follow-up on a Ticket's Thread: its notice to the main Session, the tools that act on it, what a burst costs; a worker's hand-back and context follow, and the main Session's note |
 | `tests/projects.spec.ts` | Project creation through the Engine and the main Session tool: the gate-only `project` Decision with a real Eval id, the PM Mandate and PM Session, idempotency, the Project read view and routes |
-| `tests/project-tickets.spec.ts` | PM-created Project Tickets through the Engine and the runtime: internal Triggers, record-only `delegated` Decisions with real Eval ids, Mandates, external Thread subscriptions and context-only ones, no assessor, no automatic Project Thread subscription, the optional worker tool allowlist (narrowing, inheritance, rejection), idempotency, whole-batch rollback, PM-only creation, delegated revalidation, and the PM's read scope over its Project and its Tickets |
+| `tests/project-tickets.spec.ts` | PM-created Project Tickets through the Engine and the runtime: internal Triggers, record-only `delegated` Decisions with real Eval ids, Mandates, external Thread subscriptions and context-only ones, no assessor, no automatic Project Thread subscription, the optional worker tool allowlist (narrowing, inheritance, rejection), idempotency, whole-batch rollback, PM-only creation, delegated revalidation, the PM's read scope over its Project and its Tickets, and report routing to the PM or the Router with the PM's project_report |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
@@ -539,6 +539,8 @@ New PM Sessions use `dsh-superagent-pm` (`PM_PRESET`): time context and compacti
 
 `orchestrator_project_ticket_create` takes 1–5 tasks, each with a title, goal, optional scope, note and worktree name (unique within the call), optional `allow_tools`, and optional external `threads` as `source:id` keys with `contextOnly`. The Engine requires the Project's PM Session and creates Tickets only while the Project is active; each task gets one `internal` Trigger, a record-only `delegated` Eval and Decision, and a Ticket with no Channel and no Subscription to the Project's source Thread. `allow_tools` becomes the Ticket Mandate's `allowTools`, must name known Work tools once each, and may only narrow the PM Mandate's list; omitted or empty keeps the PM Mandate's list or, without one, every Work tool. Unknown tools, duplicates, more than 32 names, an expanded list, or unknown thread keys refuse the whole batch. A repeated call reuses the Ticket each task position already created, and each Ticket's worker starts through the normal worker path, with `workOnly` restricting it and its subagents to the Mandate's allowlist.
 
+A Project Ticket's worker reports, questions for a person, failure, waiting and stop relays arrive in the PM Session, not the Router. The PM reads the child with `orchestrator_read ticket/<id>` and the Project list with `project/<id>/tickets`. It cannot answer a child's attention directly in this phase; it records the blocker in `orchestrator_project_report`. That tool still writes `ProjectProfile.latestReport`, and also relays one structured `project_report` (`project_id`, `title`, `status`, `summary`, `at`, `read`) to the main Session with an idempotent request id. The Router thus hears Project-level reports, not each child report, and the Project page keeps showing `latestReport`.
+
 ### Executor tools
 
 Each Executor has six application tools:
@@ -554,7 +556,7 @@ Each Executor has six application tools:
 
 A hand-back returns `queued: false` if another Ticket still owns the message, or this Ticket never owned it. For example, a bot message went to Eval independently.
 
-The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/app/sessions.ts` retains available file, search, shell, job, web, skill, todo and subagent tools. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
+The worker preset is defined in `cordis.patch.yml` and selected through `WORKER_PRESET`. `WORK_TOOLS` in `src/core/model.ts` retains available file, search, shell, job, web, skill, todo and subagent tools; a Ticket Mandate may narrow it. Workers do not receive tools for asking or presenting to a person, changing the profile, scheduling work outside worker slots, starting or messaging other Sessions, or editing external documents. Tool calls are refused after the Ticket ends.
 
 ### Result shapes and assessment context
 

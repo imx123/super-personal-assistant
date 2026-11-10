@@ -77,6 +77,12 @@ The PM creates Tickets only inside its own Project, never arbitrary work, with `
 - Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call reuses the Ticket each task position already produced.
 - The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.
 
+### Report routing
+
+A Worker's status reports, questions for a person, failure receipts, turn-end notices and stop receipts are relays. A Router-owned Ticket's relays go to the main Session, as before. A Project Ticket's relays go to its Project's PM Session (`project.pmSessionId`) while the Project is active and that PM Session is loaded; otherwise they fall back to the main Session. The main Session therefore receives no child `worker_report` or `worker_attention`, and child lifecycle notices are not sent to it.
+
+The PM reads a child's report or attention with `orchestrator_read ticket/<id>` and its Project's child list with `project/<id>/tickets`. If a child attention needs a person, the PM records the blocker in `orchestrator_project_report`; it does not answer the child directly in this phase. Each Project report is also relayed to the main Session once as a structured `project_report` (`project_id`, `title`, `status`, `summary`, `at`, `read`), with an idempotent request id, while the Project's `latestReport` remains what the Project page shows. The Router thus receives Project-level reports, not every child report.
+
 The Project Profiles, their latest reports and their child Ticket ids are read through `GET projects` and `GET projects/:id`, and through the `projects`, `project/<id>` and `project/<id>/tickets` read resources.
 
 ## Strength

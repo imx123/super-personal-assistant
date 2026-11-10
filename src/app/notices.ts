@@ -1,6 +1,6 @@
-/** Formats background notices and steering relays delivered to the main Session via the effect queue. */
+/** Formats background notices and steering relays delivered to a Session via the effect queue. */
 import { randomUUID } from 'node:crypto'
-import { followupOwners, key, liveTicket, type DomainEvent, type Ticket, type WorkerReport } from '../core/index.ts'
+import { followupOwners, key, liveTicket, type DomainEvent, type ProjectProfile, type Ticket, type WorkerReport } from '../core/index.ts'
 import { triggerMessage } from '../executor/dsh.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { repliedTo } from './links.ts'
@@ -73,8 +73,16 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
     note: 'For context only: its messages reach this ticket and grant nothing.' },
     `Ticket ${ticketId} follows thread ${thread} for context: ${reason}`)
 
-/** Steering relay payload for the main Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
+/** Steering relay payload for a Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string; summary?: string }
+/**
+ * The Session a relay about `ticket` belongs to: its active Project's PM when that Session is loaded, else undefined for the
+ * main Session. A Router-owned Ticket, an ended Project, or a missing PM Session falls back to the main Session.
+ */
+export function relaySession(ticket: Pick<Ticket, 'projectId'> | undefined, project: ProjectProfile | undefined,
+  pmLoaded: boolean): string | undefined {
+  return ticket?.projectId && project?.status === 'active' && pmLoaded ? project.pmSessionId : undefined
+}
 /** An operator action is an execution receipt, not a Worker-authored report. */
 export function executionStatus(ticket: Ticket, action: 'interrupt_turn' | 'stop_assignment' | 'cancel_ticket',
   sessionId: string, at: string, assignmentId?: string, cleanupError?: string): Relay {

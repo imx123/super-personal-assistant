@@ -40,7 +40,7 @@ P2.2a 做 PM 创建 PM-owned Ticket 的最小闭环，并允许 child ticket 在
 | `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 领域、授权、面板、架构与基线范围 |
 | `tests/project-tickets.spec.ts`、`tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/fixtures/host.ts` | 新增 PM Ticket 定向测试；PM 权限断言改 auto；Project 面板 child Ticket；权限 fixture 加 auto |
 
-## P2.2b 当前范围：可选工具白名单
+## 已完成的 P2.2b：可选工具白名单
 
 P2.2b 只做“可选工具白名单”，不做 capability 档、不做 `denyTools`，也不做 child report/attention 回 PM。
 
@@ -63,7 +63,32 @@ P2.2b 只做“可选工具白名单”，不做 capability 档、不做 `denyTo
 | `docs/001`、`docs/002`、`docs/007`、本文件 | allow_tools 语义、默认/收窄/非沙箱说明 |
 | `tests/project-tickets.spec.ts`、`tests/runtime.spec.ts` | 白名单字段与拒绝、实际 `restrict` 结果、未指定=全量、subagent 继承、无 2 参绕过 |
 
-明确未做：child report/attention 回 PM、Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+明确未做：Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+
+## P2.3 当前范围：child 报告回 PM + PM 项目汇报回 Router
+
+P2.3 做报告路由和 PM 项目汇报；不做 Project 暂停/停止，不做 PM 直接回答 child attention。
+
+已实现：
+
+- `relay` effect payload 增加可选 `sessionId`；`Sessions.relay(requestId, text, summary?, sessionId?)` 默认主 Session。`relay` handler 把消息投到 payload 指定的 Session，request id 仍负责幂等。
+- `DshExecutor.relay` 接收当前 Ticket：`ticket.projectId` 存在、Project 为 active 且 PM Session 已加载时发到 `project.pmSessionId`，否则回主 Session。`failed`、turn end/waiting、`resultRelay`、`reportRelay` 的 `worker_report` / `worker_attention`、`executionStatus`（stop 回执）都走这一路由。
+- Worker 的 `orchestrator_report` 也使用同一路由；child 的 `worker_report` / `worker_attention` 只到 PM，主 Session 不收。child ticket 的 `ticket.ended` notice 也不再发主 Session。
+- `orchestrator_project_report` 仍写 `ProjectProfile.latestReport`，同时向主 Session relay 一条结构化 `project_report`：`project_id`、`title`、`status`、`summary`、`at`、`read`；request id 由 project id + summary 派生，重复提交同文本不会重复打扰 Router。Project 页仍读 `latestReport`。
+- PM 已可读 child `ticket/<id>` 和 `project/<id>/tickets`；child attention 到达 PM 后，PM 可在项目汇报里标出 blocker，本轮不提供直接回答 child 的半套工具。
+- Router-owned Ticket 的报告仍去主 Session；Project Ticket 的 PM Session 不存在时 fallback 到主 Session（已定义）。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/app/effects.ts`、`sessions.ts`、`notices.ts` | relay payload `sessionId`、投递目标 Session、`relaySession` 路由规则 |
+| `src/executor/dsh.ts`、`src/app/tools/executor.ts`、`src/app/runtime.ts` | DshExecutor/Worker report/stop 回执按 Ticket 路由；child lifecycle notice 不再打扰主 Session |
+| `src/app/tools/main.ts` | `orchestrator_project_report` 写 latestReport + relay `project_report` 到 Router |
+| `docs/002`、`docs/007`、本文件 | 报告路由：独立 Ticket → Router；Project Ticket → PM；PM → Router |
+| `tests/project-tickets.spec.ts` | child report/attention 到 PM、主 Session 不收、PM report 到主 Session 且幂等、Router Ticket 回归、PM 缺失 fallback |
+
+明确未做：PM 直接回答 child attention、Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
 ## 主入口的权限模型
 
@@ -97,13 +122,12 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 ## 验证
 
-2026-11-10 在本机验证 P2.2b：
+2026-11-10 在本机验证 P2.3：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 10 项全通过：P2.2a 的建单/thread/幂等/回滚/身份/读范围，加上 `allow_tools` 写入 Ticket Mandate、未指定时不写字段、未知/重复/超 32/扩大 PM Mandate 被拒、以及省略 PM Session 无法绕过（required-PM 签名）。
-- `tests/runtime.spec.ts` 新增 1 项通过：PM 建票后受限 Ticket 的 Worker `restrict` 实际只拿到 `['read','grep']`，未指定时仍拿到全量 work tools，subagent 继承同一 `restrict`；同时修好 PM Session 的 restrict 未包含 `orchestrator_project_ticket_create` 的旧遗漏。
-- 定向回归：`projects` 6、`cards`、`tools`、`model-surface` 7、`panel-project` 1 全通过；`model-surface` 预算未上调。
-- 全量 62 个测试文件、1225 项：1177 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- `tests/project-tickets.spec.ts` 12 项全通过：P2.2a/P2.2b 的建单、thread、幂等、回滚、身份、读范围、allow_tools 全部保留；新增两张 child Ticket 的 report 都到 PM 且主 Session 不收、child attention 只到 PM 且 PM 可读 `ticket/<id>` 与 `project/<id>/tickets`、PM 的 `project_report` 到主 Session 且重复同文本只投一次、Router-owned Ticket report 仍到主 Session、PM Session 缺失时 fallback 到主 Session。
+- 定向回归：`runtime`（除既有的 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 全通过；P2.2b 的 `allow_tools` restrict 实测仍通过。
+- 全量 62 个测试文件、1227 项：1179 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -111,9 +135,10 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 1. 权限控制（初版已完成）
 2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（已完成）
 3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
-4. 任务交接 / child report 回 PM（下一段）
-5. 意外中断与恢复
-6. 再扩展新功能
+4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
+5. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+6. 意外中断与恢复
+7. 再扩展新功能
 
 ## 文档说明
 

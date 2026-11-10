@@ -1,4 +1,5 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { latestAssignment, liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
@@ -6,13 +7,13 @@ import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
-import { reportRelay, threadFollowedNotice } from '../notices.ts'
+import { relaySession, reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
-  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
+  readonly store: Pick<Store, 'tickets' | 'projects' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
@@ -100,8 +101,11 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
           const relay = reportRelay(updated, report)
-          if (relay) host.sessions.relay(relay.id, relay.text)
-          const notification = relay ? 'orchestrator' : 'internal_only'
+          const project = updated.projectId ? host.store.projects.get(updated.projectId) : undefined
+          const pmLoaded = !!project && !!host.resources.context.agents.get(project.pmSessionId as SessionId)
+          const target = relaySession(updated, project, pmLoaded)
+          if (relay) host.sessions.relay(relay.id, relay.text, undefined, target)
+          const notification = relay ? target ? 'project_pm' : 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
         })
       },

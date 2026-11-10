@@ -34,7 +34,7 @@ import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
-import { eventNotice, executionStatus, followupNotice } from './notices.ts'
+import { eventNotice, executionStatus, followupNotice, relaySession } from './notices.ts'
 import { pullEndNotices } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
@@ -162,7 +162,9 @@ export class Runtime extends Service implements SourceHost {
       const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
-          const notice = this.quiet ? undefined : eventNotice(event, id => store.tickets.get(id))
+          // A Project Ticket's lifecycle stays in its Project: the PM reads it, and the Router is not told about every child.
+          const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
+          const notice = this.quiet || ended?.projectId ? undefined : eventNotice(event, id => store.tickets.get(id))
           if (notice) sessions.notify(...notice)
           // A person's message that reached an open ticket is the ticket's; the main Session hears of it in the same transaction,
           // and of one for an ended ticket once it resumes, unless it routed the message there itself.
@@ -170,7 +172,6 @@ export class Runtime extends Service implements SourceHost {
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
           // Notify the ticket's conversations whenever it ends via a pull request.
-          const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
           if (ended && setup.configured()) {
             const source = store.triggers.get(ended.origin.triggerId)
             const request = source?.text ?? ''
@@ -178,7 +179,9 @@ export class Runtime extends Service implements SourceHost {
             if (source?.source === 'main-session' && ended.ended?.by === 'human' && ended.ended.outcome === 'stopped'
               && !ended.assignments.some(item => item.endedAt === ended.ended?.at)) {
               const relay = executionStatus(ended, 'cancel_ticket', workerSessionId(ended.id), ended.ended.at, ended.assignments.at(-1)?.id)
-              sessions.relay(relay.id, relay.text, relay.summary)
+              const project = ended.projectId ? store.projects.get(ended.projectId) : undefined
+              const pmLoaded = !!project && !!ctx.agents.get(project.pmSessionId as SessionId)
+              sessions.relay(relay.id, relay.text, relay.summary, relaySession(ended, project, pmLoaded))
             }
           }
         } })

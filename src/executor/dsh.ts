@@ -15,7 +15,7 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
-import { executionStatus, resultRelay, type Relay } from '../app/notices.ts'
+import { executionStatus, relaySession, resultRelay, type Relay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
@@ -62,7 +62,7 @@ export interface ExecutorHost {
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'turnBegan' | 'deliveryFailed' | 'report'
     | 'assignmentInterrupted'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'projects' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
@@ -371,8 +371,8 @@ export class DshExecutor implements Executor {
       if (reason === OPERATOR_STOP || cancelledByOperator) {
         const action = cancelledByOperator ? 'cancel_ticket' : 'stop_assignment'
         const finished = Promise.all([agent?.whenIdle(), cleanup]).then(
-          () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id)),
-          (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, String(error))),
+          () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id), ticket),
+          (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, String(error)), ticket),
         ).then(() => {})
         this.track(ticket.id, finished)
       }
@@ -431,12 +431,19 @@ export class DshExecutor implements Executor {
       const assignment = ticket && latestAssignment(ticket)
       if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state === 'ended') return
       const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
-      this.relay(resultRelay(updated, 'failed', summary))
+      this.relay(resultRelay(updated, 'failed', summary), updated)
     })
   }
-  private relay({ id, text, summary }: Relay): void {
-    if (summary) this.host.sessions.relay(id, text, summary)
-    else this.host.sessions.relay(id, text)
+  /**
+   * Relay a report about `ticket` to its Session: a Project Ticket goes to its active Project's loaded PM, so the Router is
+   * not told about every child report; any other Ticket, or one whose PM is missing, goes to the main Session.
+   */
+  private relay({ id, text, summary }: Relay, ticket: Ticket): void {
+    const project = ticket.projectId ? this.host.store.projects.get(ticket.projectId) : undefined
+    const pmLoaded = !!project && !!this.host.context.agents.get(project.pmSessionId as SessionId)
+    const sessionId = relaySession(ticket, project, pmLoaded)
+    if (summary) this.host.sessions.relay(id, text, summary, sessionId)
+    else this.host.sessions.relay(id, text, undefined, sessionId)
   }
   private async launch(ticket: Ticket, assignment: Assignment): Promise<void> {
     const current = () => {
@@ -654,7 +661,7 @@ export class DshExecutor implements Executor {
       this.host.store.atomic(() => {
         const at = new Date(end.time).toISOString()
         this.host.engine.turnEnded(ticket.id, idle.id, at)
-        this.relay(executionStatus(before, 'interrupt_turn', agent.id, at, idle.id))
+        this.relay(executionStatus(before, 'interrupt_turn', agent.id, at, idle.id), before)
       })
       return
     }
@@ -704,9 +711,9 @@ export class DshExecutor implements Executor {
       const before = latestReport(current)?.summary ?? ''
       const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before })
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
-      if (said) this.relay(resultRelay(updated, 'waiting', said))
+      if (said) this.relay(resultRelay(updated, 'waiting', said), updated)
       else if (!before.trim()) {
-        this.relay(resultRelay(updated, 'waiting', 'Worker ended without a status report. Use orchestrator_ticket_request_status to request one.'))
+        this.relay(resultRelay(updated, 'waiting', 'Worker ended without a status report. Use orchestrator_ticket_request_status to request one.'), updated)
       }
     })
   }

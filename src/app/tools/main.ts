@@ -42,7 +42,7 @@ export interface MainToolsHost {
     & EngineForPM & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'projects' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject' | 'relay'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -444,7 +444,16 @@ export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
       schema: z.object({
         summary: z.string().trim().min(1).max(20000).describe('The Project\'s latest status, in the source language.'),
       }).strict(),
-      execute: async args => ({ project: projectCard(host.engine.projectReport(project.id, args.summary)) }),
+      execute: async args => {
+        const updated = host.engine.projectReport(project.id, args.summary)
+        const report = updated.latestReport!
+        const read = `project/${updated.id}`
+        const payload = { kind: 'project_report', project_id: updated.id, title: updated.title, status: updated.status,
+          summary: args.summary, at: report.at, read }
+        // The Router hears Project-level reports once each, not every child report; the request id makes a retry idempotent.
+        host.sessions.relay(key('project-report', updated.id, args.summary), JSON.stringify(payload), `Project report: ${updated.title}`)
+        return { project: projectCard(updated), read }
+      },
     }),
   ]
 }

@@ -220,4 +220,78 @@ describe('a Project PM Session through the runtime', () => {
       await expect(host.runTool(project.pmSessionId, 'orchestrator_read', { resource: 'tickets' })).rejects.toThrow('outside it')
     } finally { await host.stop() }
   })
+
+  it('routes child reports and attention to the PM, the PM project report to the main Session, and Router Tickets to the main Session', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('51', 'Start a project for the settings site')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Settings site', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      const result = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' },
+        { title: 'Footer', goal: 'Fix the footer links', worktree_name: 'fix-footer' },
+      ] }) as { tickets: { ticket_id: string }[] }
+      const [header, footer] = result.tickets.map(card => host.runtime.store.tickets.get(card.ticket_id)!)
+      const headerSession = workerSessionId(header!.id), footerSession = workerSessionId(footer!.id)
+      await vi.waitFor(() => expect(host.tools.get(headerSession)).toBeDefined())
+      await vi.waitFor(() => expect(host.tools.get(footerSession)).toBeDefined())
+      const delivered = (sessionId: string) => host.deliveries.mock.calls.map(([call]) => call).filter(call => call.sessionId === sessionId)
+      const texts = (sessionId: string) => delivered(sessionId).map(call => call.text)
+      const report = (ticketId: string) => texts(project.pmSessionId).filter(text => text.includes(ticketId))
+      // A blocked child report reaches its PM, not the Router.
+      await host.runTool(headerSession, 'orchestrator_report', { state: 'blocked', summary: 'The header needs a choice.' })
+      await vi.waitFor(() => expect(report(header!.id).some(text => text.includes('"kind":"worker_report"'))).toBe(true))
+      expect(texts(host.runtime.masterId).some(text => text.includes(header!.id) && text.includes('worker_report'))).toBe(false)
+      // A child attention reaches the PM only; the PM can read the Ticket and its Project's Ticket list.
+      await host.runTool(footerSession, 'orchestrator_report', { state: 'progress', summary: 'Which footer?', human_action: 'Which footer?' })
+      await vi.waitFor(() => expect(report(footer!.id).some(text => text.includes('"kind":"worker_attention"'))).toBe(true))
+      expect(texts(host.runtime.masterId).some(text => text.includes(footer!.id) && text.includes('worker_attention'))).toBe(false)
+      expect(await host.runTool(project.pmSessionId, 'orchestrator_read', { resource: `ticket/${footer!.id}` }))
+        .toMatchObject({ ticket_id: footer!.id, attention: { question: 'Which footer?' } })
+      expect(await host.runTool(project.pmSessionId, 'orchestrator_read', { resource: `project/${project.id}/tickets` }))
+        .toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ ticket_id: footer!.id,
+          attention: expect.objectContaining({ question: 'Which footer?' }) })]) })
+      // The PM's Project report is relayed to the Router once, and a retry with the same text is idempotent.
+      await host.runTool(project.pmSessionId, 'orchestrator_project_report', { summary: 'Blocked on the footer choice.' })
+      await vi.waitFor(() => expect(texts(host.runtime.masterId).some(text => text.includes('"kind":"project_report"')
+        && text.includes(project.id))).toBe(true))
+      const projectReports = () => texts(host.runtime.masterId).filter(text => text.includes('"kind":"project_report"'))
+      expect(projectReports()).toHaveLength(1)
+      await host.runTool(project.pmSessionId, 'orchestrator_project_report', { summary: 'Blocked on the footer choice.' })
+      expect(projectReports()).toHaveLength(1)
+      // A Router-owned Ticket's report still goes to the main Session, not to the Project PM.
+      const normal = await host.acceptedTicket(feishu('52', '@bot fix a normal ticket'))
+      const normalSession = workerSessionId(normal.ticket.id)
+      await vi.waitFor(() => expect(host.tools.get(normalSession)).toBeDefined())
+      await host.runTool(normalSession, 'orchestrator_report', { state: 'blocked', summary: 'Normal ticket blocked.' })
+      await vi.waitFor(() => expect(texts(host.runtime.masterId).some(text => text.includes(normal.ticket.id)
+        && text.includes('"kind":"worker_report"'))).toBe(true))
+      expect(texts(project.pmSessionId).some(text => text.includes(normal.ticket.id))).toBe(false)
+    } finally { await host.stop() }
+  })
+
+  it('falls back to the main Session when a Project Ticket\'s PM Session is missing', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('53', 'Start a project with one Ticket')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Settings site', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      const result = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' }] }) as { tickets: { ticket_id: string }[] }
+      const ticket = host.runtime.store.tickets.get(result.tickets[0]!.ticket_id)!
+      const sessionId = workerSessionId(ticket.id)
+      await vi.waitFor(() => expect(host.tools.get(sessionId)).toBeDefined())
+      // Remove the PM Session: the Ticket's report must still reach the main Session.
+      host.agents.delete(project.pmSessionId)
+      await host.runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'No PM is loaded.' })
+      await vi.waitFor(() => expect(host.deliveries.mock.calls.some(([call]) => call.sessionId === host.runtime.masterId
+        && call.text.includes(ticket.id) && call.text.includes('"kind":"worker_report"'))).toBe(true))
+    } finally { await host.stop() }
+  })
 })

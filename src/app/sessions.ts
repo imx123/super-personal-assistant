@@ -96,12 +96,13 @@ export class Sessions {
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
-  /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
+  /** Registers ordered `relay` and `notice` effect handlers that deliver to the Session a payload names, or the main Session. */
   constructor(private readonly host: SessionsHost) {
     this.ctx = host.context
     this.agentDelivery = new AgentDelivery(host.context)
-    // Deliver relays and notices to the main Session in the order they were queued.
-    host.effects.handle('relay', ({ text, summary }, requestId) => this.prompt(host.masterId, requestId, text, summary ? { steer: summary } : 'steer'), { ordered: true })
+    // Deliver relays and notices in the order they were queued; a relay may name a Project PM instead of the main Session.
+    host.effects.handle('relay', ({ text, summary, sessionId }, requestId) =>
+      this.prompt(sessionId ?? host.masterId, requestId, text, summary ? { steer: summary } : 'steer'), { ordered: true })
     host.effects.handle('notice', ({ value, summary }, name) => this.inject(name, value, summary), { ordered: true })
   }
   /** Subscribes to host agent and session events so newly created sessions are decorated and model-budget retries are reflected in health. Call once at startup. */
@@ -190,9 +191,12 @@ export class Sessions {
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }
-  /** Enqueues a steering relay to the main Session; relays are durable and retried by `Effects` until delivered, at most once per `requestId`. */
-  relay(requestId: string, text: string, summary?: string): void {
-    this.host.effects.enqueue('relay', requestId, { text, ...(summary ? { summary } : {}) })
+  /**
+   * Enqueues a steering relay to `sessionId`, the main Session by default; relays are durable and retried by `Effects` until
+   * delivered, at most once per `requestId`.
+   */
+  relay(requestId: string, text: string, summary?: string, sessionId?: string): void {
+    this.host.effects.enqueue('relay', requestId, { text, ...(summary ? { summary } : {}), ...(sessionId ? { sessionId } : {}) })
   }
   /** Enqueues a durable background notice for injection into the main Session; a new notice with the same `name` replaces a still-waiting notice of that `name`. */
   notify(name: string, value: Record<string, unknown>, summary: string): void { this.host.effects.enqueue('notice', name, { value, summary }) }
