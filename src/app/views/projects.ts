@@ -19,6 +19,7 @@ export function projectRow(project: ProjectProfile, tickets: readonly Ticket[] =
     pmSessionId: project.pmSessionId,
     decisionId: project.decisionId, mandate: mandateOf(project.mandate),
     tickets: tickets.map(ticket => ({ id: ticket.id, title: ticket.title, threads: ticketThreads(ticket, threads) })),
+    ...(project.pendingNotes?.length ? { pendingNotes: project.pendingNotes } : {}),
     ...(report ? { latestReport: { summary: report.summary, at: report.at } } : {}),
     createdAt: project.createdAt, updatedAt: project.updatedAt }
 }

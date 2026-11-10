@@ -160,6 +160,15 @@ export interface PMMandate extends Mandate {
 }
 /** A PM's latest report on its Project, kept until its next report. */
 export interface ProjectReport { summary: string; at: string }
+/** A Project-level note for its PM's next turn: a child Worker Session was archived or restored outside the Project's own commands. */
+export interface ProjectNote {
+  id: string
+  at: string
+  kind: 'workerArchived' | 'workerRestored'
+  ticketId: string
+  sessionId: string
+  text: string
+}
 /**
  * A Project the Router created from one of its Triggers, and the PM Session that manages it: a small Router inside the
  * Project. It has a goal, its PM Mandate, the PM's latest report, and the Tickets its PM created (by `projectId`).
@@ -179,6 +188,8 @@ export interface ProjectProfile {
   mandate: PMMandate
   /** The latest report its PM recorded, if any. */
   latestReport?: ProjectReport
+  /** Notes the PM reads with its next prompt; cleared once that prompt is composed. */
+  pendingNotes?: ProjectNote[]
   createdAt: string
   updatedAt: string
 }

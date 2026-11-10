@@ -126,9 +126,11 @@ export function composeSkill(config: PromptConfig, name: string): string {
 /** The generated section that tells a PM which Project it manages, with the Router's mandate and its latest report. */
 export function pmProjectSection(project: ProjectProfile): string {
   const report = project.latestReport
+  const notes = project.pendingNotes ?? []
   return ['## Project', `Project: ${project.title} (${project.id})`, `Goal: ${project.goal}`,
     `Status: ${project.status}; mandate strength: ${project.mandate.strength}; mandate scope: ${project.mandate.scope}`,
     report ? `Latest report (${report.at}): ${report.summary}` : 'No report yet.',
+    ...notes.length ? ['Pending notes:', ...notes.map(note => `- ${note.kind}: ${note.text}`)] : [],
     'Manage this Project and record progress with orchestrator_project_report. Create its Tickets with '
       + 'orchestrator_project_ticket_create, inside this Project only; their workers start separately and you do no implementation yourself.'].join('\n')
 }

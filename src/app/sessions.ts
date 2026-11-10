@@ -332,6 +332,9 @@ export class Sessions {
       const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
       const mandate = current ? mandateInstructions(current.mandate) : ''
       const contextSection = latest ? `\n\n${pmProjectSection(latest)}` : ''
+      // The notes are in the section just composed; the PM's next prompt has now delivered them. Adding a note while PM is
+      // idle never wakes it, so this is the only point that consumes the queue.
+      if (latest?.pendingNotes?.length) this.deliverProjectNotes(latest.id, latest.pendingNotes.map(note => note.id))
       return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${mandate}${contextSection}`
     }, ...(master || project ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
@@ -421,6 +424,15 @@ export class Sessions {
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }
   /** Return the current prompt version, updating the agent's skills and recording the revision in Store when bound to a model request. */
+  /** Clear the notes whose text the PM's prompt section just carried, so they are delivered once and never wake it. */
+  private deliverProjectNotes(projectId: string, noteIds: readonly string[]): void {
+    const project = this.host.store.projects.get(projectId)
+    if (!project?.pendingNotes?.length) return
+    const pendingNotes = project.pendingNotes.filter(note => !noteIds.includes(note.id))
+    const updated = { ...project, ...pendingNotes.length ? { pendingNotes } : {}, updatedAt: new Date().toISOString() }
+    if (!pendingNotes.length) delete (updated as { pendingNotes?: unknown }).pendingNotes
+    this.host.store.projects.save(updated)
+  }
   private promptFor(agent: Agent, bind: boolean): PromptVersion {
     const version = this.host.prompts.current()
     if (!bind) return version

@@ -116,7 +116,7 @@ P2.4 只做 Project 的 active/paused/ended 状态、暂停/恢复、结束与�
 
 明确未做：Project 删除/归档、暂停项目内运行中的 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
-## P2.5-A 当前范围：Project/Ticket 归档核心
+## 已完成的 P2.5-A：Project/Ticket 归档核心
 
 P2.5-A 只做 Project/Ticket 的归档与取消归档、级联、管理 API/面板和 Router 工具；不做删除，不做 DSH 原生 archive 事件检测/pendingNotes（P2.5-B），不做 pause 新模式、PM 模型、PM→Worker 消息或 Project domain events。
 
@@ -141,6 +141,34 @@ P2.5-A 只做 Project/Ticket 的归档与取消归档、级联、管理 API/面�
 | `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 状态、归档/取消归档、Session 与级联语义 |
 
 明确未做：Project/Ticket 删除、DSH 原生 archive 事件检测/pendingNotes、pause 新模式、Project 暂停运行中 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+
+## P2.5-B 当前范围：DSH 原生归档联动 + Project pendingNotes
+
+P2.5-B 只做 DSH 原生 archive/unarchive 的应用联动与 PM pendingNotes；不做删除、pause soft/hard、PM 模型、PM→Worker 消息或 Project domain events。
+
+已实现：
+
+- `ArchiveReconciler`（`src/app/archive-reconcile.ts`）监听 Cordis `workspace/session-activity`（waterfall，必须 `return next()`）和 `workspace/session-stop`：只记录候选 session id、请求一次 reconcile，不在事件里改状态。
+- reconcile 以 `workspaceRegistry.archivedSessionIds` 为准，与 KV `archive/session-snapshot` 比较；事件即时触发，另有 30 秒 unref 定时兜底（unarchive 没有 DSH 事件）。只处理本插件的 `pm-<projectId>` / `worker-<ticketId>`。
+- 新增 archived：
+  - PM → `Engine.archiveProject` + `Sessions.archiveProject`，复用 P2.5-A 的 Project/Ticket/Session 级联。
+  - worker → 只结束当前 Assignment（`endedReason='sessionArchived'`），Ticket 保持 open、不自动 retry；所属 Project 加一条 `workerArchived` pendingNote；不唤醒 PM。
+- 从 archived 移除：PM → `Engine.unarchiveProject` + `Sessions.unarchiveProject`，恢复 `archivedFrom`；worker → 不改 Ticket/Assignment，不自动 retry，加一条可选的 `workerRestored` pendingNote。
+- `ProjectProfile.pendingNotes?: ProjectNote[]`（`{ id, at, kind, ticketId, sessionId, text }`），按确定性 id 去重。worker 归档时若 Project 已 archived 则不加 note；项目自身 archive 不会产生重复 note。
+- PM 下一次 prompt 通过 `pmProjectSection` 带上 pendingNotes，并在 prompt section 组合后立即清除/标记已投递；不主动唤醒 PM。`orchestrator_read project/<id>` 在投递前可见 pendingNotes。
+- 启动时 snapshot 缺失视为首次 reconcile，启动前已归档的 PM/worker 会被处理；至少已归档 PM 会令 Project 状态一致。P2.5-A 的 archive/unarchive 自调用可幂等重入，不产生二次级联或循环。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/app/archive-reconcile.ts`、`runtime.ts`、`kv.ts` | 事件监听、snapshot、30 秒兜底、启动 reconcile、`archive/session-snapshot` |
+| `src/core/model.ts`、`engine.ts`、`reasons.ts` | `ProjectNote`/`pendingNotes`、worker archive/unarchive 命令、`sessionArchived` |
+| `src/app/prompts.ts`、`sessions.ts`、`cards.ts`、`views/projects.ts` | PM prompt 注入并清除 notes、Project card/row 暴露 notes |
+| `tests/fixtures/host.ts`、`tests/archive-reconcile.spec.ts` | archived session 集与提示词 section 捕获、原生归档定向测试 |
+| `docs/001`、`docs/002`、`docs/007`、本文件 | 原生归档检测、snapshot、PM/worker 级联、pendingNotes、不唤醒/不重试 |
+
+明确未做：Project/Ticket 删除、pause soft/hard、PM 独立模型、PM→Worker 消息、Project domain events、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
 
 ## 主入口的权限模型
 
@@ -176,13 +204,14 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
-2026-11-10 在本机验证 P2.5-A：
+2026-11-10 在本机验证 P2.5-B：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 18 项全通过：P2.2/P2.3/P2.4 的建单、thread、幂等、回滚、身份、读范围、allow_tools、报告路由、pause/stop 全部保留；新增 archive 保存 `archivedFrom`、Project/Ticket archived、pending/running Assignment 置 ended `projectArchived`、archived 不能建单、unarchive 恢复 active/paused、清 Ticket archived 且不重试、结束后不能 archive、Router-owned Ticket 不受影响、PM/child Session archive/unarchive 调用（含 `stopActivity: true`）及失败结果。
-- `tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项全通过：面板 Archive/Unarchive、Pause/Resume/Stop 与确认；Project archive/unarchive 管理 API 走 Engine 并调用 Sessions，非允许来源/缺 header 仍 403。
-- 定向回归：`runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue`、`model-surface`（orchestrator 预算因两个归档工具调到 61,500，实测 60,840）通过。
-- 全量 62 个测试文件、1236 项：1188 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- 新增 `tests/archive-reconcile.spec.ts` 3 项全通过：`workspace/session-activity` waterfall 会 `return next()` 并触发 reconcile；PM 原生归档 → Project/child Ticket/child Session 归档，PM 取消归档 → 恢复 active；worker 原生归档 → 只结束当前 Assignment `sessionArchived`、Ticket 仍 open、恰好一条 `workerArchived` note、不新增 PM 投递；PM 下一次 prompt 包含并清除 note，重复 reconcile 不重复；worker 取消归档不改 Assignment、不自动 retry 并加 `workerRestored`；snapshot 缺失时已归档 PM 被 reconcile；项目自身 archive 不循环。
+- `tests/project-tickets.spec.ts` 18 项、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项仍全通过（P2.5-A 的 archive/unarchive、Session 调用/失败、API/panel 与同源 403 保留）。
+- `tests/model-surface.spec.ts` 通过，orchestrator 预算 61,500 未再变化。
+- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`prompts`（除既有绝对路径 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
+- 全量 63 个测试文件、1239 项：1191 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -192,10 +221,11 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
 4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
 5. P2.4 Project 状态与控制（已完成；不做删除/归档、不暂停项目内 Worker）
-6. P2.5-A Project/Ticket 归档核心（已完成；不做删除、原生 archive 事件检测、pendingNotes）
-7. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-8. 意外中断与恢复
-9. 再扩展新功能
+6. P2.5-A Project/Ticket 归档核心（已完成）
+7. P2.5-B DSH 原生归档联动 + pendingNotes（已完成；不做删除、pause soft/hard、PM 模型）
+8. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+9. 意外中断与恢复
+10. 再扩展新功能
 
 ## 文档说明
 

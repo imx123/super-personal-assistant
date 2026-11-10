@@ -31,6 +31,8 @@ export const KV = {
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID and whether the default User Session policy entry was seeded. */
   runtime: { masterId: record<string>('master-id'), mainSessionPolicySeeded: record<boolean>('main-session-policy-seeded') },
+  /** DSH archive reconciliation: the Session ids observed archived at the last reconcile. */
+  archive: { sessionSnapshot: record<string[]>('archive/session-snapshot') },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

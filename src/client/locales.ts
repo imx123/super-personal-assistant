@@ -634,6 +634,7 @@ const TEXT = {
   'reason.projectCreated': ['已创建项目 {project}', 'Created Project {project}'],
   'reason.projectTicketCreated': ['项目 PM 派工，已建项目工单 {project}', 'Delegated by the Project PM for Project {project}'],
   'reason.projectArchived': ['项目已归档', 'Project archived'],
+  'reason.sessionArchived': ['Worker Session 已归档', 'Worker Session archived'],
   'reason.explicitRouted': ['名单里的人明确请求，由主 Session 接单', 'Explicit request from someone on the list, accepted by the main Session'],
   'reason.legacyImport': ['从旧版工单记录导入', 'Imported from a legacy Ticket record'],
   'reason.channelGone': ['对话已无法接收消息', 'The conversation can no longer receive messages'],

@@ -1,7 +1,8 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, liveTicket, pmSessionId, threadKey, WORK_TOOLS } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger } from './model.ts'
+import { isoTime, latestAssignment, liveTicket, pmSessionId, threadKey, WORK_TOOLS } from './model.ts'
+import type { ChannelRef, Decision, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger }
+  from './model.ts'
 import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -342,6 +343,50 @@ export class Engine {
         this.repo.tickets.save(ticket)
       }
       return restored
+    })
+  }
+
+  /**
+   * A child Worker Session was archived outside the Project's own commands: end its current Assignment with
+   * `sessionArchived`, leave the Ticket open, and add one pending note for the PM's next prompt. It does not start or wake
+   * anything. A Ticket already archived with its Project is left alone, so a Project archive produces no duplicate note.
+   */
+  workerSessionArchived(ticketId: string, sessionId: string, at = new Date().toISOString()): void {
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.archived) return
+      const assignment = latestAssignment(ticket)
+      if (assignment && assignment.state !== 'ended') {
+        assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'sessionArchived'
+        ticket.updatedAt = at
+        this.repo.tickets.save(ticket)
+        this.options.executor.stop(ticket, assignment, 'sessionArchived')
+      }
+      if (!liveTicket(ticket)) return
+      const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
+      if (!project || project.status === 'archived') return
+      const id = key('project-note', project.id, 'workerArchived', ticket.id, sessionId)
+      if (project.pendingNotes?.some(note => note.id === id)) return
+      const note: ProjectNote = { id, at, kind: 'workerArchived', ticketId: ticket.id, sessionId,
+        text: `Worker Session archived; "${ticket.title}" stays open with no automatic retry.` }
+      this.repo.projects.save({ ...project, pendingNotes: [...project.pendingNotes ?? [], note], updatedAt: at })
+    })
+  }
+  /**
+   * A child Worker Session was unarchived outside the Project's own commands: leave the Ticket and Assignment as they are
+   * and add an optional pending note for the PM. It never restarts the Assignment.
+   */
+  workerSessionUnarchived(ticketId: string, sessionId: string, at = new Date().toISOString()): void {
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.archived || !liveTicket(ticket)) return
+      const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
+      if (!project || project.status === 'archived') return
+      const id = key('project-note', project.id, 'workerRestored', ticket.id, sessionId)
+      if (project.pendingNotes?.some(note => note.id === id)) return
+      const note: ProjectNote = { id, at, kind: 'workerRestored', ticketId: ticket.id, sessionId,
+        text: `Worker Session restored; "${ticket.title}" was not retried automatically.` }
+      this.repo.projects.save({ ...project, pendingNotes: [...project.pendingNotes ?? [], note], updatedAt: at })
     })
   }
 

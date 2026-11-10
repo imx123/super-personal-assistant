@@ -39,6 +39,8 @@ export function projectCard(project: ProjectProfile, tickets: readonly Ticket[] 
   return { project_id: project.id, title: project.title, goal: project.goal, status: project.status,
     pm_session_id: project.pmSessionId, decision_id: project.decisionId, mandate: { strength: project.mandate.strength, scope: project.mandate.scope },
     ...(tickets.length ? { ticket_ids: tickets.map(ticket => ticket.id) } : {}),
+    ...(project.pendingNotes?.length ? { pending_notes: project.pendingNotes.map(note => ({ at: note.at, kind: note.kind,
+      ticket_id: note.ticketId, session_id: note.sessionId, text: note.text })) } : {}),
     ...(report ? { latest_report: { at: report.at, summary: report.summary } } : {}), read: `project/${project.id}` }
 }
 /** A Project Ticket card with the external Threads it subscribes to, as its PM sees it after creating the Ticket. */

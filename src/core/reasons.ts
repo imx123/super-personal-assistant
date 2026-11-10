@@ -26,6 +26,7 @@ export const REASONS = {
   projectCreated: 'Created Project {project}',
   projectTicketCreated: 'Delegated Ticket for Project {project}',
   projectArchived: 'Project archived',
+  sessionArchived: 'Worker Session archived',
 } as const
 export type ReasonCode = keyof typeof REASONS
 /** Reason code and template values; `triggerId` identifies the trigger in a batch that the reason applies to. */
