@@ -273,7 +273,7 @@ describe('a Project PM Session through the runtime', () => {
     } finally { await host.stop() }
   })
 
-  it('falls back to the main Session when a Project Ticket\'s PM Session is missing', async () => {
+  it('falls back to the main Session when its Project has ended', async () => {
     const host = await startRuntime()
     try {
       const request = feishu('53', 'Start a project with one Ticket')
@@ -287,9 +287,9 @@ describe('a Project PM Session through the runtime', () => {
       const ticket = host.runtime.store.tickets.get(result.tickets[0]!.ticket_id)!
       const sessionId = workerSessionId(ticket.id)
       await vi.waitFor(() => expect(host.tools.get(sessionId)).toBeDefined())
-      // Remove the PM Session: the Ticket's report must still reach the main Session.
-      host.agents.delete(project.pmSessionId)
-      await host.runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'No PM is loaded.' })
+      // End the Project: the Ticket's report must still reach the main Session.
+      host.runtime.store.projects.save({ ...project, status: 'ended' as ProjectProfile['status'] })
+      await host.runTool(sessionId, 'orchestrator_report', { state: 'blocked', summary: 'The Project ended.' })
       await vi.waitFor(() => expect(host.deliveries.mock.calls.some(([call]) => call.sessionId === host.runtime.masterId
         && call.text.includes(ticket.id) && call.text.includes('"kind":"worker_report"'))).toBe(true))
     } finally { await host.stop() }

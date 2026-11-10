@@ -102,8 +102,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const updated = host.engine.report(ticketId, report)
           const relay = reportRelay(updated, report)
           const project = updated.projectId ? host.store.projects.get(updated.projectId) : undefined
-          const pmLoaded = !!project && !!host.resources.context.agents.get(project.pmSessionId as SessionId)
-          const target = relaySession(updated, project, pmLoaded)
+          const target = relaySession(updated, project)
           if (relay) host.sessions.relay(relay.id, relay.text, undefined, target)
           const notification = relay ? target ? 'project_pm' : 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }

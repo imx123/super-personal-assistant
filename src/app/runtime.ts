@@ -180,8 +180,7 @@ export class Runtime extends Service implements SourceHost {
               && !ended.assignments.some(item => item.endedAt === ended.ended?.at)) {
               const relay = executionStatus(ended, 'cancel_ticket', workerSessionId(ended.id), ended.ended.at, ended.assignments.at(-1)?.id)
               const project = ended.projectId ? store.projects.get(ended.projectId) : undefined
-              const pmLoaded = !!project && !!ctx.agents.get(project.pmSessionId as SessionId)
-              sessions.relay(relay.id, relay.text, relay.summary, relaySession(ended, project, pmLoaded))
+              sessions.relay(relay.id, relay.text, relay.summary, relaySession(ended, project))
             }
           }
         } })

@@ -435,13 +435,12 @@ export class DshExecutor implements Executor {
     })
   }
   /**
-   * Relay a report about `ticket` to its Session: a Project Ticket goes to its active Project's loaded PM, so the Router is
-   * not told about every child report; any other Ticket, or one whose PM is missing, goes to the main Session.
+   * Relay a report about `ticket` to its Session: a Project Ticket goes to its active Project's PM, so the Router is not told
+   * about every child report; any other Ticket, or one whose Project ended, goes to the main Session.
    */
   private relay({ id, text, summary }: Relay, ticket: Ticket): void {
     const project = ticket.projectId ? this.host.store.projects.get(ticket.projectId) : undefined
-    const pmLoaded = !!project && !!this.host.context.agents.get(project.pmSessionId as SessionId)
-    const sessionId = relaySession(ticket, project, pmLoaded)
+    const sessionId = relaySession(ticket, project)
     if (summary) this.host.sessions.relay(id, text, summary, sessionId)
     else this.host.sessions.relay(id, text, undefined, sessionId)
   }
