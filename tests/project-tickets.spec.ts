@@ -345,6 +345,13 @@ describe('a Project PM Session through the runtime', () => {
       const prompt = host.sections.get(project.pmSessionId)!({})
       expect(prompt).toContain('resumedFromHard')
       expect(host.runtime.store.projects.get(project.id)?.pendingNotes).toBeUndefined()
+      // An archived Project is history: pausing it sends no PM notice and cancels no Session.
+      await host.api('POST', `projects/${project.id}/archive`)
+      const archivedPauses = pmPauses().length
+      const archivedPause = (await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'soft' })).body as
+        { sessions: { delivered: boolean } }
+      expect(archivedPause.sessions.delivered).toBe(false)
+      expect(pmPauses()).toHaveLength(archivedPauses)
     } finally { await host.stop() }
   })
 

@@ -213,6 +213,8 @@ export class Sessions {
    */
   async pauseProject(project: ProjectProfile, mode: 'soft' | 'hard'): Promise<ProjectPauseResult> {
     const result: ProjectPauseResult = { delivered: false, cancelled: [], notLoaded: [], failures: [] }
+    // An ended or archived Project is history; pause/resume must not message or cancel its Sessions.
+    if (project.status !== 'active' && project.status !== 'paused') return result
     const actual = project.pauseMode ?? mode
     if (actual === 'hard') {
       for (const sessionId of this.projectSessions(project)) {
