@@ -65,18 +65,18 @@ P2.2b 只做“可选工具白名单”，不做 capability 档、不做 `denyTo
 
 明确未做：Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
-## P2.3 当前范围：child 报告回 PM + PM 项目汇报回 Router
+## 已完成的 P2.3：child 报告回 PM + PM 项目汇报回 Router
 
 P2.3 做报告路由和 PM 项目汇报；不做 Project 暂停/停止，不做 PM 直接回答 child attention。
 
 已实现：
 
 - `relay` effect payload 增加可选 `sessionId`；`Sessions.relay(requestId, text, summary?, sessionId?)` 默认主 Session。`relay` handler 把消息投到 payload 指定的 Session，request id 仍负责幂等。
-- `DshExecutor.relay` 接收当前 Ticket：`ticket.projectId` 存在、Project 为 active 且 PM Session 已加载时发到 `project.pmSessionId`，否则回主 Session。`failed`、turn end/waiting、`resultRelay`、`reportRelay` 的 `worker_report` / `worker_attention`、`executionStatus`（stop 回执）都走这一路由。
+- `DshExecutor.relay` 接收当前 Ticket：`ticket.projectId` 存在且 Project 为 active/paused 时发到 `project.pmSessionId`，否则回主 Session。`failed`、turn end/waiting、`resultRelay`、`reportRelay` 的 `worker_report` / `worker_attention`、`executionStatus`（stop 回执）都走这一路由。
 - Worker 的 `orchestrator_report` 也使用同一路由；child 的 `worker_report` / `worker_attention` 只到 PM，主 Session 不收。child ticket 的 `ticket.ended` notice 也不再发主 Session。
 - `orchestrator_project_report` 仍写 `ProjectProfile.latestReport`，同时向主 Session relay 一条结构化 `project_report`：`project_id`、`title`、`status`、`summary`、`at`、`read`；request id 由 project id + summary 派生，重复提交同文本不会重复打扰 Router。Project 页仍读 `latestReport`。
 - PM 已可读 child `ticket/<id>` 和 `project/<id>/tickets`；child attention 到达 PM 后，PM 可在项目汇报里标出 blocker，本轮不提供直接回答 child 的半套工具。
-- Router-owned Ticket 的报告仍去主 Session；Project Ticket 的 PM Session 不存在时 fallback 到主 Session（已定义）。
+- Router-owned Ticket 的报告仍去主 Session；Project Ticket 所属 Project 为 ended（或不存在）时 fallback 到主 Session（已定义）。
 
 改动文件：
 
@@ -89,6 +89,32 @@ P2.3 做报告路由和 PM 项目汇报；不做 Project 暂停/停止，不做 
 | `tests/project-tickets.spec.ts` | child report/attention 到 PM、主 Session 不收、PM report 到主 Session 且幂等、Router Ticket 回归、PM 缺失 fallback |
 
 明确未做：PM 直接回答 child attention、Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+
+## P2.4 当前范围：Project 状态与控制
+
+P2.4 只做 Project 的 active/paused/ended 状态、暂停/恢复、结束与级联停止；不做 Project 删除/归档，不暂停项目内运行中的 Worker，不做 PM 独立模型或 Fast Router/Memory。
+
+已实现：
+
+- `ProjectProfile.status` 扩为 `'active' | 'paused' | 'ended'`。
+- `Engine.createProjectTickets` 只在 active 时建单：paused 抛 `projectPaused`，ended 抛 `projectEnded`，两者都整批不建。PM 的 `orchestrator_project_ticket_create` 同样得到明确拒绝。
+- `Engine.pauseProject(projectId, paused)`：active ↔ paused 幂等；ended 不变更（保持 ended）。paused 只阻止新 Ticket，已有 child Ticket 继续运行并继续把报告送到 PM。
+- `Engine.stopProject(projectId, reason?)`：幂等；把 Project 置 ended，并对所有仍 open、`projectId` 匹配的 child Ticket 调用现有 `Tickets.stop` 语义，保留历史/Session/执行目录；已 ended 直接返回。不删除 Project。
+- 管理 API：`POST projects/:id/pause` body `{ paused: boolean }`、`POST projects/:id/stop`；沿用同源/header 校验，非允许来源仍 403。只给 management API/面板，不新增 PM/Worker 工具，PM 不能自己 pause/stop。
+- 面板 Project 详情加 Pause/Resume 与 Stop（Stop 用现有 ConfirmButton 确认）；状态文案补 paused/ended；停止后页面仍可读，PM Session 保留可查看，未取消。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/core/model.ts`、`engine.ts`、`errors.ts` | Project 状态联合类型、`pauseProject` / `stopProject`、级联停止、`projectPaused` |
+| `src/app/api.ts`、`http.ts`、`views/projects.ts` | pause/stop management API；Project 读模型 |
+| `src/client/projects.tsx`、`locales.ts` | Project 页 Pause/Resume/Stop、确认框、paused/ended 文案 |
+| `src/app/notices.ts` | paused Project 的 child 报告仍送 PM；ended 才 fallback |
+| `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | Project 状态、控制、级联语义 |
+| `tests/project-tickets.spec.ts`、`tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/http.spec.ts` | pause/resume/stop、级联、paused 建单拒绝、API/panel 控制与同源 403 |
+
+明确未做：Project 删除/归档、暂停项目内运行中的 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
 ## 主入口的权限模型
 
@@ -122,12 +148,13 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 ## 验证
 
-2026-11-10 在本机验证 P2.3：
+2026-11-10 在本机验证 P2.4：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 12 项全通过：P2.2a/P2.2b 的建单、thread、幂等、回滚、身份、读范围、allow_tools 全部保留；新增两张 child Ticket 的 report 都到 PM 且主 Session 不收、child attention 只到 PM 且 PM 可读 `ticket/<id>` 与 `project/<id>/tickets`、PM 的 `project_report` 到主 Session 且重复同文本只投一次、Router-owned Ticket report 仍到主 Session、PM Session 缺失时 fallback 到主 Session。
-- 定向回归：`runtime`（除既有的 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 全通过；P2.2b 的 `allow_tools` restrict 实测仍通过。
-- 全量 62 个测试文件、1227 项：1179 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- `tests/project-tickets.spec.ts` 14 项全通过：P2.2/P2.3 的建单、thread、幂等、回滚、身份、读范围、allow_tools、报告路由全部保留；新增 pause/resume 幂等、paused 建单 `projectPaused`、resume 后可建、paused 时 child 报告仍到 PM、stop 置 ended 并级联停止全部 open child Ticket、重复 stop 幂等、ended 不能建单、Router-owned Ticket 不受影响、ended 时报告 fallback。
+- `tests/panel-project.spec.tsx` 2 项、`tests/http.spec.ts` 5 项全通过：面板 Pause/Resume/Stop（Stop 确认）、状态文案；Project pause/stop 管理 API 走 Engine，非允许来源/缺 header 仍 403。
+- 定向回归：`runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
+- 全量 62 个测试文件、1231 项：1183 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -136,9 +163,10 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（已完成）
 3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
 4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
-5. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-6. 意外中断与恢复
-7. 再扩展新功能
+5. P2.4 Project 状态与控制（已完成；不做删除/归档、不暂停项目内 Worker）
+6. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+7. 意外中断与恢复
+8. 再扩展新功能
 
 ## 文档说明
 

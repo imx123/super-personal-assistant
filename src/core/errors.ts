@@ -7,6 +7,7 @@ export const USER_ERRORS = {
   unknownAssignment: ['missing', 'Unknown assignment'],
   notProjectPm: ['refused', 'Only this Project\'s PM Session may create its Tickets'],
   projectEnded: ['refused', 'This Project has ended; no new Ticket can be created'],
+  projectPaused: ['refused', 'This Project is paused; resume it before creating more Tickets'],
   invalidProjectTask: ['refused', 'Invalid Project ticket task: {reason}'],
   invalidThread: ['refused', 'Invalid thread reference: {thread}'],
   duplicateWorktree: ['refused', 'Duplicate worktree name in this request: {name}'],

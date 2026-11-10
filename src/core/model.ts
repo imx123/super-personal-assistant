@@ -168,7 +168,8 @@ export interface ProjectProfile {
   id: string
   title: string
   goal: string
-  status: 'active'
+  /** Active Projects create Tickets; paused ones keep their existing Tickets but create no new one; ended ones are read-only history. */
+  status: 'active' | 'paused' | 'ended'
   /** The `project` Decision that created it. */
   decisionId: string
   /** The Session id of its PM, `pm-<projectId>`. */

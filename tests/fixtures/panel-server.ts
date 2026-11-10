@@ -331,6 +331,18 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET tickets/:id': { answer: ({ params }) => server.ticketDetails[params.id] ?? refuse(404, 'Ticket not found') },
   'GET projects': { answer: () => ({ items: server.projects, total: server.projects.length }) },
   'GET projects/:id': { answer: ({ params }) => server.projects.find(project => project.id === params.id) ?? refuse(404, 'Project not found') },
+  'POST projects/:id/pause': { body: true, answer: ({ params, body }) => {
+    const project = server.projects.find(item => item.id === params.id)
+    if (!project) return refuse(404, 'Project not found')
+    if (project.status !== 'ended') project.status = body.paused ? 'paused' : 'active'
+    return { paused: project.status === 'paused' }
+  } },
+  'POST projects/:id/stop': { answer: ({ params }) => {
+    const project = server.projects.find(item => item.id === params.id)
+    if (!project) return refuse(404, 'Project not found')
+    project.status = 'ended'
+    return { stopped: true }
+  } },
   'POST tickets/:id/retry': { answer: ({ params }) => {
     const ticket = ticketOf(params.id)
     if (!ticket) return refuse(404, 'Ticket not found')

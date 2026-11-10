@@ -197,6 +197,11 @@ function routes(runtime: HttpHost): Routes {
       if (!project) throw new RouteError(404, 'Project not found')
       return project
     },
+    'POST projects/:id/pause': async ({ params, body }) => {
+      const { paused } = z.object({ paused: z.boolean() }).strict().parse(await body())
+      return { paused: runtime.engine.pauseProject(params.id, paused).status === 'paused' }
+    },
+    'POST projects/:id/stop': ({ params }) => { runtime.engine.stopProject(params.id); return { stopped: true } },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST tickets/:id/assignment/stop': async ({ params, body }) => {

@@ -209,8 +209,9 @@ export class Engine {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
-      if (project.status !== 'active') throw new UserError('projectEnded')
       if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
       if (!tasks || !Array.isArray(tasks) || !tasks.length) throw new UserError('invalidProjectTask', { reason: 'give 1 to 5 tasks' })
       if (tasks.length > PROJECT_TICKETS.max) throw new UserError('invalidProjectTask', { reason: `at most ${PROJECT_TICKETS.max} tasks` })
       const inheritedTools = project.mandate.allowTools?.length ? project.mandate.allowTools : undefined
@@ -253,6 +254,41 @@ export class Engine {
       const reported: ProjectProfile = { ...project, latestReport: { summary, at }, updatedAt: at }
       this.repo.projects.save(reported)
       return reported
+    })
+  }
+
+  /**
+   * Pause or resume a Project: active ↔ paused only. An ended Project ignores the change and stays ended.
+   * Existing child Tickets continue; only new Tickets are blocked while paused.
+   * @throws UserError when the Project is unknown.
+   */
+  pauseProject(projectId: string, paused: boolean): ProjectProfile {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.status === 'ended') return project
+      const status = paused ? 'paused' as const : 'active' as const
+      if (project.status === status) return project
+      const updated: ProjectProfile = { ...project, status, updatedAt: this.options.now?.() ?? new Date().toISOString() }
+      this.repo.projects.save(updated)
+      return updated
+    })
+  }
+  /**
+   * End a Project and cascade-stop every still-open Ticket it owns, using the ordinary Ticket stop semantics so history,
+   * Sessions and directories stay. It is idempotent: an ended Project returns unchanged.
+   * @throws UserError when the Project is unknown.
+   */
+  stopProject(projectId: string, reason?: string): ProjectProfile {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.status === 'ended') return project
+      const updated: ProjectProfile = { ...project, status: 'ended', updatedAt: this.options.now?.() ?? new Date().toISOString() }
+      this.repo.projects.save(updated)
+      // The Project is ended first, so child lifecycle notices and relays fall back instead of pretending it is active.
+      for (const ticket of this.repo.tickets.open()) if (ticket.projectId === projectId) this.tickets.stop(ticket.id, reason)
+      return updated
     })
   }
 
@@ -442,7 +478,8 @@ export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'cre
 /** What a Project's PM Session asks of the Engine. */
 export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets'>
 /** What people ask of the Engine, through the panel or the main Session. */
-export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
+export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
+  | 'pauseProject' | 'stopProject'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */

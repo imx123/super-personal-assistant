@@ -165,6 +165,39 @@ describe('PM-created Project Tickets', () => {
     expect(h.repo.tickets.list()).toEqual([])
   })
 
+  it('pauses and resumes a Project idempotently, refusing new Tickets only while paused', () => {
+    const h = harness()
+    const paused = h.engine.pauseProject(h.project.id, true)
+    expect(paused.status).toBe('paused')
+    expect(h.engine.pauseProject(h.project.id, true)).toEqual(paused)
+    expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectPaused'))
+    expect(h.repo.tickets.list()).toEqual([])
+    const resumed = h.engine.pauseProject(h.project.id, false)
+    expect(resumed.status).toBe('active')
+    expect(h.engine.pauseProject(h.project.id, false)).toEqual(resumed)
+    expect(h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toHaveLength(2)
+    expect(() => h.engine.pauseProject('missing', true)).toThrow(new UserError('unknownProject'))
+  })
+
+  it('ends a Project and cascades its stop to open Project Tickets only, idempotently', () => {
+    const h = harness()
+    const [first, second] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
+    h.engine.recordTriggerForRouting(trigger('p2'))
+    const normal = h.engine.decide('p2', { kind: 'accept', title: 'Normal work', scope: 'normal', reason: 'requested',
+      acknowledgement: 'ok', name: 'normal-work' })
+    const stopped = h.engine.stopProject(h.project.id, 'projectStoppedByPerson')
+    expect(stopped.status).toBe('ended')
+    for (const ticket of [first!, second!]) {
+      expect(h.repo.tickets.get(ticket.id)).toMatchObject({ ended: { by: 'human', outcome: 'stopped', reason: 'projectStoppedByPerson' } })
+    }
+    expect(h.repo.tickets.get(normal.ticketId!)).not.toHaveProperty('ended')
+    const again = h.engine.stopProject(h.project.id)
+    expect(again.status).toBe('ended')
+    expect(h.repo.tickets.list().filter(ticket => ticket.projectId === h.project.id)).toHaveLength(2)
+    expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectEnded'))
+    expect(h.engine.pauseProject(h.project.id, true).status).toBe('ended')
+  })
+
   it('revalidates a delegated Mandate without an external allowed list', () => {
     const h = harness()
     const settings = SettingsSchema.parse({})
@@ -245,6 +278,10 @@ describe('a Project PM Session through the runtime', () => {
       await host.runTool(headerSession, 'orchestrator_report', { state: 'blocked', summary: 'The header needs a choice.' })
       await vi.waitFor(() => expect(report(header!.id).some(text => text.includes('"kind":"worker_report"'))).toBe(true))
       expect(texts(host.runtime.masterId).some(text => text.includes(header!.id) && text.includes('worker_report'))).toBe(false)
+      // Pausing stops new Tickets only; the existing child's reports still reach the PM.
+      expect(host.runtime.engine.pauseProject(project.id, true).status).toBe('paused')
+      await host.runTool(headerSession, 'orchestrator_report', { state: 'blocked', summary: 'Still blocked while paused.' })
+      await vi.waitFor(() => expect(report(header!.id).some(text => text.includes('Still blocked while paused.'))).toBe(true))
       // A child attention reaches the PM only; the PM can read the Ticket and its Project's Ticket list.
       await host.runTool(footerSession, 'orchestrator_report', { state: 'progress', summary: 'Which footer?', human_action: 'Which footer?' })
       await vi.waitFor(() => expect(report(footer!.id).some(text => text.includes('"kind":"worker_attention"'))).toBe(true))

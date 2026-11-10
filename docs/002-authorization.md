@@ -77,9 +77,18 @@ The PM creates Tickets only inside its own Project, never arbitrary work, with `
 - Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call reuses the Ticket each task position already produced.
 - The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.
 
+### Project status and controls
+
+A Project is `active`, `paused` or `ended`.
+
+- Only an active Project creates Tickets. `createProjectTickets` reports `projectPaused` while paused and `projectEnded` after the end, and creates nothing in either case. The PM tool surfaces the same refusal.
+- Pausing or resuming changes only the Project status: an active Project becomes paused, a paused one becomes active again, and repeating the same request changes nothing. Existing child Tickets keep running and their reports still reach the PM while paused.
+- Ending a Project is idempotent and cascades to every still-open Ticket it owns, using the ordinary Ticket stop semantics: each ends as stopped by a person, its history, Session and directory stay. An already ended Project returns unchanged. The Project is not deleted.
+- Pause and stop are management operations on `POST projects/:id/pause` and `POST projects/:id/stop`, available only through the same-origin management API and panel. Neither the PM nor a Worker has a tool for them. After a Project ends its page remains readable and its PM Session is kept for viewing.
+
 ### Report routing
 
-A Worker's status reports, questions for a person, failure receipts, turn-end notices and stop receipts are relays. A Router-owned Ticket's relays go to the main Session, as before. A Project Ticket's relays go to its Project's PM Session (`project.pmSessionId`) while the Project is active and that PM Session is loaded; otherwise they fall back to the main Session. The main Session therefore receives no child `worker_report` or `worker_attention`, and child lifecycle notices are not sent to it.
+A Worker's status reports, questions for a person, failure receipts, turn-end notices and stop receipts are relays. A Router-owned Ticket's relays go to the main Session, as before. A Project Ticket's relays go to its Project's PM Session (`project.pmSessionId`) while the Project is active or paused; an ended Project, or a Project that is gone, falls back to the main Session. The PM Session need not be loaded yet: the relay handler resolves it through DSH. The main Session therefore receives no child `worker_report` or `worker_attention`, and child lifecycle notices are not sent to it.
 
 The PM reads a child's report or attention with `orchestrator_read ticket/<id>` and its Project's child list with `project/<id>/tickets`. If a child attention needs a person, the PM records the blocker in `orchestrator_project_report`; it does not answer the child directly in this phase. Each Project report is also relayed to the main Session once as a structured `project_report` (`project_id`, `title`, `status`, `summary`, `at`, `read`), with an idempotent request id, while the Project's `latestReport` remains what the Project page shows. The Router thus receives Project-level reports, not every child report.
 

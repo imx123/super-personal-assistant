@@ -80,6 +80,25 @@ it('answers only a same-origin request from the panel on the loopback address', 
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
 })
 
+it('protects the Project control routes with the same-origin rule and calls their Engine commands', async () => {
+  const calls: unknown[] = []
+  const call = serve({ engine: {
+    pauseProject: (id: string, paused: boolean) => { calls.push(['pause', id, paused]); return { status: paused ? 'paused' : 'active' } },
+    stopProject: (id: string) => { calls.push(['stop', id]); return { status: 'ended' } },
+  } })
+  const body = { paused: true }
+  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { origin: 'http://evil.example' }]) {
+    expect(await call('POST', 'projects/p1/pause', body, headers), JSON.stringify(headers)).toEqual({ status: 403,
+      body: { error: 'Same-origin management request required' } })
+    expect(await call('POST', 'projects/p1/stop', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
+      body: { error: 'Same-origin management request required' } })
+  }
+  const allowed = { host: 'localhost:3082', origin: 'http://localhost:3082' }
+  expect(await call('POST', 'projects/p1/pause', body, allowed)).toEqual({ status: 200, body: { paused: true } })
+  expect(await call('POST', 'projects/p1/stop', undefined, allowed)).toEqual({ status: 200, body: { stopped: true } })
+  expect(calls).toEqual([['pause', 'p1', true], ['stop', 'p1']])
+})
+
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {
   const saves: unknown[] = []
   const call = serve({

@@ -35,6 +35,8 @@ export interface Api {
   'GET tickets/:id': { response: TicketPageView }
   'GET projects': { response: ProjectListView }
   'GET projects/:id': { response: ProjectRow }
+  'POST projects/:id/pause': { body: { paused: boolean }; response: { paused: boolean } }
+  'POST projects/:id/stop': { response: { stopped: true } }
   'POST tickets/:id/retry': { response: { retried: true } }
   'POST tickets/:id/stop': { response: { stopped: true } }
   'POST tickets/:id/assignment/stop': { body: { assignmentId: string }; response: { stopped: true } }

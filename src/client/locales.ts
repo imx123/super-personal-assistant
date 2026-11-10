@@ -121,6 +121,14 @@ const TEXT = {
   'tab.execution': ['执行', 'Execution'],
   'tab.project': ['项目', 'Projects'],
   'projectStatus.active': ['进行中', 'Active'],
+  'projectStatus.paused': ['已暂停', 'Paused'],
+  'projectStatus.ended': ['已结束', 'Ended'],
+  pauseProject: ['暂停项目', 'Pause Project'],
+  resumeProject: ['恢复项目', 'Resume Project'],
+  stopProject: ['停止项目', 'Stop Project'],
+  stopProjectTitle: ['停止项目', 'Stop Project'],
+  stopProjectConfirm: ['停止“{title}”？项目会标记为结束，所有仍打开的工单会停止；历史、Session 和执行目录保留。',
+    'Stop "{title}"? The Project is marked ended and every open Ticket is stopped; history, Sessions and directories stay.'],
   projectsIntro: ['主 Session 委派给项目 PM 管理的工作。', 'Work the main Session delegated to a Project PM.'],
   projectsEmpty: ['还没有项目。', 'No Projects yet.'],
   projectNotFound: ['找不到这个项目。', 'Project not found.'],
@@ -713,6 +721,7 @@ const TEXT = {
   'userError.unknownProject': ['找不到这个项目。', USER_ERRORS.unknownProject[1]],
   'userError.notProjectPm': ['只有这个项目自己的 PM Session 才能创建项目内工单。', USER_ERRORS.notProjectPm[1]],
   'userError.projectEnded': ['这个项目已结束，不能再创建工单。', USER_ERRORS.projectEnded[1]],
+  'userError.projectPaused': ['这个项目已暂停；恢复后才能继续创建工单。', USER_ERRORS.projectPaused[1]],
   'userError.invalidProjectTask': ['项目工单任务无效：{reason}', USER_ERRORS.invalidProjectTask[1]],
   'userError.invalidThread': ['线程引用无效：{thread}', USER_ERRORS.invalidThread[1]],
   'userError.duplicateWorktree': ['同一请求里的 worktree 名称重复：{name}', USER_ERRORS.duplicateWorktree[1]],
@@ -796,7 +805,7 @@ export const GLOSSARY_VALUES = {
   decision: ['decision.accept', 'decision.reopen', 'decision.stop', 'decision.ignore', 'decision.project', 'decision.delegated', 'decision.unavailable'], strength: ['strength.explicit', 'strength.inferred'],
   ticket: ['stage.answer', 'stage.review', 'stage.blocked', 'stage.failed', 'stage.delivery', 'stage.queued', 'stage.working', 'stage.idle', 'ticket.ended'],
   assignment: ['assignment.pending', 'assignment.running', 'assignment.ended'], report: ['report.progress', 'report.waiting', 'report.ready', 'report.blocked', 'report.failed', 'report.dropped'],
-  projectStatus: ['projectStatus.active'],
+  projectStatus: ['projectStatus.active', 'projectStatus.paused', 'projectStatus.ended'],
 } as const
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {

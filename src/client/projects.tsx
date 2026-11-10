@@ -1,8 +1,13 @@
-/** Project tab: the Projects the Router created, and one Project's goal, PM Session and latest report. */
-import { ApiError, usePoll } from './api.ts'
-import { usePanel } from './provider.tsx'
+/** Project tab: the Projects the Router created, and one Project's goal, PM Session, latest report and controls. */
+import { ApiError, usePoll, type ProjectRow } from './api.ts'
+import { Button, Icon } from './controls.tsx'
+import { useAction, usePanel } from './provider.tsx'
 import { valueLabel } from './text.ts'
-import { Hint, KeyValues, LoadState, MarkdownLite, PageHead, Section, SessionButton, When } from './widgets.tsx'
+import { ConfirmButton, Hint, KeyValues, LoadState, MarkdownLite, PageHead, Section, SessionButton, When } from './widgets.tsx'
+
+/** The status dot tone for a Project state: running, paused, or ended history. */
+const projectTone = (status: ProjectRow['status']): 'ongoing' | 'warning' | 'idle' =>
+  status === 'paused' ? 'warning' : status === 'ended' ? 'idle' : 'ongoing'
 
 function ProjectList() {
   const { t, call, navigate } = usePanel()
@@ -17,7 +22,7 @@ function ProjectList() {
           <button type="button" className="dt-open" onClick={() => navigate({ page: 'project', id: project.id })}>{project.title}</button>
         </div>
         <div className="dt-row-meta">
-          <span className="dt-status-text">{valueLabel(t, 'projectStatus', project.status)}</span>
+          <span className="dt-status-text" data-state={projectTone(project.status)}>{valueLabel(t, 'projectStatus', project.status)}</span>
           <span>{project.goal}</span>
           <When at={project.updatedAt} />
         </div>
@@ -29,16 +34,30 @@ function ProjectList() {
 
 function ProjectPage({ id }: { id: string }) {
   const { t, call, navigate } = usePanel()
-  const { data, error } = usePoll(() => call('GET projects/:id', { id }), [id])
+  const { data, error, reload } = usePoll(() => call('GET projects/:id', { id }), [id])
+  const pause = useAction(async () => {
+    await call('POST projects/:id/pause', { id, body: { paused: data?.status === 'active' } })
+  }, { reload })
+  const stop = useAction(async () => { await call('POST projects/:id/stop', { id }) }, { reload })
   if (!data) return <>
     <PageHead title={t('term.project')} />
     {error instanceof ApiError && error.missing ? <Hint>{t('projectNotFound')}</Hint> : <LoadState error={error} loading />}
   </>
   const report = data.latestReport
   return <>
-    <PageHead title={data.title}><SessionButton sessionId={data.pmSessionId} label={t('openPmSession')} /></PageHead>
+    <PageHead title={data.title}>
+      {data.status !== 'ended' && <>
+        <Button variant="outline" size="sm" icon={<Icon name={data.status === 'paused' ? 'play' : 'pause'} size={14} />}
+          disabled={pause.busy} onClick={() => { void pause.run() }}>
+          {t(data.status === 'paused' ? 'resumeProject' : 'pauseProject')}
+        </Button>
+        <ConfirmButton variant="outline" icon="stop" label={t('stopProject')} title={t('stopProjectTitle')}
+          message={t('stopProjectConfirm', { title: data.title })} onConfirm={stop.run} />
+      </>}
+      <SessionButton sessionId={data.pmSessionId} label={t('openPmSession')} />
+    </PageHead>
     <div className="dt-row-meta dt-status-line">
-      <span className="dt-status-text" data-state="ongoing">{valueLabel(t, 'projectStatus', data.status)}</span>
+      <span className="dt-status-text" data-state={projectTone(data.status)}>{valueLabel(t, 'projectStatus', data.status)}</span>
     </div>
     <Section title={t('projectGoal')}><p>{data.goal}</p></Section>
     <Section title={t('projectTickets')}>

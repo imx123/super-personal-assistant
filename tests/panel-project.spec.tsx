@@ -3,7 +3,7 @@
 import { expect, it } from 'vitest'
 import type { ProjectRow } from '../src/client/api.ts'
 import { zh } from '../src/client/locales.ts'
-import { usePanel, mount, click, tab, text } from './fixtures/panel.tsx'
+import { usePanel, mount, click, find, tab, text } from './fixtures/panel.tsx'
 import { server } from './fixtures/panel-server.ts'
 
 usePanel()
@@ -33,4 +33,27 @@ it('lists Projects, opens one, shows its goal and latest report, and opens its P
   expect(text()).toContain(project.latestReport!.summary)
   await click(zh.openPmSession)
   expect(server.opened).toEqual([project.pmSessionId])
+})
+
+it('pauses, resumes and stops a Project from its page, keeping the page readable afterwards', async () => {
+  server.projects = [{ ...project, tickets: [...project.tickets] }]
+  await mount()
+  await click(tab(zh['tab.project']))
+  await click(project.title)
+  await click(zh.pauseProject)
+  expect(server.projects[0]!.status).toBe('paused')
+  expect(text()).toContain(zh['projectStatus.paused'])
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/pause', body: { paused: true } }))
+  await click(zh.resumeProject)
+  expect(server.projects[0]!.status).toBe('active')
+  expect(text()).toContain(zh['projectStatus.active'])
+  // Stop asks for confirmation first, then ends the Project and keeps its page readable.
+  await click(zh.stopProject)
+  expect(text()).toContain(zh.stopProjectTitle)
+  await click(zh.confirm)
+  expect(server.projects[0]!.status).toBe('ended')
+  expect(text()).toContain(zh['projectStatus.ended'])
+  expect(text()).toContain(project.goal)
+  expect(find(zh.openPmSession).textContent).toContain(zh.openPmSession)
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/stop' }))
 })
