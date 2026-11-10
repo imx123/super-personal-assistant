@@ -76,7 +76,7 @@ P2.3 做报告路由和 PM 项目汇报；不做 Project 暂停/停止，不做 
 - Worker 的 `orchestrator_report` 也使用同一路由；child 的 `worker_report` / `worker_attention` 只到 PM，主 Session 不收。child ticket 的 `ticket.ended` notice 也不再发主 Session。
 - `orchestrator_project_report` 仍写 `ProjectProfile.latestReport`，同时向主 Session relay 一条结构化 `project_report`：`project_id`、`title`、`status`、`summary`、`at`、`read`；request id 由 project id + summary 派生，重复提交同文本不会重复打扰 Router。Project 页仍读 `latestReport`。
 - PM 已可读 child `ticket/<id>` 和 `project/<id>/tickets`；child attention 到达 PM 后，PM 可在项目汇报里标出 blocker，本轮不提供直接回答 child 的半套工具。
-- Router-owned Ticket 的报告仍去主 Session；Project Ticket 所属 Project 为 ended（或不存在）时 fallback 到主 Session（已定义）。
+- Router-owned Ticket 的报告仍去主 Session；Project Ticket 只在 Project 为 ended/不存在时 fallback 到主 Session。PM Session 当前未加载不回退：relay 按 Project 状态选择目标，由 DSH 解析并加载 PM Session。
 
 改动文件：
 
@@ -90,7 +90,7 @@ P2.3 做报告路由和 PM 项目汇报；不做 Project 暂停/停止，不做 
 
 明确未做：PM 直接回答 child attention、Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
-## P2.4 当前范围：Project 状态与控制
+## 已完成的 P2.4：Project 状态与控制
 
 P2.4 只做 Project 的 active/paused/ended 状态、暂停/恢复、结束与级联停止；不做 Project 删除/归档，不暂停项目内运行中的 Worker，不做 PM 独立模型或 Fast Router/Memory。
 
@@ -147,6 +147,8 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 `src/executor/dsh.ts` 和 `src/app/runtime.ts` 里按 `source === 'main-session'` 走的回执分支仍在；主入口重新启用后会用到它们。
 
 ## 验证
+
+P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
 2026-11-10 在本机验证 P2.4：
 
