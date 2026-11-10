@@ -1,7 +1,8 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import { isoTime, liveTicket, pmSessionId } from './model.ts'
+import type { ChannelRef, Decision, PolicyEffect, ProjectProfile, ThreadRef, Ticket, Trigger } from './model.ts'
+import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
@@ -88,6 +89,41 @@ export class Engine {
 
   /** Register a direct user request for the main Session to route itself, without an assessment delivery. */
   recordTriggerForRouting(trigger: Trigger): ReceiveResult { return this.repo.atomic(() => this.intake.receive(trigger, false)) }
+
+  /**
+   * Create a Project from a Trigger, with its Project Profile, PM Mandate and `project` Decision in one transaction.
+   * It is idempotent: the Project id derives from the Trigger, so a repeated call returns the Project created first.
+   * The Decision comes from a gate-only Eval with a real Eval id, not from an assessor.
+   * @throws UserError when the Trigger is unknown or not admissible.
+   */
+  createProject(triggerId: string, title: string, goal: string): ProjectProfile {
+    return this.repo.atomic(() => {
+      const projectId = key('project', triggerId)
+      const existing = this.repo.projects.get(projectId)
+      if (existing) return existing
+      if (!this.repo.triggers.get(triggerId)) throw new UserError('unknownTrigger')
+      const { decision, mandate } = this.evals.project(triggerId, projectId, title, goal)
+      const project: ProjectProfile = { id: projectId, title, goal, status: 'active', decisionId: decision.id,
+        pmSessionId: pmSessionId(projectId), mandate, createdAt: decision.at, updatedAt: decision.at }
+      this.repo.projects.save(project)
+      this.options.emit?.({ type: 'project.created', at: decision.at, data: { projectId, decisionId: decision.id, pmSessionId: project.pmSessionId } })
+      return project
+    })
+  }
+  /**
+   * Record a PM's report on its Project: the latest report the read views show.
+   * @throws UserError when the Project is unknown.
+   */
+  projectReport(projectId: string, summary: string): ProjectProfile {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const reported: ProjectProfile = { ...project, latestReport: { summary, at }, updatedAt: at }
+      this.repo.projects.save(reported)
+      return reported
+    })
+  }
 
   /** The candidate of the Eval that holds a Trigger, as its assessor sees it; undefined while no Eval holds it. */
   candidate(triggerId: string): Candidate | undefined { return this.evals.candidate(triggerId) }
@@ -270,7 +306,10 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'createProject' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply'
+  | 'requestStatus' | 'note'>
+/** What a Project's PM Session asks of the Engine. */
+export type EngineForPM = Pick<Engine, 'projectReport'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

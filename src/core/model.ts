@@ -131,6 +131,42 @@ export interface Mandate {
   actor: ActorRef
   scope: string
 }
+/**
+ * What the Router delegates to a Project's PM: a project-level Mandate, not a Ticket's. It carries the same gate
+ * authorization as a Ticket Mandate, and names the Project it manages and the goal it is for.
+ */
+export interface PMMandate extends Mandate {
+  /** The Project whose management this Mandate delegates. */
+  projectId: string
+  /** What the Project is to achieve, as the Router stated it when it created the Project. */
+  goal: string
+}
+/** A PM's latest report on its Project, kept until its next report. */
+export interface ProjectReport { summary: string; at: string }
+/**
+ * A Project the Router created from one of its Triggers, and the PM Session that manages it: a small Router inside the
+ * Project. P2.1 keeps it read-mostly: it has a goal, its PM Mandate, and the PM's latest report; its Tickets arrive later.
+ */
+export interface ProjectProfile {
+  id: string
+  title: string
+  goal: string
+  status: 'active'
+  /** The `project` Decision that created it. */
+  decisionId: string
+  /** The Session id of its PM, `pm-<projectId>`. */
+  pmSessionId: string
+  mandate: PMMandate
+  /** The latest report its PM recorded, if any. */
+  latestReport?: ProjectReport
+  createdAt: string
+  updatedAt: string
+}
+/** The PM Session id of a Project: deterministic, so a retried creation reaches the same Session. */
+export const pmSessionId = (projectId: string): string => `pm-${projectId}`
+/** The Project a PM Session id names, or undefined for a Session that is not a Project's PM. */
+export const projectOfSession = (sessionId: string): string | undefined =>
+  sessionId.startsWith('pm-') ? sessionId.slice('pm-'.length) : undefined
 
 /** Active trigger evaluation on a thread; at most one exists per thread. */
 export interface Evaluation {
@@ -187,7 +223,7 @@ export interface ThreadFact { label?: Text; value: Text; problem?: true }
 /** A thread's facts by id, ordered for display; each writer owns its fact ids. */
 export type ThreadFacts = Record<string, ThreadFact>
 
-export type DecisionKind = 'ignore' | 'accept' | 'reopen' | 'stop' | 'unavailable'
+export type DecisionKind = 'ignore' | 'accept' | 'reopen' | 'stop' | 'unavailable' | 'project'
 /** Outcome of one eval, recorded on the thread. */
 export interface Decision {
   id: string
@@ -201,6 +237,8 @@ export interface Decision {
   reason: Reason[]
   strength: Strength
   ticketId?: string
+  /** The Project a `project` Decision created; such a Decision has no `ticketId`. */
+  projectId?: string
   mandate?: Mandate
   /** Assessor-supplied audit data (rule assessments, direction, evidence). */
   audit?: Record<string, unknown>
@@ -280,6 +318,8 @@ export interface Ticket {
   id: string
   title: string
   decisionId: string
+  /** The Project it belongs to; empty for a Ticket the Router owns directly (P2.1 creates no Project Tickets yet). */
+  projectId?: string
   mandate: Mandate
   /** The Channels of the messages it was accepted from, which its replies go to. */
   channels: ChannelRef[]

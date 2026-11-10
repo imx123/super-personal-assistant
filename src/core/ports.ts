@@ -1,6 +1,6 @@
 /** Ports the core depends on. Sources, policies, assessors, executors, and channels are project-specific. */
-import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, Strength, Thread, Ticket, TicketEndBy, TicketOutcome, Trigger }
-  from './model.ts'
+import type { Assignment, ChannelRef, Decision, DecisionKind, Mandate, MandateBasis, ProjectProfile, Strength, Thread, Ticket, TicketEndBy,
+  TicketOutcome, Trigger } from './model.ts'
 import type { Reason } from './reasons.ts'
 
 /** Gate admission result: either inadmissible with a reason code, or admissible with strength and MandateBasis. */
@@ -88,6 +88,8 @@ export interface DomainEvents {
   'eval.started': { evalId: string; threadKey: string; triggerIds: string[]; strength: Strength }
   'decision.recorded': { decisionId: string; kind: DecisionKind; threadKey: string }
   'ticket.created': { ticketId: string; decisionId: string; strength: Strength }
+  /** The Router created a Project from a Trigger, with the PM Session that manages it. */
+  'project.created': { projectId: string; decisionId: string; pmSessionId: string }
   'ticket.resumed': { ticketId: string; triggerId: string }
   'ticket.ended': { ticketId: string; by: TicketEndBy; outcome: TicketOutcome; reason?: string }
   'assignment.started': { ticketId: string; assignmentId: string }
@@ -130,5 +132,11 @@ export interface Repositories {
     get(id: string): Decision | undefined
     save(decision: Decision): void
     byThread(key: string): Decision[]
+  }
+  /** Project Profiles, by id; `list` returns every Project, newest first. */
+  projects: {
+    get(id: string): ProjectProfile | undefined
+    save(project: ProjectProfile): void
+    list(): ProjectProfile[]
   }
 }

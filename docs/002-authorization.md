@@ -53,6 +53,18 @@ The main Session is also a Source, named `main-session`. It is not polled: when 
 - The main Session is the only Session and is allowed to dispatch by default. Its role prompt makes it read-only by default: it reads, inspects and routes, and does not write in the shared workspace or another Session's directory. A write the person asks for directly needs their confirmation first; otherwise it goes to a full-tool Ticket. This is prompt text, not a capability restriction.
 - Each native message is its own domain Thread, so independent tasks do not fan out to one another. This is a deliberate choice of the entry, separate from the DSH chat Session, which stays continuous.
 
+## Projects and their PM
+
+Creating a Project is not an accept and does not go through `orchestrator_route`. On an explicit request that a person wants a longer goal managed, the main Session records the message with `orchestrator_user_trigger_create` and calls `orchestrator_project_create` with the trigger, a title and the goal.
+
+- The Project's Decision still passes the gate: a Trigger the gate does not admit cannot become a Project. The Eval is gate-only: it generates a real Eval id and a Decision of kind `project`, but it never asks the assessor and never delivers a candidate.
+- The same transaction creates the `project` Decision (with `projectId` and no `ticketId`), the Project Profile and the Project PM Mandate. The Project id is `key('project', triggerId)`, so a repeated call returns the Project created first and records no second Decision or PM Session.
+- No Ticket is accepted and no worker starts. The main Session receives the Project card and only acknowledges it.
+- The `PMMandate` carries the gate's strength, Policy version, basis and actor, as a Ticket Mandate does, plus the Project and its goal. It authorizes managing the Project, not arbitrary file or repository work.
+- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm`, with `orchestrator_read` and `orchestrator_project_report` only. It is a small Router: it keeps the Project's goal in view and reports to the Project. P2.1 gives it no tool that creates Tickets; that arrives with the Project Ticket tools.
+
+The Project Profiles and their latest reports are read through `GET projects` and `GET projects/:id`, and through the `projects` and `project/<id>` read resources.
+
 ## Strength
 
 | Strength | Cases |

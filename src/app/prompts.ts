@@ -1,8 +1,8 @@
 /** Manages versioned role prompts, behavioral policies, and operational skills independently of access settings. */
 import { z } from 'zod'
-import { UserError, key } from '../core/index.ts'
+import { UserError, key, type ProjectProfile } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
-import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
+import { masterPrompt, pmPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -21,7 +21,7 @@ export const SKILL_PREFIX = 'dsh-superagent-'
 const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.keys(sourceSkills) as string[]).includes(name),
   'This name belongs to a built-in skill')
 /** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
-const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
+const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/pm', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
   'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github'] as const
 export type PartKey = typeof PART_KEYS[number]
@@ -43,10 +43,11 @@ export const defaultPrompts = (): PromptConfig => ({ ...teamDefaults, skills: {}
 
 const ENVIRONMENT_HEADING = 'Execution environment (from this installation\'s settings; it takes precedence over any repository or account named elsewhere in these instructions; an empty value means that part is not configured here). The prepare command of a ticket directory reads the same variables:'
 const POLICY_HEAD = '## Policy\nPolicy version {version}; accept mode {mode}. The accept mode and the rules decide proactive candidates only: an explicit request is routed as dispatch says, in any mode and whatever the rules.'
-type Role = 'orchestrator' | 'worker'
+type Role = 'orchestrator' | 'worker' | 'pm'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
-const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker']
+const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker'],
+  PM: readonly Role[] = ['pm']
 let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
 /**
  * The built-in parts of both roles' prompts, the two Source skills, and the templates of the generated parts, whose data the
@@ -54,7 +55,7 @@ let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
  */
 export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts ??= {
   'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
-  'runtime/worker': { roles: WORKER, text: workerPrompt },
+  'runtime/worker': { roles: WORKER, text: workerPrompt }, 'runtime/pm': { roles: PM, text: pmPrompt },
   'runtime/subscriptions': { roles: BOTH, text: `## subscriptions\n${guides.subscriptions}` },
   'runtime/replies': { roles: BOTH, text: `## replies\n${guides.replies}` },
   'runtime/dispatch': { roles: MAIN, text: `## dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## work\n${guides.work}` },
@@ -104,6 +105,8 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
   const fixed = (name: string, part = name) => ({ name, kind: 'fixed' as const, key: part, text: builtIn(config, part as PartKey) })
   const team = (name: TeamSection) => ({ name, kind: 'team' as const, heading: `## ${TEAM_HEADINGS[name]}`,
     text: config[name] ? `## ${TEAM_HEADINGS[name]}\n${config[name]}` : '' })
+  // A PM manages one Project: it reads its own role text and nothing of the main Session's routing or a worker's work.
+  if (role === 'pm') return [fixed('runtime/pm')]
   return [
     fixed('runtime/shared'), fixed(`runtime/${role}`),
     ...TEAM_SECTIONS.map(team),
@@ -119,6 +122,23 @@ export function composePrompt(config: PromptConfig, role: Role, environment?: st
 }
 export function composeSkill(config: PromptConfig, name: string): string {
   return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+}
+/** The generated section that tells a PM which Project it manages, with the Router's mandate and its latest report. */
+export function pmProjectSection(project: ProjectProfile): string {
+  const report = project.latestReport
+  return ['## Project', `Project: ${project.title} (${project.id})`, `Goal: ${project.goal}`,
+    `Status: ${project.status}; mandate strength: ${project.mandate.strength}; mandate scope: ${project.mandate.scope}`,
+    report ? `Latest report (${report.at}): ${report.summary}` : 'No report yet.',
+    'Manage this Project and record progress with orchestrator_project_report. The host gives you no tool that creates Tickets yet: create none and claim no worker started.'].join('\n')
+}
+/** The first message a PM Session receives when its Project is created, as one JSON object. */
+export function projectInitMessage(project: ProjectProfile): string {
+  return JSON.stringify({ kind: 'project_created',
+    project: { project_id: project.id, title: project.title, goal: project.goal, status: project.status,
+      pm_session_id: project.pmSessionId, decision_id: project.decisionId,
+      mandate: { strength: project.mandate.strength, scope: project.mandate.scope, goal: project.mandate.goal } },
+    note: 'You are the PM of this Project. Manage it against the goal and report with orchestrator_project_report. '
+      + 'Create no Ticket: the host gives you no such tool yet. No worker was started.' })
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */

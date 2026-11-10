@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
-import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
+import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, PMMandate, Strength, Thread, Trigger } from './model.ts'
 import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
@@ -11,7 +11,7 @@ import type { Tickets } from './tickets.ts'
 /** An outcome for the Eval that holds a Trigger; `evalId` names the Eval it was judged for, so a later Eval refuses it. */
 export type Outcome = AssessmentOutcome & { evalId?: string }
 /** What an Eval ends with, as its Decision records it. */
-interface Finished { kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; mandate?: Mandate }
+interface Finished { kind: DecisionKind; reason: Reason[]; audit?: Record<string, unknown>; ticketId?: string; projectId?: string; mandate?: Mandate }
 /** An outcome's reason: a code it carries, else the words its assessor or person wrote. */
 const reasonOf = (reason: string | Reason): Reason[] => [typeof reason === 'string' ? said(reason) : reason]
 const stronger = (a: Strength, b: Strength): Strength => a === 'explicit' || b === 'explicit' ? 'explicit' : 'inferred'
@@ -155,6 +155,29 @@ export class Evals extends EnginePart {
     return this.decideEval(thread, evaluation, outcome)
   }
   /**
+   * Record the gate-only Eval that creates a Project: a real Eval id and a `project` Decision, without asking the assessor
+   * or delivering a candidate. It takes the Trigger out of any Eval that holds it, and returns the PM Mandate the
+   * Project's PM works under.
+   * @throws UserError when the Trigger is unknown or the gate does not admit it.
+   */
+  project(triggerId: string, projectId: string, title: string, goal: string): { decision: Decision; mandate: PMMandate } {
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger) throw new UserError('unknownTrigger')
+    // An Eval that holds the Trigger would otherwise ask the assessor to decide work this Project already took.
+    const held = this.holding(triggerId)
+    const reason: Reason = { code: 'projectCreated', values: { project: projectId } }
+    if (held?.evaluating) {
+      if (held.evaluating.triggerIds.length > 1) this.reassess(held, reason, [triggerId])
+      else this.finish(held, held.evaluating, { kind: 'ignore', reason: [reason] })
+    }
+    const thread = held ?? this.thread(trigger.threads[0]!)
+    const evaluation = this.directEval(thread, trigger, 'project')
+    const decision = this.finish(thread, evaluation, { kind: 'project', reason: [reason], projectId })
+    const mandate: PMMandate = { strength: evaluation.strength, policyVersion: evaluation.policyVersion, basis: evaluation.basis,
+      actor: evaluation.actor, scope: title, projectId, goal }
+    return { decision, mandate }
+  }
+  /**
    * Queue a stored Trigger for a fresh Eval on its primary Thread and emit `trigger.requeued`; returns false while an Eval holds it.
    * @throws UserError when the Trigger is unknown.
    */
@@ -268,7 +291,7 @@ export class Evals extends EnginePart {
    * ticket. It is decided at once, beside an Eval its Thread may have in progress, and takes the Trigger out of the queue.
    * Its id names the outcome's kind, so a stop and an accept of one message at the same moment are two Decisions.
    */
-  private directEval(thread: Thread, trigger: Trigger, kind: AssessmentOutcome['kind'], ticketId?: string): Evaluation {
+  private directEval(thread: Thread, trigger: Trigger, kind: AssessmentOutcome['kind'] | 'project', ticketId?: string): Evaluation {
     const policy = this.policy()
     const gate = policy.gate(trigger, thread, this.ticketsOnThread(thread))
     if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
@@ -328,7 +351,8 @@ export class Evals extends EnginePart {
     const at = this.now()
     const decision: Decision = { id: key('decision', evaluation.id), evalId: evaluation.id, threadKey: thread.key, triggerIds: evaluation.triggerIds,
       policyVersion: evaluation.policyVersion, at, kind: outcome.kind, reason: outcome.reason, strength: evaluation.strength,
-      ...(outcome.ticketId ? { ticketId: outcome.ticketId } : {}), ...(outcome.mandate ? { mandate: outcome.mandate } : {}), ...(outcome.audit ? { audit: outcome.audit } : {}) }
+      ...(outcome.ticketId ? { ticketId: outcome.ticketId } : {}), ...(outcome.projectId ? { projectId: outcome.projectId } : {}),
+      ...(outcome.mandate ? { mandate: outcome.mandate } : {}), ...(outcome.audit ? { audit: outcome.audit } : {}) }
     this.repo.decisions.save(decision)
     for (const id of evaluation.triggerIds) {
       const disposition = this.repo.triggers.disposition(id) ?? { fanout: [], at }

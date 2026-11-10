@@ -2,13 +2,13 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
-  from '../../core/index.ts'
+import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPM, type EngineForPeople,
+  type ProjectProfile } from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
-import { ticketCard } from '../cards.ts'
+import { ticketCard, projectCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
@@ -21,10 +21,11 @@ const RoutingNoteSchema = z.string().trim()
   .describe(`Optional routing background or explicit human constraint, at most ${NOTE_WORDS} words. Never add implementation instructions or replace the original source.`)
 export interface MainToolsHost {
   readonly context: Context
-  readonly engine: Pick<EngineForMainSession, 'recordTriggerForRouting' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
+  readonly engine: Pick<EngineForMainSession, 'recordTriggerForRouting' | 'createProject' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+    & EngineForPM & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
-  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
+  readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -192,6 +193,28 @@ function userTriggerTool(host: MainToolsHost, agent: Agent): Tool {
     },
   })
 }
+/**
+ * `orchestrator_project_create`: create a Project and its PM Session from a recorded trigger. It is separate from
+ * `orchestrator_route`: no Ticket is accepted and no worker starts.
+ */
+function projectCreateTool(host: MainToolsHost): Tool {
+  return tool({
+    name: 'orchestrator_project_create',
+    description: 'Create a Project and its PM Session from a recorded trigger when a person asks for ongoing management; it creates no Ticket and starts no worker. Repeated calls for the same trigger return the same Project.',
+    schema: z.object({
+      trigger_id: z.string().min(1).max(200).describe('From orchestrator_user_trigger_create.'),
+      title: z.string().trim().min(1).max(160).describe('A short Project title.'),
+      goal: z.string().trim().min(1).max(4000).describe('The outcome the person wants.'),
+    }).strict(),
+    execute: async args => {
+      const project = host.quietly(() => host.engine.createProject(args.trigger_id, args.title, args.goal))
+      await host.sessions.openProject(project)
+      host.requestPass()
+      return { project: projectCard(project), read: `project/${project.id}`,
+        note: 'The Project has a PM Session; no Ticket or worker was created.' }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -199,6 +222,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     userTriggerTool(host, agent),
+    projectCreateTool(host),
     routeTool(host),
     tool({
       name: 'orchestrator_ticket_retry',
@@ -338,6 +362,25 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const { context_delivery: _delivery, ...saved } = await savePrompts(host, args.config, args.baseRevision, 'tool')
         return saved
       },
+    }),
+  ]
+}
+/**
+ * A Project PM Session's tools: read records and report on its Project. It gets no routing, Ticket, settings, shell,
+ * file, web or subagent tool. `project` scopes its report and the Project resource it is told to read.
+ */
+export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
+  const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
+  return [
+    readTool(`Read one page of a resource the resource parameter lists. This Project is project/${project.id}; read it first, then the records it names. Follow next_offset, and next_resource where a page names one.`,
+      false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
+    tool({
+      name: 'orchestrator_project_report',
+      description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',
+      schema: z.object({
+        summary: z.string().trim().min(1).max(20000).describe('The Project\'s latest status, in the source language.'),
+      }).strict(),
+      execute: async args => ({ project: projectCard(host.engine.projectReport(project.id, args.summary)) }),
     }),
   ]
 }

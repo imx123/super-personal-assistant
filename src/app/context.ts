@@ -7,6 +7,8 @@ export { textPage } from './cards.ts'
 export const sharedPrompt = promptFile('shared')
 export const masterPrompt = promptFile('orchestrator')
 export const workerPrompt = promptFile('worker')
+/** The Project Manager prompt: a small Router inside one Project, which manages it and creates no Tickets yet. */
+export const pmPrompt = promptFile('pm')
 /** Built-in policy sections referenced by role prompts; a team may override them. */
 export const guides: Readonly<Record<string, string>> = Object.fromEntries(['subscriptions', 'replies', 'dispatch', 'work']
   .map(name => [name, promptFile(name)]))

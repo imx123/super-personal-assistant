@@ -23,6 +23,7 @@ const TEXT = {
   'decision.reopen': ['续做', 'Reopen'],
   'decision.stop': ['停止', 'Stop'],
   'decision.ignore': ['忽略', 'Ignore'],
+  'decision.project': ['创建项目', 'Project'],
   'decision.unavailable': ['未完成', 'Unavailable'],
   'strength.explicit': ['明确', 'Explicit'],
   'strength.inferred': ['推断', 'Inferred'],
@@ -478,6 +479,7 @@ const TEXT = {
   'promptReadBy.skill': ['Session 需要时按名字加载。', 'Sessions load it by name when they need it.'],
   'promptReadBy.orchestrator': ['只有主 Session 会读到。', 'Only the main Session reads it.'],
   'promptReadBy.worker': ['只有执行器 Session 会读到。', 'Only Executor Sessions read it.'],
+  'promptReadBy.pm': ['只有项目 PM Session 会读到。', 'Only a Project PM Session reads it.'],
   promptBuiltInGroup: ['内置段落', 'Built-in parts'],
   promptTemplateHint: ['这是模板：保留占位符 {placeholders}，由系统填入内容。', 'A template: keep the placeholders {placeholders}, which the system fills in.'],
   promptDefaultUpdated: ['默认内容已更新', 'Default updated'],
@@ -509,6 +511,7 @@ const TEXT = {
   'promptPart.runtime/shared': ['共享约定', 'Shared rules'],
   'promptPart.runtime/orchestrator': ['主 Session 角色', 'Main Session role'],
   'promptPart.runtime/worker': ['执行器角色', 'Executor role'],
+  'promptPart.runtime/pm': ['项目 PM 角色', 'Project PM role'],
   'promptPart.runtime/subscriptions': ['订阅', 'Subscriptions'],
   'promptPart.runtime/replies': ['回复与确认', 'Replies and acknowledgements'],
   'promptPart.runtime/dispatch': ['路由', 'Routing'],
@@ -597,6 +600,7 @@ const TEXT = {
   'reason.noRuleMatched': ['没有启用的准入规则匹配', 'No enabled admission rule matched'],
   'reason.ignoredFromCard': ['仅凭候选卡片忽略，未经规则研判', 'Ignored from its card, without a rule assessment'],
   'reason.observed': ['观察模式：本会接单（{text}）', 'Observe mode: would accept ({text})'],
+  'reason.projectCreated': ['已创建项目 {project}', 'Created Project {project}'],
   'reason.explicitRouted': ['名单里的人明确请求，由主 Session 接单', 'Explicit request from someone on the list, accepted by the main Session'],
   'reason.legacyImport': ['从旧版工单记录导入', 'Imported from a legacy Ticket record'],
   'reason.channelGone': ['对话已无法接收消息', 'The conversation can no longer receive messages'],
@@ -687,6 +691,7 @@ const TEXT = {
   'userError.unknownTicket': ['找不到这个工单。', USER_ERRORS.unknownTicket[1]],
   'userError.unknownProblem': ['找不到这个未完成的评估。', USER_ERRORS.unknownProblem[1]],
   'userError.unknownTrigger': ['找不到这个触发。', USER_ERRORS.unknownTrigger[1]],
+  'userError.unknownProject': ['找不到这个项目。', USER_ERRORS.unknownProject[1]],
   'userError.unknownAssignment': ['找不到这个派工。', USER_ERRORS.unknownAssignment[1]],
   'userError.unknownBlock': ['没有这个设置块：{block}', USER_ERRORS.unknownBlock[1]],
   'userError.unknownPromptRevision': ['没有提示词版本 {revision}。', USER_ERRORS.unknownPromptRevision[1]],
@@ -764,7 +769,7 @@ export const GLOSSARY = {
   execution: ['executor', 'environment', 'ticket', 'assignment', 'input', 'report', 'attention'],
 } as const
 export const GLOSSARY_VALUES = {
-  decision: ['decision.accept', 'decision.reopen', 'decision.stop', 'decision.ignore', 'decision.unavailable'], strength: ['strength.explicit', 'strength.inferred'],
+  decision: ['decision.accept', 'decision.reopen', 'decision.stop', 'decision.ignore', 'decision.project', 'decision.unavailable'], strength: ['strength.explicit', 'strength.inferred'],
   ticket: ['stage.answer', 'stage.review', 'stage.blocked', 'stage.failed', 'stage.delivery', 'stage.queued', 'stage.working', 'stage.idle', 'ticket.ended'],
   assignment: ['assignment.pending', 'assignment.running', 'assignment.ended'], report: ['report.progress', 'report.waiting', 'report.ready', 'report.blocked', 'report.failed', 'report.dropped'],
 } as const

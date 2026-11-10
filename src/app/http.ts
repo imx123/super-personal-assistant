@@ -27,6 +27,7 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import { projectDetail, projectList } from './views/projects.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -190,6 +191,12 @@ function routes(runtime: HttpHost): Routes {
       return ticketList(views(runtime), state, offset, limit)
     },
     'GET tickets/:id': ({ params }) => ticketPage(runtime, params.id),
+    'GET projects': () => projectList(store),
+    'GET projects/:id': ({ params }) => {
+      const project = projectDetail(store, params.id)
+      if (!project) throw new RouteError(404, 'Project not found')
+      return project
+    },
     'POST tickets/:id/retry': ({ params }) => { const id = ticket(params.id); runtime.engine.retryTicket(id); return { retried: true } },
     'POST tickets/:id/stop': ({ params }) => { const id = ticket(params.id); runtime.engine.stopTicket(id); return { stopped: true } },
     'POST tickets/:id/assignment/stop': async ({ params, body }) => {

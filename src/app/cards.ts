@@ -1,5 +1,5 @@
 /** Compact, bounded model-facing projections of triggers, tickets, threads, and decisions; full texts stay behind readable resources. */
-import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type Thread, type Ticket, type TicketInput,
+import { latestReport, reasonText, threadKey, ticketStage, type Decision, type Mandate, type ProjectProfile, type Thread, type Ticket, type TicketInput,
   type Trigger, type TriggerDisposition } from '../core/index.ts'
 import { pullOf } from '../sources/github-pull.ts'
 import { batchLine, inputResource } from '../executor/dsh.ts'
@@ -30,6 +30,13 @@ export function ticketCard(ticket: Ticket) {
     ...(pullOf(ticket) ? { pr_number: pullOf(ticket) } : {}), ...(ended ? { ended } : {}),
     ...(attention ? { attention: { question: attention.question, ...attention.triggerId ? { trigger_id: attention.triggerId } : {} } } : {}),
     preview: preview(latestReport(ticket)?.summary ?? ''), read: `ticket/${ticket.id}` }
+}
+/** Compact model-facing projection of a Project Profile: its goal, PM Session, creating Decision and latest report. */
+export function projectCard(project: ProjectProfile) {
+  const report = project.latestReport
+  return { project_id: project.id, title: project.title, goal: project.goal, status: project.status,
+    pm_session_id: project.pmSessionId, decision_id: project.decisionId, mandate: { strength: project.mandate.strength, scope: project.mandate.scope },
+    ...(report ? { latest_report: { at: report.at, summary: report.summary } } : {}), read: `project/${project.id}` }
 }
 /** Strips `policyVersion`, an internal hash that callers never query by. */
 const mandateOf = ({ policyVersion: _version, ...mandate }: Mandate) => mandate

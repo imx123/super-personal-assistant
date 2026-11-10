@@ -4,9 +4,10 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { z } from 'zod'
-import { assignmentStopped, key, latestAssignment, liveTicket, type Ticket } from '../core/index.ts'
+import { assignmentStopped, key, latestAssignment, liveTicket, projectOfSession, type ProjectProfile, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { AgentDelivery, messageId, type DeliveryMode } from './delivery.ts'
@@ -15,7 +16,7 @@ import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
-import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
+import { pmProjectSection, projectInitMessage, SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
@@ -24,19 +25,25 @@ import type { RegisterTool, Tool } from './tools/tool.ts'
 export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
-  readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
+  readonly store: Pick<Store, 'tickets' | 'projects' | 'settings' | 'get' | 'set' | 'keys'>
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
   readonly masterId: string
+  /** The state directory, where a Project's PM Session works; it does no file work. */
+  readonly stateDir: string
   readonly lifetime: AbortSignal
   closing(): boolean
   /** Execution environment variables for `ticket`, rendered into its worker's system prompt. */
   environment(ticket: Ticket): Variable[]
-  /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
-  tools(agent: Agent, ticket?: Ticket): Tool[]
+  /** Tools to register on the main Session, on `ticket`'s worker Session, or on `project`'s PM Session. */
+  tools(agent: Agent, target: SessionTarget): Tool[]
 }
+/** What a decorated Session works on: a Ticket's worker, a Project's PM, or neither for the main Session. */
+export interface SessionTarget { ticket?: Ticket; project?: ProjectProfile }
+/** The roles `Sessions.ensure` creates: the main Session, a worker, or a Project's PM. */
+export type SessionRole = 'orchestrator' | 'worker' | 'pm'
 
 /**
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
@@ -44,8 +51,8 @@ export interface SessionsHost {
  */
 interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
 
-/** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
-export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
+/** The agent presets Executor Sessions, the main Session, and a Project's PM are created with, which the bundle's patch defines. */
+export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PM_PRESET = 'dsh-superagent-pm'
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -125,7 +132,10 @@ export class Sessions {
     ctx.inject(['agentPresets'], child => {
       child.on('agent-preset/selected', (sessionId, preset) => {
         const ticketId = ticketOfSession(sessionId), agent = ctx.agents.get(sessionId as SessionId)
-        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET : undefined
+        const projectId = projectOfSession(sessionId)
+        const project = projectId ? this.host.store.projects.get(projectId) : undefined
+        const ours = sessionId === this.host.masterId ? ROUTER_PRESET : ticketId && this.host.store.tickets.get(ticketId) ? WORKER_PRESET
+          : project ? PM_PRESET : undefined
         if (!ours || preset === ours || !agent) return
         const presets = child.get('agentPresets') as { select(agent: Agent, preset: string): Promise<string> }
         presets.select(agent, ours).catch(() => {})
@@ -136,19 +146,19 @@ export class Sessions {
     })
   }
   /** Resolves or creates a session, then sets its role model, tools, permissions, and title before delivery. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  async ensure(id: string, cwd: string, title: string, role: SessionRole): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
       const workspace = await ctx.workspaceRegistry.create(cwd)
       // A Session keeps the preset it was created with, one of the bundle's own (cordis.patch.yml).
-      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id,
-        agentPreset: role === 'worker' ? WORKER_PRESET : ROUTER_PRESET })
+      const preset = role === 'worker' ? WORKER_PRESET : role === 'pm' ? PM_PRESET : ROUTER_PRESET
+      await ctx.sessionController.create({ sessionId: id as SessionId, workspaceId: workspace.id, agentPreset: preset })
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    await initializeRoleModel(ctx, result.agent, role === 'worker' ? settings.executor.model : settings.eval.model)
     await this.decorate(result.agent)
     const permissions = ctx.permissionPresets
     // Auto is advertised only while the host's reviewer is registered. Tool denials or errors never change this selection.
@@ -156,6 +166,17 @@ export class Sessions {
     permissions.set(result.agent.session, preset)
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /**
+   * Create or resolve a Project's PM Session and send it its first message once. The PM works in a directory of its own
+   * under the state directory, since it does no file work; the message is idempotent by its Project.
+   */
+  async openProject(project: ProjectProfile): Promise<string> {
+    const directory = join(this.host.stateDir, 'projects', project.id)
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+    await this.ensure(project.pmSessionId, directory, project.title, 'pm')
+    await this.prompt(project.pmSessionId, `project-init:${project.id}`, projectInitMessage(project), 'queue')
+    return project.pmSessionId
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -239,8 +260,11 @@ export class Sessions {
     if (this.bindings.has(agent)) return
     const host = this.host
     const master = agent.id === host.masterId
-    const ticket = master ? undefined : this.ticketOf(agent)
-    if (!master && !ticket) { this.limitSubagent(agent); return }
+    const projectId = master ? undefined : projectOfSession(agent.id)
+    const project = projectId ? host.store.projects.get(projectId) : undefined
+    const ticket = master || project ? undefined : this.ticketOf(agent)
+    if (!master && !ticket && !project) { this.limitSubagent(agent); return }
+    const role = master ? 'orchestrator' as const : project ? 'pm' as const : 'worker' as const
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
@@ -250,9 +274,12 @@ export class Sessions {
     binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
-      const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
-    }, ...(master ? { complete: true } : {}) }))
+      const latest = project && host.store.projects.get(project.id)
+      const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
+      const mandate = current ? mandateInstructions(current.mandate) : ''
+      const contextSection = latest ? `\n\n${pmProjectSection(latest)}` : ''
+      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${mandate}${contextSection}`
+    }, ...(master || project ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
       binding.scope = scope
@@ -264,11 +291,14 @@ export class Sessions {
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
     const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
+    for (const tool of host.tools(agent, { ...ticket ? { ticket } : {}, ...project ? { project } : {} })) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
       const shell = process.platform === 'win32' && agent.ctx.tools.get('pwsh', scopeParentOf(agent)) ? 'pwsh' : 'bash'
       binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', shell, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+    } else if (project) {
+      // A Project's PM reads records and reports on its Project; the preset gives it no shell, file, web or subagent tools.
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['orchestrator_read', 'orchestrator_project_report'] }))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))
