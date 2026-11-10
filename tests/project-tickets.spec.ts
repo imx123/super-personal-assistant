@@ -1,7 +1,7 @@
-/** P2.2a: PM-created Project Tickets through internal Triggers and delegated Decisions, their external Threads, idempotency and rollback. */
+/** P2.2a/P2.2b: PM-created Project Tickets, delegated Decisions, external Threads, and their optional worker tool allowlist. */
 import { describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, UserError, key, type Assessor, type Candidate, type DomainEvent, type Executor,
-  type Mandate, type Policy, type ProjectProfile, type Ticket, type Trigger } from '../src/core/index.ts'
+  type Mandate, type Policy, type ProjectProfile, type ProjectTicketTask, type Ticket, type Trigger } from '../src/core/index.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
 import { feishu, startRuntime } from './fixtures/host.ts'
@@ -123,6 +123,45 @@ describe('PM-created Project Tickets', () => {
     expect(() => h.engine.createProjectTickets('missing', h.project.pmSessionId, tasks)).toThrow(new UserError('unknownProject'))
     h.repo.projects.save({ ...h.project, status: 'ended' as ProjectProfile['status'] })
     expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)).toThrow(new UserError('projectEnded'))
+    expect(h.repo.tickets.list()).toEqual([])
+  })
+
+  it('writes the final worker tool allowlist on the Ticket Mandate, and leaves it absent for the full tool set', () => {
+    const h = harness()
+    const [narrow, full] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [
+      { title: 'Header', goal: 'Make the header legible', allow_tools: ['read', 'grep'] },
+      { title: 'Footer', goal: 'Fix the footer links' },
+    ])
+    expect(narrow!.mandate.allowTools).toEqual(['read', 'grep'])
+    expect(h.repo.decisions.get(narrow!.decisionId)?.mandate?.allowTools).toEqual(['read', 'grep'])
+    expect(full!.mandate).not.toHaveProperty('allowTools')
+  })
+
+  it('rejects unknown, duplicate, oversized and widening allowlists, creating nothing', () => {
+    const h = harness()
+    const call = (allow_tools: unknown) => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'A', goal: 'A', allow_tools: allow_tools as string[] }])
+    expect(() => call(['read', 'nope'])).toThrow(/unknown work tool "nope"/)
+    expect(() => call(['read', 'read'])).toThrow(/duplicate work tool "read"/)
+    expect(() => call(Array.from({ length: 33 }, () => 'read'))).toThrow(/more than 32 tools/)
+    expect(h.repo.tickets.list()).toEqual([])
+
+    const inherited = harness()
+    inherited.repo.projects.save({ ...inherited.project, mandate: { ...inherited.project.mandate, allowTools: ['read', 'grep'] } })
+    expect(() => inherited.engine.createProjectTickets(inherited.project.id, inherited.project.pmSessionId,
+      [{ title: 'A', goal: 'A', allow_tools: ['read', 'bash'] }])).toThrow(/cannot widen the PM Mandate: bash/)
+    expect(inherited.repo.tickets.list()).toEqual([])
+    const [subset, inheritedList] = inherited.engine.createProjectTickets(inherited.project.id, inherited.project.pmSessionId,
+      [{ title: 'A', goal: 'A', allow_tools: ['read'] }, { title: 'B', goal: 'B' }])
+    expect(subset!.mandate.allowTools).toEqual(['read'])
+    expect(inheritedList!.mandate.allowTools).toEqual(['read', 'grep'])
+  })
+
+  it('requires the Project PM Session, so a caller that omits it cannot create Tickets', () => {
+    const h = harness()
+    const withoutCaller = h.engine.createProjectTickets.bind(h.engine) as unknown as
+      (projectId: string, tasks: readonly ProjectTicketTask[]) => Ticket[]
+    expect(() => withoutCaller(h.project.id, tasks)).toThrow(new UserError('notProjectPm'))
     expect(h.repo.tickets.list()).toEqual([])
   })
 

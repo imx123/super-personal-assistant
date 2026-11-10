@@ -1,6 +1,6 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, liveTicket, pmSessionId, threadKey } from './model.ts'
+import { isoTime, liveTicket, pmSessionId, threadKey, WORK_TOOLS } from './model.ts'
 import type { ChannelRef, Decision, PolicyEffect, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger } from './model.ts'
 import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
@@ -18,7 +18,7 @@ export type { ReceiveResult } from './intake.ts'
 export type { Reply, ReplyRequest } from './replies.ts'
 
 /** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
-export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300 } as const
+export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300, tools: 32 } as const
 const WORKTREE_NAME = /^[a-z]+(?:-[a-z0-9]+){0,3}$/
 /** A short lowercase ASCII worktree name from an English title, or `task-<n>` when the title has none. */
 function worktreeName(title: string, index: number): string {
@@ -36,7 +36,33 @@ function projectThread(value: string): ThreadRef {
   }
   return { source, id }
 }
-/** One validated task, with its deterministic index and the Threads it subscribes to, deduplicated. */
+const invalidTask = (reason: string): never => { throw new UserError('invalidProjectTask', { reason }) }
+/**
+ * The tools a PM task allows: its explicit list, or the PM Mandate's when it names none; undefined means every work tool.
+ * A list may only narrow the PM Mandate's, must name known work tools once each, and holds at most PROJECT_TICKETS.tools.
+ */
+function prepareAllowTools(value: unknown, inherited: readonly string[] | undefined): string[] | undefined {
+  const base = inherited?.length ? [...inherited] : undefined
+  if (value === undefined || value === null) return base
+  if (!Array.isArray(value)) return invalidTask('allow_tools must be an array of tool names')
+  if (value.length > PROJECT_TICKETS.tools) invalidTask(`allow_tools has more than ${PROJECT_TICKETS.tools} tools`)
+  const tools: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || !item.trim()) invalidTask('each allow_tools entry must be a tool name')
+    const name = item.trim()
+    if (!WORK_TOOLS.includes(name)) invalidTask(`unknown work tool "${name}"`)
+    if (tools.includes(name)) invalidTask(`duplicate work tool "${name}"`)
+    tools.push(name)
+  }
+  // An empty explicit list names no narrower set, so it keeps the PM Mandate's restriction or stays unrestricted.
+  if (!tools.length) return base
+  if (base) {
+    const outside = tools.filter(name => !base.includes(name))
+    if (outside.length) invalidTask(`allow_tools cannot widen the PM Mandate: ${outside.join(', ')}`)
+  }
+  return tools
+}
+/** One validated task, with its deterministic index, the tools it allows, and the Threads it subscribes to, deduplicated. */
 interface PreparedProjectTask {
   index: number
   title: string
@@ -44,11 +70,12 @@ interface PreparedProjectTask {
   scope: string
   note?: string
   worktree_name: string
+  allowTools?: string[]
   threads: (ThreadRef & { contextOnly: boolean })[]
 }
 /** Validate one task and its Threads before the batch creates anything. */
-function prepareProjectTask(task: ProjectTicketTask, index: number): PreparedProjectTask {
-  const invalid = (reason: string): never => { throw new UserError('invalidProjectTask', { reason }) }
+function prepareProjectTask(task: ProjectTicketTask, index: number, inheritedTools: readonly string[] | undefined): PreparedProjectTask {
+  const invalid = invalidTask
   if (!task || typeof task !== 'object') invalid('the task is not an object')
   const text = (value: unknown) => typeof value === 'string' ? value.trim() : ''
   const title = text(task.title), goal = text(task.goal), scope = text(task.scope), note = text(task.note)
@@ -73,8 +100,9 @@ function prepareProjectTask(task: ProjectTicketTask, index: number): PreparedPro
     threads.set(key, { ...ref, contextOnly: previous ? previous.contextOnly && item.contextOnly === true : item.contextOnly === true })
   }
   if (threads.size > PROJECT_TICKETS.threads) invalid(`more than ${PROJECT_TICKETS.threads} threads`)
+  const allowTools = prepareAllowTools((task as { allow_tools?: unknown }).allow_tools, inheritedTools)
   return { index, title, goal, scope: scope || goal, ...(note ? { note } : {}), worktree_name: worktree || worktreeName(title, index),
-    threads: [...threads.values()] }
+    ...(allowTools ? { allowTools } : {}), threads: [...threads.values()] }
 }
 
 /**
@@ -172,25 +200,21 @@ export class Engine {
   }
   /**
    * Create the Tickets a Project's PM delegated, one internal Trigger, record-only `delegated` Eval and Decision per task,
-   * in one transaction: a task the PM's request cannot create leaves no Trigger, Decision or Ticket behind. The Project must
-   * still be active; when the caller names its Session id, it must be the Project's own PM. A repeated call reuses the Ticket
-   * each task index produced before. No Ticket subscribes to the Project's source Thread; only the external Threads a task names.
+   * in one transaction: a task the PM's request cannot create leaves no Trigger, Decision or Ticket behind. Only the Project's
+   * own PM Session may call it, and the Project must still be active. A repeated call reuses the Ticket each task index
+   * produced before. No Ticket subscribes to the Project's source Thread; only the external Threads a task names.
    * @throws UserError when the Project is unknown or has ended, the caller is not its PM, or a task is invalid.
    */
-  createProjectTickets(projectId: string, tasks: readonly ProjectTicketTask[]): Ticket[]
-  createProjectTickets(projectId: string, pmSessionId: string, tasks: readonly ProjectTicketTask[]): Ticket[]
-  createProjectTickets(projectId: string, pmSessionIdOrTasks: string | readonly ProjectTicketTask[],
-    maybeTasks?: readonly ProjectTicketTask[]): Ticket[] {
-    const tasks = Array.isArray(pmSessionIdOrTasks) ? pmSessionIdOrTasks : maybeTasks
-    const callerSessionId = Array.isArray(pmSessionIdOrTasks) ? undefined : pmSessionIdOrTasks
+  createProjectTickets(projectId: string, pmSessionId: string, tasks: readonly ProjectTicketTask[]): Ticket[] {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.status !== 'active') throw new UserError('projectEnded')
-      if (callerSessionId !== undefined && project.pmSessionId !== callerSessionId) throw new UserError('notProjectPm')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
       if (!tasks || !Array.isArray(tasks) || !tasks.length) throw new UserError('invalidProjectTask', { reason: 'give 1 to 5 tasks' })
       if (tasks.length > PROJECT_TICKETS.max) throw new UserError('invalidProjectTask', { reason: `at most ${PROJECT_TICKETS.max} tasks` })
-      const prepared = tasks.map((task, index) => prepareProjectTask(task, index))
+      const inheritedTools = project.mandate.allowTools?.length ? project.mandate.allowTools : undefined
+      const prepared = tasks.map((task, index) => prepareProjectTask(task, index, inheritedTools))
       const at = this.options.now?.() ?? new Date().toISOString()
       const existing = prepared.map(task => this.repo.tickets.get(key('ticket', project.id, 'delegated', String(task.index))))
       const names = new Set(existing.flatMap(ticket => ticket?.execution ? [ticket.execution.name.replace(`-${ticket.id.slice(0, 12)}`, '')] : []))
@@ -208,7 +232,7 @@ export class Engine {
           meta: { projectId: project.id, pmSessionId: project.pmSessionId, taskIndex: task.index, title: task.title, goal: task.goal,
             scope: task.scope, ...(task.note ? { note: task.note } : {}) } }
         this.repo.triggers.save(trigger)
-        const { decision, mandate } = this.evals.delegated(trigger, project, ticketId, task.scope)
+        const { decision, mandate } = this.evals.delegated(trigger, project, ticketId, task.scope, task.allowTools)
         this.tickets.createDelegated(ticketId, decision.id, mandate, project.id, trigger, { kind: 'accept', title: task.title,
           scope: task.scope, reason: { code: 'projectTicketCreated', values: { project: project.id } }, name: task.worktree_name,
           ...(task.note ? { note: task.note } : {}) }, decision.at)

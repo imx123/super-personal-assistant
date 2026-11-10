@@ -12,7 +12,7 @@
 
 P2.1 建好了 Project Profile、PMMandate、`DecisionKind 'project'`、`project` 表、`createProject`、PM Session 和 Project Tab。这些仍在下文生效。
 
-## P2.2a 当前范围：PM 创建 Project Ticket + child ticket 外部 thread
+## 已完成的 P2.2a：PM 创建 Project Ticket + child ticket 外部 thread
 
 P2.2a 做 PM 创建 PM-owned Ticket 的最小闭环，并允许 child ticket 在创建时订阅外部 thread；不做能力档、child 报告回 PM、Project 暂停/停止或 PM 独立模型。
 
@@ -20,14 +20,14 @@ P2.2a 做 PM 创建 PM-owned Ticket 的最小闭环，并允许 child ticket 在
 
 - `MandateBasis` 增加 `via: 'delegated'`（含 `projectId`、`pmSessionId`）；`DecisionKind` 增加 `delegated`，`Decision.ticketId` 对 delegated 必填，`Decision.mandate` 记录 Ticket 的 Mandate，`evalId` 是真实记录 ID。`Policy.revalidate` 对 delegated 直接返回 true，不查外部 allowed list。
 - 新增内置 Source kind `internal`（`src/sources/internal.ts`）：空 schema、无 channel、无 poll、无 health、无 threadContext，`scope` 恒为 listened；Runtime 启动时注册。
-- Engine 新增 `createProjectTickets(projectId, [pmSessionId,] tasks)`：校验 Project 存在且 active，给了 PM Session 时校验调用者就是该项目的 PM；每个 task 生成一条内部 Trigger（actor `{source:'internal', id: pmSessionId}`、`human:false`、不设 addressed、一条独立 Thread）、一个 record-only Eval（真实 `evalId`、`basis.via='delegated'`、strength 取 PM Mandate、不调 assessor、不投 candidate）→ `delegated` Decision → Ticket。Ticket 带 `projectId`、`decisionId`、从 PM Mandate 复制的 strength/policyVersion/actor、task scope/goal、内部 Trigger origin、`channels: []`、title、`prepareTicket` 生成的 execution，以及新 Assignment + `executor.start`；emit `ticket.created`。整批原子，一个 task 失败则全批不建；同一 projectId + task index 幂等。
+- Engine 新增 `createProjectTickets(projectId, pmSessionId, tasks)`：校验 Project 存在且 active，并强制校验调用者就是该项目的 PM（不再有省略 PM Session 的 2 参重载）；每个 task 生成一条内部 Trigger（actor `{source:'internal', id: pmSessionId}`、`human:false`、不设 addressed、一条独立 Thread）、一个 record-only Eval（真实 `evalId`、`basis.via='delegated'`、strength 取 PM Mandate、不调 assessor、不投 candidate）→ `delegated` Decision → Ticket。Ticket 带 `projectId`、`decisionId`、从 PM Mandate 复制的 strength/policyVersion/actor、task scope/goal、内部 Trigger origin、`channels: []`、title、`prepareTicket` 生成的 execution，以及新 Assignment + `executor.start`；emit `ticket.created`。整批原子，一个 task 失败则全批不建；同一 projectId + task index 幂等。
 - Ticket 不自动订阅 Project 的源 Thread；只订阅 task 显式列出的 `threads`。`Tickets` 新增 PM 创建入口 `createDelegated` 与公开订阅入口 `subscribeExternal(ticketId, ref, contextOnly)`：校验 ThreadRef、按 ticket 去重、`contextOnly` 写入 `Thread.context`；不写 `Ticket.follows`，不自动订阅 origin。
 - PM 新增 `orchestrator_project_ticket_create`：仅 PM Session 注册；接收 1–5 个 task（title/goal 长度受限，worktree_name 在同批唯一），返回 `{ tickets: projectTicketCard[], project: projectCard, note }`，不声称 worker 已完成。PM 只能建自己项目内的 Ticket；Project 不存在或结束拒绝。
 - PM Session 权限改为默认 `auto`（宿主提供 auto 时），否则 `workspace-write`、`read-only`，最后才 full；child Ticket 的 Worker 仍走现有 worker 权限逻辑（auto 优先），不额外强制 workspace-write。
 - PM 读范围扩展：`orchestrator_read` 允许自己的 `project/<id>`、`project/<id>/tickets`，以及 `projectId` 属于自己项目的 `ticket/<id>`；其他资源拒绝。Project 详情/API/资源能看到 child Ticket 列表与各自 thread；面板 Project 页也列出 child Ticket 和 thread（context-only 有标记）。
 - `prompts/pm.md` 更新：PM 可以创建 Ticket，只建项目内 Ticket，不自己实现，不声称 worker 已完成。
 
-明确未做：能力档 `read-only/workspace-write/full` 与 `denyTools`、P2.2b 的可选 `allow_tools` 白名单、child report/attention 回 PM（仍去主 Session，已知下一段）、Project 暂停/停止/删除、PM 独立模型、父 Ticket、Dispatch、TaskSpec、Fast Router、Memory/RAG。主窗口 active dispatch 的 directEval 路线保持原样。
+明确未做：能力档 `read-only/workspace-write/full` 与 `denyTools`、child report/attention 回 PM（仍去主 Session，已知下一段）、Project 暂停/停止/删除、PM 独立模型、父 Ticket、Dispatch、TaskSpec、Fast Router、Memory/RAG。主窗口 active dispatch 的 directEval 路线保持原样。
 
 改动文件：
 
@@ -39,6 +39,31 @@ P2.2a 做 PM 创建 PM-owned Ticket 的最小闭环，并允许 child ticket 在
 | `prompts/pm.md`、`src/client/projects.tsx`、`locales.ts`、`marks.ts`、`ticket.tsx` | PM 提示词；Project 页 child Ticket/thread；delegated 文案、标记与 basis 展示 |
 | `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 领域、授权、面板、架构与基线范围 |
 | `tests/project-tickets.spec.ts`、`tests/projects.spec.ts`、`tests/panel-project.spec.tsx`、`tests/fixtures/host.ts` | 新增 PM Ticket 定向测试；PM 权限断言改 auto；Project 面板 child Ticket；权限 fixture 加 auto |
+
+## P2.2b 当前范围：可选工具白名单
+
+P2.2b 只做“可选工具白名单”，不做 capability 档、不做 `denyTools`，也不做 child report/attention 回 PM。
+
+已实现：
+
+- `Mandate` 增加可选 `allowTools?: string[]`；`PMMandate` 与 Ticket Mandate 直接继承，不建新类型层。Ticket Mandate 的 `allowTools` 写入最终列表：task 显式 `allow_tools` 或继承 PM Mandate 的列表；都没有则不写字段 = Worker 全量工具。
+- `WORK_TOOLS` 收敛为 `src/core/model.ts` 的唯一声明，`Sessions.workOnly` 从 core 导入；PM 任务校验也使用同一集合。
+- PM 的 `orchestrator_project_ticket_create` task 增加可选 `allow_tools?: string[]`。省略/空数组 = 继承 PM Mandate 的列表；PM Mandate 没有列表时 = Worker 全量。PM Mandate 自身有 `allowTools` 时，child 只能取子集，扩大被拒。Project 创建时 PM Mandate 默认不设 `allowTools`。
+- 校验：工具名必须是 `WORK_TOOLS` 中的名字、不能重复、最多 32 个；未知/重复/超长/扩大 PM Mandate 都抛 `invalidProjectTask`，整批回滚。PM 工具 schema 的数组上限也是 32。
+- `Sessions.workOnly` 的工具 allow 集合按 `ticket.mandate.allowTools` 过滤；`limitSubagent` 继续调用同一个 `workOnly`，所以 Worker 的 subagent 与孙 subagent 继承同一白名单，不能绕过。过滤结果还会与宿主实际提供的工具取交集。
+- `allowTools` 只是工具可见性，不是文件系统/权限沙箱；未引入 `denyTools`、能力档或新类型层。
+- 删除 `Engine.createProjectTickets(projectId, tasks)` 2 参重载，只保留 `(projectId, pmSessionId, tasks)`；PM 工具继续传 `project.pmSessionId`。主 Session 没有 PM 工具，调用方也不能省略 PM Session 绕过身份校验。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/core/model.ts`、`engine.ts`、`evals.ts` | `Mandate.allowTools`、`WORK_TOOLS`、`allow_tools` 校验/收窄/继承、required-PM 签名 |
+| `src/app/sessions.ts`、`tools/main.ts` | `workOnly` 按 Mandate 过滤（subagent 继承）；PM task schema 增加 `allow_tools` |
+| `docs/001`、`docs/002`、`docs/007`、本文件 | allow_tools 语义、默认/收窄/非沙箱说明 |
+| `tests/project-tickets.spec.ts`、`tests/runtime.spec.ts` | 白名单字段与拒绝、实际 `restrict` 结果、未指定=全量、subagent 继承、无 2 参绕过 |
+
+明确未做：child report/attention 回 PM、Project 暂停/停止/删除、PM 独立模型、Project Memory、父 Ticket、Dispatch、TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
 
 ## 主入口的权限模型
 
@@ -72,21 +97,21 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 ## 验证
 
-2026-11-10 在本机验证 P2.2a：
+2026-11-10 在本机验证 P2.2b：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- 新增 `tests/project-tickets.spec.ts` 7 项全通过：2 张 Project Ticket、delegated Decision/真实 evalId/projectId/ticketId/mandate、无 assessor、不自动订阅 Project 源 thread、显式 thread 与 contextOnly、幂等、整批回滚、非 PM/未知/结束 Project 拒绝、delegated revalidate，以及 runtime 下 PM 工具建 1–2 张 Ticket、Worker Assignment 启动、PM 读项目内 Ticket、读项目外 Ticket 被拒、内部 Trigger `source='internal'`。
-- 定向回归：`projects` 6、`core-engine` 115、`policy` 329、`panel-project` 1、`locales` 6、`model-surface` 7、`bundle-patch` 3、`navigation` 7、`panel-panel` 8、`client` 5 全通过；`tools`、`cards` 通过。
-- 全量 62 个测试文件、1221 项：1173 通过，48 失败。失败均为既有的 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。`locales` 的 reason 文案检查已补齐 `reason.projectTicketCreated` 后通过。
-- `model-surface` 预算未上调：新增的 `project/<id>/tickets` 读资源与 PM 工具没有超出 orchestrator/worker 的既有预算。
-- 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是本轮环境限制，不是测试失败。
+- `tests/project-tickets.spec.ts` 10 项全通过：P2.2a 的建单/thread/幂等/回滚/身份/读范围，加上 `allow_tools` 写入 Ticket Mandate、未指定时不写字段、未知/重复/超 32/扩大 PM Mandate 被拒、以及省略 PM Session 无法绕过（required-PM 签名）。
+- `tests/runtime.spec.ts` 新增 1 项通过：PM 建票后受限 Ticket 的 Worker `restrict` 实际只拿到 `['read','grep']`，未指定时仍拿到全量 work tools，subagent 继承同一 `restrict`；同时修好 PM Session 的 restrict 未包含 `orchestrator_project_ticket_create` 的旧遗漏。
+- 定向回归：`projects` 6、`cards`、`tools`、`model-surface` 7、`panel-project` 1 全通过；`model-surface` 预算未上调。
+- 全量 62 个测试文件、1225 项：1177 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
 
 1. 权限控制（初版已完成）
-2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（当前完成）
-3. P2.2b 可选 tool allowlist（PM 建 Ticket 时可传 `allow_tools`，空=worker 全工具；不做 denyTools/能力档）
-4. 任务交接
+2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（已完成）
+3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
+4. 任务交接 / child report 回 PM（下一段）
 5. 意外中断与恢复
 6. 再扩展新功能
 

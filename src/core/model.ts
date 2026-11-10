@@ -135,7 +135,19 @@ export interface Mandate {
   basis: MandateBasis
   actor: ActorRef
   scope: string
+  /**
+   * The Executor tools this work may use, a subset of WORK_TOOLS; absent means every work tool. It narrows tool
+   * visibility only: it is not a filesystem or permission sandbox.
+   */
+  allowTools?: string[]
 }
+/**
+ * The work tools an Executor Session may hold: files, search, the shell and its jobs, the web, skills, its todo list and
+ * subagents. `Mandate.allowTools` may only narrow this set, and an Executor's subagents inherit the same narrowing.
+ */
+export const WORK_TOOLS: readonly string[] = ['read', 'write', 'edit', 'read_image', 'glob', 'grep', 'bash', 'pwsh', 'job_output',
+  'job_list', 'job_kill', 'web_search', 'web_fetch', 'skill', 'todo_write', 'subagent', 'list_subagent_models', 'send_message',
+  'list_agents', 'interrupt_agent']
 /**
  * What the Router delegates to a Project's PM: a project-level Mandate, not a Ticket's. It carries the same gate
  * authorization as a Ticket Mandate, and names the Project it manages and the goal it is for.
@@ -184,6 +196,8 @@ export interface ProjectTicketTask {
   scope?: string
   note?: string
   worktree_name?: string
+  /** Worker tools to allow; omitted or empty means the PM Mandate's list, or every work tool when it has none. */
+  allow_tools?: string[]
   threads?: ProjectTicketThread[]
 }
 

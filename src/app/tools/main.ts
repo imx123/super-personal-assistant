@@ -28,6 +28,8 @@ const ProjectTaskSchema = z.object({
     .describe('Optional narrower boundary; defaults to the goal.'),
   note: RoutingNoteSchema.optional(),
   worktree_name: WorktreeNameSchema.optional(),
+  allow_tools: z.array(z.string().trim().min(1).max(64)).max(PROJECT_TICKETS.tools).optional()
+    .describe('Optional worker tools to allow, a subset of the worker tool set; omitted or empty means the PM Mandate\'s list, or every work tool when it has none. It narrows tool visibility only, not the filesystem or permissions.'),
   threads: z.array(z.object({
     key: z.string().trim().min(3).max(PROJECT_TICKETS.threadKey).describe('A source:id key, such as github:123 or feishu:<chat>:<root message>.'),
     contextOnly: z.boolean().optional().describe('true reads the Thread for context only; it grants nothing and resumes no Ticket.'),
@@ -240,7 +242,8 @@ function projectTicketCreateTool(host: MainToolsHost, project: ProjectProfile): 
     name: 'orchestrator_project_ticket_create',
     description: 'Create 1-5 Tickets inside this Project, each with its own worker, when the Project goal needs work done. '
       + 'The Tickets are delegated under the Project Mandate; they are queued and their workers start separately, so do not say a Ticket, worker or pull request has finished. '
-      + 'A repeated request reuses the Ticket each task position created. List external Threads a Ticket should follow with their source:id keys; other forms are refused.',
+      + 'A repeated request reuses the Ticket each task position created. List external Threads a Ticket should follow with their source:id keys; other forms are refused. '
+      + 'A task may name allow_tools to narrow its worker\'s tools; it cannot widen the Project Mandate\'s allowlist, and omitting it keeps the worker\'s full tool set.',
     schema: z.object({
       tasks: z.array(ProjectTaskSchema).min(1).max(PROJECT_TICKETS.max).refine(tasks => {
         const names = tasks.flatMap(task => task.worktree_name ? [task.worktree_name] : [])

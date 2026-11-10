@@ -65,12 +65,14 @@ Creating a Project is not an accept and does not go through `orchestrator_route`
 
 ### A PM's delegated Tickets
 
-The PM creates Tickets only inside its own Project, never arbitrary work, with `orchestrator_project_ticket_create`. One call takes 1–5 tasks, each with a title, goal, optional scope and note, optional worktree name, and optional external Threads.
+The PM creates Tickets only inside its own Project, never arbitrary work, with `orchestrator_project_ticket_create`. One call takes 1–5 tasks, each with a title, goal, optional scope and note, optional worktree name, optional `allow_tools`, and optional external Threads.
 
-- The Engine validates that the caller is that Project's PM Session and that the Project is active. An unknown Project, a non-PM caller or an ended Project creates nothing.
+- The Engine requires the Project's own PM Session id and validates that the Project is active. An unknown Project, a non-PM caller, a call that omits the PM Session, or an ended Project creates nothing.
 - Each task records one Trigger of the built-in `internal` Source: actor `{source: 'internal', id: pmSessionId}`, `human: false`, no addressed mark, and one internal Thread of its own.
 - A record-only Eval with a real Eval id records a `delegated` Decision, without asking the assessor and without delivering a candidate. Its basis is `{via: 'delegated', projectId, pmSessionId}`; its strength comes from the PM Mandate. The Decision names the Ticket and the Project, and records the Ticket's Mandate.
 - The Ticket's Mandate copies the PM Mandate's strength, Policy version and actor, narrows the scope to the task's scope (or goal), and carries the delegated basis. `Policy.revalidate` accepts a delegated Mandate directly: the PM Mandate is its authority, so no external allowed list is checked.
+- A task's `allow_tools` becomes the Ticket's `Mandate.allowTools`. Omitted or empty means the PM Mandate's own `allowTools` when it has one, else no restriction (every Worker tool). A task may only name known Worker tools, once each, at most 32, and may only narrow a PM Mandate's list, never widen it; an invalid list refuses the whole batch. `WORK_TOOLS` is the single declared set.
+- `allowTools` narrows tool visibility only. It is not a filesystem, permission or sandbox boundary, and policy still governs what the work may be. The Executor's `workOnly` gives a Worker only the intersection of its Mandate's list and the tools the host actually offers; a subagent of that Worker inherits the same intersection and cannot reach a forbidden tool.
 - The Ticket has no Channel and does not subscribe to the Project's source Thread. It subscribes only to the external Threads its task names; a `contextOnly` Thread is recorded in `Thread.context`, so its messages reach the worker without granting authority and do not resume an ended Ticket. Unknown thread keys or malformed references refuse the whole batch.
 - Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call reuses the Ticket each task position already produced.
 - The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.

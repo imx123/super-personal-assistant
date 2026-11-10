@@ -192,7 +192,7 @@ beforeEach(async () => {
           return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
         },
         restrict: vi.fn((rule: { allow: string[] }) => {
-          if (rule.allow.some(name => !inherited.includes(name))) throw new Error('Restriction names a non-inherited tool')
+          if (rule.allow.some(name => !inherited.includes(name) && !sessionTools.has(name))) throw new Error('Restriction names an unknown tool')
           restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule]); return () => {}
         }),
         guard: vi.fn((check: Guard) => { guards.set(sessionId, check); return () => {} }) })
@@ -1818,6 +1818,33 @@ it('gives a subagent of a worker only the worker\'s work tools, and none once th
   other.session.header = { parentSession: 'someone-else' }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: other } as never)
   expect(restricts.get('child-2')).toBeUndefined()
+})
+
+it('gives a Project Ticket worker only the tools its Mandate allows, and its subagent the same', async () => {
+  const trigger = feishu('31', '@bot 开个设置站项目')
+  await receive(trigger)
+  const created = await runTool(runtime.masterId, 'orchestrator_project_create',
+    { trigger_id: trigger.id, title: '设置站', goal: '让设置页更清楚' }) as { project: { project_id: string } }
+  const project = runtime.store.projects.get(created.project.project_id)!
+  expect(tools.get(runtime.masterId)!.has('orchestrator_project_ticket_create')).toBe(false)
+  const result = await runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+    { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header', allow_tools: ['read', 'grep'] },
+    { title: 'Footer', goal: 'Fix the footer links', worktree_name: 'fix-footer' },
+  ] }) as { tickets: { ticket_id: string }[] }
+  const [restricted, full] = result.tickets.map(card => runtime.store.tickets.get(card.ticket_id)!)
+  expect(restricted!.mandate.allowTools).toEqual(['read', 'grep'])
+  expect(full!.mandate).not.toHaveProperty('allowTools')
+  const restrictedSession = `worker-${restricted!.id}`, fullSession = `worker-${full!.id}`
+  await vi.waitFor(() => expect(restricts.get(restrictedSession)).toEqual([{ allow: ['read', 'grep'] }]))
+  await vi.waitFor(() => expect(restricts.get(fullSession)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output',
+    'job_list', 'job_kill', 'web_search', 'skill'] }]))
+  // A subagent of the restricted worker inherits the same allowlist, with no way to reach a forbidden tool.
+  await (controller.create as (options: { sessionId: string }) => Promise<void>)({ sessionId: 'allow-child-1' })
+  const child = agents.get('allow-child-1')! as unknown as { session: { header: { parentSession?: string } } }
+  child.session.header = { parentSession: restrictedSession }
+  await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
+  expect(restricts.get('allow-child-1')).toEqual([{ allow: ['read', 'grep'] }])
+  expect(guards.get('allow-child-1')!()).toBeUndefined()
 })
 
 it('gives a subagent of a worker\'s subagent the same work tools and guard', async () => {

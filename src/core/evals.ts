@@ -181,8 +181,10 @@ export class Evals extends EnginePart {
    * Record the gate-less, record-only Eval of one internal Trigger the PM of `project` delegated: a real Eval id and a
    * `delegated` Decision with the Ticket's Mandate, without asking the assessor or delivering a candidate. The PM Mandate
    * is the authority, so the Eval's strength comes from it and its basis is `delegated`; nothing external is checked.
+   * `allowTools` is the Ticket's final tool allowlist, already narrowed by the PM Mandate when it has one.
    */
-  delegated(trigger: Trigger, project: ProjectProfile, ticketId: string, scope: string): { decision: Decision; mandate: Mandate } {
+  delegated(trigger: Trigger, project: ProjectProfile, ticketId: string, scope: string, allowTools?: readonly string[]):
+    { decision: Decision; mandate: Mandate } {
     const thread = this.thread(trigger.threads[0]!)
     const at = this.now()
     const basis: MandateBasis = { via: 'delegated', projectId: project.id, pmSessionId: project.pmSessionId }
@@ -191,7 +193,7 @@ export class Evals extends EnginePart {
     thread.lastAt = trigger.at
     this.repo.threads.save(thread)
     const mandate: Mandate = { strength: project.mandate.strength, policyVersion: project.mandate.policyVersion, basis,
-      actor: project.mandate.actor, scope }
+      actor: project.mandate.actor, scope, ...(allowTools?.length ? { allowTools: [...allowTools] } : {}) }
     const decision = this.record(thread, evaluation, { kind: 'delegated', reason: [{ code: 'projectTicketCreated', values: { project: project.id } }],
       ticketId, projectId: project.id, mandate })
     return { decision, mandate }
