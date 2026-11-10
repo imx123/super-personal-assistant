@@ -3,6 +3,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
+import { WorkspaceUnknownSessionError } from '@deepseek-ai/dsh-workspace'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -137,6 +138,8 @@ export class Sessions {
   private readonly agentDelivery: AgentDelivery
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
+  /** Sessions the host proved were never created; archiving them is a no-op, not a failure to retry forever. */
+  private readonly absentSessions = new Set<string>()
   private readonly retryHealth = new RetryHealth()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the Session a payload names, or the main Session. */
@@ -303,6 +306,14 @@ export class Sessions {
         } else await registry!.unarchiveSession!(sessionId as SessionId)
         ids.push(sessionId)
       } catch (error) {
+        // A never-started Worker has no Session to archive; the host reports a definite miss, not a transient failure.
+        // Treat it as done so reconcile does not retry it forever (P2-A04).
+        if (error instanceof WorkspaceUnknownSessionError
+          || (error instanceof Error && error.name === 'WorkspaceUnknownSessionError')) {
+          this.absentSessions.add(sessionId)
+          ids.push(sessionId)
+          continue
+        }
         const message = error instanceof Error ? error.message : String(error)
         this.ctx.logger.warn('dsh-superagent could not %s Session %s: %s', archive ? 'archive' : 'unarchive', sessionId, message)
         failures.push({ sessionId, error: message })
@@ -312,6 +323,7 @@ export class Sessions {
   }
   /** Whether the host reports `sessionId` archived; undefined when the host offers no archived Session ids. */
   archivedSession(sessionId: string): boolean | undefined {
+    if (this.absentSessions.has(sessionId)) return true
     const registry = this.ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
     if (!registry || !Array.isArray(registry.archivedSessionIds)) return undefined
     return registry.archivedSessionIds.map(String).includes(sessionId)

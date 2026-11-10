@@ -83,6 +83,13 @@ export class Evals extends EnginePart {
       for (const triggerId of followups) this.emit('trigger.followup', { triggerId })
       if (!thread.pending.length) return
     }
+    // P2-A03: a Trigger that already created a Project must never re-enter a batch, even if an older queue still lists it.
+    const projectRouted = thread.pending.filter(id => this.projectDecision(id))
+    if (projectRouted.length) {
+      thread.pending = thread.pending.filter(id => !projectRouted.includes(id))
+      this.repo.threads.save(thread)
+      if (!thread.pending.length) return
+    }
     // Triggers that already originated a ticket cannot lend authority to a new evaluation or spawn a duplicate ticket.
     const accepted = this.accepted(thread.key)
     const started = thread.pending.filter(id => accepted.has(id))
@@ -154,6 +161,11 @@ export class Evals extends EnginePart {
     // A follow-up that reached a ticket is its worker's to judge: the main Session may only stop the work on it.
     if (outcome.kind !== 'stop') this.leftToWorkers(trigger)
     const evaluation = held?.evaluating ?? this.directEval(thread, trigger, outcome.kind, outcome.kind === 'stop' ? outcome.ticketId : undefined)
+    // P2-A03: an Eval may already hold a batch that includes a Trigger routed to a Project. Refuse the whole accept rather
+    // than letting that Trigger enter an independent Ticket.
+    if (outcome.kind === 'accept' && evaluation.triggerIds.some(id => this.projectDecision(id))) {
+      throw new UserError('alreadyRouted', { route: 'Project' })
+    }
     // An inferred candidate is accepted only on enabled rules its assessment matched, while assessments may accept.
     if (outcome.kind === 'accept' && evaluation.strength !== 'explicit' && !this.policy().admitsInferred(outcome.rules ?? [])) {
       throw new UserError('notExplicit')
@@ -230,6 +242,8 @@ export class Evals extends EnginePart {
   private requeue(triggerId: string): boolean {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
+    // P2-A03: a Project-routed Trigger is never queued again; a batch could otherwise carry it into a Ticket.
+    if (this.projectDecision(triggerId)) return false
     if (this.holding(triggerId)) return false
     this.queueForEval(trigger)
     const disposition = this.repo.triggers.disposition(triggerId) ?? { fanout: [], at: this.now() }
@@ -327,6 +341,12 @@ export class Evals extends EnginePart {
     return accepted
   }
   /** The `project` Decision a Trigger created, if any: one Trigger routes to one Project (P2-A03). */
+  private projectDecision(triggerId: string): Decision | undefined {
+    const decisionId = this.repo.triggers.disposition(triggerId)?.decisionId
+    const decision = decisionId ? this.repo.decisions.get(decisionId) : undefined
+    return decision?.kind === 'project' ? decision : undefined
+  }
+  /** The `project` Decision on `thread` for `triggerId`, if any: one Trigger routes to one Project (P2-A03). */
   private projectRoute(thread: Thread, triggerId: string): Decision | undefined {
     return this.repo.decisions.byThread(thread.key)
       .find(decision => decision.kind === 'project' && decision.triggerIds.includes(triggerId))

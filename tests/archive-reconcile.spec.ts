@@ -1,6 +1,7 @@
 /** P2.5-B: native DSH archive reconciliation and Project pending notes. */
 import { describe, expect, it, vi } from 'vitest'
 import type { SessionId } from '@deepseek-ai/dsh-session'
+import { WorkspaceUnknownSessionError } from '@deepseek-ai/dsh-workspace'
 import { liveTicket } from '../src/core/index.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
 import { KV } from '../src/kv.ts'
@@ -27,6 +28,26 @@ async function projectWith(host: Host, id: string, tasks: string[]) {
 }
 
 describe('native DSH archive reconciliation', () => {
+  it('treats a never-created Worker Session as archived, not a retryable failure (P2-A04)', async () => {
+    const host = await startRuntime()
+    try {
+      const { project, tickets } = await projectWith(host, '70', ['Header'])
+      const absent = workerSessionId(tickets[0]!.id)
+      const original = host.workspace.archiveSession.getMockImplementation()!
+      host.workspace.archiveSession.mockImplementation(async (sessionId: string, options?: { stopActivity?: boolean }) => {
+        if (sessionId === absent) throw new WorkspaceUnknownSessionError(sessionId as SessionId, 'archive')
+        await original(sessionId, options)
+      })
+      const result = await host.runtime.sessions.archiveProject(project)
+      expect(result.failures).toEqual([])
+      expect(result.ids).toContain(absent)
+      expect(host.runtime.sessions.archivedSession(absent)).toBe(true)
+      // A second call is a no-op for the absent Session, not another host failure.
+      const again = await host.runtime.sessions.archiveProject(project)
+      expect(again.failures).toEqual([])
+    } finally { await host.stop() }
+  })
+
   it('archives a Project whose PM Session was archived in DSH, then restores it on unarchive', async () => {
     const host = await startRuntime()
     try {

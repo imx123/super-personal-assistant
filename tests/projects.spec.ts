@@ -101,6 +101,18 @@ describe('Project creation', () => {
     expect(h.repo.decisions.byThread('main-session:p1')).toHaveLength(1)
   })
 
+  it('keeps a Project-routed Trigger out of a later batch accept (P2-A03)', () => {
+    const h = harness()
+    const shared = { source: 'main-session', id: 'shared' }
+    h.engine.recordTriggerForRouting(trigger('p1', { threads: [shared] }))
+    h.engine.createProject('p1', 'Website', 'Ship the new site')
+    expect(h.engine.reevaluate('p1')).toBe(false)
+    h.engine.recordTriggerForRouting(trigger('p2', { threads: [shared] }))
+    const decision = h.engine.decide('p2', { kind: 'accept', title: 'Normal work', scope: 'normal', reason: 'requested' })
+    expect(decision).toMatchObject({ kind: 'accept', triggerIds: ['p2'] })
+    expect(h.repo.tickets.get(decision.ticketId!)?.origin.triggerIds).toEqual(['p2'])
+  })
+
   it('refuses an unknown trigger and one the gate does not admit, recording neither a Project nor a Decision', () => {
     const h = harness()
     expect(() => h.engine.createProject('missing', 'Website', 'Ship')).toThrow(new UserError('unknownTrigger'))
