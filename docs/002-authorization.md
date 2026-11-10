@@ -62,6 +62,7 @@ Creating a Project is not an accept and does not go through `orchestrator_route`
 - No Ticket is accepted and no worker starts at Project creation. The main Session receives the Project card and only acknowledges it.
 - The `PMMandate` carries the gate's strength, Policy version, basis and actor, as a Ticket Mandate does, plus the Project and its goal. It authorizes managing the Project, not arbitrary file or repository work.
 - The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm` with four tools: `orchestrator_read`, `orchestrator_project_ticket_create`, `orchestrator_project_ticket_message` and `orchestrator_project_report`. It is a small Router: it keeps the Project's goal in view, delegates its Tickets, coordinates them and reports to the Project. Its read tool accepts its own `project/<id>`, its `project/<id>/tickets`, and a `ticket/<id>` only when that Ticket's `projectId` is its Project; every other resource is refused. It takes the `auto` permission preset when the host offers it, else `workspace-write`, then `read-only`; full access only when none exists.
+- A new PM Session uses `eval.pmModel` when set, else `eval.model`; a worker still uses `executor.model` and the main Session `eval.model`. Changing `pmModel` applies to newly created PM Sessions only; an existing PM Session keeps its selection.
 
 ### A PM's delegated Tickets
 

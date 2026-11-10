@@ -84,6 +84,8 @@ export const EvalConfigSchema = z.object({
   mode: z.enum(['off', 'observe', 'auto']).default('observe'),
   timeoutSeconds: z.number().int().min(LIMITS.evalTimeoutSeconds.min).max(LIMITS.evalTimeoutSeconds.max).default(120),
   model: RoleModelSchema.nullable().default(null),
+  /** An optional separate model for Project PM Sessions; null inherits `model`. */
+  pmModel: RoleModelSchema.nullable().default(null),
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)

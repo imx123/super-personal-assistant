@@ -15,6 +15,23 @@ function deferred<T>() {
 }
 const model = { provider: 'worker-provider', model: 'worker-model' }
 
+it('validates and saves a separate PM model, and clearing it returns to inheritance', async () => {
+  h = await startRuntime()
+  const { settings, store } = h.runtime
+  const llm = (h.ctx as unknown as { llm: { resolveCallConfig: ReturnType<typeof vi.fn> } }).llm
+  const current = store.settings().eval
+  const invalid = { ...current, pmModel: { provider: 'nowhere', model: 'missing' } }
+  llm.resolveCallConfig.mockRejectedValueOnce(new Error('unknown provider nowhere'))
+  await expect(settings.save('eval', invalid, store.blockRevision('eval'), 'panel')).rejects.toMatchObject({
+    code: 'modelUnavailable', values: expect.objectContaining({ block: 'eval' }) })
+  expect(store.settings().eval.pmModel).toBeNull()
+  const pm = { provider: 'pm-provider', model: 'pm-model' }
+  await settings.save('eval', { ...current, pmModel: pm }, store.blockRevision('eval'), 'panel')
+  expect(store.settings().eval.pmModel).toEqual(pm)
+  await settings.save('eval', { ...store.settings().eval, pmModel: null }, store.blockRevision('eval'), 'panel')
+  expect(store.settings().eval.pmModel).toBeNull()
+})
+
 it('refuses a save of a block that another save changed during its model or account check, and saves nothing of it', async () => {
   h = await startRuntime()
   const { settings, store } = h.runtime

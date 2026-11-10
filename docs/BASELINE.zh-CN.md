@@ -197,7 +197,7 @@ P2.6 只做 Project pause 的 soft/hard 语义；不做删除、PM 模型、PM�
 
 明确未做：Project/Ticket 删除、PM 独立模型、PM→Worker 消息、Project domain events、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
 
-## P2.7 当前范围：PM→Worker 协调消息
+## 已完成的 P2.7：PM→Worker 协调消息
 
 P2.7 只做 PM 给 child Ticket 的协调消息；不做删除、PM 模型、Project events、pause 新行为或父 Ticket/Dispatch/TaskSpec。
 
@@ -220,6 +220,30 @@ P2.7 只做 PM 给 child Ticket 的协调消息；不做删除、PM 模型、Pro
 | `docs/001`、`docs/002`、`docs/007`、本文件 | note Input、wake、无新授权、跨 Project 限制 |
 
 明确未做：Project/Ticket 删除、PM 独立模型、Project domain events、pause 新行为、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG。
+
+## P2.8 当前范围：eval.pmModel 独立 PM 模型
+
+P2.8 只做 PM Session 的独立模型设置；不做 Project events、删除、pause 新行为、PM→Worker 消息改动或模型设置重构。
+
+已实现：
+
+- `EvalConfigSchema` 增加 `pmModel: RoleModelSchema.nullable().default(null)`，`Settings['eval']['pmModel']`；`SettingsSchema.parse({})` 默认 `null`。
+- 新 Session 模型：主 Session/orchestrator 用 `eval.model`；PM 用 `eval.pmModel ?? eval.model`；worker 仍用 `executor.model`。已有 PM Session 不会被自动换模型。
+- Settings 保存 `eval` block 时，`model` 和 `pmModel` 分别比较并走现有 `resolveRoleModel`；变化且非 null 的 `pmModel` 非法时返回 `modelUnavailable`，错误 block 仍为 `eval`；清空 `pmModel` 不校验并回退继承。
+- `resources.models` 的 `roles` 增加 `pm`（有效模型：`pmModel ?? eval.model`）。
+- Eval 设置区新增“PM 模型”`ModelField`，可留空继承研判模型；block draft 保存/冲突/清空逻辑沿用现有实现。
+- `settings-history` 增加 `evalPmModel` 变更项和双语 locale。
+
+改动文件：
+
+| 文件 | 变更 |
+| --- | --- |
+| `src/policy.ts`、`src/app/settings.ts`、`src/app/role-models.ts`、`src/app/sessions.ts`、`src/app/resources.ts` | pmModel schema、保存校验、PM 模型解析、roles.pm |
+| `src/client/eval.tsx`、`settings-kit.tsx`、`locales.ts`、`src/app/settings-history.ts` | PM 模型字段、data-model 标记、历史变更与文案 |
+| `tests/policy.spec.ts`、`settings.spec.ts`、`panel-settings.spec.tsx`、`runtime.spec.ts`、`project-tickets.spec.ts` | 默认值、非法/合法/清空保存、面板渲染编辑、history、PM/worker 模型选择 |
+| `docs/002`、`docs/007`、本文件 | PM 继承语义、只影响新 Session、roles.pm |
+
+明确未做：Project events、删除、pause 新行为、PM→Worker 消息改动、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、其他模型设置重构。
 
 ## 主入口的权限模型
 
@@ -255,15 +279,16 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
 
-2026-11-10 在本机验证 P2.7：
+2026-11-10 在本机验证 P2.8：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过（`lib/index.js`、`lib/client.js` 与声明文件）。
-- `tests/project-tickets.spec.ts` 24 项全通过：P2.5/P2.6 的归档、原生 reconcile、pendingNotes、pause soft/hard、报告路由仍保留；新增 PM 消息落为 note Input、running deliver、wake=false 不新建 Assignment、wake=true 仅 retryable 才启动、同文本幂等、paused/archived/ended/ended-Ticket/Router-owned 拒绝、archived worker Session 返回 `not_started` 且不投递；runtime 下 PM 工具发 child note、重复不重复、跨 Project 拒绝。
-- `tests/projects.spec.ts` 6 项、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项全通过：PM 工具列表含 `orchestrator_project_ticket_message`，Pause soft/Hard pause/Resume 与 pause API 保持。
-- `tests/archive-reconcile.spec.ts` 3 项仍通过。
+- `tests/project-tickets.spec.ts` 26 项全通过：P2.5/P2.6/P2.7 的归档、reconcile、pause、PM 消息仍保留；新增 runtime 下 `eval.pmModel` 用于新 PM Session、清空后继承 `eval.model`、worker 仍用 `executor.model`。
+- `tests/settings.spec.ts` 5 项、`tests/panel-settings.spec.tsx` 通过：非法 pmModel 返回 `modelUnavailable`（block=`eval`）、合法保存、清空回退；Eval 设置区渲染/编辑 PM 模型，history 显示“PM 模型”变更。
+- `tests/policy.spec.ts` 通过：`SettingsSchema.parse({})` 的 `eval.pmModel` 默认 null；`settings/model` 迁移期待已同步。
+- `tests/projects.spec.ts` 6 项、`tests/panel-project.spec.tsx` 3 项、`tests/http.spec.ts` 5 项、`tests/archive-reconcile.spec.ts` 3 项仍通过。
 - `model-surface` 通过，orchestrator 预算 61,500 未变。
-- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`archive-reconcile`、`projects`、`tools`、`outbox`、`passes`、`queue` 通过。
-- 全量 63 个测试文件、1245 项：1197 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
+- 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`role-models`、`settings`、`panel-settings`、`projects`、`project-tickets` 通过。
+- 全量 63 个测试文件、1249 项：1201 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
 - 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
 
 ## 后续顺序
@@ -276,10 +301,11 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 6. P2.5-A Project/Ticket 归档核心（已完成）
 7. P2.5-B DSH 原生归档联动 + pendingNotes（已完成）
 8. P2.6 Project pause soft/hard（已完成）
-9. P2.7 PM→Worker 协调消息（已完成；不做删除、PM 模型、Project events）
-10. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
-11. 意外中断与恢复
-12. 再扩展新功能
+9. P2.7 PM→Worker 协调消息（已完成）
+10. P2.8 eval.pmModel 独立 PM 模型（已完成；只影响新 PM Session）
+11. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续
+12. 意外中断与恢复
+13. 再扩展新功能
 
 ## 文档说明
 

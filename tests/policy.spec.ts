@@ -23,6 +23,10 @@ function setup(settings: Settings = base) {
   return { sources, policy: settingsPolicy(settings, sources), version: policyVersion(settings) }
 }
 const { sources, policy } = setup()
+
+it('defaults the separate PM model to null so it inherits the Assessor model', () => {
+  expect(SettingsSchema.parse({}).eval.pmModel).toBeNull()
+})
 const thread = (subscriptions: string[] = []): Thread => ({ key: 'feishu:x', ref: { source: 'feishu', id: 'x' }, createdAt: '', subscriptions, correlated: [], pending: [], meta: {} })
 const feishu = (overrides: Partial<Trigger> & { meta?: Record<string, unknown> } = {}): Trigger => ({ id: 't', source: 'feishu', threads: [{ source: 'feishu', id: 'x' }], actor: { source: 'feishu', id: MEMBER }, human: true, at: '', text: 'hi', addressed: 'mention', meta: { chatId: CHAT, direct: false, mentioned: true }, ...overrides })
 const unaddressed = (overrides: Partial<Trigger> = {}): Trigger => { const { addressed: _addressed, ...rest } = feishu(overrides); return rest }
@@ -264,7 +268,7 @@ describe('settings migration', () => {
       paused: true,
       sources: { feishu: feishuSource({ chats: [{ chatId: CHAT, listen: 'mentions' }, { chatId: OBSERVED, listen: 'all' }], directMessages: false }), github: { enabled: true, config: { pollSeconds: 120 } } },
       policy: { rules: [], sources: { feishu: { allowed: [{ id: MEMBER, name: 'A' }], admission: {} }, github: { allowed: [{ id: 'a' }], admission: {} } } },
-      eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' } },
+      eval: { mode: 'auto', timeoutSeconds: 90, model: { provider: 'p', model: 'm' }, pmModel: null },
       executor: { model: null, maxWorkers: 5, directory: '', prepare: '', blockedCommands: [] },
     })
     expect(migrateSettings(migrated)).toEqual(migrated)

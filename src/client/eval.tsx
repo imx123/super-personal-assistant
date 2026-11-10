@@ -211,6 +211,9 @@ function EvalBlock() {
       <Section title={t('assessorModel')} hint={t('assessorModelHint')}>
         <ModelField id="dt-eval-model" value={value.model} onChange={model => edit({ model })} />
       </Section>
+      <Section title={t('pmModel')} hint={t('pmModelHint')}>
+        <ModelField id="dt-pm-model" value={value.pmModel} onChange={pmModel => edit({ pmModel })} />
+      </Section>
     </Fields>
     <SaveBar {...draft} onDiscard={draft.discard} />
   </form>

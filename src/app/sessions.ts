@@ -172,7 +172,8 @@ export class Sessions {
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'worker' ? settings.executor.model : settings.eval.model)
+    const model = role === 'worker' ? settings.executor.model : role === 'pm' ? settings.eval.pmModel ?? settings.eval.model : settings.eval.model
+    await initializeRoleModel(ctx, result.agent, model)
     await this.decorate(result.agent)
     const permissions = ctx.permissionPresets
     // Auto is advertised only while the host's reviewer is registered. Tool denials or errors never change this selection.

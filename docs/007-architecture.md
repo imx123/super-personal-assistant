@@ -240,7 +240,7 @@ Validation inherits an omitted base from the saved override, drops removed parts
 
 ### Sessions
 
-`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for both roles. `ensure` creates a Session with its role's model. `install` follows agent events and registers prompts, skills and tools for managed Sessions.
+`Sessions` (`src/app/sessions.ts`) manages DeepSeek Harness Sessions for the main, Project PM and worker roles. `ensure` creates a Session with its role's model (`eval.model` for the main/orchestrator, `eval.pmModel ?? eval.model` for a PM, `executor.model` for a worker). `install` follows agent events and registers prompts, skills and tools for managed Sessions.
 
 `prompt` delivers once per request id. `relay` and `notify` enqueue Session messages handled by the `relay` and `notice` effects; a relay may name a Project PM Session instead of the main Session. `src/app/notices.ts` defines their content; `delivery` checks whether a message arrived.
 
@@ -341,7 +341,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/archive-reconcile.ts` | `ArchiveReconciler`: records `workspace/session-activity`/`session-stop` candidates without changing state, reconciles `archivedSessionIds` against the KV snapshot on events and a 30-second unref fallback, and routes PM/worker additions and removals to the Engine and Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
-| `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
+| `src/app/role-models.ts` | Resolves the Assessor, PM and Executor models, and seeds a new Session with its role's model; a PM uses `eval.pmModel` when set, else `eval.model` |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
@@ -438,12 +438,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/archive-reconcile.spec.ts` | Native DSH archive reconciliation: the activity waterfall pass-through, PM archive/unarchive changing the Project, worker archive ending only its Assignment with a single pending note, the note in and then cleared from the PM prompt, repeated reconcile without a duplicate, worker unarchive without retry, a missing snapshot, and no self-archive loop |
 | `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
-| `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the two roles |
+| `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the main/PM/worker roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
-| `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
+| `tests/settings.spec.ts` | Settings saves that race a model or account check, an invalid PM model refused, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
 | `tests/migration.spec.ts` | The schema 11 migration: every stored record in its current shape, and the refusal of older schemas |
@@ -615,7 +615,7 @@ Ticket cards use the closed `TICKET_STATES` set from `src/app/cards.ts`: an open
 | Ticket subresources | `/assignments`, `/inputs`, `/assignment`, `/result`, `/report/<assignment id>`, `/transcript`, `/message/<n>`, `/input/<id>` |
 | `settings`, `settings/<block>` | Revisions and summaries, or a complete block ready to save |
 | `prompts`, `prompts/<revision>`, `prompts/current`, `prompts/defaults`, `prompt-preview/<id>` | Prompt configurations and composed text |
-| `models`, `models/<provider>` | Available models |
+| `models`, `models/<provider>` | Available models; `models` also names the configured orchestrator, PM and worker roles, with the PM falling back to the Assessor model |
 | `feishu/<trigger id>/…`, `github/…` | Original Source records, described in the Source skills |
 
 Ticket Threads are marked `context` for context-only follows and `bound` for Source bindings. Assignment pages are newest first and include report previews. Continue lists with `next_offset`. `/input/<id>` accepts an Input's name or id. `settings` includes small blocks in full and summarizes Policy and Source blocks.

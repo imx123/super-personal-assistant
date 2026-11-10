@@ -367,6 +367,41 @@ describe('PM-created Project Tickets', () => {
 })
 
 describe('a Project PM Session through the runtime', () => {
+  it('uses eval.pmModel for a new PM Session, inherits eval.model when empty, and leaves workers on executor.model', async () => {
+    const host = await startRuntime()
+    try {
+      const llm = (host.ctx as unknown as { llm: { resolveCallConfig: ReturnType<typeof vi.fn> } }).llm
+      const saved = host.runtime.store.settings()
+      const evalModel = { provider: 'eval-provider', model: 'eval-model' }
+      const pmModel = { provider: 'pm-provider', model: 'pm-model' }
+      const workerModel = { provider: 'worker-provider', model: 'worker-model' }
+      host.runtime.store.saveSettings({ ...saved, eval: { ...saved.eval, model: evalModel, pmModel }, executor: { ...saved.executor, model: workerModel } })
+      const create = async (id: string) => {
+        const request = feishu(id, `Start a project for ${id}`)
+        host.runtime.receive(request)
+        await host.runtime.idle()
+        return host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+          { trigger_id: request.id, title: `Model project ${id}`, goal: 'Ship a clearer settings site' }) as Promise<{ project: { project_id: string } }>
+      }
+      const first = await create('27')
+      expect(llm.resolveCallConfig).toHaveBeenCalledWith(expect.objectContaining(pmModel))
+      const firstProject = host.runtime.store.projects.get(first.project.project_id)!
+      expect(host.tools.get(firstProject.pmSessionId)).toBeDefined()
+      // Clearing pmModel makes a later PM inherit eval.model, while a worker still uses executor.model.
+      host.runtime.store.saveSettings({ ...host.runtime.store.settings(), eval: { ...host.runtime.store.settings().eval, pmModel: null } })
+      const second = await create('28')
+      const secondProject = host.runtime.store.projects.get(second.project.project_id)!
+      expect(llm.resolveCallConfig).toHaveBeenCalledWith(expect.objectContaining(evalModel))
+      const result = await host.runTool(secondProject.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' }] }) as { tickets: { ticket_id: string }[] }
+      const ticket = host.runtime.store.tickets.get(result.tickets[0]!.ticket_id)!
+      await vi.waitFor(() => expect(host.tools.get(workerSessionId(ticket.id))).toBeDefined())
+      expect(llm.resolveCallConfig).toHaveBeenCalledWith(expect.objectContaining(workerModel))
+      // The first PM Session keeps the model it was created with.
+      expect(firstProject.pmSessionId).not.toBe(secondProject.pmSessionId)
+    } finally { await host.stop() }
+  })
+
   it('lets the PM message a child as a note Input without granting authority or duplicating it', async () => {
     const host = await startRuntime()
     try {

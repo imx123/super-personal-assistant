@@ -85,7 +85,7 @@ export function ModelField({ id, value, onChange }: { id: string; value: RoleMod
     <Input list={`${id}-${name}s`} spellCheck={false} placeholder={placeholder} value={current[name]}
       onChange={event => set({ [name]: event.target.value })} />
   </Field>
-  return <div className="dt-model">
+  return <div className="dt-model" data-model={id}>
     <Hint>{fallback ? t('defaultModel', { model: `${fallback.provider} / ${fallback.model}${fallback.reasoningEffort
       ? ` · ${fallback.reasoningEffort}` : ''}` }) : t('defaultModelUnavailable')}</Hint>
     {error && <p className="dt-error">{t('modelCatalogError', { error })}</p>}
