@@ -33,6 +33,7 @@ export class ArchiveReconciler {
   private running?: Promise<void>
   private again = false
   private readonly candidates = new Set<string>()
+  private readonly unarchivedProjects = new Set<string>()
   private readonly warned = new Set<string>()
   private readonly disposers: (() => void)[] = []
   private unavailableLogged = false
@@ -105,6 +106,7 @@ export class ArchiveReconciler {
     const added = first ? current : current.filter(id => !previous.has(id))
     const removed = first ? [] : [...previous].filter(id => !current.includes(id))
     this.candidates.clear()
+    this.unarchivedProjects.clear()
     let ok = true
     const attempt = async (run: () => Promise<void> | void): Promise<void> => {
       try { await run() } catch (error) {
@@ -144,6 +146,7 @@ export class ArchiveReconciler {
     const project = this.projectOf(sessionId)
     if (!project || project.status !== 'archived') return
     const restored = this.host.engine.unarchiveProject(project.id)
+    this.unarchivedProjects.add(project.id)
     await this.host.sessions.unarchiveProject(restored)
   }
   private archiveWorker(sessionId: string): void {
@@ -154,6 +157,9 @@ export class ArchiveReconciler {
   private unarchiveWorker(sessionId: string): void {
     const ticketId = ticketOfSession(sessionId)
     if (!ticketId) return
+    // A Project's own unarchive already restores every child Session; that is not a Worker restored by hand.
+    const ticket = this.host.store.tickets.get(ticketId)
+    if (ticket?.projectId && this.unarchivedProjects.has(ticket.projectId)) return
     this.host.engine.workerSessionUnarchived(ticketId, sessionId)
   }
   private projectOf(sessionId: string) {

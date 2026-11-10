@@ -140,9 +140,9 @@ P2.5-A 只做 Project/Ticket 的归档与取消归档、级联、管理 API/面�
 | `tests/fixtures/host.ts`、`panel-server.ts`、`tests/project-tickets.spec.ts`、`panel-project.spec.tsx`、`http.spec.ts`、`model-surface.spec.ts` | Session archive fake、API/panel 控件、归档/取消归档/失败/幂等、预算 |
 | `docs/001`、`docs/002`、`docs/005`、`docs/007`、本文件 | 状态、归档/取消归档、Session 与级联语义 |
 
-明确未做：Project/Ticket 删除、DSH 原生 archive 事件检测/pendingNotes、pause 新模式、Project 暂停运行中 Worker、PM 独立模型、Project Memory、父 Ticket/Dispatch/TaskSpec、Fast Router/RAG、capability 档、`denyTools`。
+明确未做（P2.5-A 当时范围）：Project/Ticket 删除；DSH 原生 archive 事件检测/pendingNotes 已由 P2.5-B 补齐；pause 新模式、PM 模型、PM 消息、Project domain events 仍留待后续。
 
-## P2.5-B 当前范围：DSH 原生归档联动 + Project pendingNotes
+## 已完成的 P2.5-B：DSH 原生归档联动 + Project pendingNotes
 
 P2.5-B 只做 DSH 原生 archive/unarchive 的应用联动与 PM pendingNotes；不做删除、pause soft/hard、PM 模型、PM→Worker 消息或 Project domain events。
 
@@ -220,7 +220,7 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 2. 任务分派 / P2.1 Project + PM（已完成）；P2.2a PM 建 Project Ticket + child thread（已完成）
 3. P2.2b 可选 tool allowlist（已完成；不做 denyTools/能力档）
 4. P2.3 child report/attention 回 PM + PM 项目汇报回 Router（已完成）
-5. P2.4 Project 状态与控制（已完成；不做删除/归档、不暂停项目内 Worker）
+5. P2.4 Project 状态与控制（已完成；当时不做归档，归档见 P2.5）
 6. P2.5-A Project/Ticket 归档核心（已完成）
 7. P2.5-B DSH 原生归档联动 + pendingNotes（已完成；不做删除、pause soft/hard、PM 模型）
 8. 任务交接（下一步）；PM 直接回答 child attention 仍留待后续

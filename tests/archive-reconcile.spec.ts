@@ -48,6 +48,8 @@ describe('native DSH archive reconciliation', () => {
       stopSession(host, project.pmSessionId)
       await vi.waitFor(() => expect(host.runtime.store.projects.get(project.id)?.status).toBe('active'))
       for (const ticket of tickets) expect(host.runtime.store.tickets.get(ticket.id)?.archived).toBeUndefined()
+      // Restoring the Project restores its child Sessions; that is not a Worker restored by hand, so no notes.
+      expect(host.runtime.store.projects.get(project.id)?.pendingNotes).toBeUndefined()
     } finally { await host.stop() }
   })
 
