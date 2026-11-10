@@ -69,18 +69,19 @@ DSH 主 Session 是一条连续聊天会话。领域里的 `Trigger.threads` 目
 
 ## 验证
 
-2026-11-09 在本机验证：
+2026-11-10 在本机验证 P2.1：
 
 - `tsc --noEmit` 通过，`tsdown` 打包通过。
-- 定向 6 个测试文件（`runtime`、`policy`、`core-engine`、`model-surface`、`tools`、`runtime-concurrency`）共 630 项：629 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
-- 设置、面板、registry 和 views 相关的 5 个测试文件共 50 项全部通过；`index`、`http` 7 项全部通过。
-- `tests/docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档和链接检查通过。
-- 模型可见文本预算（`model-surface`）已重新压到 59000 字符以内。
+- 定向 13 个测试文件（Project、core-engine、policy、bundle-patch、model-surface、tools、runtime、cards、client、navigation、panel-project、panel-panel、panel-overview）共 672 项：671 通过；1 项失败，是 Windows 下 Git 配置路径转义断言，与上游已知问题同类。
+- `cards.spec.ts` 55 项通过（主 Session prompt 已压回 1400 字符内）；`prompts.spec.ts` 21 项通过。
+- `docs.spec.ts` 3 项失败，都是 Windows 路径分隔符导致的既有问题；新增的基线文档和链接检查通过。
+- `model-surface` 的 orchestrator 预算从 59,000 调到 60,000，用于 Project 工具和 `projects`/`project/<id>` 读资源；worker 预算不变。
+- 子代理全量记录：1214 项，1166 通过、48 失败，均为 sandbox `spawn EPERM`、Windows 路径/权限位等既有环境问题；本轮未重跑全量。
 
 ## 后续顺序
 
-1. 权限控制（当前）
-2. 任务分派
+1. 权限控制（初版已完成）
+2. 任务分派 / P2.1 Project + PM（当前）
 3. 任务交接
 4. 意外中断与恢复
 5. 再扩展新功能
