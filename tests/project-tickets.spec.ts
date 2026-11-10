@@ -1,6 +1,6 @@
 /** P2.2a/P2.2b: PM-created Project Tickets, delegated Decisions, external Threads, and their optional worker tool allowlist. */
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, key, waitsForPerson, type Assessor, type Candidate, type DomainEvent, type Executor,
+import { Engine, MemoryRepositories, UserError, waitsForPerson, type Assessor, type Candidate, type DomainEvent, type Executor,
   type Mandate, type Policy, type ProjectProfile, type ProjectTicketTask, type Ticket, type Trigger } from '../src/core/index.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
 import { SettingsSchema, settingsPolicy } from '../src/policy.ts'
@@ -52,7 +52,7 @@ describe('PM-created Project Tickets', () => {
     expect(h.repo.tickets.list()).toHaveLength(2)
     for (const [index, ticket] of tickets.entries()) {
       expect(ticket).toMatchObject({ projectId: h.project.id, channels: [], title: tasks[index]!.title,
-        origin: { triggerIds: [key('trigger', h.project.id, 'delegated', String(index))] },
+        origin: { triggerIds: [ticket.origin.triggerId] },
         mandate: { strength: 'explicit', basis: { via: 'delegated', projectId: h.project.id, pmSessionId: h.project.pmSessionId },
           scope: tasks[index]!.scope ?? tasks[index]!.goal } })
       expect(ticket.execution?.directory).toContain(ticket.id.slice(0, 12))
@@ -87,15 +87,43 @@ describe('PM-created Project Tickets', () => {
     expect(footer!.follows).toBeUndefined()
   })
 
-  it('is idempotent per task position and records no second Trigger, Eval or Decision', () => {
+  it('is idempotent per batch and records no second Trigger, Eval or Decision', () => {
     const h = harness()
     const first = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
     const second = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
     expect(second.map(ticket => ticket.id)).toEqual(first.map(ticket => ticket.id))
     expect(h.repo.tickets.list()).toHaveLength(2)
-    expect(h.repo.decisions.byThread(`internal:${key('trigger', h.project.id, 'delegated', '0')}`)).toHaveLength(1)
-    expect(h.repo.triggers.get(key('trigger', h.project.id, 'delegated', '1'))).toBeDefined()
+    expect(h.repo.decisions.byThread(`internal:${first[0]!.origin.triggerId}`)).toHaveLength(1)
+    expect(h.repo.triggers.get(first[1]!.origin.triggerId)).toBeDefined()
     expect(h.launches).toHaveLength(2)
+  })
+
+  // P2-A02: idempotency follows the whole batch's content, not only the Project and a task's position.
+  it('creates a new Ticket batch when the same positions carry different tasks, and replays each batch to its own Tickets', () => {
+    const h = harness()
+    const alpha = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Alpha', goal: 'Do alpha', worktree_name: 'alpha' }])
+    const beta = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Beta', goal: 'Do beta', worktree_name: 'beta' }])
+    expect(beta[0]!.id).not.toBe(alpha[0]!.id)
+    expect(beta[0]).toMatchObject({ id: beta[0]!.id, title: 'Beta' })
+    expect(h.repo.tickets.list()).toHaveLength(2)
+    expect(h.repo.decisions.byThread(`internal:${alpha[0]!.origin.triggerId}`).map(decision => decision.kind))
+      .toEqual(['delegated'])
+    // Each batch replays to the Ticket it created; a changed goal at the same position is a new batch again.
+    expect(h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Alpha', goal: 'Do alpha', worktree_name: 'alpha' }])[0]!.id).toBe(alpha[0]!.id)
+    expect(h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Beta', goal: 'Do beta', worktree_name: 'beta' }])[0]!.id).toBe(beta[0]!.id)
+    expect(h.repo.tickets.list()).toHaveLength(2)
+    const changed = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Alpha', goal: 'Do alpha differently', worktree_name: 'alpha-2' }])
+    expect(changed[0]!.id).not.toBe(alpha[0]!.id)
+    expect(h.repo.tickets.list()).toHaveLength(3)
+    // A worktree name stays unique across batches within the Project.
+    expect(() => h.engine.createProjectTickets(h.project.id, h.project.pmSessionId,
+      [{ title: 'Gamma', goal: 'Do gamma', worktree_name: 'alpha' }])).toThrow(new UserError('duplicateWorktree', { name: 'alpha' }))
+    expect(h.repo.tickets.list()).toHaveLength(3)
   })
 
   it('creates nothing when one task is invalid, including an unknown Thread key or a duplicate worktree name', () => {
@@ -104,8 +132,7 @@ describe('PM-created Project Tickets', () => {
       [tasks[0]!, { title: 'Bad', goal: 'Bad', threads: [{ key: 'not-a-thread-key' }] }]))
       .toThrow(new UserError('invalidThread', { thread: 'not-a-thread-key' }))
     expect(badThread.repo.tickets.list()).toEqual([])
-    expect(badThread.repo.decisions.byThread(`internal:${key('trigger', badThread.project.id, 'delegated', '0')}`)).toEqual([])
-    expect(badThread.repo.triggers.get(key('trigger', badThread.project.id, 'delegated', '0'))).toBeUndefined()
+    expect(badThread.repo.threads.list().filter(thread => thread.key.startsWith('internal:'))).toEqual([])
     const badTask = harness()
     expect(() => badTask.engine.createProjectTickets(badTask.project.id, badTask.project.pmSessionId,
       [tasks[0]!, { title: '', goal: 'x' }])).toThrow('title is required')

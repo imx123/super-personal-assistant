@@ -41,7 +41,8 @@ describe('native DSH archive reconciliation', () => {
       // A second pass absorbs the child Sessions archived by this command, without adding worker notes.
       await host.runtime.reconcileArchives()
       expect(host.runtime.store.projects.get(project.id)?.pendingNotes).toBeUndefined()
-      expect(host.workspace.archiveSession).toHaveBeenCalledWith(project.pmSessionId, { stopActivity: true })
+      // The PM was already archived by DSH, so reconciliation archives only its child Sessions and never repeats that call.
+      expect(host.workspace.archiveSession.mock.calls.map(([sessionId]) => sessionId)).not.toContain(project.pmSessionId)
       for (const ticket of tickets) expect(host.workspace.archiveSession).toHaveBeenCalledWith(workerSessionId(ticket.id), { stopActivity: true })
 
       for (const id of [project.pmSessionId, ...tickets.map(ticket => workerSessionId(ticket.id))]) host.workspace.archived.delete(id)
@@ -89,6 +90,39 @@ describe('native DSH archive reconciliation', () => {
       await vi.waitFor(() => expect(host.runtime.store.projects.get(project.id)?.pendingNotes?.[0]?.kind).toBe('workerRestored'))
       expect(host.runtime.store.tickets.get(ticket.id)?.assignments).toHaveLength(assignments)
       expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.endedReason).toBe('sessionArchived')
+    } finally { await host.stop() }
+  })
+
+  // P2-A04: a Project archive whose child Session archive failed must keep retrying that child on later passes.
+  it('retries a missed child Session archive on the next reconcile and only then advances the snapshot', async () => {
+    const host = await startRuntime()
+    try {
+      const { project, tickets } = await projectWith(host, '74', ['Header', 'Footer'])
+      const missed = workerSessionId(tickets[1]!.id)
+      const archive = host.workspace.archiveSession.getMockImplementation()!
+      let failed = false
+      host.workspace.archiveSession.mockImplementation(async (sessionId, options) => {
+        if (sessionId === missed && !failed) { failed = true; throw new Error('injected archive failure') }
+        return archive(sessionId, options)
+      })
+      expect(host.runtime.store.get(KV.archive.sessionSnapshot)).toEqual([])
+      host.workspace.archived.add(project.pmSessionId)
+      await host.runtime.reconcileArchives()
+      // The Project is archived, but the failed child keeps the pass from advancing the snapshot.
+      expect(host.runtime.store.projects.get(project.id)?.status).toBe('archived')
+      expect(host.workspace.archived.has(missed)).toBe(false)
+      expect(host.runtime.store.get(KV.archive.sessionSnapshot)).toEqual([])
+      expect(host.runtime.store.projects.get(project.id)?.pendingNotes).toBeUndefined()
+      // The next pass retries only what is missing and settles the Project's Sessions.
+      await host.runtime.reconcileArchives()
+      expect(host.workspace.archived.has(missed)).toBe(true)
+      expect(host.runtime.store.get(KV.archive.sessionSnapshot)).toEqual(expect.arrayContaining(
+        [project.pmSessionId, ...tickets.map(ticket => workerSessionId(ticket.id))]))
+      // Once settled, a later pass neither archives a Session again nor changes the Project.
+      const calls = host.workspace.archiveSession.mock.calls.length
+      await host.runtime.reconcileArchives()
+      expect(host.workspace.archiveSession.mock.calls.length).toBe(calls)
+      expect(host.runtime.store.projects.get(project.id)?.status).toBe('archived')
     } finally { await host.stop() }
   })
 

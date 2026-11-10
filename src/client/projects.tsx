@@ -48,6 +48,7 @@ function ProjectPage({ id }: { id: string }) {
     await call('POST projects/:id/pause', { id, body: { paused: false } })
   }, { reload })
   const stop = useAction(async () => { await call('POST projects/:id/stop', { id }) }, { reload })
+  const startPm = useAction(async () => { await call('POST projects/:id/pm', { id }) }, { reload })
   const archive = useAction(async () => {
     const result = await call('POST projects/:id/archive', { id })
     reportArchive(result.sessions, t('archiveProject'))
@@ -79,6 +80,8 @@ function ProjectPage({ id }: { id: string }) {
           message={t('stopProjectConfirm', { title: data.title })} onConfirm={stop.run} />
       </>}
       <SessionButton sessionId={data.pmSessionId} label={t('openPmSession')} />
+      {(data.status === 'active' || data.status === 'paused') && <Button variant="outline" size="sm" icon={<Icon name="play" size={14} />}
+        title={t('startPmSessionHint')} disabled={startPm.busy} onClick={() => { void startPm.run() }}>{t('startPmSession')}</Button>}
     </PageHead>
     <div className="dt-row-meta dt-status-line">
       <span className="dt-status-text" data-state={projectTone(data.status)}>{valueLabel(t, 'projectStatus', data.status)}</span>

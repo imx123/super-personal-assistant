@@ -109,6 +109,22 @@ function prepareProjectTask(task: ProjectTicketTask, index: number, inheritedToo
   return { index, title, goal, scope: scope || goal, ...(note ? { note } : {}), worktree_name: worktree || worktreeName(title, index),
     ...(allowTools ? { allowTools } : {}), threads: [...threads.values()] }
 }
+/**
+ * The content-derived key of one PM Ticket batch: replaying the same tasks reaches the same Tickets, while a new batch gets
+ * new ones even at the same task positions (P2-A02). Every field that shapes the Ticket is part of the key, so a changed
+ * goal, scope, note, worktree name, tool allowlist or Thread set is a different batch.
+ */
+function batchKey(projectId: string, tasks: readonly PreparedProjectTask[]): string {
+  const canonical = tasks.map(task => ({ index: task.index, title: task.title, goal: task.goal, scope: task.scope,
+    note: task.note ?? null, worktree_name: task.worktree_name, allowTools: task.allowTools ?? null,
+    threads: task.threads.map(thread => ({ source: thread.source, id: thread.id, contextOnly: thread.contextOnly })) }))
+  return key('project-tickets', projectId, JSON.stringify(canonical))
+}
+/** The Ticket a batch's task position created; a new batch has its own ids. */
+const ticketIdFor = (projectId: string, batch: string, index: number): string =>
+  key('ticket', projectId, 'delegated', batch, String(index))
+/** The worktree name a Ticket's execution directory carries, without the Ticket id suffix. */
+const worktreeOf = (ticket: Ticket): string => ticket.execution!.name.replace(`-${ticket.id.slice(0, 12)}`, '')
 
 /**
  * Single transactional entry point for mutating Triggers, Threads, Decisions, Tickets, and Assignments.
@@ -206,9 +222,11 @@ export class Engine {
   /**
    * Create the Tickets a Project's PM delegated, one internal Trigger, record-only `delegated` Eval and Decision per task,
    * in one transaction: a task the PM's request cannot create leaves no Trigger, Decision or Ticket behind. Only the Project's
-   * own PM Session may call it, and the Project must still be active. A repeated call reuses the Ticket each task index
-   * produced before. No Ticket subscribes to the Project's source Thread; only the external Threads a task names.
-   * @throws UserError when the Project is unknown or has ended, the caller is not its PM, or a task is invalid.
+   * own PM Session may call it, and the Project must still be active. A repeated call with the same tasks reuses the Tickets
+   * that batch produced; a new batch gets new Tickets even at the same positions. No Ticket subscribes to the Project's source
+   * Thread; only the external Threads a task names.
+   * @throws UserError when the Project is unknown or has ended, the caller is not its PM, a task is invalid, or a worktree
+   * name is already used in the Project.
    */
   createProjectTickets(projectId: string, pmSessionId: string, tasks: readonly ProjectTicketTask[]): Ticket[] {
     return this.repo.atomic(() => {
@@ -223,8 +241,11 @@ export class Engine {
       const inheritedTools = project.mandate.allowTools?.length ? project.mandate.allowTools : undefined
       const prepared = tasks.map((task, index) => prepareProjectTask(task, index, inheritedTools))
       const at = this.options.now?.() ?? new Date().toISOString()
-      const existing = prepared.map(task => this.repo.tickets.get(key('ticket', project.id, 'delegated', String(task.index))))
-      const names = new Set(existing.flatMap(ticket => ticket?.execution ? [ticket.execution.name.replace(`-${ticket.id.slice(0, 12)}`, '')] : []))
+      const batch = batchKey(project.id, prepared)
+      const existing = prepared.map(task => this.repo.tickets.get(ticketIdFor(project.id, batch, task.index)))
+      // Worktree names stay unique within the Project, across batches: an earlier Ticket keeps its directory.
+      const names = new Set(this.repo.tickets.list().filter(ticket => ticket.projectId === project.id)
+        .flatMap(ticket => ticket.execution ? [worktreeOf(ticket)] : []))
       for (const task of prepared) {
         if (!existing[task.index] && names.has(task.worktree_name)) throw new UserError('duplicateWorktree', { name: task.worktree_name })
         names.add(task.worktree_name)
@@ -232,8 +253,8 @@ export class Engine {
       return prepared.map(task => {
         const done = existing[task.index]
         if (done) return done
-        const ticketId = key('ticket', project.id, 'delegated', String(task.index))
-        const triggerId = key('trigger', project.id, 'delegated', String(task.index))
+        const ticketId = ticketIdFor(project.id, batch, task.index)
+        const triggerId = key('trigger', project.id, 'delegated', batch, String(task.index))
         const trigger: Trigger = { id: triggerId, source: 'internal', threads: [{ source: 'internal', id: triggerId }],
           actor: { source: 'internal', id: project.pmSessionId }, human: false, at, text: `${task.title}: ${task.goal}`,
           meta: { projectId: project.id, pmSessionId: project.pmSessionId, taskIndex: task.index, title: task.title, goal: task.goal,

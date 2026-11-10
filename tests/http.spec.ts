@@ -88,13 +88,15 @@ it('protects the Project control routes with the same-origin rule and calls thei
     stopProject: (id: string) => { calls.push(['stop', id]); return { status: 'ended' } },
     archiveProject: (id: string) => { calls.push(['archive', id]); return { id, status: 'archived' } },
     unarchiveProject: (id: string) => { calls.push(['unarchive', id]); return { id, status: 'active' } },
-  }, sessions: {
+  }, store: { projects: { get: (id: string) => id === 'p1' ? { id: 'p1', status: 'active', pmSessionId: 'pm-p1' } : undefined } },
+  sessions: {
     pauseProject: async (_project: unknown, mode: string) => { calls.push(['pauseSessions', mode])
       return { delivered: true, cancelled: [], notLoaded: [], failures: [] } },
     resumeProject: async () => { calls.push(['resumeSessions']); return { delivered: false, cancelled: [], notLoaded: [], failures: [] } },
     archiveProject: async () => { calls.push(['archiveSessions']); return { ids: ['pm-p1'], failures: [] } },
     unarchiveProject: async () => { calls.push(['unarchiveSessions']); return { ids: ['pm-p1'], failures: [] } },
-  } })
+    openProject: async (project: { id: string; pmSessionId: string }) => { calls.push(['openProject', project.id]); return project.pmSessionId },
+  }, requestPass: () => {} })
   const body = { paused: true, mode: 'soft' }
   const hard = { paused: true, mode: 'hard' }
   for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { origin: 'http://evil.example' }]) {
@@ -105,6 +107,8 @@ it('protects the Project control routes with the same-origin rule and calls thei
     expect(await call('POST', 'projects/p1/archive', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
     expect(await call('POST', 'projects/p1/unarchive', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
+      body: { error: 'Same-origin management request required' } })
+    expect(await call('POST', 'projects/p1/pm', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
   }
   const allowed = { host: 'localhost:3082', origin: 'http://localhost:3082' }
@@ -119,9 +123,12 @@ it('protects the Project control routes with the same-origin rule and calls thei
     body: { archived: true, sessions: { ids: ['pm-p1'], failures: [] } } })
   expect(await call('POST', 'projects/p1/unarchive', undefined, allowed)).toEqual({ status: 200,
     body: { archived: false, sessions: { ids: ['pm-p1'], failures: [] } } })
+  expect(await call('POST', 'projects/p1/pm', undefined, allowed)).toEqual({ status: 200,
+    body: { started: true, sessionId: 'pm-p1' } })
+  expect(await call('POST', 'projects/missing/pm', undefined, allowed)).toEqual({ status: 404, body: { error: 'Project not found' } })
   expect(calls).toEqual([['pause', 'p1', true, 'soft'], ['pauseSessions', 'soft'], ['pause', 'p1', true, 'hard'],
     ['pauseSessions', 'hard'], ['pause', 'p1', false, 'soft'], ['resumeSessions'], ['stop', 'p1'], ['archive', 'p1'],
-    ['archiveSessions'], ['unarchive', 'p1'], ['unarchiveSessions']])
+    ['archiveSessions'], ['unarchive', 'p1'], ['unarchiveSessions'], ['openProject', 'p1']])
 })
 
 it('answers a prompt save that lost a race with 409, and a settings body over 128 KiB with 400', async () => {

@@ -74,6 +74,28 @@ interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: 
 
 /** The agent presets Executor Sessions, the main Session, and a Project's PM are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router', PM_PRESET = 'dsh-superagent-pm'
+/** The tools a Project's PM may see and call: it reads its Project, creates and messages its Tickets, and reports on it. */
+export const PM_TOOLS = ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
+  'orchestrator_project_ticket_message'] as const
+/**
+ * The tool boundary of a Project's PM. `tools.restrict` masks only the tools a Session inherits (DSH's global layer and its
+ * preset's) and rejects scope-local names, so naming the PM's own four tools there fails with `names unknown global tools`
+ * (P2-A05). This instead hides every inherited tool with a deny mask and refuses, through a scope guard, any call outside
+ * `PM_TOOLS`; the PM's own registrations stay visible because they belong to the Session's layer. Register the guard before
+ * a Session's tools, and keep it if a visibility mask cannot be built, so execution stays bounded in every case.
+ */
+export function pmToolBoundary(agent: Agent): (() => void)[] {
+  const tools = agent.ctx.tools
+  const isPmTool = (name: string): boolean => PM_TOOLS.includes(name as typeof PM_TOOLS[number])
+  const disposers: (() => void)[] = [tools.guard(({ name }) => isPmTool(name) ? undefined
+    : `A Project PM may use only ${PM_TOOLS.join(', ')}`)]
+  // The parent view holds exactly the global and preset tools a restriction may name; the PM's own tools are not there.
+  const inherited = typeof tools.schemas === 'function'
+    ? tools.schemas(scopeParentOf(agent)).map(schema => schema.name).filter(name => name !== 'run_code' && !isPmTool(name))
+    : []
+  if (inherited.length) disposers.push(tools.restrict({ deny: inherited }))
+  return disposers
+}
 declare module '@deepseek-ai/cordis' {
   interface Events {
     /** DSH's agent preset registry selected `agentPreset` for a Session. */
@@ -273,8 +295,12 @@ export class Sessions {
     const ids: string[] = [], failures: { sessionId: string; error: string }[] = []
     for (const sessionId of this.projectSessions(project)) {
       try {
-        if (archive) await registry!.archiveSession!(sessionId as SessionId, { stopActivity: true })
-        else await registry!.unarchiveSession!(sessionId as SessionId)
+        if (archive) {
+          // A retried archive must reach only the Sessions an earlier attempt missed; DSH reports the archived set, so an
+          // already archived Session is recorded as done without another host call.
+          if (this.archivedSession(sessionId) === true) { ids.push(sessionId); continue }
+          await registry!.archiveSession!(sessionId as SessionId, { stopActivity: true })
+        } else await registry!.unarchiveSession!(sessionId as SessionId)
         ids.push(sessionId)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -382,45 +408,55 @@ export class Sessions {
     const role = master ? 'orchestrator' as const : project ? 'pm' as const : 'worker' as const
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
-    this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
-    if (agent.status === 'idle') this.retryHealth.clear(agent.id)
-    this.updateModelHealth()
-    // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
-    binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
-      const version = this.promptFor(agent, context.signal !== undefined)
-      const current = ticket && host.store.tickets.get(ticket.id)
-      const latest = project && host.store.projects.get(project.id)
-      const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
-      const mandate = current ? mandateInstructions(current.mandate) : ''
-      const contextSection = latest ? `\n\n${pmProjectSection(latest)}` : ''
-      // The notes are in the section just composed; the PM's next prompt has now delivered them. Adding a note while PM is
-      // idle never wakes it, so this is the only point that consumes the queue.
-      if (latest?.pendingNotes?.length) this.deliverProjectNotes(latest.id, latest.pendingNotes.map(note => note.id))
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${mandate}${contextSection}`
-    }, ...(master || project ? { complete: true } : {}) }))
-    // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
-    const skillScope = agent.ctx.inject(['skills'], scope => {
-      binding.scope = scope
-      binding.skills = undefined
-      this.bindSkills(binding, host.prompts.current())
-    })
-    binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
-    await skillScope
-    // Bail out if the agent was disposed while awaiting the skill scope.
-    if (this.bindings.get(agent) !== binding) return
-    const register = this.registerTool(agent, binding)
-    for (const tool of host.tools(agent, { ...ticket ? { ticket } : {}, ...project ? { project } : {} })) register(tool.name, tool.description, tool.schema, tool.execute)
-    if (master) {
-      const shell = process.platform === 'win32' && agent.ctx.tools.get('pwsh', scopeParentOf(agent)) ? 'pwsh' : 'bash'
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', shell, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
-        agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
-    } else if (project) {
-      // A Project's PM reads records, creates/messages its Tickets and reports; the preset gives it no shell, file, web or subagent tools.
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
-        'orchestrator_project_ticket_message'] }))
-    } else {
-      // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
-      binding.disposers.push(...this.workOnly(agent, ticket!.id))
+    try {
+      this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
+      if (agent.status === 'idle') this.retryHealth.clear(agent.id)
+      this.updateModelHealth()
+      // Disable variable interpolation so literal ${{ ... }} expressions in team prompts are preserved.
+      binding.disposers.push(agent.ctx.systemPrompt.section({ name: 'dsh-superagent-policy', order: 9999, interpolate: false, text: context => {
+        const version = this.promptFor(agent, context.signal !== undefined)
+        const current = ticket && host.store.tickets.get(ticket.id)
+        const latest = project && host.store.projects.get(project.id)
+        const composed = host.prompts.compose(version.config, role, current ? host.environment(current) : undefined)
+        const mandate = current ? mandateInstructions(current.mandate) : ''
+        const contextSection = latest ? `\n\n${pmProjectSection(latest)}` : ''
+        // The notes are in the section just composed; the PM's next prompt has now delivered them. Adding a note while PM is
+        // idle never wakes it, so this is the only point that consumes the queue.
+        if (latest?.pendingNotes?.length) this.deliverProjectNotes(latest.id, latest.pendingNotes.map(note => note.id))
+        return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${mandate}${contextSection}`
+      }, ...(master || project ? { complete: true } : {}) }))
+      // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
+      const skillScope = agent.ctx.inject(['skills'], scope => {
+        binding.scope = scope
+        binding.skills = undefined
+        this.bindSkills(binding, host.prompts.current())
+      })
+      binding.disposers.push(() => { skillScope.dispose().catch((error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release a skill scope: %s', String(error)) }) })
+      await skillScope
+      // Bail out if the agent was disposed while awaiting the skill scope.
+      if (this.bindings.get(agent) !== binding) return
+      // Apply a role's capability boundary before its tools: a PM's guard must exist before the first PM tool, and a failure
+      // while registering cannot leave a Session with tools but no bound (see pmToolBoundary and the retry entry).
+      if (master) {
+        const shell = process.platform === 'win32' && agent.ctx.tools.get('pwsh', scopeParentOf(agent)) ? 'pwsh' : 'bash'
+        binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', shell, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
+          agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
+      } else if (project) {
+        // A Project's PM reads records, creates/messages its Tickets and reports; the preset gives it no shell, file, web or
+        // subagent tools, and its boundary hides anything else the host would otherwise inherit into the Session.
+        binding.disposers.push(...pmToolBoundary(agent))
+      }
+      const register = this.registerTool(agent, binding)
+      for (const tool of host.tools(agent, { ...ticket ? { ticket } : {}, ...project ? { project } : {} })) register(tool.name, tool.description, tool.schema, tool.execute)
+      if (!master && !project) {
+        // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
+        binding.disposers.push(...this.workOnly(agent, ticket!.id))
+      }
+    } catch (error) {
+      // A retried PM start must decorate from scratch: release what this attempt registered so the next ensure() does not
+      // return early on a half-decorated binding. The release also removes any boundary or tool installed before the failure.
+      if (this.bindings.get(agent) === binding) this.release(agent)
+      throw error
     }
   }
   /**

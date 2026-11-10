@@ -9,6 +9,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { PM_TOOLS } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
 import { mandateInstructions } from '../src/executor/dsh.ts'
@@ -191,10 +192,17 @@ beforeEach(async () => {
           const own = scope === agents.get(sessionId)
           return (scope === preset || own) && inherited.includes(name) || own && name === 'subagent' ? { name } : undefined
         },
-        restrict: vi.fn((rule: { allow: string[] }) => {
-          if (rule.allow.some(name => !inherited.includes(name) && !sessionTools.has(name))) throw new Error('Restriction names an unknown tool')
+        // DSH's real `restrict` masks only inherited (global and preset) tools and rejects a Session's own names, which is
+        // exactly the P2-A05 failure; this fake keeps that contract instead of accepting any registered name.
+        restrict: vi.fn((rule: { allow?: string[]; deny?: string[] }) => {
+          if (rule.allow === undefined && rule.deny === undefined) throw new Error('tools.restrict({}) is a no-op')
+          const unknown = [...rule.allow ?? [], ...rule.deny ?? []].filter(name => !inherited.includes(name))
+          if (unknown.length) throw new Error(`tools.restrict() names unknown global tools ${unknown.map(name => `"${name}"`).join(', ')}`)
           restricts.set(sessionId, [...restricts.get(sessionId) ?? [], rule]); return () => {}
         }),
+        // The parent view holds only inherited tools; the Session's own view adds its scope-local registrations.
+        schemas: (scope?: object) => (scope === agents.get(sessionId) ? [...inherited, ...sessionTools.keys()] : inherited)
+          .map(name => ({ name })),
         guard: vi.fn((check: Guard) => { guards.set(sessionId, check); return () => {} }) })
       agentCtx.reflect.provide('skills', { register: () => () => {} })
       agentCtx.reflect.provide('systemPrompt', { section: (spec: Section) => { sections.set(sessionId, spec); return () => {} } })
@@ -1659,6 +1667,26 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
   expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+})
+
+// P2-A05: PM Session creation must not name its scope-local tools in `restrict`; the guard and an inherited-tool deny mask
+// keep the model-visible and callable set to the four PM tools.
+it('creates a Project PM Session on real restrict semantics with only its four tools callable', async () => {
+  const request = feishu('90', '@bot 开个项目')
+  await receive(request)
+  const created = await runTool(runtime.masterId, 'orchestrator_project_create',
+    { trigger_id: request.id, title: 'PM boundary', goal: 'Keep the boundary' }) as { project: { project_id: string } }
+  const project = runtime.store.projects.get(created.project.project_id)!
+  const pm = project.pmSessionId
+  expect([...tools.get(pm)!.keys()].sort()).toEqual([...PM_TOOLS].sort())
+  const restriction = restricts.get(pm)!
+  expect(restriction).toHaveLength(1)
+  const denied = (restriction[0] as { deny: string[] }).deny
+  expect(denied).toEqual(expect.arrayContaining(['bash', 'read']))
+  expect(denied).not.toContain('orchestrator_read')
+  const guard = guards.get(pm)!
+  expect(guard({ name: 'bash' } as never)).toMatch(/A Project PM may use only/)
+  expect(guard({ name: 'orchestrator_read' } as never)).toBeUndefined()
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {

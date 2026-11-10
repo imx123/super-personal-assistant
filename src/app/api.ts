@@ -39,6 +39,7 @@ export interface Api {
   'POST projects/:id/pause': { body: { paused: boolean; mode?: 'soft' | 'hard' };
     response: { paused: boolean; mode: 'soft' | 'hard' | null; sessions: ProjectPauseResult } }
   'POST projects/:id/stop': { response: { stopped: true } }
+  'POST projects/:id/pm': { response: { started: true; sessionId: string } }
   'POST projects/:id/archive': { response: { archived: true; sessions: SessionArchiveResult } }
   'POST projects/:id/unarchive': { response: { archived: false; sessions: SessionArchiveResult } }
   'POST tickets/:id/retry': { response: { retried: true } }

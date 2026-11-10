@@ -35,6 +35,19 @@ it('lists Projects, opens one, shows its goal and latest report, and opens its P
   expect(server.opened).toEqual([project.pmSessionId])
 })
 
+it('offers Start / Retry PM Session and asks the host to reopen the PM Session', async () => {
+  server.projects = [{ ...project, tickets: [...project.tickets] }]
+  await mount()
+  await click(tab(zh['tab.project']))
+  await click(project.title)
+  await click(zh.startPmSession)
+  expect(server.startedPm).toBe(1)
+  expect(server.requests).toContainEqual(expect.objectContaining({ method: 'POST', path: 'projects/project-1/pm' }))
+  // The entry stays available for another retry; project-init deduplication is the host's job.
+  await click(zh.startPmSession)
+  expect(server.startedPm).toBe(2)
+})
+
 it('pauses, resumes and stops a Project from its page, keeping the page readable afterwards', async () => {
   server.projects = [{ ...project, tickets: [...project.tickets] }]
   await mount()

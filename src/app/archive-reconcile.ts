@@ -1,9 +1,9 @@
 /** Reconciling native DSH Session archives with Project and Ticket state, without changing state from the event itself. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-workspace'
-import type { Engine } from '../core/index.ts'
+import type { Engine, ProjectProfile } from '../core/index.ts'
 import { projectOfSession } from '../core/index.ts'
-import { ticketOfSession } from '../executor/dsh.ts'
+import { ticketOfSession, workerSessionId } from '../executor/dsh.ts'
 import { KV } from '../kv.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
@@ -12,7 +12,7 @@ export interface ArchiveReconcileHost {
   readonly context: Context
   readonly store: Pick<Store, 'projects' | 'tickets' | 'get' | 'set'>
   readonly engine: Pick<Engine, 'archiveProject' | 'unarchiveProject' | 'workerSessionArchived' | 'workerSessionUnarchived'>
-  readonly sessions: Pick<Sessions, 'archiveProject' | 'unarchiveProject'>
+  readonly sessions: Pick<Sessions, 'archiveProject' | 'unarchiveProject' | 'archivedSession'>
   configured(): boolean
   closing(): boolean
 }
@@ -116,9 +116,10 @@ export class ArchiveReconciler {
     }
     // A restored PM goes first, then a newly archived PM, so its child workers see the Project's definitive state.
     for (const sessionId of removed) if (projectOfSession(sessionId)) await attempt(() => this.unarchiveProject(sessionId))
-    for (const sessionId of added) if (projectOfSession(sessionId)) await attempt(() => this.archiveProject(sessionId))
+    const handled = new Set<string>()
+    for (const sessionId of added) if (projectOfSession(sessionId)) { handled.add(sessionId); await attempt(() => this.archiveProject(sessionId)) }
     // A snapshot may already have recorded a PM whose Project was not archived, such as an upgrade from before this check.
-    for (const sessionId of current) if (projectOfSession(sessionId)) await attempt(() => this.ensureProjectArchived(sessionId))
+    for (const sessionId of current) if (projectOfSession(sessionId) && !handled.has(sessionId)) await attempt(() => this.ensureProjectArchived(sessionId))
     for (const sessionId of added) if (!projectOfSession(sessionId)) await attempt(() => this.archiveWorker(sessionId))
     for (const sessionId of removed) if (!projectOfSession(sessionId)) await attempt(() => this.unarchiveWorker(sessionId))
     // Only a clean pass advances the snapshot; a failed application step is retried on the next event or timer. Re-read the
@@ -131,16 +132,32 @@ export class ArchiveReconciler {
   private async archiveProject(sessionId: string): Promise<void> {
     const project = this.projectOf(sessionId)
     if (!project) return
-    if (project.status === 'archived') return
     if (project.status === 'ended') { this.warn(`the PM Session for ended Project ${project.id} is archived; keeping the Project ended`); return }
-    const archived = this.host.engine.archiveProject(project.id)
-    await this.host.sessions.archiveProject(archived)
+    // The Project may already be archived by an earlier pass whose Session archive failed partway; archive its Sessions
+    // again so the missing ones are retried (P2-A04). DSH archive is idempotent, and already archived Sessions are skipped.
+    const archived = project.status === 'archived' ? project : this.host.engine.archiveProject(project.id)
+    await this.archiveSessions(archived)
   }
   private async ensureProjectArchived(sessionId: string): Promise<void> {
     const project = this.projectOf(sessionId)
-    if (!project || project.status === 'archived' || project.status === 'ended') return
-    const archived = this.host.engine.archiveProject(project.id)
-    await this.host.sessions.archiveProject(archived)
+    if (!project || project.status === 'ended') return
+    const archived = project.status === 'archived' ? project : this.host.engine.archiveProject(project.id)
+    await this.archiveSessions(archived)
+  }
+  /**
+   * Ask the host to archive every PM and child Session the Project's archived state expects. A failure rejects so the pass
+   * does not advance the snapshot and the next reconcile retries; a Project whose Sessions are all archived is left alone.
+   */
+  private async archiveSessions(project: ProjectProfile): Promise<void> {
+    if (!this.missingSessions(project).length) return
+    const result = await this.host.sessions.archiveProject(project)
+    if (result.failures.length) throw new Error(`Project ${project.id} Session archive failed: ${result.failures.map(failure => `${failure.sessionId}: ${failure.error}`).join('; ')}`)
+  }
+  /** The Project's PM and child worker Sessions the host does not report archived; a host without that view reports none. */
+  private missingSessions(project: ProjectProfile): string[] {
+    const expected = [project.pmSessionId, ...this.host.store.tickets.list()
+      .filter(ticket => ticket.projectId === project.id).map(ticket => workerSessionId(ticket.id))]
+    return expected.filter(sessionId => this.host.sessions.archivedSession(sessionId) === false)
   }
   private async unarchiveProject(sessionId: string): Promise<void> {
     const project = this.projectOf(sessionId)

@@ -95,6 +95,8 @@ export interface PanelServer {
   person: TicketRow[]; search: Pick<ApiResponse<'GET search'>, 'items' | 'threads'>; history: HistoryView
   /** Project Profiles the fake API lists; a test that needs one pushes a row here. */
   projects: ApiResponse<'GET projects'>['items']
+  /** How many times the panel asked the host to start or retry a Project's PM Session. */
+  startedPm: number
   requests: { path: string; method: string; body?: unknown }[]
   /** Requests with undeclared query params or invalid body presence; asserted empty after each test. */
   misuse: string[]
@@ -249,7 +251,7 @@ function initial(): PanelServer {
     en: 'Feishu message' } }
   const defaults = { revision: 0, previousRevision: null, savedAt: '', source: 'defaults' }
   return {
-    health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [],
+    health: {}, down: false, pending: 0, opened: [], requests: [], misuse: [], queued: new Set(), dropped: [], failing: [], startedPm: 0,
     setup: { machine: MACHINE, problem: null, feishuProblem: null,
       accounts: { repository: 'acme/widgets', agent: 'agent-bot', feishu: { appId: 'cli_bot', brand: 'feishu', botId: 'ou_bot',
         name: 'Widgets Bot' } } },
@@ -347,6 +349,12 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
     if (!project) return refuse(404, 'Project not found')
     project.status = 'ended'
     return { stopped: true }
+  } },
+  'POST projects/:id/pm': { answer: ({ params }) => {
+    const project = server.projects.find(item => item.id === params.id)
+    if (!project) return refuse(404, 'Project not found')
+    server.startedPm++
+    return { started: true, sessionId: project.pmSessionId }
   } },
   'POST projects/:id/archive': { answer: ({ params }) => {
     const project = server.projects.find(item => item.id === params.id)

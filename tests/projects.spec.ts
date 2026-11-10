@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, UserError, key, projectOfSession, pmSessionId, type Assessor, type Candidate,
   type DomainEvent, type Executor, type Policy, type ProjectProfile, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Store } from '../src/app/store.ts'
+import { PM_TOOLS } from '../src/app/sessions.ts'
 import { projectDetail, projectList } from '../src/app/views/projects.ts'
 import { startRuntime, feishu } from './fixtures/host.ts'
 
@@ -28,7 +29,7 @@ function harness() {
   const outbox = { send: vi.fn(), status: () => undefined, withdraw: vi.fn() }
   const engine = new Engine({ repo, scope: { scope: () => ({ listened: true, observed: false }) }, policy: () => policy, assessor, executor, outbox,
     emit: event => { events.push(event) }, now: () => '2026-11-10T00:00:00.000Z' })
-  return { repo, engine, requests, events }
+  return { repo, engine, requests, events, policy }
 }
 
 describe('Project creation', () => {
@@ -109,6 +110,52 @@ describe('Project creation', () => {
     expect(h.repo.decisions.byThread('main-session:p2')).toEqual([])
   })
 
+  // P2-A01: a Project is a routing act, so an inferred Trigger may not create one; an explicit one still can.
+  it('refuses an inferred Trigger a Project and leaves no Project or Decision, while an explicit Trigger still creates one', () => {
+    const h = harness()
+    h.policy.gate = (t: Trigger) => t.actor.id === actor.id
+      ? { admissible: true, strength: 'inferred', basis: { via: 'admission', cell: 'listedUnaddressed' } }
+      : { admissible: false, reason: 'not the operator' }
+    h.engine.recordTriggerForRouting(trigger('p4'))
+    expect(() => h.engine.createProject('p4', 'Inferred project', 'Must not start')).toThrow(new UserError('notExplicit'))
+    expect(h.repo.projects.list()).toEqual([])
+    expect(h.repo.decisions.byThread('main-session:p4')).toEqual([])
+    // The refused attempt left the Trigger usable: an explicit re-evaluation can still route it to a Project.
+    h.policy.gate = () => ({ admissible: true, strength: 'explicit', basis: { via: 'listed' } })
+    const project = h.engine.createProject('p4', 'Explicit project', 'Works')
+    expect(project.mandate.strength).toBe('explicit')
+    expect(h.repo.decisions.byThread('main-session:p4').map(decision => decision.kind)).toEqual(['project'])
+  })
+
+  // P2-A03: one Trigger takes one route; the other path is refused after the first commits.
+  it('refuses an accept once the Trigger created a Project, leaving no independent Ticket', () => {
+    const h = harness()
+    h.engine.recordTriggerForRouting(trigger('p5'))
+    const project = h.engine.createProject('p5', 'Project first', 'Ship the site')
+    expect(() => h.engine.decide('p5', { kind: 'accept', title: 'Independent ticket', scope: 'Independent ticket',
+      reason: 'requested', acknowledgement: 'ok', name: 'independent-ticket' })).toThrow(/already routed to a Project/)
+    expect(h.repo.tickets.list()).toEqual([])
+    expect(h.repo.projects.get(project.id)).toEqual(project)
+    // Replaying the Project route stays idempotent and does not record a second Decision.
+    expect(h.engine.createProject('p5', 'Project first', 'Ship the site')).toEqual(project)
+    expect(h.repo.decisions.byThread('main-session:p5').map(decision => decision.kind)).toEqual(['project'])
+  })
+
+  it('refuses a Project once the Trigger accepted a Ticket, and leaves the accepted Ticket as its only route', () => {
+    const h = harness()
+    h.engine.recordTriggerForRouting(trigger('p6'))
+    const accept = h.engine.decide('p6', { kind: 'accept', title: 'Ticket first', scope: 'Ticket first', reason: 'requested',
+      acknowledgement: 'ok', name: 'ticket-first' })
+    expect(() => h.engine.createProject('p6', 'Late project', 'Must not start')).toThrow(/already routed to a Ticket/)
+    expect(h.repo.projects.list()).toEqual([])
+    expect(h.repo.decisions.byThread('main-session:p6').map(decision => decision.kind)).toEqual(['accept'])
+    expect(h.repo.tickets.list()).toHaveLength(1)
+    // Replaying the accept stays idempotent and creates no second Ticket.
+    expect(h.engine.decide('p6', { kind: 'accept', title: 'Again', scope: 'Again', reason: 'requested', acknowledgement: 'ok',
+      name: 'again' })).toEqual(accept)
+    expect(h.repo.tickets.list()).toHaveLength(1)
+  })
+
   it('records the PM report on the Project and keeps the latest one', () => {
     const h = harness()
     h.engine.recordTriggerForRouting(trigger())
@@ -154,6 +201,30 @@ describe('Project persistence and read views', () => {
     }
   })
 
+  // P2-A01 through the real runtime: observe mode admits this external message as inferred, which must not create a Project.
+  it('refuses an inferred Trigger a Project in observe mode, while an explicit request still creates one', async () => {
+    const host = await startRuntime()
+    try {
+      const settings = host.runtime.store.settings()
+      host.runtime.store.saveSettings({ ...settings, eval: { ...settings.eval, mode: 'observe' },
+        policy: { ...settings.policy, sources: { ...settings.policy.sources, feishu: { ...settings.policy.sources.feishu,
+          admission: { oc_team: { unlistedAddressed: 'inferred' } } } } } })
+      const inferred = feishu('34', '@bot 帮我看看这个设置页', { sender_id: 'ou_stranger' })
+      // Record directly so no Settings sync replaces the admission table before the Project tool reads the gate.
+      expect(host.runtime.engine.recordTriggerForRouting(inferred)).toBe('stored')
+      await expect(host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: inferred.id, title: 'Inferred project', goal: 'Must not start' })).rejects.toThrow(/explicit/i)
+      expect(host.runtime.store.projects.get(key('project', inferred.id))).toBeUndefined()
+      expect(host.runtime.store.triggers.disposition(inferred.id)?.decisionId).toBeUndefined()
+      // The same tool still creates a Project for an explicit request from the allowed member.
+      const explicit = feishu('35', '@bot 开一个项目')
+      expect(host.runtime.engine.recordTriggerForRouting(explicit)).toBe('stored')
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: explicit.id, title: 'Explicit project', goal: 'Start' }) as { project: { project_id: string } }
+      expect(host.runtime.store.projects.get(created.project.project_id)?.mandate.strength).toBe('explicit')
+    } finally { await host.stop() }
+  })
+
   it('creates the Project with its PM Session through the main Session tool, and serves it on the project routes', async () => {
     const host = await startRuntime()
     try {
@@ -185,6 +256,44 @@ describe('Project persistence and read views', () => {
       expect((await host.api('GET', 'projects')).body).toMatchObject({ total: 1, items: [{ id: project.id, latestReport: { summary: 'Kickoff done.' } }] })
       expect((await host.api('GET', `projects/${project.id}`)).body).toMatchObject({ id: project.id, goal: 'Ship a clearer settings site' })
       expect((await host.api('GET', 'projects/missing')).status).toBe(404)
+    } finally { await host.stop() }
+  })
+
+  // P2-A05: a Project whose PM Session failed to start is recoverable, and the recovery entry is idempotent.
+  it('starts a failed PM Session through POST projects/:id/pm without a second project-init', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('33', 'Start a project whose PM Session fails')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const projectId = key('project', request.id)
+      const pm = pmSessionId(projectId)
+      const original = host.controller.resolveAgent.getMockImplementation()!
+      host.controller.resolveAgent.mockImplementation(async (id: string) => {
+        if (id === pm) throw new Error('PM Session could not start')
+        return original(id)
+      })
+      await expect(host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'Recovery', goal: 'Survive a failed PM start' })).rejects.toThrow('PM Session could not start')
+      // The Project committed before the PM failed: it is active with no PM Session and no Ticket.
+      expect(host.runtime.store.projects.get(projectId)?.status).toBe('active')
+      expect(host.agents.get(pm)).toBeUndefined()
+      expect(host.tools.get(pm)).toBeUndefined()
+      host.controller.resolveAgent.mockImplementation(original)
+      const first = await host.api('POST', `projects/${projectId}/pm`)
+      expect(first).toEqual({ status: 200, body: { started: true, sessionId: pm } })
+      expect(host.agents.get(pm)).toBeDefined()
+      expect([...host.tools.get(pm)!.keys()].sort()).toEqual([...PM_TOOLS].sort())
+      const init = () => host.deliveries.mock.calls.map(([call]) => call)
+        .filter(call => call.sessionId === pm && (JSON.parse(call.text) as { kind?: string }).kind === 'project_created')
+      expect(init()).toHaveLength(1)
+      // Repeating the recovery request reopens the same Session and never sends project-init twice.
+      const second = await host.api('POST', `projects/${projectId}/pm`)
+      expect(second).toEqual({ status: 200, body: { started: true, sessionId: pm } })
+      expect(init()).toHaveLength(1)
+      // The recovered PM is decorated and answers on its Project.
+      expect(await host.runTool(pm, 'orchestrator_project_report', { summary: 'Recovered.' }))
+        .toMatchObject({ project: { project_id: projectId, latest_report: { summary: 'Recovered.' } } })
     } finally { await host.stop() }
   })
 

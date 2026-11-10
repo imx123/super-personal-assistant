@@ -125,16 +125,23 @@ export class Evals extends EnginePart {
   /**
    * Decide a Trigger: the Eval that holds it, or a direct Eval of it alone when none does.
    * @throws UserError when the Trigger is unknown or not admissible, `outcome.evalId` names an Eval that has finished, a
-   * ticket's worker still decides the Trigger and the outcome is not a stop, or an inferred candidate is accepted outside `auto`
-   * mode or without enabled matching rules.
+   * ticket's worker still decides the Trigger and the outcome is not a stop, the Trigger already created a Project, or an
+   * inferred candidate is accepted outside `auto` mode or without enabled matching rules.
    */
   decide(triggerId: string, outcome: Outcome): Decision {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     const held = this.holding(triggerId)
     if (outcome.evalId && held?.evaluating?.id !== outcome.evalId) throw new UserError('evalFinished', { eval: outcome.evalId })
+    const thread = held ?? this.thread(trigger.threads[0]!)
+    // P2-A03: a Trigger that already created a Project took that route; accepting it would leave a Project and an
+    // independent Ticket for the same request.
+    if (outcome.kind === 'accept') {
+      const project = this.projectRoute(thread, triggerId)
+      if (project) throw new UserError('alreadyRouted', { route: 'Project' })
+    }
     // Prevent a replayed trigger that already created a ticket from spawning a second one.
-    const earlier = outcome.kind === 'accept' ? this.accepted(threadKey(trigger.threads[0]!)).get(triggerId) : undefined
+    const earlier = outcome.kind === 'accept' ? this.accepted(thread.key).get(triggerId) : undefined
     if (earlier) {
       // Only an Eval started by an earlier version can still hold it; reassess the remaining triggers without it, or ignore it if alone.
       const others = held?.evaluating?.triggerIds.filter(id => id !== triggerId) ?? []
@@ -146,7 +153,6 @@ export class Evals extends EnginePart {
     }
     // A follow-up that reached a ticket is its worker's to judge: the main Session may only stop the work on it.
     if (outcome.kind !== 'stop') this.leftToWorkers(trigger)
-    const thread = held ?? this.thread(trigger.threads[0]!)
     const evaluation = held?.evaluating ?? this.directEval(thread, trigger, outcome.kind, outcome.kind === 'stop' ? outcome.ticketId : undefined)
     // An inferred candidate is accepted only on enabled rules its assessment matched, while assessments may accept.
     if (outcome.kind === 'accept' && evaluation.strength !== 'explicit' && !this.policy().admitsInferred(outcome.rules ?? [])) {
@@ -157,20 +163,33 @@ export class Evals extends EnginePart {
   /**
    * Record the gate-only Eval that creates a Project: a real Eval id and a `project` Decision, without asking the assessor
    * or delivering a candidate. It takes the Trigger out of any Eval that holds it, and returns the PM Mandate the
-   * Project's PM works under.
-   * @throws UserError when the Trigger is unknown or the gate does not admit it.
+   * Project's PM works under. A Project is a routing act, so it requires explicit strength just as an accept does (P2-A01);
+   * a Trigger that already accepted a Ticket cannot also start one (P2-A03).
+   * @throws UserError when the Trigger is unknown, the gate does not admit it, its strength is not explicit, or it already
+   * routed to a Ticket or another Project.
    */
   project(triggerId: string, projectId: string, goal: string): { decision: Decision; mandate: PMMandate } {
     const trigger = this.repo.triggers.get(triggerId)
     if (!trigger) throw new UserError('unknownTrigger')
     // An Eval that holds the Trigger would otherwise ask the assessor to decide work this Project already took.
     const held = this.holding(triggerId)
+    const thread = held ?? this.thread(trigger.threads[0]!)
+    // P2-A03: one Trigger routes once. A replay of this same Project is allowed through, as Engine.createProject returns it
+    // before asking here; another Project or an accepted Ticket is a second execution path.
+    const accepted = this.accepted(thread.key).get(triggerId)
+    if (accepted) throw new UserError('alreadyRouted', { route: 'Ticket' })
+    const routed = this.projectRoute(thread, triggerId)
+    if (routed && routed.projectId !== projectId) throw new UserError('alreadyRouted', { route: 'Project' })
+    // P2-A01: an inferred Trigger may not become a Project. Check the gate before touching a holding Eval, so a refused
+    // request leaves no Project, Decision, or reassessed Eval behind.
+    const gate = this.policy().gate(trigger, thread, this.ticketsOnThread(thread))
+    if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
+    if (gate.strength !== 'explicit') throw new UserError('notExplicit')
     const reason: Reason = { code: 'projectCreated', values: { project: projectId } }
     if (held?.evaluating) {
       if (held.evaluating.triggerIds.length > 1) this.reassess(held, reason, [triggerId])
       else this.finish(held, held.evaluating, { kind: 'ignore', reason: [reason] })
     }
-    const thread = held ?? this.thread(trigger.threads[0]!)
     const evaluation = this.directEval(thread, trigger, 'project')
     const mandate: PMMandate = { strength: evaluation.strength, policyVersion: evaluation.policyVersion, basis: evaluation.basis,
       actor: evaluation.actor, scope: goal, projectId, goal }
@@ -306,6 +325,11 @@ export class Evals extends EnginePart {
       for (const id of decision.triggerIds) if (!accepted.has(id)) accepted.set(id, decision)
     }
     return accepted
+  }
+  /** The `project` Decision a Trigger created, if any: one Trigger routes to one Project (P2-A03). */
+  private projectRoute(thread: Thread, triggerId: string): Decision | undefined {
+    return this.repo.decisions.byThread(thread.key)
+      .find(decision => decision.kind === 'project' && decision.triggerIds.includes(triggerId))
   }
   /**
    * A gate-only Eval of one Trigger, for an outcome decided without a queued Eval, such as on a follow-up that reached a

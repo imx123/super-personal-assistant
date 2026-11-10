@@ -236,7 +236,8 @@ function projectCreateTool(host: MainToolsHost): Tool {
 }
 /**
  * `orchestrator_project_ticket_create`: the PM delegates 1–5 Tickets inside its own Project. The Engine creates each
- * delegated Decision, Ticket and first Assignment atomically; a repeated request reuses what each task index created.
+ * delegated Decision, Ticket and first Assignment atomically; a repeated request with the same tasks reuses that batch's
+ * Tickets, while changed tasks create new ones.
  * Workers are started separately, so the tool never says one finished.
  */
 function projectTicketCreateTool(host: MainToolsHost, project: ProjectProfile): Tool {
@@ -244,7 +245,7 @@ function projectTicketCreateTool(host: MainToolsHost, project: ProjectProfile): 
     name: 'orchestrator_project_ticket_create',
     description: 'Create 1-5 Tickets inside this Project, each with its own worker, when the Project goal needs work done. '
       + 'The Tickets are delegated under the Project Mandate; they are queued and their workers start separately, so do not say a Ticket, worker or pull request has finished. '
-      + 'A repeated request reuses the Ticket each task position created. List external Threads a Ticket should follow with their source:id keys; other forms are refused. '
+      + 'A repeated request with the same tasks reuses that batch\'s Tickets; changed tasks create new Tickets even at the same positions. List external Threads a Ticket should follow with their source:id keys; other forms are refused. '
       + 'A task may name allow_tools to narrow its worker\'s tools; it cannot widen the Project Mandate\'s allowlist, and omitting it keeps the worker\'s full tool set.',
     schema: z.object({
       tasks: z.array(ProjectTaskSchema).min(1).max(PROJECT_TICKETS.max).refine(tasks => {

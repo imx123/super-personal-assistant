@@ -48,7 +48,7 @@ P2 完成：
 | Project 取消归档 | 恢复 archivedFrom；清 Ticket archived；Session unarchive；不自动 retry | `tests/project-tickets.spec.ts` |
 | DSH 原生归档 | PM archive→Project archive、PM unarchive→Project unarchive；worker archive→Assignment `sessionArchived`、Ticket open、pendingNote；重复 reconcile 不重复 | `tests/archive-reconcile.spec.ts` |
 | 拒绝/权限 | PM 只能是自己的 Project 的 PM；PM 不能 pause/stop/archive；API 非同源或缺 header 403 | `tests/projects.spec.ts`、`tests/http.spec.ts` |
-| Project Tab | 列表/详情/child Ticket/Thread/Open PM Session/Pause/Stop/Archive/Unarchive | `tests/panel-project.spec.tsx` |
+| Project Tab | 列表/详情/child Ticket/Thread/Open PM Session/Start-Retry PM Session/Pause/Stop/Archive/Unarchive | `tests/panel-project.spec.tsx` |
 
 ## 验证记录
 

@@ -36,7 +36,7 @@ export interface HttpHost {
   readonly sources: SourceRegistry
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'archiveProject' | 'unarchiveProject'
-    | 'pauseProject' | 'resumeProject'>
+    | 'pauseProject' | 'resumeProject' | 'openProject'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
   readonly executor: Pick<DshExecutor, 'activeCount'>
@@ -209,6 +209,17 @@ function routes(runtime: HttpHost): Routes {
       return { paused: project.status === 'paused', mode: project.pauseMode ?? null, sessions }
     },
     'POST projects/:id/stop': ({ params }) => { runtime.engine.stopProject(params.id); return { stopped: true } },
+    // Recovery entry for a Project whose PM Session could not start at creation. It reopens the same deterministic PM
+    // Session; project-init is deduplicated by its Project id, so repeated calls neither duplicate it nor start work.
+    'POST projects/:id/pm': async ({ params }) => {
+      const project = store.projects.get(params.id)
+      if (!project) throw new RouteError(404, 'Project not found')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'ended') throw new UserError('projectEnded')
+      const sessionId = await runtime.sessions.openProject(project)
+      runtime.requestPass()
+      return { started: true as const, sessionId }
+    },
     'POST projects/:id/archive': async ({ params }) => {
       const project = runtime.engine.archiveProject(params.id)
       return { archived: true as const, sessions: await runtime.sessions.archiveProject(project) }
