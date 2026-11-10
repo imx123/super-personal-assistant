@@ -476,6 +476,32 @@ export class Tickets extends EnginePart {
     return this.require(ticketId)
   }
   /**
+   * Add a note Input under a caller-chosen deterministic id, so a repeated request with the same text adds it once.
+   * @throws UserError when the ticket is unknown or has ended.
+   */
+  noteWithId(ticketId: string, text: string, id: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    this.addInput(ticket, { id, kind: 'note', text, at: this.now() })
+    return this.require(ticketId)
+  }
+  /**
+   * Add a note Input under a deterministic id without delivering it or starting an Assignment, such as when its worker
+   * Session is known to be archived.
+   * @throws UserError when the ticket is unknown or has ended.
+   */
+  queueNoteWithId(ticketId: string, text: string, id: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    if (ticket.inputs.some(input => input.id === id)) return ticket
+    const at = this.now()
+    ticket.inputs.push({ id, kind: 'note', text, at })
+    ticket.undelivered.push(id)
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return this.require(ticketId)
+  }
+  /**
    * Subscribe an open ticket to a Thread its Executor found related, for context: see `Thread.context`.
    * @returns false when the ticket follows the Thread already.
    * @throws UserError when the ticket is unknown or has ended.

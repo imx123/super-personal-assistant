@@ -61,7 +61,7 @@ Creating a Project is not an accept and does not go through `orchestrator_route`
 - The same transaction creates the `project` Decision (with `projectId` and no `ticketId`), the Project Profile and the Project PM Mandate. The Project id is `key('project', triggerId)`, so a repeated call returns the Project created first and records no second Decision or PM Session.
 - No Ticket is accepted and no worker starts at Project creation. The main Session receives the Project card and only acknowledges it.
 - The `PMMandate` carries the gate's strength, Policy version, basis and actor, as a Ticket Mandate does, plus the Project and its goal. It authorizes managing the Project, not arbitrary file or repository work.
-- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm` with three tools: `orchestrator_read`, `orchestrator_project_ticket_create` and `orchestrator_project_report`. It is a small Router: it keeps the Project's goal in view, delegates its Tickets and reports to the Project. Its read tool accepts its own `project/<id>`, its `project/<id>/tickets`, and a `ticket/<id>` only when that Ticket's `projectId` is its Project; every other resource is refused. It takes the `auto` permission preset when the host offers it, else `workspace-write`, then `read-only`; full access only when none exists.
+- The PM Session (`pm-<projectId>`) runs under `dsh-superagent-pm` with four tools: `orchestrator_read`, `orchestrator_project_ticket_create`, `orchestrator_project_ticket_message` and `orchestrator_project_report`. It is a small Router: it keeps the Project's goal in view, delegates its Tickets, coordinates them and reports to the Project. Its read tool accepts its own `project/<id>`, its `project/<id>/tickets`, and a `ticket/<id>` only when that Ticket's `projectId` is its Project; every other resource is refused. It takes the `auto` permission preset when the host offers it, else `workspace-write`, then `read-only`; full access only when none exists.
 
 ### A PM's delegated Tickets
 
@@ -76,6 +76,12 @@ The PM creates Tickets only inside its own Project, never arbitrary work, with `
 - The Ticket has no Channel and does not subscribe to the Project's source Thread. It subscribes only to the external Threads its task names; a `contextOnly` Thread is recorded in `Thread.context`, so its messages reach the worker without granting authority and do not resume an ended Ticket. Unknown thread keys or malformed references refuse the whole batch.
 - Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call reuses the Ticket each task position already produced.
 - The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.
+
+### PM coordination messages
+
+`orchestrator_project_ticket_message` is available only to the Project's PM, only for a Ticket whose `projectId` is that Project. It stores the text as a `note` Ticket Input under a deterministic id, so repeating the same text and Ticket adds it once; the Input is context and grants no authority, tools, Mandate or permission. The Project must be active: paused, archived and ended Projects refuse with `projectPaused`, `projectArchived` and `projectEnded`. Router-owned Tickets and Tickets in another Project refuse with `notProjectTicket`.
+
+`wake` defaults false. A running Assignment gets the note delivered; a pending Assignment is started; with no Assignment the note waits. With `wake=true`, a retryable Ticket starts a new Assignment through the ordinary retry path; a non-retryable Ticket returns `not_started` and still leaves the note queued. `wake` never bypasses a paused/archived/ended Project. If the worker Session is reported archived, the note is queued, nothing is delivered or started, and the tool returns `not_started`; if the host cannot report archived Sessions, `wake=true` returns `queued` rather than claiming a start.
 
 ### Project status and controls
 

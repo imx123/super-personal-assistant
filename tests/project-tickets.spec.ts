@@ -233,6 +233,66 @@ describe('PM-created Project Tickets', () => {
     expect(h.engine.pauseProject(h.project.id, true, 'hard').status).toBe('ended')
   })
 
+  it('stores a PM message as a note Input and delivers it to a running worker without a new Assignment', () => {
+    const h = harness()
+    const [first] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [tasks[0]!])
+    h.engine.assignmentStarted(first!.id, first!.assignments[0]!.id)
+    const result = h.engine.messageTicket(first!.id, 'Header coordination note')
+    expect(result.delivered).toBe('running')
+    const stored = h.repo.tickets.get(first!.id)!
+    expect(stored.inputs).toContainEqual(expect.objectContaining({ kind: 'note', text: 'Header coordination note' }))
+    expect(stored.assignments).toHaveLength(1)
+    expect(stored.mandate).toEqual(first!.mandate)
+    expect(h.executor.deliver).toHaveBeenCalledWith(expect.objectContaining({ id: first!.id }),
+      expect.objectContaining({ id: first!.assignments[0]!.id }))
+    const inputs = stored.inputs.length
+    h.engine.messageTicket(first!.id, 'Header coordination note')
+    expect(h.repo.tickets.get(first!.id)!.inputs).toHaveLength(inputs)
+  })
+
+  it('starts a new Assignment only for wake=true and a retryable Ticket', () => {
+    const h = harness()
+    const [ticket] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [tasks[0]!])
+    h.engine.pauseProject(h.project.id, true, 'hard')
+    h.engine.pauseProject(h.project.id, false)
+    const before = h.repo.tickets.get(ticket!.id)!.assignments.length
+    expect(h.engine.messageTicket(ticket!.id, 'Queued note').delivered).toBe('queued')
+    expect(h.repo.tickets.get(ticket!.id)!.assignments).toHaveLength(before)
+    expect(h.engine.messageTicket(ticket!.id, 'Wake note', true).delivered).toBe('started')
+    expect(h.repo.tickets.get(ticket!.id)!.assignments).toHaveLength(before + 1)
+    // A note is still stored when no Assignment may start.
+    const other = harness()
+    const [notRetryable] = other.engine.createProjectTickets(other.project.id, other.project.pmSessionId, [tasks[0]!])
+    const stored = other.repo.tickets.get(notRetryable!.id)!
+    stored.assignments[0]!.state = 'ended'; stored.assignments[0]!.endedReason = 'failedLaunch'
+    other.repo.tickets.save(stored)
+    expect(other.engine.messageTicket(notRetryable!.id, 'No start', true).delivered).toBe('not_started')
+    expect(other.repo.tickets.get(notRetryable!.id)!.inputs).toEqual([expect.objectContaining({ kind: 'note', text: 'No start' })])
+  })
+
+  it('rejects messages to paused, archived, ended, ended-Ticket and Router-owned Tickets', () => {
+    const h = harness()
+    const [ticket] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, [tasks[0]!])
+    h.engine.pauseProject(h.project.id, true)
+    expect(() => h.engine.messageTicket(ticket!.id, 'Paused')).toThrow(new UserError('projectPaused'))
+    h.engine.pauseProject(h.project.id, false)
+    h.engine.stopTicket(ticket!.id)
+    expect(() => h.engine.messageTicket(ticket!.id, 'Ended')).toThrow(new UserError('ticketEnded'))
+    const archived = harness()
+    const [archivedTicket] = archived.engine.createProjectTickets(archived.project.id, archived.project.pmSessionId, [tasks[0]!])
+    archived.engine.archiveProject(archived.project.id)
+    expect(() => archived.engine.messageTicket(archivedTicket!.id, 'Archived')).toThrow(new UserError('projectArchived'))
+    const stopped = harness()
+    const [stoppedTicket] = stopped.engine.createProjectTickets(stopped.project.id, stopped.project.pmSessionId, [tasks[0]!])
+    stopped.engine.stopProject(stopped.project.id)
+    expect(() => stopped.engine.messageTicket(stoppedTicket!.id, 'Ended project')).toThrow(new UserError('projectEnded'))
+    stopped.engine.recordTriggerForRouting(trigger('p9'))
+    const normal = stopped.engine.decide('p9', { kind: 'accept', title: 'Router work', scope: 'normal', reason: 'requested',
+      acknowledgement: 'ok', name: 'router-work' })
+    expect(() => stopped.engine.messageTicket(normal.ticketId!, 'Router ticket')).toThrow(new UserError('notProjectTicket'))
+    expect(() => stopped.engine.messageTicket('missing', 'Unknown')).toThrow(new UserError('unknownTicket'))
+  })
+
   it('archives a Project and its child Tickets, ends running Assignments, and leaves Router-owned Tickets alone', () => {
     const h = harness()
     const [first, second] = h.engine.createProjectTickets(h.project.id, h.project.pmSessionId, tasks)
@@ -294,6 +354,42 @@ describe('PM-created Project Tickets', () => {
 })
 
 describe('a Project PM Session through the runtime', () => {
+  it('lets the PM message a child as a note Input without granting authority or duplicating it', async () => {
+    const host = await startRuntime()
+    try {
+      const request = feishu('29', 'Start a project for PM messages')
+      host.runtime.receive(request)
+      await host.runtime.idle()
+      const created = await host.runTool(host.runtime.masterId, 'orchestrator_project_create',
+        { trigger_id: request.id, title: 'PM messages', goal: 'Ship a clearer settings site' }) as { project: { project_id: string } }
+      const project = host.runtime.store.projects.get(created.project.project_id)!
+      const result = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_create', { tasks: [
+        { title: 'Header', goal: 'Make the header legible', worktree_name: 'fix-header' }] }) as { tickets: { ticket_id: string }[] }
+      const ticket = host.runtime.store.tickets.get(result.tickets[0]!.ticket_id)!
+      await vi.waitFor(() => expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.state).toBe('running'))
+      const sent = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_message',
+        { ticket_id: ticket.id, text: 'The footer task found a shared token.' }) as { delivered: string; ticket: { ticket_id: string } }
+      expect(sent).toMatchObject({ delivered: 'running', ticket: { ticket_id: ticket.id } })
+      const stored = host.runtime.store.tickets.get(ticket.id)!
+      const notes = stored.inputs.filter(input => input.kind === 'note' && input.text === 'The footer task found a shared token.')
+      expect(notes).toHaveLength(1)
+      expect(stored.assignments).toHaveLength(ticket.assignments.length)
+      expect(stored.mandate).toEqual(ticket.mandate)
+      await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_message',
+        { ticket_id: ticket.id, text: 'The footer task found a shared token.' })
+      expect(host.runtime.store.tickets.get(ticket.id)!.inputs.filter(input => input.kind === 'note'
+        && input.text === 'The footer task found a shared token.')).toHaveLength(1)
+      // A known archived worker Session must not be claimed as delivered, even for a running Assignment.
+      host.workspace.archived.add(workerSessionId(ticket.id))
+      const archived = await host.runTool(project.pmSessionId, 'orchestrator_project_ticket_message',
+        { ticket_id: ticket.id, text: 'Archived worker note', wake: true }) as { delivered: string }
+      expect(archived.delivered).toBe('not_started')
+      // A PM cannot message a Ticket outside its Project, including an unknown one.
+      await expect(host.runTool(project.pmSessionId, 'orchestrator_project_ticket_message',
+        { ticket_id: 'missing', text: 'No' })).rejects.toThrow('does not belong')
+    } finally { await host.stop() }
+  })
+
   it('soft-pauses with one PM notice, hard-pauses Sessions, and resumes with a note', async () => {
     const host = await startRuntime()
     try {

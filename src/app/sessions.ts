@@ -283,6 +283,12 @@ export class Sessions {
     }
     return { ids, failures }
   }
+  /** Whether the host reports `sessionId` archived; undefined when the host offers no archived Session ids. */
+  archivedSession(sessionId: string): boolean | undefined {
+    const registry = this.ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
+    if (!registry || !Array.isArray(registry.archivedSessionIds)) return undefined
+    return registry.archivedSessionIds.map(String).includes(sessionId)
+  }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
@@ -408,8 +414,9 @@ export class Sessions {
       binding.disposers.push(agent.ctx.tools.restrict({ allow: ['skill', shell, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else if (project) {
-      // A Project's PM reads records, creates its Tickets and reports; the preset gives it no shell, file, web or subagent tools.
-      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create'] }))
+      // A Project's PM reads records, creates/messages its Tickets and reports; the preset gives it no shell, file, web or subagent tools.
+      binding.disposers.push(agent.ctx.tools.restrict({ allow: ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
+        'orchestrator_project_ticket_message'] }))
     } else {
       // An Executor Session keeps the profile's work tools it has, which DSH requires to be known; its own tools are not masked.
       binding.disposers.push(...this.workOnly(agent, ticket!.id))

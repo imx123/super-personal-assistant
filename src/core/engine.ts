@@ -1,6 +1,6 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { isoTime, latestAssignment, liveTicket, pmSessionId, threadKey, WORK_TOOLS } from './model.ts'
+import { isoTime, latestAssignment, liveTicket, pmSessionId, runningAssignment, threadKey, waitsForPerson, WORK_TOOLS } from './model.ts'
 import type { ChannelRef, Decision, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef, Ticket, Trigger }
   from './model.ts'
 import { key } from './ids.ts'
@@ -10,6 +10,7 @@ import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest } from './replies.ts'
+import { canRetry } from './stage.ts'
 import { Tickets } from './tickets.ts'
 
 export type { EngineOptions } from './part.ts'
@@ -17,6 +18,9 @@ export type { WorkerReport } from './assignments.ts'
 export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
 export type { Reply, ReplyRequest } from './replies.ts'
+
+/** How a PM's message to a child Ticket reached its worker: routed to a running one, started an Assignment, queued only, or not started. */
+export type TicketMessageDelivery = 'running' | 'started' | 'queued' | 'not_started'
 
 /** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
 export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300, tools: 32 } as const
@@ -562,6 +566,43 @@ export class Engine {
    */
   note(ticketId: string, text: string): Ticket { return this.repo.atomic(() => this.tickets.note(ticketId, text)) }
   /**
+   * A Project PM's coordination message to one of its child Tickets. It is stored as a note Input first, so it stays in the
+   * Ticket's history and grants nothing. A running Assignment gets it delivered, a pending one is started, and with
+   * `wake` a retryable Ticket gets a new Assignment; otherwise the note waits. The note id is derived from the Ticket and
+   * text, so the same request adds it once. `queueOnly` stores the note without delivering or starting, for a known archived
+   * worker Session.
+   * @throws UserError when the Ticket is unknown, ended, archived or outside a Project, or when its Project is paused,
+   * archived or ended.
+   */
+  messageTicket(ticketId: string, text: string, wake = false, queueOnly = false): { delivered: TicketMessageDelivery; ticket: Ticket } {
+    return this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket) throw new UserError('unknownTicket')
+      const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
+      if (!ticket.projectId || !project) throw new UserError('notProjectTicket')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      if (ticket.archived) throw new UserError('ticketArchived')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      const running = !!runningAssignment(ticket)
+      const pending = latestAssignment(ticket)?.state === 'pending' && !waitsForPerson(ticket)
+      const canStart = canRetry(ticket)
+      const id = key('input', ticketId, 'note', 'pm', text)
+      if (queueOnly) {
+        this.tickets.queueNoteWithId(ticketId, text, id)
+        return { delivered: 'not_started', ticket: this.repo.tickets.get(ticketId)! }
+      }
+      this.tickets.noteWithId(ticketId, text, id)
+      let delivered: TicketMessageDelivery
+      if (running) delivered = 'running'
+      else if (pending) delivered = 'started'
+      else if (wake && canStart) { this.tickets.retry(ticketId); delivered = 'started' }
+      else delivered = wake ? 'not_started' : 'queued'
+      return { delivered, ticket: this.repo.tickets.get(ticketId)! }
+    })
+  }
+  /**
    * An Executor's hand-back of a message that reached its ticket but asks for more than it: see `Evals.handback`.
    * @returns whether it was queued for Eval: false while another ticket still decides it, and for one this ticket did not decide (see `Evals.handback`).
    * @throws UserError when the ticket or trigger is unknown, the trigger did not reach the ticket, or the ticket already handed it back.
@@ -605,7 +646,7 @@ export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadCl
 export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'createProject' | 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply'
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
-export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets'>
+export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
   | 'pauseProject' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>

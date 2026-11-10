@@ -735,6 +735,7 @@ const TEXT = {
   'userError.unknownTrigger': ['找不到这个触发。', USER_ERRORS.unknownTrigger[1]],
   'userError.unknownProject': ['找不到这个项目。', USER_ERRORS.unknownProject[1]],
   'userError.notProjectPm': ['只有这个项目自己的 PM Session 才能创建项目内工单。', USER_ERRORS.notProjectPm[1]],
+  'userError.notProjectTicket': ['这条工单不属于当前项目。', USER_ERRORS.notProjectTicket[1]],
   'userError.projectEnded': ['这个项目已结束，不能再创建工单。', USER_ERRORS.projectEnded[1]],
   'userError.projectPaused': ['这个项目已暂停；恢复后才能继续创建工单。', USER_ERRORS.projectPaused[1]],
   'userError.projectPauseMode': ['暂停模式只能是 soft 或 hard。', USER_ERRORS.projectPauseMode[1]],

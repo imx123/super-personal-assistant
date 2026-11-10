@@ -6,6 +6,7 @@ export const USER_ERRORS = {
   unknownProject: ['missing', 'Unknown Project'],
   unknownAssignment: ['missing', 'Unknown assignment'],
   notProjectPm: ['refused', 'Only this Project\'s PM Session may create its Tickets'],
+  notProjectTicket: ['refused', 'This Ticket does not belong to the Project'],
   projectEnded: ['refused', 'This Project has ended; no new Ticket can be created'],
   projectPaused: ['refused', 'This Project is paused; resume it before creating more Tickets'],
   projectPauseMode: ['refused', 'Pause mode must be soft or hard'],

@@ -6,6 +6,7 @@ import { UserError, PROJECT_TICKETS, followupOwners, key, reasonText, type Decis
   type EngineForPeople, type ProjectProfile, type ProjectTicketTask, type Ticket } from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
+import { workerSessionId } from '../../executor/dsh.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { projectCard, projectTicketCard, ticketCard } from '../cards.ts'
@@ -43,7 +44,7 @@ export interface MainToolsHost {
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'projects' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject' | 'relay'
-    | 'archiveProject' | 'unarchiveProject'>
+    | 'archiveProject' | 'unarchiveProject' | 'archivedSession'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
   readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
   readonly resources: ResourceHost
@@ -282,6 +283,41 @@ function projectArchiveTool(host: MainToolsHost, archive: boolean): Tool {
     },
   })
 }
+/**
+ * `orchestrator_project_ticket_message`: the PM sends one of its own Project's Tickets a coordination note. The note is
+ * stored as a Ticket Input, so it is in the Ticket's history and grants no authority; `wake` may start a retryable Ticket.
+ */
+function projectTicketMessageTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_message',
+    description: 'Send one child Ticket a coordination note. The note is stored as a Ticket Input and grants no authority. '
+      + 'wake=false (default) only routes it to a running worker or queues it; wake=true also starts a new Assignment when the Ticket is retryable. '
+      + 'Only Tickets inside this Project are accepted.',
+    schema: z.object({
+      ticket_id: z.string().min(1).max(200),
+      text: z.string().trim().min(1).max(4000).describe('The coordination fact or question; never a new authorization.'),
+      wake: z.boolean().optional().describe('false only queues or delivers; true may start a retryable Ticket\'s new Assignment.'),
+    }).strict(),
+    execute: async args => {
+      const ticket = host.store.tickets.get(args.ticket_id)
+      if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
+      const sessionArchived = host.sessions.archivedSession(workerSessionId(ticket.id))
+      if (sessionArchived === true) {
+        const result = host.quietly(() => host.engine.messageTicket(args.ticket_id, args.text, false, true))
+        return { delivered: 'not_started', ticket: projectTicketCard(result.ticket),
+          note: 'The worker Session is archived; the note is queued but nothing was delivered or started.' }
+      }
+      if (sessionArchived === undefined && args.wake) {
+        const result = host.quietly(() => host.engine.messageTicket(args.ticket_id, args.text, false, true))
+        return { delivered: 'queued', ticket: projectTicketCard(result.ticket),
+          note: 'The host does not report archived Sessions, so the note was queued and no Assignment was started.' }
+      }
+      const result = host.quietly(() => host.engine.messageTicket(args.ticket_id, args.text, args.wake ?? false))
+      return { delivered: result.delivered, ticket: projectTicketCard(result.ticket),
+        note: 'The message is a Ticket Input, not new authority. "not_started" or "queued" means no worker received it yet.' }
+    },
+  })
+}
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
@@ -460,6 +496,7 @@ export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
       }, `${own}: this Project's goal, status, PM Session, mandate, latest report and child Ticket ids; ${ownTickets}: its child Tickets with their Threads; `
         + 'ticket/<id>: one of those Tickets only'),
     projectTicketCreateTool(host, project),
+    projectTicketMessageTool(host, project),
     tool({
       name: 'orchestrator_project_report',
       description: 'Record the latest report on this Project: what changed, what is blocked, and what a person must decide. It replaces the previous report the Project shows.',

@@ -52,6 +52,8 @@ A native DSH archive of `pm-<projectId>` archives the whole Project in the appli
 
 A paused Project has a `pauseMode`. Soft pause lets running Assignments finish and asks the PM to report and stop; hard pause immediately ends pending/running Assignments with `projectPaused`, stops the PM and child Worker Sessions without ending or archiving Tickets, and leaves the state paused. All new Assignments (creation, retry, resume, attach) are refused with `projectPaused` until resume. Resuming restores `active`, clears the mode, does not restart old Assignments, and after a hard pause queues a `resumedFromHard` note telling the PM to re-read the Project and Tickets and synchronize before continuing.
 
+A PM may send one of its child Tickets a coordination message. The message becomes a `note` Ticket Input in that Ticket's history, so it is context and grants no authority, no new tools and no new Mandate. A running Assignment receives it as an Input; a pending Assignment is started; with `wake` a retryable Ticket may get a new Assignment, but `wake` never bypasses a paused/archived/ended Project, and a Ticket whose worker Session is archived only queues the note without claiming delivery.
+
 ## Rejected concepts
 
 | Rejected | Reason |
@@ -116,7 +118,7 @@ A reference list of the terms this and the later documents use, with their Chine
 | Report | 报告 | The state an Assignment reports to its Ticket |
 | Attention | 待人工决定 | A question on a Ticket that waits for a person's answer |
 | Disposition | 去向 | The record of a Trigger being filtered, evaluated or fanned out |
-| Input | 输入 | Context delivered to a Ticket: fanned-out Triggers, Policy changes, resumes and text |
+| Input | 输入 | Context delivered to a Ticket: fanned-out Triggers, Policy changes, resumes, text, and a PM's coordination note |
 | Internal dispatch | 内部派工 | The built-in Source a Project PM records one Trigger on per delegated Ticket |
 | Scope | 范围 | The work a Mandate allows |
 | Tool allowlist | 工具白名单 | The Worker tools a Mandate allows, a subset of the Executor's work tools; absent means all |
