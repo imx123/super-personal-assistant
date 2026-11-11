@@ -14,6 +14,16 @@ export const EXECUTOR_VARIABLES: readonly (VariableSpec & { ticket?: true })[] =
   { key: 'DSH_SUPERAGENT_BLOCKED_COMMANDS', description: { zh: '这个执行环境禁止调用的命令，以空格分隔；不要运行它们', en: 'Commands blocked in this execution environment, separated by spaces; never run them' } },
 ]
 export interface Variable { key: string; value: string; description: Localized; owner: string }
+/** Largest value one execution-environment variable may hold, which bounds what external Trigger data can add. */
+export const MAX_VARIABLE_VALUE = 8192
+/**
+ * Normalizes an execution-environment value for a child process: control characters, including newlines, become spaces and
+ * the value is capped. Values are data: the operator's prepare command is the only shell program, and these values are
+ * passed to it in the environment, never interpolated into its text.
+ */
+export function environmentValue(value: string): string {
+  return value.replace(/[\u0000-\u001F\u007F-\u009F]/g, ' ').slice(0, MAX_VARIABLE_VALUE)
+}
 
 export const executionRoot = (settings: Settings, stateDir: string): string => settings.executor.directory || join(stateDir, 'work')
 
@@ -32,7 +42,7 @@ export function environmentOf(input: { deployment: Deployment; sources: SourceRe
     const values = environment.values({ deployment, config, ...trigger ? { trigger } : {} })
     for (const spec of environment.variables) result.push({ key: spec.key, value: values[spec.key] ?? '', description: spec.description, owner: kind.kind })
   }
-  return result
+  return result.map(variable => ({ ...variable, value: environmentValue(variable.value) }))
 }
 
 /** Combines a ticket's fixed directory, name, and origin trigger with the deployment's current settings. */

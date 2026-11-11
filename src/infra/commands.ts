@@ -4,6 +4,7 @@ import { basename } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
+import { safeEnvironment } from './environment.ts'
 import { redact } from './redact.ts'
 
 const exec = promisify(execFile)
@@ -44,6 +45,13 @@ function ended(error: unknown): string {
   if (typeof code === 'number') return `exited with code ${code}`
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
 }
+/** The envelope `lark-cli --format json` prints: `ok` decides success, `data` is the payload, `error` the failure. */
+const LarkResultSchema = z.looseObject({ ok: z.boolean(), data: z.unknown().optional(),
+  error: z.looseObject({ code: z.number().optional(), message: z.string().optional() }).optional() })
+/** Parses JSON a CLI printed; malformed output is a CLI failure instead of a value a caller could mistake for data. */
+function json(text: string, program: string): unknown {
+  try { return JSON.parse(text) as unknown } catch { throw new CliError(`${basename(program)} printed output that is not JSON`) }
+}
 export interface Tally { skipped: number }
 /** Parses array elements against a schema, skipping invalid items and incrementing `tally.skipped`. */
 export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tally?: Tally): T[] {
@@ -64,7 +72,7 @@ function membership(error: unknown): unknown {
 export class Commands {
   /**
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
-   * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
+   * @param environment - variables overriding the allowlisted host environment for every command (such as isolated git settings).
    */
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
@@ -73,12 +81,15 @@ export class Commands {
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+        env: safeEnvironment({ ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }) })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }
-  /** Runs the agent's GitHub CLI and parses its JSON output; callers should prefer `api`, which is restricted to the configured repository and validates output. */
-  async gh<T>(args: string[]): Promise<T> { return JSON.parse(await this.run(this.deployment.github.cli, args)) as T }
+  /**
+   * Runs the agent's GitHub CLI and parses its JSON output as `unknown`. Every caller validates the value with a schema or a
+   * format check before using it (see `api`, `pages`).
+   */
+  async gh(args: string[]): Promise<unknown> { return json(await this.run(this.deployment.github.cli, args), this.deployment.github.cli) }
   /**
    * Calls the GitHub API on a path within the configured repository, validating JSON output when a schema is provided
    * or returning raw CLI output (such as raw files or `--include` headers) when omitted.
@@ -98,22 +109,26 @@ export class Commands {
   }
   private path(path: string): string {
     const outside = /^\/|^[a-z]+:|(^|\/)\.\.?(\/|\?|$)/i.test(path)
-    if (outside) throw new Error('GitHub calls are restricted to the configured repository')
+    // A control character cannot be part of a GitHub API address; reject it before it reaches the CLI argument.
+    const control = /[\u0000-\u001F\u007F]/.test(path)
+    if (outside || control) throw new Error('GitHub calls are restricted to the configured repository')
     return path ? `repos/${this.repository}/${path}` : `repos/${this.repository}`
   }
   /**
    * Runs the Feishu bot's `lark-cli` and returns the JSON `data` payload.
    * @throws CliError with Feishu's error code on failure (rewriting 232011 when the bot is not in the chat).
    */
-  async lark<T>(args: string[], cwd?: string): Promise<T> {
+  async lark(args: string[], cwd?: string): Promise<unknown> {
     const bot = this.deployment.feishu
     if (!bot) throw new Error('The Feishu Source has no working bot CLI')
     const output = await this.run(bot.cli, [...args, '--as', 'bot', '--format', 'json'], cwd)
       .catch((error: unknown) => { throw membership(error) })
-    const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }
-    const code = result.error?.code
-    if (!result.ok) throw membership(new CliError(redact(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`), code))
-    return result.data
+    const parsed = LarkResultSchema.safeParse(json(output, bot.cli))
+    if (!parsed.success) throw new CliError(`${basename(bot.cli)} returned a result that is not a Feishu CLI result`)
+    const { ok, data, error } = parsed.data
+    const code = error?.code
+    if (!ok) throw membership(new CliError(redact(`${error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`), code))
+    return data
   }
   /** Runs `git` on PATH using the agent's isolated git environment and credential helper. */
   async git(args: string[], cwd: string): Promise<string> { return this.run('git', args, cwd) }

@@ -5,6 +5,8 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
 import { runFeishu } from '../src/sources/feishu-loops.ts'
+import { safeAppLink, topicEvent } from '../src/sources/feishu-trigger.ts'
+import { triggerCard } from '../src/app/cards.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
@@ -64,10 +66,10 @@ const pulled = (number: number) => ({ follows: [{ thread: `github:${number}`, ow
 const endedPull = (number: number, at: string, merged = true): Pull =>
   ({ ...openPull(number), state: 'closed', merged, ...merged ? { merged_at: at } : { closed_at: at } })
 const agentsPull = (number: number, ref: string): Pull =>
-  ({ ...openPull(number), user: { login: 'agent-bot' }, head: { sha: 'abc', ref, repo: { full_name: 'acme/widgets' } } })
+  ({ ...openPull(number), user: { login: 'agent-bot' }, head: { sha: 'abcdef1', ref, repo: { full_name: 'acme/widgets' } } })
 const openPull = (number: number) => ({ number, title: 'Fix the margin', state: 'open',
   html_url: `https://github.com/acme/widgets/pull/${number}`, user: { login: 'carol' },
-  head: { sha: 'abc', ref: 'fix', repo: { full_name: 'acme/widgets' } } })
+  head: { sha: 'abcdef1', ref: 'fix', repo: { full_name: 'acme/widgets' } } })
 const notification = (number: number, kind: 'issues' | 'pulls' = 'issues') => ({ id: `n${number}`, updated_at: '2026-09-09T00:00:00Z',
   reason: 'mention',
   repository: { full_name: 'acme/widgets' }, subject: { url: `https://api.github.com/repos/acme/widgets/${kind}/${number}`,
@@ -121,6 +123,37 @@ describe('feishu source', () => {
     expect(feishuRef(trigger)).toEqual({ triggerId: trigger.id, chatId: 'oc_1', messageId: 'om_2', at: trigger.at })
     expect(feishuTrigger({ message_id: 'om_3', chat_id: 'oc_1', chat_type: 'p2p', sender_id: 'ou_bot', sender_type: 'bot', content: 'me', create_time: '1' }, 'ou_bot', 'cli_bot')).toBeUndefined()
     expect(feishuTrigger(historyEvent({ message_id: 'om_4', chat_id: 'oc_1', create_time: '2', sender: { id: 'ou_x', sender_type: 'app' }, body: { content: '{"text":"from app"}' } }, 'oc_1', false), 'ou_bot', 'cli_bot')).toMatchObject({ human: false, text: 'from app', threads: [{ id: 'oc_1:om_4' }] })
+  })
+  it('keeps only clean https AppLinks: no credentials, query, fragment, or other scheme', () => {
+    const event = (message_app_link: unknown) => ({ message_id: 'om_link', chat_id: 'oc_1', chat_type: 'group' as const, sender_id: MEMBER,
+      sender_type: 'user' as const, content: 'hi', create_time: '1', mentions: [{ id: 'cli_bot' }], message_app_link })
+    const url = (value: unknown) => feishuTrigger(event(value), 'ou_bot', 'cli_bot')?.url
+    expect(safeAppLink('https://applink.feishu.cn/client/message/link/open?token=secret#frag'))
+      .toBe('https://applink.feishu.cn/client/message/link/open')
+    expect(url('https://applink.feishu.cn/client/message/link/open?token=secret#frag')).toBe('https://applink.feishu.cn/client/message/link/open')
+    expect(url('https://applink.feishu.cn/client/message/link/open')).toBe('https://applink.feishu.cn/client/message/link/open')
+    for (const value of ['javascript:alert(1)', 'data:text/html,<script>', 'file:///etc/passwd', 'vbscript:msgbox(1)',
+      'http://applink.feishu.cn/x', 'https://user:secret@applink.feishu.cn/x', '//applink.feishu.cn/x', 'not a link', 42, undefined]) {
+      expect(url(value), String(value)).toBeUndefined()
+    }
+    // The history and topic paths normalize the same way, and an invalid link leaves the rest of the message intact.
+    const historical = historyEvent({ message_id: 'om_hist', chat_id: 'oc_1', create_time: '2', sender: { id: MEMBER, sender_type: 'user' },
+      body: { content: '{"text":"hi"}' }, message_app_link: 'https://applink.feishu.cn/client/message/link/open?token=hist#frag' }, 'oc_1', false)
+    expect(feishuTrigger(historical, 'ou_bot', 'cli_bot')).toMatchObject({ text: 'hi',
+      url: 'https://applink.feishu.cn/client/message/link/open' })
+    const topic = topicEvent({ message_id: 'om_topic', chat_id: 'oc_1', msg_type: 'text', content: 'hi', sender: { id: MEMBER, sender_type: 'user' },
+      create_time: '3', message_app_link: 'javascript:alert(1)' }, 'oc_1', false, 'om_topic')
+    expect(feishuTrigger(topic, 'ou_bot', 'cli_bot')).toMatchObject({ text: 'hi' })
+    expect(feishuTrigger(topic, 'ou_bot', 'cli_bot')!.url).toBeUndefined()
+    // What is persisted, and what a card shows, carries no query or userinfo either.
+    const h = host()
+    const trigger = feishuTrigger(event('https://applink.feishu.cn/client/message/link/open?token=secret'), 'ou_bot', 'cli_bot')!
+    h.store.triggers.save(trigger)
+    expect(h.store.triggers.get(trigger.id)!.url).toBe('https://applink.feishu.cn/client/message/link/open')
+    expect(JSON.stringify(h.store.triggers.get(trigger.id))).not.toContain('token=')
+    expect(triggerCard(trigger)).toMatchObject({ source_url: 'https://applink.feishu.cn/client/message/link/open' })
+    expect(JSON.stringify(triggerCard(trigger))).not.toContain('secret')
+    h.store.close()
   })
   it('polls subscribed threads and stores unseen replies as triggers on that thread', async () => {
     const h = host()
@@ -552,9 +585,9 @@ describe('github source', () => {
       subscriptions: ['t9'], correlated: [], pending: [], meta: { number: 9, isPr: true, title: 'Fix' } })
     const pr = { number: 9, title: 'Fix', state: 'open', auto_merge: { merge_method: 'merge' } as unknown,
       html_url: 'https://github.com/acme/widgets/pull/9', user: { login: 'agent-bot' },
-      head: { sha: 'abc', ref: 'agent/nine', repo: { full_name: 'acme/widgets' } } }
+      head: { sha: 'abcdef1', ref: 'agent/nine', repo: { full_name: 'acme/widgets' } } }
     const checks = { check_runs: [{ name: 'test', status: 'in_progress', conclusion: null }] }
-    const routes: Record<string, unknown> = { notifications: [notification(9, 'pulls')], 'pulls/9': pr, 'commits/abc/check-runs': checks }
+    const routes: Record<string, unknown> = { notifications: [notification(9, 'pulls')], 'pulls/9': pr, 'commits/abcdef1/check-runs': checks }
     const reads = github(h, routes)
     await pollRound(h)
     // The notification, the ticket's PR and the subscribed Thread share one read of the PR.
@@ -562,7 +595,7 @@ describe('github source', () => {
     const facts = () => h.store.threads.get('github:9')!.meta.facts as Record<string, unknown>
     expect(facts()).toMatchObject({ autoMerge: { label: { zh: '自动合并', en: 'Auto-merge' } }, ci: { value: '1' } })
     routes['pulls/9'] = { ...pr, auto_merge: null }
-    routes['commits/abc/check-runs'] = { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }
+    routes['commits/abcdef1/check-runs'] = { check_runs: [{ name: 'test', status: 'completed', conclusion: 'failure' }] }
     await pollRound(h)
     expect(facts()).not.toHaveProperty('autoMerge')
     // Only a change after the first look is a Trigger.
@@ -1043,7 +1076,7 @@ describe('feishu event consumer', () => {
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
    * and `flaky` exits after its first ready. It records each run and the PID of the latest.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late' | 'env'): string {
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1054,6 +1087,7 @@ describe('feishu event consumer', () => {
     ready) echo '[event] ready' >&2; exec sleep 60 ;;
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
     events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
+    env) env > '${dir}/child-env'; echo '[event] ready' >&2; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
   esac
   `, { mode: 0o755 })
@@ -1096,6 +1130,26 @@ describe('feishu event consumer', () => {
     expect(store.get(KV.feishu.chats)).toEqual({ oc_group: false, oc_dm: true })
     expect(health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
     controller.abort(); await running; store.close()
+  }, 20_000)
+  it('gives the event consumer the allowlisted host environment and none of the host credentials', async () => {
+    for (const [name, value] of Object.entries({ GH_TOKEN: 'gh-personal', GITHUB_TOKEN: 'github-personal', OPENCODE_GO_API_KEY: 'provider',
+      AWS_ACCESS_KEY_ID: 'aws-id', AWS_SECRET_ACCESS_KEY: 'aws-secret', NO_COLOR: 'kept' })) vi.stubEnv(name, value)
+    const { ctx, store } = consumerSource(cli('env'))
+    try {
+      running = runFeishu(ctx, controller.signal)
+      await vi.waitFor(() => expect(existsSync(join(dir, 'child-env'))).toBe(true), until)
+      const child = Object.fromEntries(readFileSync(join(dir, 'child-env'), 'utf8').split('\n').filter(Boolean).map(line => {
+        const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1)]
+      }))
+      for (const name of ['GH_TOKEN', 'GITHUB_TOKEN', 'OPENCODE_GO_API_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
+        expect(child, name).not.toHaveProperty(name)
+      }
+      expect(child.NO_COLOR).toBe('kept')
+      expect(child.PATH).toBeTruthy()
+      expect(child.LARKSUITE_CLI_NO_UPDATE_NOTIFIER).toBe('1')
+    } finally {
+      controller.abort(); await running; store.close(); vi.unstubAllEnvs()
+    }
   }, 20_000)
   it('drops the events it reads once the Source is off', async () => {
     writeFileSync(join(dir, 'events'), event('om_9', 'oc_group', 'group') + '\n')

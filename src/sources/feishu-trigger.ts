@@ -4,6 +4,23 @@ import { key, type ChannelRef, type Trigger } from '../core/index.ts'
 import type { FeishuMessage, FeishuRef } from './feishu-read.ts'
 
 export const SOURCE = 'feishu'
+/** Longest AppLink accepted from an event; longer values are dropped rather than persisted. */
+const MAX_APP_LINK = 2048
+/**
+ * Returns an AppLink that is safe to persist and show, or `undefined` for anything that is not one.
+ * Feishu AppLinks are `https://applink.feishu.cn/...` (or the Lark equivalent); `http:` is refused so a link whose token
+ * could travel in clear text, and `javascript:`, `data:`, `file:`, `vbscript:` and every other scheme are refused with it.
+ * Credentials/userinfo in the URL, and any query or fragment that could carry a session token, are removed rather than stored.
+ */
+export function safeAppLink(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > MAX_APP_LINK) return undefined
+  let link: URL
+  try { link = new URL(value) } catch { return undefined }
+  if (link.protocol !== 'https:' || link.username || link.password) return undefined
+  link.search = ''
+  link.hash = ''
+  return link.toString()
+}
 /** Constructs a Feishu reply channel address; records `direct` explicitly because both group and direct chat IDs start with `oc_`. */
 export const feishuChannel = (chatId: string, messageId: string, direct = false): ChannelRef =>
   ({ source: SOURCE, thread: `feishu:${chatId}`, address: { chatId, messageId, ...direct ? { direct: 'true' } : {} } })
@@ -11,7 +28,7 @@ export const feishuChannel = (chatId: string, messageId: string, direct = false)
 const EventSchema = z.object({ message_id: z.string(), chat_id: z.string(), chat_type: z.enum(['p2p', 'group']),
   sender_id: z.string(), sender_type: z.enum(['user', 'bot']), content: z.string(), create_time: z.string(),
   mentions: z.array(z.object({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).default([]),
-  root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional() })
+  root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.unknown().optional() })
 export type FeishuEvent = z.infer<typeof EventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
 /** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
@@ -34,11 +51,12 @@ export function feishuTrigger(input: unknown, botId: string, botAppId: string): 
   const direct = event.chat_type === 'p2p'
   const mentioned = event.mentions.some(mention => mention.id === botId || mention.id === botAppId)
   const thread = feishuThreadId(event.chat_id, event.root_id, event.message_id)
+  const url = safeAppLink(event.message_app_link)
   return { id: feishuTriggerId(event.message_id), source: SOURCE, threads: [{ source: SOURCE, id: thread }],
     actor: { source: SOURCE, id: event.sender_id }, human: event.sender_type === 'user',
     ...(direct ? { addressed: 'direct' as const } : mentioned ? { addressed: 'mention' as const } : {}),
     at: feishuTime(event.create_time), text: withMentionNames(event.content, event.mentions),
-    channel: feishuChannel(event.chat_id, event.message_id, direct), ...(event.message_app_link ? { url: event.message_app_link } : {}),
+    channel: feishuChannel(event.chat_id, event.message_id, direct), ...(url ? { url } : {}),
     meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...(event.root_id ? { rootId: event.root_id } : {}),
       ...(event.parent_id ? { parentId: event.parent_id } : {}), ...(event.thread_id ? { threadId: event.thread_id } : {}) } }
 }
@@ -54,7 +72,7 @@ export function feishuRef(trigger: Trigger): FeishuRef | undefined {
 export const HistoricalMessageSchema = z.looseObject({
   message_id: z.string(), chat_id: z.string(), create_time: z.string(),
   root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(),
-  deleted: z.boolean().optional(), message_app_link: z.string().optional(),
+  deleted: z.boolean().optional(), message_app_link: z.unknown().optional().transform(value => safeAppLink(value)).optional(),
   sender: z.looseObject({ id: z.string().default(''), sender_type: z.string() }),
   body: z.looseObject({ content: z.string() }).optional(),
   mentions: z.array(z.looseObject({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).optional(),
@@ -75,7 +93,7 @@ export function historyEvent(message: HistoricalMessage, chatId: string, direct:
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot', content: historyText(message),
     mentions: message.mentions ?? [], root_id: message.root_id, parent_id: message.parent_id, thread_id: message.thread_id,
-    message_app_link: message.message_app_link }
+    message_app_link: safeAppLink(message.message_app_link) }
 }
 /**
  * Adapts a topic-page message into the live-event schema, falling back to `root` when Feishu omits `root_id` on replies;
@@ -85,5 +103,5 @@ export function topicEvent(message: FeishuMessage, chatId: string, direct: boole
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.open_bot_id ?? message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot',
     content: message.content ?? '', mentions: message.mentions ?? [], parent_id: message.parent_id, thread_id: message.thread_id,
-    root_id: message.root_id ?? (message.message_id === root ? undefined : root), message_app_link: message.message_app_link }
+    root_id: message.root_id ?? (message.message_id === root ? undefined : root), message_app_link: safeAppLink(message.message_app_link) }
 }

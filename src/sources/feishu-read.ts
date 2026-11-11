@@ -3,7 +3,7 @@ import { z } from 'zod'
 import type { Trigger } from '../core/index.ts'
 import { validItems, type Commands } from '../infra/commands.ts'
 import { admissionImageKeys, readAdmissionImage } from './feishu-image.ts'
-import { feishuRef, feishuTime, HistoricalMessageSchema, HistoryPageSchema, historyText, withMentionNames, type HistoricalMessage }
+import { feishuRef, feishuTime, HistoricalMessageSchema, HistoryPageSchema, historyText, safeAppLink, withMentionNames, type HistoricalMessage }
   from './feishu-trigger.ts'
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
@@ -19,7 +19,7 @@ const messageSchema = z.object({
   sender: z.object({ id: z.string(), name: z.string().optional(), open_bot_id: z.string().optional(), sender_type: z.string() }),
   create_time: z.string(), update_time: z.string().optional(), updated: z.boolean().optional(), deleted: z.boolean().optional(),
   mentions: z.array(z.object({ id: z.string(), name: z.string().optional(), key: z.string().optional() })).optional(),
-  message_app_link: z.string().optional(), thread_id: z.string().optional(), root_id: z.string().optional(), parent_id: z.string().optional(),
+  message_app_link: z.unknown().optional().transform(value => safeAppLink(value)).optional(), thread_id: z.string().optional(), root_id: z.string().optional(), parent_id: z.string().optional(),
 })
 export type FeishuMessage = z.infer<typeof messageSchema>
 /** A topic page; messages are validated individually so an unreadable item is skipped alone and counted. */
@@ -29,11 +29,12 @@ const threadSchema = z.object({ messages: z.array(z.unknown()), has_more: z.bool
 /** Reads the CLI-provided AppLink for the source message alone, without retaining expanded thread content. */
 export async function readFeishuLink(commands: Commands, ref: FeishuRef): Promise<string> {
   const id = messageId.parse(ref.messageId)
-  const result = z.object({ messages: z.array(z.object({ message_id: messageId, chat_id: z.string(), message_app_link: z.url().optional(), deleted: z.boolean().optional() })) })
+  const result = z.object({ messages: z.array(z.object({ message_id: messageId, chat_id: z.string(), message_app_link: z.unknown().optional(), deleted: z.boolean().optional() })) })
     .parse(await commands.lark(['im', '+messages-mget', '--message-ids', id, '--no-reactions']))
   const message = result.messages.find(item => item.message_id === id)
-  if (!message || message.deleted || message.chat_id !== ref.chatId || !message.message_app_link) throw new Error('Source message link unavailable')
-  return message.message_app_link
+  const link = safeAppLink(message?.message_app_link)
+  if (!message || message.deleted || message.chat_id !== ref.chatId || !link) throw new Error('Source message link unavailable')
+  return link
 }
 
 /** Resource references are anchored to an accepted trigger instead of arbitrary chat or message IDs. */
@@ -99,17 +100,19 @@ function isoTime(value: string): string {
   try { return feishuTime(value) } catch { return value }
 }
 export function feishuView(message: FeishuMessage): ContextMessage {
+  const url = safeAppLink(message.message_app_link)
   return { id: message.message_id, from: message.sender.name || message.sender.id, at: isoTime(message.create_time),
     text: message.deleted ? '' : withMentionNames(message.content ?? '', message.mentions ?? []),
     ...message.sender.sender_type !== 'user' ? { bot: true } : {}, ...message.deleted ? { deleted: true } : {},
-    ...message.parent_id ? { reply_to: message.parent_id } : {}, ...message.message_app_link ? { url: message.message_app_link } : {} }
+    ...message.parent_id ? { reply_to: message.parent_id } : {}, ...url ? { url } : {} }
 }
 /** Formats a chat history API message for model inspection; the history API identifies senders by `open_id` only. */
 function historyView(message: HistoricalMessage): ContextMessage {
+  const url = safeAppLink(message.message_app_link)
   return { id: message.message_id, from: message.sender.id, at: isoTime(message.create_time),
     text: message.deleted ? '' : withMentionNames(historyText(message), message.mentions ?? []),
     ...message.sender.sender_type !== 'user' ? { bot: true } : {}, ...message.deleted ? { deleted: true } : {},
-    ...message.parent_id ? { reply_to: message.parent_id } : {}, ...message.message_app_link ? { url: message.message_app_link } : {} }
+    ...message.parent_id ? { reply_to: message.parent_id } : {}, ...url ? { url } : {} }
 }
 /** Reads chat messages surrounding `ref.at` (five before and five after on initial read, then pages of ten older messages). */
 async function chatAround(commands: Commands, ref: FeishuRef, cursor: string | undefined, before = 5,

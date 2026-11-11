@@ -21,13 +21,18 @@ describe('account-isolated operations', () => {
     await commands.gh(['api','some-path','-f','body=`whoami` $(touch x)'])
     expect(run).toHaveBeenCalledWith('/path/agent-gh', ['api','some-path','-f','body=`whoami` $(touch x)'])
   })
-  it('runs every command with its environment over the process environment, where undefined removes a variable', async () => {
-    process.env.GH_TOKEN = 'personal'
+  it('runs every command with the allowlisted host environment and explicit overrides, never host credentials', async () => {
+    for (const [name, value] of Object.entries({ GH_TOKEN: 'gh-personal', GITHUB_TOKEN: 'github-personal', OPENCODE_GO_API_KEY: 'provider',
+      AWS_ACCESS_KEY_ID: 'aws-id', AWS_SECRET_ACCESS_KEY: 'aws-secret', NO_COLOR: 'kept' })) vi.stubEnv(name, value)
     try {
       const output = await new Commands(() => deployment, { GH_TOKEN: undefined, DSH_SUPERAGENT_PROBE: 'agent' }, new AbortController().signal).run('env', [])
       expect(output).toContain('DSH_SUPERAGENT_PROBE=agent')
-      expect(output).not.toContain('GH_TOKEN=')
-    } finally { delete process.env.GH_TOKEN }
+      expect(output).toMatch(/^NO_COLOR=kept$/m)
+      expect(output).toMatch(/^PATH=/m)
+      for (const name of ['GH_TOKEN', 'GITHUB_TOKEN', 'OPENCODE_GO_API_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
+        expect(output, name).not.toMatch(new RegExp(`^${name}=`, 'm'))
+      }
+    } finally { vi.unstubAllEnvs() }
   })
   it('refuses Feishu commands when the deployment has no Feishu bot', async () => {
     await expect(new Commands(() => testDeployment({ feishu: undefined }), {}, new AbortController().signal).lark(['im', '+chat-list'])).rejects.toThrow('The Feishu Source has no working bot CLI')
@@ -159,6 +164,19 @@ describe('GitHub calls', () => {
     run.mockResolvedValue('{"message":"not a list"}')
     await expect(value.pages(z.looseObject({ id: z.number() }), 'issues/12/comments')).rejects.toThrow()
   })
+})
+it('rejects CLI output that is not JSON, and CLI JSON that does not have the shape the caller validates', async () => {
+  const commands = new Commands(() => deployment, {}, new AbortController().signal)
+  const run = vi.spyOn(commands, 'run').mockResolvedValue('not json')
+  await expect(commands.gh(['api', 'user'])).rejects.toThrow('printed output that is not JSON')
+  await expect(commands.api(z.looseObject({ number: z.number() }), 'issues/12')).rejects.toThrow('not JSON')
+  run.mockResolvedValue('{"number":"twelve"}')
+  await expect(commands.api(z.looseObject({ number: z.number() }), 'issues/12')).rejects.toThrow()
+  run.mockResolvedValue('{"ok":"yes","data":{}}')
+  await expect(commands.lark(['im', '+chat-list'])).rejects.toThrow('not a Feishu CLI result')
+  run.mockResolvedValue('{"ok":true,"data":{"unreadable":true}}')
+  expect(await commands.lark(['im', '+chat-list'])).toEqual({ unreadable: true })
+  vi.restoreAllMocks()
 })
 it('says how to add the bot to a chat when Feishu answers that it is not a member, and keeps the code', async () => {
   const commands = new Commands(() => deployment, {}, new AbortController().signal)

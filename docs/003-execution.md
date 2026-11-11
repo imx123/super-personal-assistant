@@ -62,7 +62,7 @@ Other Inputs, such as CI results, wait for a normal slot. A launch waits in `wor
 
 ### Execution variables
 
-The prepare command and Executor instructions receive the same execution variables. The command reads environment variables; the Executor reads their values and descriptions in its prompt. None contains credentials.
+The prepare command and Executor instructions receive the same execution variables. The command reads environment variables; the Executor reads their values and descriptions in its prompt. None contains credentials. The operator's command is the only shell program: external values, such as a Trigger's chat or PR number, are passed as environment data, never interpolated into the command, and control characters in them are replaced and their length capped before they reach it.
 
 | Variable | Registered by | Value |
 | --- | --- | --- |

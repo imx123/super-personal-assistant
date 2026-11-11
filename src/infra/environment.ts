@@ -1,6 +1,7 @@
 /**
  * Process environment and CLI shims that bind git, gh, and lark-cli to the deployment's accounts and block disallowed commands.
  * Variables read by workers avoid `KEY|PASSWORD|SECRET|TOKEN` in their names because DSH strips credential-shaped variables from child environments.
+ * Commands and the Feishu event consumer start from `SAFE_ENVIRONMENT`, an allowlist of the variables CLIs need, rather than from the host's whole environment.
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
@@ -29,6 +30,27 @@ export function sameDirectory(a: string, b: string): boolean {
 }
 export function withoutDirectory(path: string, dir: string): string {
   return path.split(delimiter).filter(entry => !sameDirectory(entry, dir)).join(delimiter)
+}
+
+/**
+ * Variables a CLI needs to find its executable, home, temporary directory and configuration on Windows and Unix. The set is
+ * an allowlist: a credential-shaped host variable (`GH_TOKEN`, `OPENCODE_GO_API_KEY`, `AWS_*`, ...) is passed only when a
+ * caller explicitly overrides it. `GH_CONFIG_DIR` and `LARKSUITE_CLI_CONFIG_DIR` name configuration directories, not
+ * credentials, and keep a CLI the operator configured outside the default locations working.
+ */
+export const SAFE_ENVIRONMENT: readonly string[] = ['PATH', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME',
+  'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'SHELL', 'TERM', 'NO_COLOR',
+  'GH_CONFIG_DIR', 'LARKSUITE_CLI_CONFIG_DIR']
+
+/**
+ * Builds the environment of a CLI child process from `SAFE_ENVIRONMENT`, then applies the caller's explicit overrides;
+ * an override set to `undefined` removes that variable. Nothing else from `process.env` is passed.
+ */
+export function safeEnvironment(overrides: Record<string, string | undefined> = {}): Record<string, string> {
+  const environment: Record<string, string> = {}
+  for (const name of SAFE_ENVIRONMENT) { const value = process.env[name]; if (value !== undefined) environment[name] = value }
+  for (const [name, value] of Object.entries(overrides)) { if (value === undefined) delete environment[name]; else environment[name] = value }
+  return environment
 }
 
 /**

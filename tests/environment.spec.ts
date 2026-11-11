@@ -5,8 +5,9 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SENSITIVE_ENV_PATTERN, type SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { GIT_LOCATION, agentVariables, credentialHelper, runAsWorker, verifyDirectory, withoutDirectory, workerBin, workerGitConfig, writeEnvironment }
-  from '../src/infra/environment.ts'
+import { GIT_LOCATION, SAFE_ENVIRONMENT, agentVariables, credentialHelper, runAsWorker, safeEnvironment, verifyDirectory, withoutDirectory,
+  workerBin, workerGitConfig, writeEnvironment } from '../src/infra/environment.ts'
+import { MAX_VARIABLE_VALUE, environmentValue } from '../src/app/execution-environment.ts'
 import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
@@ -175,6 +176,36 @@ describe('ticket directory check', () => {
     expect((leaky as CliError).message).toContain('token=[redacted]')
     expect((leaky as CliError).message).toContain('<path>')
     expect((leaky as CliError).message).not.toContain('abc123')
+  })
+})
+
+describe('CLI child environment', () => {
+  it('passes only the allowlisted host variables and explicit overrides, never host credentials', () => {
+    for (const [name, value] of Object.entries({ GH_TOKEN: 'gh-personal', GITHUB_TOKEN: 'github-personal', OPENCODE_GO_API_KEY: 'provider',
+      AWS_ACCESS_KEY_ID: 'aws-id', AWS_SECRET_ACCESS_KEY: 'aws-secret', NO_COLOR: 'kept', GH_CONFIG_DIR: '/tmp/gh-config',
+      LARKSUITE_CLI_CONFIG_DIR: '/tmp/lark-config' })) vi.stubEnv(name, value)
+    try {
+      const env = safeEnvironment({ LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', DSH_SUPERAGENT_PROBE: 'agent' })
+      expect(env).toMatchObject({ NO_COLOR: 'kept', GH_CONFIG_DIR: '/tmp/gh-config', LARKSUITE_CLI_CONFIG_DIR: '/tmp/lark-config',
+        LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', DSH_SUPERAGENT_PROBE: 'agent' })
+      expect(env.PATH).toBe(process.env.PATH)
+      for (const name of ['GH_TOKEN', 'GITHUB_TOKEN', 'OPENCODE_GO_API_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
+        expect(env, name).not.toHaveProperty(name)
+      }
+      expect(Object.keys(env).filter(name => !SAFE_ENVIRONMENT.includes(name)).sort()).toEqual(['DSH_SUPERAGENT_PROBE', 'LARKSUITE_CLI_NO_UPDATE_NOTIFIER'])
+    } finally { vi.unstubAllEnvs() }
+  })
+  it('removes an allowlisted variable whose override is undefined', () => {
+    vi.stubEnv('NO_COLOR', 'kept')
+    try {
+      expect(safeEnvironment()).toHaveProperty('NO_COLOR', 'kept')
+      expect(safeEnvironment({ NO_COLOR: undefined })).not.toHaveProperty('NO_COLOR')
+    } finally { vi.unstubAllEnvs() }
+  })
+  it('normalizes external execution values to bounded data', () => {
+    expect(environmentValue('oc_1; $(touch x)\nnext\r\u0000')).toBe('oc_1; $(touch x) next  ')
+    expect(environmentValue('x'.repeat(MAX_VARIABLE_VALUE + 5))).toHaveLength(MAX_VARIABLE_VALUE)
+    expect(environmentValue('refs/pull/7/head')).toBe('refs/pull/7/head')
   })
 })
 

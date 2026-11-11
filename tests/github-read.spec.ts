@@ -23,16 +23,25 @@ it('rejects unsupported or escaping paths without making a request', async () =>
 it('reads checks across pages and canonicalizes the latest status per context', async () => {
   vi.spyOn(commands, 'gh').mockResolvedValue([{ check_runs: [{ name: 'z', status: 'completed', conclusion: 'success' }] }, { check_runs: [{ name: 'a', status: 'in_progress', conclusion: null }] }])
   vi.spyOn(commands, 'pages').mockResolvedValue([{ context: 'build', state: 'success' }, { context: 'build', state: 'failure' }])
-  const result = await pullChecks(commands, 'abc')
+  const result = await pullChecks(commands, 'abcdef1')
   expect(result.checks.map((check: { name: string }) => check.name)).toEqual(['a', 'z'])
   expect(result.statuses).toEqual([{ context: 'build', state: 'success' }])
 })
 
 it('reads any requested PR’s CI on demand without restricting the author', async () => {
-  const gh = vi.spyOn(commands, 'gh').mockResolvedValueOnce({ head: { sha: 'abc' }, user: { login: 'another-author' } }).mockResolvedValueOnce([{ check_runs: [] }])
+  const gh = vi.spyOn(commands, 'gh').mockResolvedValueOnce({ head: { sha: 'abcdef1' }, user: { login: 'another-author' } }).mockResolvedValueOnce([{ check_runs: [] }])
   vi.spyOn(commands, 'pages').mockResolvedValue([])
-  expect(await readGithub(commands, 'github/pulls/123/checks')).toEqual({ head: 'abc', checks: [], statuses: [] })
+  expect(await readGithub(commands, 'github/pulls/123/checks')).toEqual({ head: 'abcdef1', checks: [], statuses: [] })
   expect(gh).toHaveBeenCalledTimes(2)
+})
+
+it('rejects a malformed PR head commit id before making any API call with it', async () => {
+  const gh = vi.spyOn(commands, 'gh').mockResolvedValue({ head: { sha: 'not-a-sha/../../x' }, user: { login: 'another-author' } })
+  await expect(readGithub(commands, 'github/pulls/123/checks')).rejects.toThrow('invalid commit id')
+  expect(gh).toHaveBeenCalledTimes(1)
+  gh.mockClear()
+  await expect(pullChecks(commands, 'javascript:alert(1)')).rejects.toThrow('invalid commit id')
+  expect(gh).not.toHaveBeenCalled()
 })
 
 /** Fake GitHub REST API pull request review comment payload. */

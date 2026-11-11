@@ -52,23 +52,28 @@ it('reports absent parent/thread and deleted content explicitly', async () => {
   expect(await readFeishu(commands, event, 'feishu/source/root', 20)).toMatchObject({ status: 'deleted' })
 })
 
-it('reads only the source message link and rejects absent, deleted or cross-chat results', async () => {
-  const linked = { message_id: 'om_source', chat_id: 'oc_chat', message_app_link: 'https://applink.feishu.cn/client/message/link/open?token=source' }
+it('reads only a clean https source message link, rejecting absent, deleted, cross-chat or unsafe results', async () => {
+  const linked = { message_id: 'om_source', chat_id: 'oc_chat', message_app_link: 'https://applink.feishu.cn/client/message/link/open?token=secret#frag' }
   const lark = vi.spyOn(commands, 'lark').mockResolvedValue({ messages: [{ ...linked, message_id: 'om_other', message_app_link: 'https://example.com/other' }, linked] })
-  await expect(readFeishuLink(commands, event)).resolves.toBe(linked.message_app_link)
+  await expect(readFeishuLink(commands, event)).resolves.toBe('https://applink.feishu.cn/client/message/link/open')
   expect(lark).toHaveBeenCalledWith(['im', '+messages-mget', '--message-ids', 'om_source', '--no-reactions'])
-  for (const row of [{ ...linked, deleted: true }, { ...linked, chat_id: 'oc_elsewhere' }, { ...linked, message_app_link: undefined }, { ...linked, message_id: 'om_other' }]) {
+  for (const row of [{ ...linked, deleted: true }, { ...linked, chat_id: 'oc_elsewhere' }, { ...linked, message_app_link: undefined }, { ...linked, message_id: 'om_other' },
+    { ...linked, message_app_link: 'javascript:alert(1)' }, { ...linked, message_app_link: 'http://applink.feishu.cn/x' },
+    { ...linked, message_app_link: 'https://user:secret@applink.feishu.cn/x' }, { ...linked, message_app_link: 'data:text/html,x' }]) {
     lark.mockResolvedValueOnce({ messages: [row] })
     await expect(readFeishuLink(commands, event)).rejects.toThrow('unavailable')
   }
 })
 it('reads a topic page as messages a model reads: id, author, ISO time, text and the message each answers', async () => {
   vi.spyOn(commands, 'lark').mockResolvedValueOnce({ items: [source] }).mockResolvedValueOnce({ thread_id: 'omt_thread', has_more: false,
-    messages: [{ ...message, message_id: 'om_reply', thread_id: 'omt_thread', parent_id: 'om_root', message_app_link: 'https://applink.feishu.cn/x' },
+    messages: [{ ...message, message_id: 'om_reply', thread_id: 'omt_thread', parent_id: 'om_root',
+      message_app_link: 'https://applink.feishu.cn/x?token=secret#frag' },
       { ...message, message_id: 'om_bot', sender: { id: 'cli_bot', name: 'Bot', sender_type: 'app' } }] })
-  expect(await feishuRead(commands, event, 'feishu/source/thread', 20)).toEqual({ status: 'available', thread_id: 'omt_thread', next_resource: null,
+  const page = await feishuRead(commands, event, 'feishu/source/thread', 20)
+  expect(page).toEqual({ status: 'available', thread_id: 'omt_thread', next_resource: null,
     messages: [{ id: 'om_reply', from: 'User', at: new Date('2026-09-11 12:00').toISOString(), text: message.content, reply_to: 'om_root',
       url: 'https://applink.feishu.cn/x' }, { id: 'om_bot', from: 'Bot', at: new Date('2026-09-11 12:00').toISOString(), text: message.content, bot: true }] })
+  expect(JSON.stringify(page)).not.toContain('token=')
 })
 it('reads the chat around a message by time: five before it, the message and five after, then earlier pages', async () => {
   const at = Date.parse('2026-09-11T12:00:00Z')

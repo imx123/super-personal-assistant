@@ -14,7 +14,7 @@ import { redact } from '../infra/redact.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
-import { executionRoot, type Variable } from '../app/execution-environment.ts'
+import { environmentValue, executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
 import { executionStatus, relaySession, resultRelay, type Relay } from '../app/notices.ts'
@@ -262,6 +262,8 @@ export class DshExecutor implements Executor {
   /**
    * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
    * execution environment variables, then verifies the directory as the worker sees it.
+   * The operator's command is the only shell program. External Trigger values reach it only as environment data: values are
+   * normalized (control characters and newlines replaced, length capped) and never interpolated into the command text.
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
    * @throws PrepareFailed with the command's output when the prepare command fails.
    */
@@ -269,7 +271,7 @@ export class DshExecutor implements Executor {
     const directory = ticket.execution?.directory ?? ''
     await mkdir(dirname(directory), { recursive: true })
     const command = this.host.store.settings().executor.prepare.trim()
-    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, environmentValue(variable.value)]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
     if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)

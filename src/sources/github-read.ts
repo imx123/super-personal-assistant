@@ -5,6 +5,12 @@ import { validItems, type Commands, type Tally } from '../infra/commands.ts'
 import { CommentSchema, IssueSchema, isHumanLogin, reviewPlace, type GithubComment } from './github-trigger.ts'
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
+/** Parses a page cursor before it is interpolated into an API path; only positive safe integers are accepted. */
+function pageNumber(value: unknown): number {
+  const page = typeof value === 'number' ? value : Number(value)
+  if (!Number.isSafeInteger(page) || page < 1) throw new Error('GitHub conversation pages start at 1')
+  return page
+}
 const CheckSchema = z.looseObject({ name: z.string(), status: z.string(), conclusion: z.string().nullable() })
 const StatusSchema = z.looseObject({ context: z.string(), state: z.string() })
 type Check = Pick<z.infer<typeof CheckSchema>, 'name' | 'status' | 'conclusion'>
@@ -56,16 +62,27 @@ export async function readRepositoryPath(commands: Commands, path: string, kind:
   return entries.map(entry => entry.name).filter(name => !name.startsWith('.') && name !== 'node_modules').sort().join('\n')
 }
 
-/** Reads check runs and commit statuses for a commit without emitting a trigger. */
+/** A commit id as GitHub names it in API payloads and accepts in `commits/<sha>/...` paths. */
+const COMMIT_ID = /^[0-9a-f]{7,40}$/i
+/**
+ * Validates a commit id from a CLI payload before it is interpolated into an API path.
+ * @throws Error when the value is not 7–40 hexadecimal characters.
+ */
+export function commitId(value: string): string {
+  if (!COMMIT_ID.test(value)) throw new Error('GitHub returned an invalid commit id')
+  return value
+}
+/** Reads check runs and commit statuses for a commit without emitting a trigger; `head` must be a commit id. */
 export async function pullChecks(commands: Commands, head: string, tally?: Tally): Promise<CiSnapshot> {
+  const sha = commitId(head)
   const page = z.looseObject({ check_runs: z.array(z.unknown()) })
-  const pages = await commands.api(z.array(page), `commits/${head}/check-runs?per_page=100`, '--paginate', '--slurp')
+  const pages = await commands.api(z.array(page), `commits/${sha}/check-runs?per_page=100`, '--paginate', '--slurp')
   const runs = validItems(CheckSchema, pages.flatMap(page => page.check_runs), tally)
-  const statuses = await commands.pages(StatusSchema, `commits/${head}/statuses?per_page=100`, tally)
+  const statuses = await commands.pages(StatusSchema, `commits/${sha}/statuses?per_page=100`, tally)
   const latest = new Map<string, string>()
   for (const status of statuses) if (!latest.has(status.context)) latest.set(status.context, status.state)
   const checks = runs.map(({ name, status, conclusion }) => ({ name, status, conclusion }))
-  return { head, checks: checks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+  return { head: sha, checks: checks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     statuses: [...latest].map(([context, state]) => ({ context, state })).sort((a, b) => a.context.localeCompare(b.context)) }
 }
 
@@ -108,6 +125,7 @@ export async function readGithub(commands: Commands, resource: string): Promise<
     throw new Error('Use github/issues/<number>, github/pulls/<number>, or append /comments/<page>, /reviews/<page>, /thread/<comment-id> or /checks; or github/commits/<sha>/checks')
   }
   const [, kind, number, section, page = '1'] = match
+  const pageNo = pageNumber(page)
   if (kind === 'issues' && (section === 'reviews' || section === 'checks' || section === 'thread')) {
     throw new Error('Reviews, review threads and checks require a pull request')
   }
@@ -130,14 +148,14 @@ export async function readGithub(commands: Commands, resource: string): Promise<
     return { number: item.number, title: item.title, state: item.state, ...item.merged ? { merged: true } : {},
       ...item.draft ? { draft: true } : {}, ...branches, ...labels, ...githubMessage(item, item.body ?? '', String(item.number)) }
   }
-  const listed = await commands.api(z.array(z.unknown()), `${path}/${section}?per_page=20&page=${page}`)
+  const listed = await commands.api(z.array(z.unknown()), `${path}/${section}?per_page=20&page=${pageNo}`)
   const tally = { skipped: 0 }
   const items = validItems(CommentSchema, listed, tally)
   const messages = items.map(item => section === 'reviews'
     ? githubMessage({ ...item, created_at: item.submitted_at ?? item.created_at }, reviewText(item), String(item.id))
     : { ...githubMessage(item, item.body ?? '', String(item.id)), ...item.in_reply_to_id ? { reply_to: String(item.in_reply_to_id) } : {} })
   return { messages, ...tally.skipped ? { skipped: tally.skipped } : {},
-    ...listed.length === 20 ? { next_resource: `github/${kind}/${number}/${section}/${Number(page) + 1}` } : {} }
+    ...listed.length === 20 ? { next_resource: `github/${kind}/${number}/${section}/${pageNo + 1}` } : {} }
 }
 /** Reads one page of an Issue or PR conversation (with the Issue/PR description first on page 1), using comment URLs as message IDs. */
 async function conversationPage(commands: Commands, number: number, page: number) {
@@ -171,7 +189,7 @@ export const githubThreadContext: ThreadContext<unknown> = {
       const read = part === 'thread' ? messages : messages.slice(0, 1)
       return { messages: read, body: { status: 'review_thread', messages: read }, status: 'review_thread' }
     }
-    const body = await conversationPage(commands, number, Number(cursor ?? '1'))
+    const body = await conversationPage(commands, number, pageNumber(cursor ?? '1'))
     return { messages: body.messages, next: body.next_resource ?? undefined, body }
   },
 }

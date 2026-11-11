@@ -156,7 +156,7 @@ function nativeTurn(text = '整理这条任务', id = 'native-1'): void {
 }
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'abcdef1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
@@ -886,11 +886,14 @@ it('finds triggers by #PR number, GitHub link prefix and Feishu message id', asy
 it('keeps pages of Source reads, prompt previews and Feishu message links in memory, outside the kv area', async () => {
   const message = feishu('30', '随便说说', { mentions: [] })
   await receive(message)
-  const link = 'https://applink.feishu.cn/client/message/link/open?token=t30'
+  const link = 'https://applink.feishu.cn/client/message/link/open?token=t30#frag'
+  const safe = 'https://applink.feishu.cn/client/message/link/open'
   vi.mocked(Commands.prototype.lark).mockResolvedValue({ messages: [{ message_id: 'om_30', chat_id: CHAT, message_app_link: link }] })
-  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: `trigger/${message.id}` })).toMatchObject({ source_url: link })
-  // An AppLink is found by the links read since dsh-superagent started.
-  expect((await api('GET', `search?q=${encodeURIComponent(link)}`)).body).toMatchObject({ items: [expect.objectContaining({ id: message.id })] })
+  const read = await runTool(runtime.masterId, 'orchestrator_read', { resource: `trigger/${message.id}` })
+  expect(read).toMatchObject({ source_url: safe })
+  expect(JSON.stringify(read)).not.toContain('token=')
+  // An AppLink is found by the clean link read since dsh-superagent started.
+  expect((await api('GET', `search?q=${encodeURIComponent(safe)}`)).body).toMatchObject({ items: [expect.objectContaining({ id: message.id })] })
   const config = runtime.prompts.current().config
   const { previews } = await runTool(runtime.masterId, 'orchestrator_prompts_save', { config, preview: true }) as { previews: { read: string }[] }
   expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: previews[0]!.read, offset: 4000 })).toMatchObject({ offset: 4000 })
@@ -1199,6 +1202,27 @@ it('runs the prepare command once for a new ticket, under the execution root wit
   await runtime.idle()
   expect(runtime.store.tickets.get(failed.ticket.id)!.assignments.at(-1)).toMatchObject({ report: expect.objectContaining({ state: 'failed', summary: expect.stringContaining('The prepare command failed: fatal: no such clone') }) })
   expect(waitsForPerson(runtime.store.tickets.get(failed.ticket.id)!)).toBe(true)
+})
+
+it('passes external Trigger values to the prepare command as one environment value, never as command text', async () => {
+  subprocess.spawn.mockClear()
+  const prepare = 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR"'
+  const settings = runtime.store.settings()
+  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare },
+    sources: { ...settings.sources, feishu: { enabled: true, config: { ...settings.sources.feishu!.config, otherChats: 'mentions' } } } })
+  const marker = join(directory, 'injected')
+  // A chat id as an untrusted event could carry it: it still passes the Feishu scope as a mentioned chat.
+  const chat = `oc_team; touch ${marker}\n$(touch ${marker})`
+  const { ticket } = await acceptedTicket(feishu('12', '@bot 修一下标题', { chat_id: chat }))
+  await runtime.idle()
+  const runs = subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> })
+    .filter(spec => spec.argv[0] === 'sh')
+  expect(runs).toHaveLength(1)
+  // The operator's command is the only shell program and is passed unchanged; no external text was interpolated into it.
+  expect(runs[0]!.argv).toEqual(['sh', '-c', prepare])
+  expect(runs[0]!.cwd).toBe(join(directory, 'work'))
+  expect(runs[0]!.env!.DSH_SUPERAGENT_FEISHU_CHAT).toBe(`oc_team; touch ${marker} $(touch ${marker})`)
+  expect(ticket.execution!.directory).toBe(join(directory, 'work', ticket.execution!.name))
 })
 
 it('counts a ticket whose directory the host prepared before prepare commands existed as prepared', async () => {
