@@ -155,6 +155,8 @@ function policyMessage(effect?: PolicyEffect): string {
       : `Rule ${rule.name} (${rule.id}), which this ticket was accepted under, changed. Keep the remaining work within it as it reads now: ${rule.instruction}`),
     ...effect.proactive === false ? ['Work inferred from a rule is no longer accepted, as the accept mode is no longer auto: finish only '
       + 'what is in progress within the assignment, or report dropped, and take on nothing new.'] : [],
+    ...effect.delegatedAuthority === false ? ['The Project PM Mandate that authorized this delegated ticket no longer holds: finish only work '
+      + 'already in progress within the assignment, or report dropped, and take on nothing new.'] : [],
     ...effect.requesterAllowed === false ? [`The sender this ticket is for, ${effect.requester ? `${effect.requester.id} on ${effect.requester.source}` : 'who '
       + 'asked for it'}, may no longer start work here: finish the assignment within its scope, and take no new requests from them on it.`] : []].join('\n')
 }

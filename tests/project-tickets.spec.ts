@@ -386,11 +386,14 @@ describe('PM-created Project Tickets', () => {
     expect(paused.status).toBe('paused')
   })
 
-  it('revalidates a delegated Mandate without an external allowed list', () => {
+  it('revalidates a delegated Mandate through its Project PM Mandate, not an external allowed list', () => {
     const h = harness()
-    const settings = SettingsSchema.parse({})
-    const policy = settingsPolicy(settings, { scope: () => ({ listened: false, reason: 'off' }) })
+    const settings = SettingsSchema.parse({ policy: { sources: { 'main-session': { allowed: [{ id: actor.id }] } } }, eval: { mode: 'auto' } })
+    const scope = { scope: () => ({ listened: true as const, observed: false }) }
+    const policy = settingsPolicy(settings, scope, id => h.repo.projects.get(id))
     expect(policy.revalidate(mandateFor(h.project))).toBe(true)
+    h.engine.stopProject(h.project.id)
+    expect(settingsPolicy(settings, scope, id => h.repo.projects.get(id)).revalidate(mandateFor(h.project))).toBe(false)
   })
 })
 

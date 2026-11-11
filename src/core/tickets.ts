@@ -322,6 +322,8 @@ export class Tickets extends EnginePart {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     if (ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+    // A revoked PM Mandate cannot revive its Project's Tickets, whatever stop the Worker carries.
+    if (!this.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
     const stop = ticket.manualStop
     if (stop?.scope === 'worker') throw new UserError('manualStopNeedsUserApproval')
     const latest = latestAssignment(ticket)
@@ -630,6 +632,27 @@ export class Tickets extends EnginePart {
     }
   }
   /**
+   * Stop each open delegated Ticket whose Project PM authority a Policy change removed, through the same single-Worker
+   * stop a Project hard pause uses. Its Mandate stays revoked: retry, wake and revive refuse it until the PM Mandate holds
+   * again, and a `project` stop marks the Worker stopped without making it a person's stop.
+   * @returns the IDs of the Tickets stopped.
+   */
+  revokeDelegated(effects: ReadonlyMap<string, PolicyEffect>): string[] {
+    const revoked: string[] = []
+    for (const ticket of this.repo.tickets.open()) {
+      if (ticket.mandate.basis.via !== 'delegated' || !effects.has(ticket.id)) continue
+      if (this.policy().revalidate(ticket.mandate)) continue
+      try {
+        this.hardStopWorker(ticket.id, { scope: 'project', by: 'policy', ...(ticket.projectId ? { projectId: ticket.projectId } : {}),
+          reason: 'policyRevoked' })
+        revoked.push(ticket.id)
+      } catch {
+        // Its revoked Mandate still keeps it from starting again, also when an already ended Worker leaves nothing to stop.
+      }
+    }
+    return revoked
+  }
+  /**
    * Drop a Thread's Subscriptions, every ticket's or only `ticketId`'s, and say so; false when none dropped. A ticket that
    * followed the Thread follows it no more, so its close no longer ends the ticket. Each ticket keeps deciding the messages
    * it received from the Thread.
@@ -808,10 +831,12 @@ export class Tickets extends EnginePart {
     return !!ticket.projectId && this.repo.projects.get(ticket.projectId)?.status === 'paused'
   }
   /**
-   * Refuse to start work for a manually stopped Worker: a `worker` stop needs a person's approval, and a `project` stop its
-   * PM's revive once the Project is active.
+   * Refuse to start work for a manually stopped Worker, or for a delegated Ticket whose Project PM Mandate no longer holds:
+   * a `worker` stop needs a person's approval, and a `project` stop its PM's revive once the Project is active.
    */
   private refuseManualStop(ticket: Ticket): void {
+    // A delegated Ticket whose Project PM Mandate no longer holds starts no new Assignment, whatever its stop label says.
+    if (ticket.mandate.basis.via === 'delegated' && !this.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
     const stop = ticket.manualStop
     if (!stop) return
     throw new UserError(stop.scope === 'worker' ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')

@@ -423,10 +423,15 @@ describe('a revoked Project refuses new work after a stop', () => {
     expect(h.repo.tickets.get(archived.tickets[0]!.id)!.manualStop).toBeUndefined()
   })
 
-  it('is revalidated by a delegated Mandate without an allowed list', () => {
+  it('follows the Project PM Mandate instead of accepting any delegated basis', () => {
     const h = harness()
     const { project } = h.projectWith('p1')
-    const policy = settingsPolicy(SettingsSchema.parse({}), { scope: () => ({ listened: false, reason: 'off' }) })
-    expect(policy.revalidate({ ...project.mandate, basis: { via: 'delegated', projectId: project.id } })).toBe(true)
+    const settings = SettingsSchema.parse({ policy: { sources: { 'main-session': { allowed: [{ id: actor.id }] } } }, eval: { mode: 'auto' } })
+    const scope = { scope: () => ({ listened: true as const, observed: false }) }
+    const policy = settingsPolicy(settings, scope, id => h.repo.projects.get(id))
+    const mandate = { ...project.mandate, basis: { via: 'delegated' as const, projectId: project.id, pmSessionId: project.pmSessionId } }
+    expect(policy.revalidate(mandate)).toBe(true)
+    h.engine.stopProject(project.id)
+    expect(settingsPolicy(settings, scope, id => h.repo.projects.get(id)).revalidate(mandate)).toBe(false)
   })
 })

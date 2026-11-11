@@ -1204,11 +1204,15 @@ export class Engine {
   // Settings
 
   /**
-   * The Policy changed: each open ticket in `effects` is told how the change bears on it, and Evals in progress start again
-   * under the new version.
+   * The Policy changed: each open ticket in `effects` is told how the change bears on it, Evals in progress start again
+   * under the new version, and a delegated Ticket whose Project PM Mandate no longer holds has its Worker stopped.
    */
   policyChanged(from: string, to: string, effects: ReadonlyMap<string, PolicyEffect> = new Map()): void {
-    this.repo.atomic(() => { this.tickets.policyChanged(from, to, effects); this.evals.policyChanged(from, to) })
+    this.repo.atomic(() => {
+      this.tickets.policyChanged(from, to, effects)
+      this.evals.policyChanged(from, to)
+      this.tickets.revokeDelegated(effects)
+    })
   }
 }
 

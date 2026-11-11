@@ -11,7 +11,7 @@ The host enforces allowed lists, rules and Mandates. Messages, comments and quot
 The Source records whether a message addresses the agent: `mention` for a mention of the bot or agent account, and `direct` for a direct message. The gate checks the sender and the Source's Policy:
 
 - An allowed person who addresses the agent makes an explicit request.
-- A person's follow-up on a Thread with Tickets follows the rules below.
+- A person's follow-up on a Thread with Tickets follows the rules below; for an unlisted person, the follow-up must not hit an `ignore` admission cell.
 - Other human messages use the admission table for their receiving scope.
 - A bot on the Source's bot list can produce an inferred candidate, never an explicit request. Other bots are not admitted.
 
@@ -71,12 +71,21 @@ The PM creates Tickets only inside its own Project, never arbitrary work, with `
 - The Engine requires the Project's own PM Session id and validates that the Project is active. An unknown Project, a non-PM caller, a call that omits the PM Session, or an ended Project creates nothing.
 - Each task records one Trigger of the built-in `internal` Source: actor `{source: 'internal', id: pmSessionId}`, `human: false`, no addressed mark, and one internal Thread of its own.
 - A record-only Eval with a real Eval id records a `delegated` Decision, without asking the assessor and without delivering a candidate. Its basis is `{via: 'delegated', projectId, pmSessionId}`; its strength comes from the PM Mandate. The Decision names the Ticket and the Project, and records the Ticket's Mandate.
-- The Ticket's Mandate copies the PM Mandate's strength, Policy version and actor, narrows the scope to the task's scope (or goal), and carries the delegated basis. `Policy.revalidate` accepts a delegated Mandate directly: the PM Mandate is its authority, so no external allowed list is checked.
+- The Ticket's Mandate copies the PM Mandate's strength, Policy version and actor, narrows the scope to the task's scope (or goal), and carries the delegated basis. `Policy.revalidate` follows that basis to the Ticket's Project: the Project must still exist, its `pmSessionId` must match the recorded one, and its status must be `active` or `paused`; its current PM Mandate must then still hold under today's settings, revalidated with a base Policy that never follows delegation again. An ended or archived Project, a missing or mismatched Project, or a PM Mandate that no longer holds revokes the Ticket. A Project's PM authority is checked, not an external allowed list for the internal Trigger.
 - A task's `allow_tools` becomes the Ticket's `Mandate.allowTools`. Omitted or empty means the PM Mandate's own `allowTools` when it has one, else no restriction (every Worker tool). A task may only name known Worker tools, once each, at most 32, and may only narrow a PM Mandate's list, never widen it; an invalid list refuses the whole batch. `WORK_TOOLS` is the single declared set.
 - `allowTools` narrows tool visibility only. It is not a filesystem, permission or sandbox boundary, and policy still governs what the work may be. The Executor's `workOnly` gives a Worker only the intersection of its Mandate's list and the tools the host actually offers; a subagent of that Worker inherits the same intersection and cannot reach a forbidden tool.
 - The Ticket has no Channel and does not subscribe to the Project's source Thread. It subscribes only to the external Threads its task names; a `contextOnly` Thread is recorded in `Thread.context`, so its messages reach the worker without granting authority and do not resume an ended Ticket. Unknown thread keys or malformed references refuse the whole batch.
 - Batch atomicity and idempotence: if one task is invalid, no Trigger, Decision or Ticket from the call remains. A repeated call with the same tasks reuses that batch's Tickets; changed tasks create new Tickets even at the same positions, and worktree names stay unique within the Project across batches.
 - The PM remains the Project's only voice outward; a child Ticket does not reply to its external Threads.
+
+### Revoking delegated authority
+
+Delegated creation itself stays gate-less: the PM Mandate is the authority, so the internal Trigger is not re-gated. The authority is revalidated instead, at every point that would start or continue work.
+
+- A Policy change that invalidates the Project's PM Mandate records a `policy-changed` Input with `delegatedAuthority: false` on each open delegated Ticket, and stops a running or pending Assignment through the same single-Worker stop a Project hard pause uses: the turn is cancelled, the Assignment ends as `stoppedByOperator`, and the Ticket records `manualStop` with `scope: 'project'` and reason `policyRevoked`.
+- The Ticket keeps its revoked Mandate. Retry, wake from a person's follow-up, and the PM's revive refuse it with `mandateRevoked`; nothing starts or resumes it while the PM Mandate does not hold. The PM may revive it once its authority holds again, which clears the project stop and starts one new Assignment under the unchanged Mandate.
+- Ending a Project still cascades to its Tickets, and archiving still marks them archived and ends their Assignments. Revalidation also reports false for such a Project, so no later path can revive work under it.
+- A paused Project is temporary: it keeps its PM Mandate and its Tickets' delegated authority, and soft or hard pause procedures remain the only pause-related stop.
 
 ### PM coordination messages
 
@@ -131,10 +140,10 @@ The Project Profiles, their latest reports and their child Ticket ids are read t
 | Strength | Cases |
 | --- | --- |
 | explicit | A person on the list addresses the agent, or follows up on a Thread that already has a Ticket; a cell of the admission table set to explicit request |
-| inferred | A person not on the list follows up on a Thread with a Ticket, unless their cell of the admission table is explicit; a cell of the admission table set to inferred candidate; a message of a bot on the Source's bot list that addresses the agent or arrives where the Source receives every message |
+| inferred | A person not on the list follows up on a Thread with a Ticket while their admission cell is inferred; a cell of the admission table set to inferred candidate; a message of a bot on the Source's bot list that addresses the agent or arrives where the Source receives every message |
 | not admitted | Any other bot's message, everything the admission table ignores, and every inferred case while the accept mode is `off` |
 
-For an unlisted person, an explicit admission cell takes precedence even on a Thread with Tickets and works in every accept mode. Otherwise their follow-up is inferred and is not admitted in `off` mode. Messages on Threads followed only for context use the admission table instead of follow-up strength.
+For an unlisted person, a follow-up never overrides an `ignore` admission cell: only an inferred or explicit cell admits it, and an explicit cell takes precedence even on a Thread with Tickets and works in every accept mode. An ignored cell refuses the follow-up however many Tickets the Thread has, and the inferring cases are not admitted in `off` mode. Messages on Threads followed only for context use the admission table instead of follow-up strength.
 
 ## Admission
 
@@ -153,9 +162,9 @@ A row has up to three cells. Each cell decides whether a message becomes an expl
 
 Cells for unaddressed messages are available only where the Source receives every message, such as a Feishu chat set to **全部消息** or a GitHub scope with its receive-all switch enabled. A CI result has no sender, so its row offers only the last cell. Bot messages use the bot list instead of these cells.
 
-Setting the unlisted-addressed cell to explicit lets anyone in that scope request work by mentioning the agent. This can be useful for a dedicated support chat. Inferred candidates still depend on the accept mode. Follow-ups normally bypass this table, except that an explicit cell still grants explicit strength.
+Setting the unlisted-addressed cell to explicit lets anyone in that scope request work by mentioning the agent. This can be useful for a dedicated support chat. Inferred candidates still depend on the accept mode. Follow-ups of listed senders bypass this table. An unlisted person's follow-up still reads their own cell: an `ignore` cell refuses it even on a Thread with Tickets, so a follow-up never overrides an `ignore` admission cell; an `inferred` cell makes it an inferred candidate, and an explicit cell makes it an explicit request.
 
-The admission table is part of the Policy version. Weakening a cell does not immediately stop open Tickets accepted under it. It can revoke their Mandates when they are revalidated before resuming.
+The admission table is part of the Policy version. For an ordinary Ticket, weakening a cell does not immediately stop it; it can revoke the Mandate when revalidated before resuming. A delegated Ticket whose PM authority lapses is stopped immediately instead (see Revoking delegated authority).
 
 ### Bots and automated reviewers
 
@@ -194,10 +203,11 @@ Rules, accept mode and each Source's Policy form the Policy version. Every Manda
 A version change discards running Evals and queues their Triggers again. It also sends a policy-changed Input to each affected live Ticket. The Input explains whether:
 
 - a matched rule changed, including its new text, or no longer applies;
-- the requester may no longer start work; or
-- proactive work is no longer accepted, for example because the mode changed from `auto`.
+- the requester may no longer start work;
+- proactive work is no longer accepted, for example because the mode changed from `auto`; or
+- the Project PM Mandate behind a delegated Ticket no longer holds (`delegatedAuthority: false`). Its running or pending Assignment is stopped, and the Ticket cannot retry, wake or be revived until the Mandate holds again.
 
-Unaffected Tickets receive no notice. The change does not immediately revoke live Tickets' Mandates.
+Unaffected Tickets receive no notice. Apart from a delegated Ticket whose PM authority lapsed, the change does not immediately revoke live Tickets' Mandates.
 
 Source configuration is separate from Policy. It controls what enters the system: which chats are read and whether a scope receives all messages or only mentions. A Mandate records its Source and receiving scope. Resuming needs the Source to still listen to the Thread, but does not require it to still receive every message there.
 
@@ -220,8 +230,9 @@ The Source must still listen to the original Thread. The remaining checks depend
 - A Mandate admitted by a table cell must still receive at least its original strength under today's table and sender membership. Removing a sender from the list can therefore revoke a Mandate accepted through the listed-sender cell.
 - A bot's Mandate requires that bot to remain on the Source's bot list. Inferred table and bot Mandates also need `auto` mode and enabled matched rules.
 - Other Mandates require the sender to remain on the Source's allowed list.
+- A `delegated` Mandate requires its Project to still exist, match the recorded `pmSessionId`, and be active or paused; its current PM Mandate must then still hold under today's settings, revalidated with a base Policy. A missing or mismatched Project, an ended or archived Project, and a PM Mandate that no longer holds all revoke it. A paused Project is not a revocation.
 
-If revalidation fails, the Ticket stays ended and takes none of its waiting messages. Each message is treated as having reached no Ticket; if no other Ticket owns it, it goes to Eval. The main Session is not told it reached a worker. This also applies after a processing pause. Attaching to the Ticket is refused, and further work requires a new accept.
+If revalidation fails, the Ticket stays ended and takes none of its waiting messages. Each message is treated as having reached no Ticket; if no other Ticket owns it, it goes to Eval. The main Session is not told it reached a worker. This also applies after a processing pause. Attaching to the Ticket is refused, and further work requires a new accept. A delegated Ticket whose PM authority lapses instead stays open and is stopped; retry, wake and revive refuse it until the authority holds again (see Revoking delegated authority).
 
 - **A person saying "stop" in a Thread is an ordinary Trigger,** and Eval decides stop. An Executor cannot declare that a person asked it to stop.
 - **Stop in the panel is a command.** It acts on the Ticket directly and is recorded as a manual stop.

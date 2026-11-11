@@ -383,14 +383,16 @@ export type TicketInput =
 
 /**
  * How a Policy change bears on a ticket: the rules it was accepted under that changed, with their instruction now, or no
- * longer apply; `proactive: false` once inferred work is no longer accepted, as when the accept mode leaves `auto`; and
- * `requesterAllowed: false` once the sender it is for, `requester`, a person or a bot, may no longer start work there.
+ * longer apply; `proactive: false` once inferred work is no longer accepted, as when the accept mode leaves `auto`;
+ * `requesterAllowed: false` once the sender it is for, `requester`, a person or a bot, may no longer start work there; and
+ * `delegatedAuthority: false` once the Project PM Mandate that authorized a delegated Ticket no longer holds.
  */
 export interface PolicyEffect {
   rules?: { id: string; name: string; change: 'changed' | 'disabled'; instruction?: string }[]
   proactive?: false
   requesterAllowed?: false
   requester?: ActorRef
+  delegatedAuthority?: false
 }
 
 export type TicketEndBy = 'executor' | 'human'

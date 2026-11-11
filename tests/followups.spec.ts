@@ -56,6 +56,10 @@ it('leaves a delivered follow-up to its ticket\'s worker: the main Session may s
   }
   const master = (name: string, args: Record<string, unknown>) => h!.runTool(h!.runtime.masterId, name, args)
   const decides = /its worker decides whether it belongs there/
+  // C4: an unlisted follow-up needs an admission cell other than ignore; this chat admits inferred candidates.
+  const current = h.runtime.store.settings()
+  h.runtime.store.saveSettings({ ...current, policy: { ...current.policy, sources: { ...current.policy.sources,
+    feishu: { ...current.policy.sources.feishu!, admission: { [CHAT]: { unlistedUnaddressed: 'inferred' } } } } } })
   // A guest's follow-up stays inferred, so its stop does not stop the work; the main Session cannot route or requeue it.
   const guest = await settle('4', '别做了', 'ou_guest')
   expect(await h!.route({ kind: 'stop', ticket_id: ticket.id, trigger_id: guest })).toMatchObject({ decision: 'ignore' })

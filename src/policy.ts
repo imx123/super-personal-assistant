@@ -5,8 +5,8 @@
 import { LIMITS } from './limits.ts'
 import { z } from 'zod'
 import { ADMISSION_DEFAULTS, type Admission, type AdmissionCell, type AdmissionRow } from './admission.ts'
-import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffect, type SourceScope, type Strength, type Thread, type Ticket,
-  type Trigger, type ActorRef, type GateResult } from './core/index.ts'
+import { key, type AssessmentOutcome, type Mandate, type Policy, type PolicyEffect, type ProjectProfile, type SourceScope, type Strength,
+  type Thread, type Ticket, type Trigger, type ActorRef, type GateResult } from './core/index.ts'
 import { sameName } from './infra/text.ts'
 import { WORKER_COMMANDS } from './infra/environment.ts'
 
@@ -142,10 +142,16 @@ function admissionOf(settings: Settings, source: string, row: string | undefined
 }
 const STRENGTH: Readonly<Record<Admission, number>> = { ignore: 0, inferred: 1, explicit: 2 }
 
+/**
+ * Finds the Project a delegated Mandate names, so the Policy can revalidate the Project PM Mandate that authorizes it.
+ * Production supplies the Store's Project lookup; a unit test may supply a map. Without one, a delegated Mandate does not
+ * revalidate: the Policy refuses an authority it cannot see rather than trusting the recorded basis.
+ */
+export type DelegatedAuthority = (projectId: string) => ProjectProfile | undefined
 /** Compute how a settings change from `old` to `now` affects the authorization or matched rules of each open ticket. */
-export function policyEffects(tickets: readonly Ticket[], old: Settings, now: Settings, scope: (settings: Settings) => SourceScope):
-  Map<string, PolicyEffect> {
-  const before = settingsPolicy(old, scope(old)), after = settingsPolicy(now, scope(now))
+export function policyEffects(tickets: readonly Ticket[], old: Settings, now: Settings, scope: (settings: Settings) => SourceScope,
+  delegatedAuthority?: DelegatedAuthority): Map<string, PolicyEffect> {
+  const before = settingsPolicy(old, scope(old), delegatedAuthority), after = settingsPolicy(now, scope(now), delegatedAuthority)
   const effects = new Map<string, PolicyEffect>()
   for (const ticket of tickets) {
     const rules = (ticket.mandate.basis.rules ?? []).flatMap((id): NonNullable<PolicyEffect['rules']> => {
@@ -155,18 +161,23 @@ export function policyEffects(tickets: readonly Ticket[], old: Settings, now: Se
     })
     const effect: PolicyEffect = rules.length ? { rules } : {}
     if (before.revalidate(ticket.mandate) && !after.revalidate(ticket.mandate)) {
-      // With the previous accept mode and rules, the Mandate holds unless the sender or receiving scope lost authorization.
-      const asBefore = { ...now, eval: old.eval, policy: { ...now.policy, rules: old.policy.rules } }
-      if (!settingsPolicy(asBefore, scope(now)).revalidate(ticket.mandate)) {
-        Object.assign(effect, { requesterAllowed: false, requester: ticket.mandate.actor })
-      } else if (ticket.mandate.strength === 'inferred' && old.eval.mode === 'auto' && now.eval.mode !== 'auto') effect.proactive = false
+      if (ticket.mandate.basis.via === 'delegated') {
+        // The Ticket's only authority is its Project's PM Mandate, which no longer holds under the new settings.
+        effect.delegatedAuthority = false
+      } else {
+        // With the previous accept mode and rules, the Mandate holds unless the sender or receiving scope lost authorization.
+        const asBefore = { ...now, eval: old.eval, policy: { ...now.policy, rules: old.policy.rules } }
+        if (!settingsPolicy(asBefore, scope(now), delegatedAuthority).revalidate(ticket.mandate)) {
+          Object.assign(effect, { requesterAllowed: false, requester: ticket.mandate.actor })
+        } else if (ticket.mandate.strength === 'inferred' && old.eval.mode === 'auto' && now.eval.mode !== 'auto') effect.proactive = false
+      }
     }
     if (Object.keys(effect).length) effects.set(ticket.id, effect)
   }
   return effects
 }
 /** Build the active Policy for gating incoming Triggers and revalidating existing Ticket Mandates. */
-export function settingsPolicy(settings: Settings, sources: SourceScope): Policy {
+export function settingsPolicy(settings: Settings, sources: SourceScope, delegatedAuthority?: DelegatedAuthority): Policy {
   const version = policyVersion(settings)
   const mode = settings.eval.mode
   /** Gate non-human triggers: only listed bots (as inferred candidates) and senderless system/CI events may pass; other bots are rejected. */
@@ -204,8 +215,10 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
       const basis = { ...recorded, via: 'admission' as const, cell, ...trigger.addressed ? { addressed: trigger.addressed } : {} }
       // Check explicit admission cells before thread follow-ups so a thread's tickets never weaken an explicit request to a follow-up.
       if (admission === 'explicit') return { admissible: true, strength: 'explicit', basis }
-      // Direct-message threads belong to one sender (no follow-up for others), and inferred follow-ups require an accept mode other than off (when off, the table decides).
-      if (!(trigger.addressed === 'direct' && !allowed) && (allowed || mode !== 'off') && participating(thread, tickets)) {
+      // Direct-message threads belong to one sender (no follow-up for others). A listed sender's follow-up stays explicit
+      // whatever the table says; an unlisted one needs a cell other than ignore, and a mode other than off (when off, the table decides).
+      if (!(trigger.addressed === 'direct' && !allowed) && (allowed || (admission !== 'ignore' && mode !== 'off'))
+        && participating(thread, tickets)) {
         return { admissible: true, strength: allowed ? 'explicit' : 'inferred', basis: { ...recorded, via: 'followup' } }
       }
       if (admission === 'inferred' && mode !== 'off') return { admissible: true, strength: 'inferred', basis: { ...basis, observation: { mode } } }
@@ -215,8 +228,17 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
     revalidate(mandate: Mandate) {
       // Revalidation rules follow docs/002 (Eval path; Resume revalidates).
       const { basis } = mandate
-      // A Project PM delegated this Ticket: the PM Mandate is its authority, so no external allowed list applies.
-      if (basis.via === 'delegated') return true
+      // A Project PM delegated this Ticket: the PM Mandate is its only authority. Verify the Project still exists and
+      // matches the recorded basis, then revalidate its PM Mandate with a base Policy (never through delegation again).
+      if (basis.via === 'delegated') {
+        const project = delegatedAuthority?.(basis.projectId)
+        if (!project || project.id !== basis.projectId) return false
+        // A pause is temporary and keeps the Mandate; an ended or archived Project does not.
+        if (project.status !== 'active' && project.status !== 'paused') return false
+        if (project.pmSessionId !== basis.pmSessionId) return false
+        if (project.mandate.projectId !== project.id) return false
+        return settingsPolicy(settings, sources).revalidate(project.mandate)
+      }
       const { source } = basis
       const current = source && basis.scope ? listened(sources, source, basis.scope) : undefined
       if (current && !current.listened) return false

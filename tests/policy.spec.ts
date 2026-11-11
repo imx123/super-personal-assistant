@@ -6,7 +6,7 @@ import { SourceRegistry } from '../src/sources/registry.ts'
 import { MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../src/sources/main-session.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
-import type { Thread, Ticket, Trigger } from '../src/core/index.ts'
+import type { Mandate, ProjectProfile, Thread, Ticket, Trigger } from '../src/core/index.ts'
 
 const MEMBER = 'ou_alice'
 const CHAT = 'oc_team'
@@ -79,14 +79,30 @@ describe('gate', () => {
     const named = SettingsSchema.parse({ policy: { sources: { 'main-session': { allowed: [{ id: 'alice', name: 'Alice' }] } } } })
     expect(syncMainSessionOperator(named, 'alice').policy.sources[MAIN_SESSION_SOURCE]?.allowed).toEqual([{ id: 'alice', name: 'Alice' }])
   })
-  it('assesses follow-ups on Threads with Tickets, explicit from an allowed sender and inferred from anyone else', () => {
+  it('assesses follow-ups on Threads with Tickets, explicit from an allowed sender and refused for an unlisted one whose cell ignores', () => {
     const quiet = { meta: { chatId: CHAT, direct: false, mentioned: false } }
-    expect(policy.gate(unaddressed({ ...quiet, actor: { source: 'feishu', id: 'ou_guest' } }), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'inferred', basis: { via: 'followup' } })
-    expect(policy.gate(unaddressed(quiet), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'explicit', basis: { via: 'followup', sender: 'Alice' } })
-    expect(policy.gate(github('someone'), thread(), [ticket])).toMatchObject({ admissible: true, strength: 'inferred' })
+    expect(policy.gate(unaddressed({ ...quiet, actor: { source: 'feishu', id: 'ou_guest' } }), thread(['ticket']), []))
+      .toEqual({ admissible: false, reason: 'not_a_member' })
+    expect(policy.gate(unaddressed(quiet), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'explicit', basis: { via: 'followup' } })
+    expect(policy.gate(github('someone'), thread(), [ticket])).toEqual({ admissible: false, reason: 'not_a_member' })
     // A Thread a ticket follows only for context lends no follow-up: the admission table decides, as on any Thread.
     const context = { ...thread(['ticket']), context: ['ticket'] }
     expect(policy.gate(unaddressed(quiet), context, [ticket])).toMatchObject({ admissible: false })
+  })
+  it('admits an unlisted follow-up only while its admission cell is not ignore, and keeps a listed follow-up explicit', () => {
+    const quiet = { meta: { chatId: CHAT, direct: false, mentioned: false } }
+    const observed = { meta: { chatId: OBSERVED, direct: false, mentioned: false } }
+    const admission = (cell: 'inferred' | 'ignore') => setup({ ...base, policy: { ...base.policy, sources: { ...base.policy.sources,
+      feishu: { ...base.policy.sources.feishu!, admission: { [OBSERVED]: { unlistedUnaddressed: cell } } } } } })
+    // The default cell ignores, so an unlisted guest never rides an existing Thread into admission.
+    expect(admission('ignore').policy.gate(unaddressed({ ...observed, actor: { source: 'feishu', id: 'ou_guest' } }), thread(['ticket']), []))
+      .toEqual({ admissible: false, reason: 'not_a_member' })
+    expect(admission('inferred').policy.gate(unaddressed({ ...observed, actor: { source: 'feishu', id: 'ou_guest' } }), thread(['ticket']), []))
+      .toMatchObject({ admissible: true, strength: 'inferred', basis: { via: 'followup' } })
+    // A listed sender's follow-up stays explicit whatever the table says.
+    expect(setup({ ...base, policy: { ...base.policy, sources: { ...base.policy.sources,
+      feishu: { ...base.policy.sources.feishu!, admission: { [CHAT]: { listedUnaddressed: 'ignore' } } } } } })
+      .policy.gate(unaddressed(quiet), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'explicit', basis: { via: 'followup' } })
   })
   it('infers strength for allowed senders\' messages the Source observes, unless Eval is off', () => {
     const observed = unaddressed({ meta: { chatId: OBSERVED, direct: false, mentioned: false } })
@@ -154,16 +170,21 @@ describe('admission table', () => {
       const open = setup(withTable({ [CHAT]: { unlistedAddressed: 'explicit' } }, {}, mode))
       expect(open.policy.gate(inChat(CHAT, STRANGER), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'explicit',
         basis: { via: 'admission', cell: 'unlistedAddressed' } })
-      // A cell that is not explicit leaves the follow-up inferred, while Eval is on.
+      // A cell that ignores refuses the follow-up: a Thread's Tickets never override an ignore cell.
       const strict = setup(withTable({ [CHAT]: { unlistedAddressed: 'ignore' } }, {}, mode))
-      expect(strict.policy.gate(inChat(CHAT, STRANGER), thread(['ticket']), [])).toMatchObject(mode === 'off'
+      expect(strict.policy.gate(inChat(CHAT, STRANGER), thread(['ticket']), [])).toEqual({ admissible: false, reason: 'not_a_member' })
+      // An inferred cell admits the follow-up while Eval is on.
+      const inferred = setup(withTable({ [CHAT]: { unlistedAddressed: 'inferred' } }, {}, mode))
+      expect(inferred.policy.gate(inChat(CHAT, STRANGER), thread(['ticket']), [])).toMatchObject(mode === 'off'
         ? { admissible: false } : { admissible: true, strength: 'inferred', basis: { via: 'followup' } })
     }
   })
-  it('keeps follow-ups on a Thread with Tickets outside the table', () => {
+  it('keeps listed follow-ups outside the table, but not unlisted ignored ones', () => {
     const strict = setup(withTable({ [OBSERVED]: { listedUnaddressed: 'ignore', unlistedUnaddressed: 'ignore' } }))
     expect(strict.policy.gate(inChat(OBSERVED, MEMBER, false), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'explicit', basis: { via: 'followup' } })
-    expect(strict.policy.gate(inChat(OBSERVED, STRANGER, false), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'inferred', basis: { via: 'followup' } })
+    expect(strict.policy.gate(inChat(OBSERVED, STRANGER, false), thread(['ticket']), [])).toEqual({ admissible: false, reason: 'not_a_member' })
+    const inferred = setup(withTable({ [OBSERVED]: { unlistedUnaddressed: 'inferred' } }))
+    expect(inferred.policy.gate(inChat(OBSERVED, STRANGER, false), thread(['ticket']), [])).toMatchObject({ admissible: true, strength: 'inferred', basis: { via: 'followup' } })
   })
   it('invalidates a Mandate once its cell gives less than the strength it was accepted with, and keeps it while the cell holds', () => {
     const open = withTable({ [CHAT]: { unlistedAddressed: 'explicit' } })
@@ -420,6 +441,73 @@ describe('policy effects', () => {
     const visual = ticket('t4', { strength: 'explicit', actor: { source: 'feishu', id: 'ou_alice' },
       basis: { via: 'listed', source: 'feishu', rules: ['visual'] } })
     expect(policyEffects([visual], base, deleted, scope).get('t4')).toEqual({ rules: [{ id: 'visual', name: 'Visual', change: 'disabled' }] })
+  })
+})
+describe('delegated mandates', () => {
+  const projectId = 'project-1'
+  const pmSession = 'pm-project-1'
+  const pm = (overrides: Partial<Mandate> = {}): Mandate => ({ strength: 'explicit', policyVersion: 'v',
+    basis: { via: 'addressed', addressed: 'mention', source: 'feishu', scope: { chatId: CHAT } }, actor: { source: 'feishu', id: MEMBER },
+    scope: 'Goal', ...overrides })
+  const inferredPM = (): Mandate => pm({ strength: 'inferred', basis: { via: 'admission', cell: 'listedUnaddressed', source: 'feishu',
+    scope: { chatId: OBSERVED }, row: OBSERVED, observation: { mode: 'auto' }, rules: ['copy'] } })
+  const profile = (status: ProjectProfile['status'] = 'active', mandate: Mandate = pm()): ProjectProfile => ({ id: projectId,
+    title: 'Website', goal: 'Goal', status, decisionId: 'decision', pmSessionId: pmSession,
+    mandate: { ...mandate, projectId, goal: 'Goal' }, createdAt: '', updatedAt: '' })
+  const delegated = (basis: Partial<Extract<Mandate['basis'], { via: 'delegated' }>> = {}): Mandate => ({ ...pm(), scope: 'Task',
+    basis: { via: 'delegated', projectId, pmSessionId: pmSession, ...basis } })
+  const policyFor = (settings: Settings, project?: ProjectProfile) => {
+    const registry = new SourceRegistry(() => settings)
+    registry.register(feishuKind); registry.register(githubKind)
+    return settingsPolicy(settings, registry, id => project && project.id === id ? project : undefined)
+  }
+  const without = (settings: Settings): Settings => ({ ...settings, policy: { ...settings.policy,
+    sources: { ...settings.policy.sources, feishu: { ...settings.policy.sources.feishu!, allowed: [] } } } })
+  const disabledCopy = (settings: Settings): Settings => ({ ...settings, policy: { ...settings.policy,
+    rules: settings.policy.rules.map(rule => rule.id === 'copy' ? { ...rule, enabled: false } : rule) } })
+  const observe = (settings: Settings): Settings => ({ ...settings, eval: { ...settings.eval, mode: 'observe' as const } })
+  const effectsScope = () => ({ scope: () => ({ listened: true as const, observed: true, row: OBSERVED }) })
+  it('revalidates through the Project and its PM Mandate, and refuses without either', () => {
+    expect(policyFor(base, profile()).revalidate(delegated())).toBe(true)
+    // Without a Project resolver the Policy cannot see the authority and does not trust the recorded basis.
+    expect(setup().policy.revalidate(delegated())).toBe(false)
+    expect(policyFor(base).revalidate(delegated())).toBe(false)
+    expect(policyFor(base, profile()).revalidate(delegated({ projectId: 'other-project' }))).toBe(false)
+    expect(policyFor(base, profile()).revalidate(delegated({ pmSessionId: 'pm-other' }))).toBe(false)
+  })
+  it('follows the PM sender list and the PM Mandate rules rather than an external allowed list', () => {
+    expect(policyFor(without(base), profile()).revalidate(delegated())).toBe(false)
+    // Another allowed person does not matter: the PM actor must still be on the list.
+    const plusBob = { ...base, policy: { ...base.policy, sources: { ...base.policy.sources,
+      feishu: { ...base.policy.sources.feishu!, allowed: [{ id: 'ou_bob' }] } } } }
+    expect(policyFor(plusBob, profile()).revalidate(delegated())).toBe(false)
+  })
+  it('revokes an inferred PM Mandate when its rule is disabled or the mode leaves auto, while an explicit one survives', () => {
+    expect(policyFor(base, profile('active', inferredPM())).revalidate(delegated())).toBe(true)
+    expect(policyFor(observe(base), profile('active', inferredPM())).revalidate(delegated())).toBe(false)
+    expect(policyFor(disabledCopy(base), profile('active', inferredPM())).revalidate(delegated())).toBe(false)
+    // An explicit PM Mandate does not depend on rules or the accept mode.
+    expect(policyFor(disabledCopy(base), profile()).revalidate(delegated())).toBe(true)
+    expect(policyFor(observe(base), profile()).revalidate(delegated())).toBe(true)
+  })
+  it('treats a pause as temporary, and an ended or archived Project as no authority', () => {
+    expect(policyFor(base, profile('paused')).revalidate(delegated())).toBe(true)
+    expect(policyFor(base, profile('ended')).revalidate(delegated())).toBe(false)
+    expect(policyFor(base, profile('archived')).revalidate(delegated())).toBe(false)
+  })
+  it('names a delegated Ticket whose PM authority a policy change revoked', () => {
+    const ticket = (mandate: Mandate) => ({ id: 'delegated-ticket', mandate } as unknown as Ticket)
+    const scope = () => effectsScope()
+    const authority = (project: ProjectProfile) => (id: string) => project.id === id ? project : undefined
+    expect(policyEffects([ticket(delegated())], base, without(base), scope, authority(profile())).get('delegated-ticket'))
+      .toEqual({ delegatedAuthority: false })
+    expect(policyEffects([ticket(delegated())], base, observe(base), scope, authority(profile())).size).toBe(0)
+    expect(policyEffects([ticket(delegated())], base, observe(base), scope, authority(profile('active', inferredPM()))).get('delegated-ticket'))
+      .toEqual({ delegatedAuthority: false })
+    expect(policyEffects([ticket(delegated())], base, disabledCopy(base), scope, authority(profile('active', inferredPM()))).get('delegated-ticket'))
+      .toEqual({ delegatedAuthority: false })
+    // A temporary pause is not a revocation, and neither is an unchanged PM authority.
+    expect(policyEffects([ticket(delegated())], base, base, scope, authority(profile('paused'))).size).toBe(0)
   })
 })
 describe('bots and events without a sender', () => {
