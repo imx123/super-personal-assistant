@@ -201,7 +201,7 @@ function routes(runtime: HttpHost): Routes {
     'POST projects/:id/pause': async ({ params, body }) => {
       const { paused, mode = 'soft' } = z.object({ paused: z.boolean(), mode: z.enum(['soft', 'hard']).optional() }).strict()
         .parse(await body())
-      const result = runtime.engine.pauseProjectReport(params.id, paused, mode)
+      const result = await runtime.engine.pauseProjectReport(params.id, paused, mode)
       const project = result.project
       const sessions = paused
         ? project.status === 'paused' ? await runtime.sessions.pauseProject(project, mode)

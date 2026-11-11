@@ -87,7 +87,7 @@ describe('the one hardStopWorker primitive', () => {
       .toEqual([{ ticketId: single.id, scope: 'worker' }, { ticketId: bulk.id, scope: 'project' }])
   })
 
-  it('stops an already ended Worker idempotently and keeps its worker label through a Project hard pause', () => {
+  it('stops an already ended Worker idempotently and keeps its worker label through a Project hard pause', async () => {
     const h = harness()
     const { project, tickets: [ticket] } = h.projectWith('p1', [{ title: 'Header', goal: 'Fix the header' }])
     h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
@@ -99,7 +99,7 @@ describe('the one hardStopWorker primitive', () => {
     expect(h.repo.tickets.get(ticket!.id)!.manualStop).toEqual(stopped)
     expect(h.stops).toHaveLength(1)
     // A later Project hard pause must not overwrite it, even though it visits the already stopped Worker.
-    const report = h.engine.pauseProjectReport(project.id, true, 'hard')
+    const report = await h.engine.pauseProjectReport(project.id, true, 'hard')
     expect(report.workers.stopped).toEqual([ticket!.id])
     expect(report.workers.failures).toEqual([])
     expect(h.repo.tickets.get(ticket!.id)!.manualStop).toEqual(stopped)
@@ -110,12 +110,12 @@ describe('the one hardStopWorker primitive', () => {
     expect(() => h.engine.retryTicket(ticket!.id)).toThrow(new UserError('manualStopNeedsUserApproval'))
   })
 
-  it('continues with the other Workers when one stop fails and reports the failure', () => {
+  it('continues with the other Workers when one stop fails and reports the failure', async () => {
     const h = harness()
     const { project, tickets } = h.projectWith('p1', [{ title: 'Header', goal: 'Fix the header' }, { title: 'Footer', goal: 'Fix the footer' }])
     for (const ticket of tickets) h.engine.assignmentStarted(ticket.id, ticket.assignments[0]!.id)
     h.failing.add(tickets[0]!.id)
-    const report = h.engine.pauseProjectReport(project.id, true, 'hard')
+    const report = await h.engine.pauseProjectReport(project.id, true, 'hard')
     expect(report.project.status).toBe('paused')
     expect(report.workers.stopped).toEqual([tickets[1]!.id])
     expect(report.workers.failures).toEqual([{ ticketId: tickets[0]!.id, error: 'stop failed' }])
@@ -348,7 +348,7 @@ describe('a Project PM stop and revive through the runtime', () => {
       const stop = host.runtime.executor.stop.bind(host.runtime.executor)
       const denied = vi.spyOn(host.runtime.executor, 'stop').mockImplementation((ticket, assignment, reason) => {
         if (ticket.id === first!.id) throw new Error('cancel denied')
-        stop(ticket, assignment, reason)
+        return stop(ticket, assignment, reason)
       })
       try {
         const hard = (await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'hard' })).body as

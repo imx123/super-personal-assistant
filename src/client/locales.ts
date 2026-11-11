@@ -799,6 +799,7 @@ const TEXT = {
   'userError.handoffHandled': ['这个交接已经决定过了。', USER_ERRORS.handoffHandled[1]],
   'userError.handoffTarget': ['交接目标必须是本安装内另一个进行中的项目，不能是本项目。', USER_ERRORS.handoffTarget[1]],
   'userError.invalidHandoff': ['交接请求无效：{reason}', USER_ERRORS.invalidHandoff[1]],
+  'userError.handoffCleanupFailed': ['旧 Worker 的后台工作停不下来（{error}）；没有启动替代 Worker，工单仍开放，可稍后重试。', USER_ERRORS.handoffCleanupFailed[1]],
   'userError.sourceThread': ['这是工单开始时所在的线程，会保持订阅。', USER_ERRORS.sourceThread[1]],
   'userError.followedThread': ['这是工单自己的线程，例如它的 PR，会保持订阅。', USER_ERRORS.followedThread[1]],
   'userError.notFollowing': ['这个工单没有订阅那个线程。', USER_ERRORS.notFollowing[1]],

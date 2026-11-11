@@ -418,8 +418,12 @@ export interface ManualStop {
 export type HandoffKind = 'transfer' | 'split'
 /** A cross-Project request waits for its target PM; a transfer or accepted split is decided. */
 export type HandoffStatus = 'pending' | 'accepted' | 'rejected'
-/** One side of a Handoff: its Ticket and Project, and the Worker Session when one ran or will run there. */
-export interface HandoffEndpoint { ticketId?: string; projectId: string; sessionId?: string }
+/**
+ * One side of a Handoff: its Ticket and Project, the Assignment that produced or receives the work, and that Assignment's
+ * Worker Session. `assignmentId` binds the record to the exact Assignment: a request must not finalize after the source
+ * Ticket was approved and revived into another Assignment in the same Session.
+ */
+export interface HandoffEndpoint { ticketId?: string; projectId: string; assignmentId?: string; sessionId?: string }
 /**
  * Work handed from one Worker or Project to another, recorded on both Tickets. A `transfer` keeps the same Ticket, Mandate
  * and worktree and only changes the Worker Session; a `split` ends the source Ticket and asks the target Project's PM to

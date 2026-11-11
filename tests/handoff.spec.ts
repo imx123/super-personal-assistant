@@ -70,12 +70,12 @@ describe('Worker Session ids after a handoff', () => {
 })
 
 describe('same-Project Ticket handoff', () => {
-  it('keeps the Ticket, Mandate and worktree, ends the old Assignment handedOff and starts worker-h1', () => {
+  it('keeps the Ticket, Mandate and worktree, ends the old Assignment handedOff and starts worker-h1', async () => {
     const h = harness()
     const { project, tickets: [ticket] } = h.projectWith('p1')
     h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
     const before = h.repo.tickets.get(ticket!.id)!
-    const handed = h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'The Worker is stuck',
+    const handed = await h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'The Worker is stuck',
       summary: 'Header done; footer still needs a link check.', unfinished: ['Check the footer links'] })
     expect(handed.ended).toBeUndefined()
     expect(handed.mandate).toEqual(before.mandate)
@@ -86,8 +86,10 @@ describe('same-Project Ticket handoff', () => {
     expect(assignmentOf(h.repo, ticket!)).toMatchObject({ state: 'pending', sessionId: `${workerSessionId(ticket!.id)}-h1` })
     expect(handed.handoffs).toHaveLength(1)
     expect(handed.handoffs![0]).toMatchObject({ kind: 'transfer', status: 'accepted',
-      from: { ticketId: ticket!.id, projectId: project.id, sessionId: workerSessionId(ticket!.id) },
-      to: { ticketId: ticket!.id, projectId: project.id, sessionId: `${workerSessionId(ticket!.id)}-h1` },
+      from: { ticketId: ticket!.id, projectId: project.id, assignmentId: ticket!.assignments[0]!.id,
+        sessionId: workerSessionId(ticket!.id) },
+      to: { ticketId: ticket!.id, projectId: project.id, assignmentId: handed.assignments[1]!.id,
+        sessionId: `${workerSessionId(ticket!.id)}-h1` },
       reason: 'The Worker is stuck', summary: 'Header done; footer still needs a link check.', unfinished: ['Check the footer links'],
       approvedBy: { kind: 'pm', sessionId: project.pmSessionId } })
     // The new Worker gets the handoff briefing, and the old one is stopped with the handedOff reason.
@@ -100,12 +102,12 @@ describe('same-Project Ticket handoff', () => {
         toSessionId: `${workerSessionId(ticket!.id)}-h1` }])
   })
 
-  it('numbers further handoffs h2, h3 and keeps every earlier Assignment and Session', () => {
+  it('numbers further handoffs h2, h3 and keeps every earlier Assignment and Session', async () => {
     const h = harness()
     const { project, tickets: [ticket] } = h.projectWith('p1')
     h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
-    h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'One', summary: 'First' })
-    h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'Two', summary: 'Second' })
+    await h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'One', summary: 'First' })
+    await h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: 'Two', summary: 'Second' })
     const stored = h.repo.tickets.get(ticket!.id)!
     expect(stored.assignments.map(assignment => assignment.sessionId)).toEqual([workerSessionId(ticket!.id),
       `${workerSessionId(ticket!.id)}-h1`, `${workerSessionId(ticket!.id)}-h2`])
@@ -116,39 +118,39 @@ describe('same-Project Ticket handoff', () => {
     expect(stored.assignments.map(assignment => assignment.endedReason)).toEqual(['handedOff', 'handedOff', undefined])
   })
 
-  it('refuses a handoff outside an active Project, from another PM or Worker, and with nothing to hand over', () => {
+  it('refuses a handoff outside an active Project, from another PM or Worker, and with nothing to hand over', async () => {
     const h = harness()
     const { project, tickets: [ticket] } = h.projectWith('p1')
     const transfer = (projectId = project.id, pm = project.pmSessionId, ticketId = ticket!.id) =>
       h.engine.transferTicket(projectId, pm, ticketId, { reason: 'Stuck', summary: 'Summary' })
     h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
-    expect(() => transfer(project.id, 'pm-other')).toThrow(new UserError('notProjectPm'))
-    expect(() => transfer('missing')).toThrow(new UserError('unknownProject'))
+    await expect(transfer(project.id, 'pm-other')).rejects.toThrow(new UserError('notProjectPm'))
+    await expect(transfer('missing')).rejects.toThrow(new UserError('unknownProject'))
     h.engine.pauseProject(project.id, true)
-    expect(() => transfer()).toThrow(new UserError('projectPaused'))
+    await expect(transfer()).rejects.toThrow(new UserError('projectPaused'))
     h.engine.pauseProject(project.id, false)
     // A Ticket whose Assignment already ended has nothing to hand over; an ended Ticket neither.
     const ended = h.projectWith('p2').tickets[0]!
     const stored = h.repo.tickets.get(ended.id)!
     stored.assignments[0]!.state = 'ended'; stored.assignments[0]!.endedReason = 'sessionArchived'
     h.repo.tickets.save(stored)
-    expect(() => h.engine.transferTicket(ended.projectId!, h.repo.projects.get(ended.projectId!)!.pmSessionId, ended.id,
-      { reason: 'Stuck', summary: 'Summary' })).toThrow(new UserError('notHandoffable'))
+    await expect(h.engine.transferTicket(ended.projectId!, h.repo.projects.get(ended.projectId!)!.pmSessionId, ended.id,
+      { reason: 'Stuck', summary: 'Summary' })).rejects.toThrow(new UserError('notHandoffable'))
     h.engine.stopTicket(ended.id)
-    expect(() => h.engine.transferTicket(ended.projectId!, h.repo.projects.get(ended.projectId!)!.pmSessionId, ended.id,
-      { reason: 'Stuck', summary: 'Summary' })).toThrow(new UserError('ticketEnded'))
+    await expect(h.engine.transferTicket(ended.projectId!, h.repo.projects.get(ended.projectId!)!.pmSessionId, ended.id,
+      { reason: 'Stuck', summary: 'Summary' })).rejects.toThrow(new UserError('ticketEnded'))
     const router = (() => {
       h.engine.recordTriggerForRouting(trigger('p9'))
       return h.engine.decide('p9', { kind: 'accept', title: 'Normal', scope: 'normal', reason: 'requested', acknowledgement: 'ok',
         name: 'normal-work' })
     })()
-    expect(() => h.engine.transferTicket(project.id, project.pmSessionId, router.ticketId!,
-      { reason: 'Stuck', summary: 'Summary' })).toThrow(new UserError('notProjectTicket'))
-    expect(() => h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: '', summary: '' }))
-      .toThrow(new UserError('invalidHandoff', { reason: 'summary is required' }))
+    await expect(h.engine.transferTicket(project.id, project.pmSessionId, router.ticketId!,
+      { reason: 'Stuck', summary: 'Summary' })).rejects.toThrow(new UserError('notProjectTicket'))
+    await expect(h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id, { reason: '', summary: '' }))
+      .rejects.toThrow(new UserError('invalidHandoff', { reason: 'summary is required' }))
     // A person's stop is not silently handed over.
     h.engine.stopAssignment(ticket!.id, ticket!.assignments[0]!.id)
-    expect(() => transfer()).toThrow(new UserError('manualStopNeedsUserApproval'))
+    await expect(transfer()).rejects.toThrow(new UserError('manualStopNeedsUserApproval'))
   })
 })
 

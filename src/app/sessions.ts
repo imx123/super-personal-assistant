@@ -80,7 +80,8 @@ export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-super
  * decides handoffs addressed to it, and reports. */
 export const PM_TOOLS = ['orchestrator_read', 'orchestrator_project_report', 'orchestrator_project_ticket_create',
   'orchestrator_project_ticket_message', 'orchestrator_project_ticket_revive', 'orchestrator_project_ticket_handoff',
-  'orchestrator_project_ticket_handoff_to_project', 'orchestrator_project_ticket_handoff_decide'] as const
+  'orchestrator_project_ticket_handoff_new_ticket', 'orchestrator_project_ticket_handoff_to_project',
+  'orchestrator_project_ticket_handoff_decide'] as const
 /**
  * The tool boundary of a Project's PM. `tools.restrict` masks only the tools a Session inherits (DSH's global layer and its
  * preset's) and rejects scope-local names, so naming the PM's own tools there fails with `names unknown global tools`

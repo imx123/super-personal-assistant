@@ -45,6 +45,8 @@ export interface ProjectHandoffRequest extends TicketHandoffRequest {
 }
 /** What a target PM decided about a cross-Project handoff, and the Ticket it created when accepted. */
 export interface ProjectHandoffResult { handoff: Handoff; ticket?: Ticket }
+/** A same-Project split: the new Ticket the PM creates when a Worker reports work beyond its own Ticket. */
+export interface TicketSplitRequest extends TicketHandoffRequest { title: string; goal: string; scope?: string; worktree_name?: string }
 /** The bounds a cross-Project handoff's summary and unfinished items keep. */
 export const HANDOFF = { summary: 4000, unfinished: 20, item: 500 } as const
 
@@ -119,6 +121,14 @@ function prepareHandoff(input: ProjectHandoffRequest): { request: NonNullable<Ha
   if (items.some(item => !item || item.length > HANDOFF.item)) invalid(`each unfinished item needs 1-${HANDOFF.item} characters`)
   return { request: { title, goal, scope: scope || goal, ...(worktree ? { worktree_name: worktree } : {}) }, reason, summary,
     ...items.length ? { unfinished: items } : {} }
+}
+/** The useful text of a failure, including the causes of an Executor's AggregateError. */
+function errorText(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const causes = error.errors.map(item => item instanceof Error ? item.message : String(item)).filter(Boolean)
+    return causes.length ? causes.join('; ') : error.message
+  }
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** One validated task, with its deterministic index, the tools it allows, and the Threads it subscribes to, deduplicated. */
@@ -343,24 +353,50 @@ export class Engine {
    * A soft pause blocks new Tickets and Assignments while running Assignments finish; a hard pause stops the Project's
    * Workers one by one through `Tickets.hardStopWorker`, so each ends exactly as a person's single stop would, records a
    * `project` manual stop unless it already carries a `worker` one, and asks the Executor to stop it. A Worker that fails to
-   * stop is reported and the rest still stop; the Project is paused either way. Resuming clears only its Workers' `project`
-   * stops, never their `worker` stops, and adds one `resumedFromHard` note for the PM; it restarts nothing.
+   * stop, or whose background cleanup cannot finish, is reported and the rest still stop; the Project is paused either way.
+   * Resuming clears only its Workers' `project` stops, never their `worker` stops, and adds one `resumedFromHard` note for
+   * the PM; it restarts nothing. This synchronous form reports only failures known at commit; the async
+   * `pauseProjectReport` also waits for background cleanup.
    * @throws UserError when the Project is unknown or the mode is not `soft`/`hard`.
    */
   pauseProject(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectProfile {
-    return this.pauseProjectReport(projectId, paused, mode).project
+    const begun = this.repo.atomic(() => this.pauseProjectNow(projectId, paused, mode))
+    if (begun.hardChanged) this.emitPausedByUser(begun)
+    return begun.report.project
   }
-  /** `pauseProject`, with the Workers a hard pause stopped and the ones it failed to stop. */
-  pauseProjectReport(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectPauseReport {
+  /**
+   * `pauseProject`, with the Workers a hard pause stopped and the ones it failed to stop, after waiting for every started
+   * background cleanup. A cleanup that rejects moves its Ticket from `stopped` to `failures`, so neither the API result nor
+   * the Router notice claims a Worker was stopped while its jobs may still run.
+   */
+  async pauseProjectReport(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): Promise<ProjectPauseReport> {
+    const begun = this.repo.atomic(() => this.pauseProjectNow(projectId, paused, mode))
+    for (const { ticketId, work } of begun.cleanups) {
+      try {
+        await work
+      } catch (error) {
+        begun.report.workers.stopped = begun.report.workers.stopped.filter(id => id !== ticketId)
+        begun.report.workers.failures.push({ ticketId, error: errorText(error) })
+      }
+    }
+    if (begun.hardChanged) this.emitPausedByUser(begun)
+    return begun.report
+  }
+  /** Apply the pause/resume transaction and collect the Worker cleanups a hard pause started; the caller reports them. */
+  private pauseProjectNow(projectId: string, paused: boolean, mode: 'soft' | 'hard'):
+    { report: ProjectPauseReport; cleanups: { ticketId: string; work: Promise<void> }[]; hardChanged: boolean; at: string } {
     if (mode !== 'soft' && mode !== 'hard') throw new UserError('projectPauseMode')
     return this.repo.atomic(() => {
       const workers: ProjectPauseWorkers = { stopped: [], failures: [] }
+      const cleanups: { ticketId: string; work: Promise<void> }[] = []
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
-      if (project.status === 'ended' || project.status === 'archived') return { project, workers }
       const at = this.options.now?.() ?? new Date().toISOString()
+      if (project.status === 'ended' || project.status === 'archived') {
+        return { report: { project, workers }, cleanups, hardChanged: false, at }
+      }
       if (!paused) {
-        if (project.status !== 'paused') return { project, workers }
+        if (project.status !== 'paused') return { report: { project, workers }, cleanups, hardChanged: false, at }
         const active: ProjectProfile = { ...project, status: 'active', updatedAt: at }
         delete active.pauseMode
         if (project.pauseMode === 'hard') {
@@ -374,33 +410,41 @@ export class Engine {
         // Only the stops the hard pause wrote go: a person's stop of one Worker stays until a person approves its resume.
         this.tickets.clearProjectManualStops(projectId, 'user')
         this.options.emit?.({ type: 'project.resumed', at, data: { projectId, ...(project.pauseMode ? { mode: project.pauseMode } : {}) } })
-        return { project: this.repo.projects.get(projectId)!, workers }
+        return { report: { project: this.repo.projects.get(projectId)!, workers }, cleanups, hardChanged: false, at }
       }
       // A hard pause is not downgraded by a later soft request; it ends only on resume.
-      if (project.status === 'paused' && project.pauseMode === 'hard' && mode === 'soft') return { project, workers }
-      if (project.status === 'paused' && project.pauseMode === mode) return { project, workers }
+      if (project.status === 'paused' && project.pauseMode === 'hard' && mode === 'soft') {
+        return { report: { project, workers }, cleanups, hardChanged: false, at }
+      }
+      if (project.status === 'paused' && project.pauseMode === mode) return { report: { project, workers }, cleanups, hardChanged: false, at }
       const pausedProject: ProjectProfile = { ...project, status: 'paused', pauseMode: mode, updatedAt: at }
       this.repo.projects.save(pausedProject)
       this.options.emit?.({ type: 'project.paused', at, data: { projectId, mode,
         ...(project.status === 'paused' && project.pauseMode ? { from: project.pauseMode } : {}) } })
-      if (mode === 'hard') {
+      const hardChanged = mode === 'hard'
+      if (hardChanged) {
         // Each Worker stops in its own transaction through the one primitive a person's stop uses, so its failure leaves the
         // others stopping and the Project still pauses; the aggregate event tells the Router which ones failed.
         for (const ticket of this.repo.tickets.open()) {
           if (ticket.projectId !== projectId) continue
+          const local: { ticketId: string; work: Promise<void> }[] = []
           try {
             this.repo.atomic(() => this.tickets.hardStopWorker(ticket.id, { scope: 'project', by: 'user', projectId,
-              reason: 'projectPausedByUser' }))
+              reason: 'projectPausedByUser', cleanups: local }))
             workers.stopped.push(ticket.id)
+            cleanups.push(...local)
           } catch (error) {
-            workers.failures.push({ ticketId: ticket.id, error: error instanceof Error ? error.message : String(error) })
+            workers.failures.push({ ticketId: ticket.id, error: errorText(error) })
           }
         }
-        this.options.emit?.({ type: 'project.pausedByUser', at, data: { projectId, mode: 'hard', stopped: workers.stopped,
-          failures: workers.failures } })
       }
-      return { project: this.repo.projects.get(projectId)!, workers }
+      return { report: { project: this.repo.projects.get(projectId)!, workers }, cleanups, hardChanged, at }
     })
+  }
+  /** Emit the aggregate hard-pause event the Runtime relays to the Router, with the failures known when it is emitted. */
+  private emitPausedByUser(begun: { report: ProjectPauseReport; at: string }): void {
+    this.options.emit?.({ type: 'project.pausedByUser', at: begun.at, data: { projectId: begun.report.project.id, mode: 'hard',
+      stopped: [...begun.report.workers.stopped], failures: [...begun.report.workers.failures] } })
   }
   /**
    * A person's explicit approval to make a Worker that a single stop ended resumable: clear its `worker` stop. It restarts
@@ -430,13 +474,17 @@ export class Engine {
   }
   /**
    * A Project PM moves one of its Tickets to a new Worker: the same Ticket, Mandate and worktree, a new Session named
-   * `worker-<ticketId>-h<seq>`, and the old Assignment and Session stopped. Only the PM may call it; a Worker can only
-   * report that it needs another Worker.
+   * `worker-<ticketId>-h<seq>`, and the old Assignment and Session stopped. The new Assignment starts only after the old
+   * Worker's background cleanup succeeds; a cleanup failure ends it as `handoffCleanupFailed` and starts no replacement
+   * Session over the old one's work. Only the PM may call it; a Worker can only report that it needs another Worker.
    * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, or the Ticket is not
-   * its own, is ended, carries a manual stop, or has no running or pending Assignment.
+   * its own, is ended, carries a manual stop, or has no running or pending Assignment; or when the cleanup fails.
    */
-  transferTicket(projectId: string, pmSessionId: string, ticketId: string, request: TicketHandoffRequest): Ticket {
-    return this.repo.atomic(() => {
+  async transferTicket(projectId: string, pmSessionId: string, ticketId: string, request: TicketHandoffRequest): Promise<Ticket> {
+    const summary = typeof request?.summary === 'string' ? request.summary.trim() : ''
+    if (!summary) throw new UserError('invalidHandoff', { reason: 'summary is required' })
+    if (summary.length > HANDOFF.summary) throw new UserError('invalidHandoff', { reason: `summary exceeds ${HANDOFF.summary} characters` })
+    const begun = this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
@@ -445,11 +493,88 @@ export class Engine {
       if (project.status !== 'active') throw new UserError('projectEnded')
       const ticket = this.repo.tickets.get(ticketId)
       if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
-      const summary = typeof request?.summary === 'string' ? request.summary.trim() : ''
-      if (!summary) throw new UserError('invalidHandoff', { reason: 'summary is required' })
-      if (summary.length > HANDOFF.summary) throw new UserError('invalidHandoff', { reason: `summary exceeds ${HANDOFF.summary} characters` })
-      return this.tickets.transfer(ticketId, projectId, pmSessionId, { reason: request.reason?.trim() || 'Handed to a new Worker',
+      return this.tickets.beginTransfer(ticketId, projectId, pmSessionId, { reason: request.reason?.trim() || 'Handed to a new Worker',
         summary, ...request.unfinished?.length ? { unfinished: request.unfinished } : {} })
+    })
+    if (begun.work) {
+      try {
+        await begun.work
+      } catch (error) {
+        const message = errorText(error)
+        this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId, message))
+        throw new UserError('handoffCleanupFailed', { error: message.slice(0, 300) })
+      }
+    }
+    try {
+      return this.repo.atomic(() => {
+        const project = this.repo.projects.get(projectId)
+        if (!project) throw new UserError('unknownProject')
+        if (project.status === 'paused') throw new UserError('projectPaused')
+        if (project.status === 'archived') throw new UserError('projectArchived')
+        if (project.status !== 'active') throw new UserError('projectEnded')
+        return this.tickets.completeTransfer(ticketId, begun.assignmentId, begun.handoffId)
+      })
+    } catch (error) {
+      this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId,
+        `The handoff could not start its replacement Worker: ${errorText(error)}`))
+      throw error
+    }
+  }
+  /**
+   * A Project PM answers a Worker's "this is beyond my Ticket" report by creating an independent Ticket in the same Project
+   * and ending the source Ticket as `handedOff`: a `split` Handoff binds the exact source Assignment/Session to the new
+   * Ticket's first Assignment, the new Ticket gets its own Delegated Decision, Mandate, worktree and briefing, and the two
+   * Tickets are peers (no parent). The PM chooses the new task; a Worker can only report the need.
+   * @throws UserError when the Project is unknown or not active, the caller is not its PM, the source Ticket is not its own,
+   * ended or manually stopped, its latest Assignment ended, or the new task is invalid or reuses the Project's worktree name.
+   */
+  splitTicket(projectId: string, pmSessionId: string, ticketId: string, input: TicketSplitRequest): ProjectHandoffResult {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      const source = this.repo.tickets.get(ticketId)
+      if (!source || source.projectId !== projectId) throw new UserError('notProjectTicket')
+      if (!liveTicket(source)) throw new UserError('ticketEnded')
+      if (source.manualStop) throw new UserError(source.manualStop.scope === 'worker'
+        ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+      const latest = latestAssignment(source)
+      if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
+      const prepared = prepareHandoff({ ...input, targetProjectId: projectId })
+      const at = this.options.now?.() ?? new Date().toISOString()
+      const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: prepared.request.title,
+        goal: prepared.request.goal, scope: prepared.request.scope, worktree_name: prepared.request.worktree_name,
+        note: `Split from Ticket ${ticketId} after its Worker reported work beyond it. Read the handoff summary and unfinished `
+          + 'work in this Ticket\'s handoff briefing.' }])
+      const target = this.repo.tickets.get(created!.id)!
+      const targetAssignment = target.assignments.at(-1)
+      const accepted: Handoff = { id: key('handoff', ticketId, 'split', target.id), at, kind: 'split', status: 'accepted',
+        from: { ticketId, projectId, assignmentId: latest.id, sessionId: assignmentSessionId(ticketId, latest) },
+        to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {},
+          sessionId: targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id) },
+        reason: prepared.reason, summary: prepared.summary, ...prepared.unfinished ? { unfinished: prepared.unfinished } : {},
+        approvedBy: { kind: 'pm', sessionId: pmSessionId }, decidedAt: at }
+      const sourceTicket = this.repo.tickets.get(ticketId)!
+      sourceTicket.handoffs = [...sourceTicket.handoffs ?? [], accepted]
+      sourceTicket.updatedAt = at
+      this.repo.tickets.save(sourceTicket)
+      target.handoffs = [...target.handoffs ?? [], accepted]
+      target.updatedAt = at
+      this.repo.tickets.save(target)
+      this.tickets.briefHandoff(target, accepted, false)
+      const siblings = this.repo.tickets.get(ticketId)!
+      siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id !== accepted.id && item.status === 'pending' && item.kind === 'split'
+        ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Split into Ticket ${target.id}` }
+        : item)
+      siblings.updatedAt = at
+      this.repo.tickets.save(siblings)
+      this.tickets.handoffAway(ticketId, `Split into Ticket ${target.id}`)
+      this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId, handoffId: accepted.id, kind: 'split',
+        toTicketId: target.id, toSessionId: accepted.to.sessionId! } })
+      return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
     })
   }
   /**
@@ -482,12 +607,24 @@ export class Engine {
       const latest = latestAssignment(ticket)
       if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
       const prepared = prepareHandoff(input)
-      const id = key('handoff', ticketId, target.id, JSON.stringify({ ...prepared, reason: prepared.reason }))
+      const assignmentId = latest.id
+      const sessionId = assignmentSessionId(ticket.id, latest)
+      // Bind the request to the Assignment and Session that made it: after a transfer or a revive, the same content is a new
+      // request, and the old one can no longer finalize the Ticket.
+      const id = key('handoff', ticketId, target.id, assignmentId, sessionId, JSON.stringify({ ...prepared, reason: prepared.reason }))
       const existing = ticket.handoffs?.find(handoff => handoff.id === id)
-      if (existing) return existing
+      if (existing) {
+        // A request recorded before assignment binding is upgraded in place on a fresh request with the same content.
+        if (existing.from.assignmentId) return existing
+        const upgraded: Handoff = { ...existing, from: { ...existing.from, assignmentId, sessionId } }
+        ticket.handoffs = (ticket.handoffs ?? []).map(item => item.id === existing.id ? upgraded : item)
+        ticket.updatedAt = this.options.now?.() ?? new Date().toISOString()
+        this.repo.tickets.save(ticket)
+        return upgraded
+      }
       const at = this.options.now?.() ?? new Date().toISOString()
       const handoff: Handoff = { id, at, kind: 'split', status: 'pending',
-        from: { ticketId, projectId, sessionId: latest.sessionId }, to: { projectId: target.id },
+        from: { ticketId, projectId, assignmentId, sessionId }, to: { projectId: target.id },
         reason: prepared.reason, summary: prepared.summary, ...prepared.unfinished ? { unfinished: prepared.unfinished } : {},
         request: prepared.request }
       ticket.handoffs = [...ticket.handoffs ?? [], handoff]
@@ -520,9 +657,16 @@ export class Engine {
       }
       if (!source || !handoff) throw new UserError('unknownHandoff')
       if (handoff.kind !== 'split' || handoff.to.projectId !== projectId) throw new UserError('notProjectTicket')
+      // A decided request answers only its own action: accepting an accepted request is idempotent, rejecting it is a
+      // contradiction, and so is accepting a rejected one.
       if (handoff.status === 'accepted') {
+        if (decision.action !== 'accept') throw new UserError('handoffHandled')
         const ticket = handoff.to.ticketId ? this.repo.tickets.get(handoff.to.ticketId) : undefined
         return { handoff, ...ticket ? { ticket } : {} }
+      }
+      if (handoff.status === 'rejected') {
+        if (decision.action !== 'reject') throw new UserError('handoffHandled')
+        return { handoff }
       }
       if (handoff.status !== 'pending') throw new UserError('handoffHandled')
       const at = this.options.now?.() ?? new Date().toISOString()
@@ -546,7 +690,13 @@ export class Engine {
       if (origin.manualStop) throw new UserError(origin.manualStop.scope === 'worker'
         ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
       const current = latestAssignment(origin)
-      if (!current || current.state === 'ended' || assignmentSessionId(origin.id, current) !== handoff.from.sessionId) {
+      const currentSession = current ? assignmentSessionId(origin.id, current) : undefined
+      // A record made before P3-B has no assignmentId: there is no safe way to prove it still names the Assignment that
+      // requested it, so it is refused explicitly and the source PM must request again.
+      if (!handoff.from.assignmentId) throw new UserError('notHandoffable')
+      const expectedSession = handoff.from.sessionId ?? currentSession
+      if (!current || current.state === 'ended' || current.id !== handoff.from.assignmentId
+        || currentSession !== expectedSession) {
         throw new UserError('notHandoffable')
       }
       const request = handoff.request
@@ -556,9 +706,11 @@ export class Engine {
         note: `Handoff from Project ${handoff.from.projectId}, Ticket ${handoff.from.ticketId}. Read the handoff summary and `
           + 'unfinished work in this Ticket\'s handoff briefing.' }])
       const target = this.repo.tickets.get(created!.id)!
-      const sessionId = target.assignments.at(-1)?.sessionId ?? workerSessionId(target.id)
+      const targetAssignment = target.assignments.at(-1)
+      const sessionId = targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id)
       const accepted: Handoff = { ...handoff, status: 'accepted', decidedAt: at,
-        to: { ticketId: target.id, projectId, sessionId }, approvedBy: { kind: 'pm', sessionId: pmSessionId } }
+        to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {}, sessionId },
+        approvedBy: { kind: 'pm', sessionId: pmSessionId } }
       this.replaceHandoff(origin, accepted)
       target.handoffs = [...target.handoffs ?? [], accepted]
       target.updatedAt = at
@@ -927,7 +1079,7 @@ export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'cre
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
 export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket' | 'reviveProjectTicket'
-  | 'transferTicket' | 'requestProjectHandoff' | 'decideProjectHandoff'>
+  | 'transferTicket' | 'splitTicket' | 'requestProjectHandoff' | 'decideProjectHandoff'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
   | 'pauseProject' | 'pauseProjectReport' | 'allowResume' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>
@@ -935,4 +1087,4 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 're
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'turnBegan' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply' | 'stopAssignment'>

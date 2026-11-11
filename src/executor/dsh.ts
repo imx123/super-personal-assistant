@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { assignmentSessionId, key, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP, runningAssignment, threadKey,
-  ticketOfSession, waitsForPerson, workerSessionsOf } from '../core/index.ts'
+  ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
@@ -59,7 +59,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'turnBegan' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'stopAssignment'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'projects' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -220,6 +220,11 @@ export class DshExecutor implements Executor {
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
   private readonly personal = new Map<string, string>()
+  /**
+   * Agents whose current turn this plugin cancelled itself (operator stop, handoff, Project pause, shutdown), so the next
+   * `turn/end` with a user abort is not mistaken for a person pressing Stop in the native DSH UI.
+   */
+  private readonly expectedStops = new WeakSet<Agent>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
@@ -350,9 +355,11 @@ export class DshExecutor implements Executor {
   /**
    * After the ending transaction commits (so a rollback leaves the worker working, and a launch the same transaction queued
    * starts after it): ends the look at its background work, cancels its turn unless its last word was a `ready` or `dropped`
-   * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
+   * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person. The
+   * returned promise settles with that cleanup, so a Project hard pause or a handoff can wait for it and report a real
+   * failure instead of starting a Worker over jobs that still run.
    */
-  stop(ticket: Ticket, assignment: Assignment, reason: string): void {
+  stop(ticket: Ticket, assignment: Assignment, reason: string): Promise<void> {
     this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
@@ -361,23 +368,38 @@ export class DshExecutor implements Executor {
     const handedOff = reason === 'handedOff'
     const ownTurn = !handedOff && !cancelledByOperator && reason !== OPERATOR_STOP && (report?.state === 'ready' || report?.state === 'dropped') && !busy
     const sessionId = assignmentSessionId(ticket.id, assignment)
-    this.host.store.afterCommit(() => {
-      this.settling.get(ticket.id)?.abort()
-      const agent = this.host.context.agents.get(sessionId as SessionId)
-      if (!ownTurn) agent?.cancel({ kind: 'user' }, { keepInbox: false })
-      // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
-      const cleanup = this.stopWork(ticket.id, sessionId, reason)
-      // A Project hard pause reports its Workers in one aggregate Router notice, not one relay per stopped Worker.
-      if ((reason === OPERATOR_STOP || cancelledByOperator) && ticket.manualStop?.scope !== 'project') {
-        const action = cancelledByOperator ? 'cancel_ticket' : 'stop_assignment'
-        const finished = Promise.all([agent?.whenIdle(), cleanup]).then(
-          () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id), ticket),
-          (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, String(error)), ticket),
-        ).then(() => {})
-        this.track(ticket.id, finished)
-      }
-      this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
+    const done = new Promise<void>((resolve, reject) => {
+      this.host.store.afterCommit(() => {
+        let cleanup: Promise<void>
+        try {
+          this.settling.get(ticket.id)?.abort()
+          const agent = this.host.context.agents.get(sessionId as SessionId)
+          if (!ownTurn && agent) {
+            // The abort that follows is ours: workerIdle must not turn it into a second, single-Worker native stop.
+            if (agent.status !== 'idle') this.expectedStops.add(agent)
+            agent.cancel({ kind: 'user' }, { keepInbox: false })
+          }
+          // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
+          cleanup = this.stopWork(ticket.id, sessionId, reason)
+          const finished = Promise.all([agent?.whenIdle(), cleanup])
+          // A Project hard pause reports its Workers in one aggregate Router notice, not one relay per stopped Worker.
+          if ((reason === OPERATOR_STOP || cancelledByOperator) && ticket.manualStop?.scope !== 'project') {
+            const action = cancelledByOperator ? 'cancel_ticket' : 'stop_assignment'
+            void finished.then(
+              () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id), ticket),
+              (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, String(error)), ticket),
+            ).catch(() => {})
+          }
+          this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
+          finished.then(() => resolve(), reject)
+        } catch (error) {
+          reject(error)
+        }
+      })
     })
+    // A single stop may ignore the result; it must not become an unhandled rejection. Callers that care still await `done`.
+    done.catch(() => {})
+    return done
   }
   /** Stop what a Ticket's Worker runs in the given Session in the background (see `stopBackground`). */
   private stopWork(ticketId: string, sessionId: string, reason: string, keepInbox = false): Promise<void> {
@@ -385,14 +407,20 @@ export class DshExecutor implements Executor {
     this.track(ticketId, stopped)
     return stopped
   }
-  /** A stop of a ticket's background work, which a launch or a delivery of the ticket waits for while it runs. */
+  /**
+   * A stop of a ticket's background work, which a launch or a delivery of the ticket waits for while it runs. The entry keeps
+   * the stop's rejection: `stopped` must fail a launch rather than let it start a replacement Worker over live jobs.
+   */
   private track(ticketId: string, stop: Promise<void>): void {
-    const entry: Promise<void> = Promise.all([this.stopping.get(ticketId), stop.catch(() => {})]).then(() => {})
+    const earlier = this.stopping.get(ticketId)
+    const entry: Promise<void> = Promise.all([earlier?.then(() => {}, () => {}), stop]).then(() => {})
       .finally(() => { if (this.stopping.get(ticketId) === entry) this.stopping.delete(ticketId) })
     this.stopping.set(ticketId, entry)
+    // The entry is awaited where it matters; keep an ignored failure from surfacing as an unhandled rejection.
+    entry.catch(() => {})
     void this.background(stop)
   }
-  /** Wait for a stop of the ticket's background work that runs, unless the host stops first. */
+  /** Wait for a stop of the ticket's background work that runs, unless the host stops first; its failure propagates. */
   private async stopped(ticketId: string): Promise<void> {
     const stopping = this.stopping.get(ticketId)
     if (stopping) await until(stopping, this.host.lifetime)
@@ -457,6 +485,10 @@ export class DshExecutor implements Executor {
     const source = sourceTrigger(this.host, ticket)
     const workspace = ticket.execution?.directory ?? ''
     if (!current()) return
+    // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message and
+    // no replacement Worker is prepared or started over a cleanup that failed.
+    await this.stopped(ticket.id)
+    if (!current()) return
     // Prepare the workspace directory once; an existing directory counts as already prepared, including worktrees created before `prepare` commands existed.
     if (!await stat(workspace).then(() => true, () => false)) {
       await this.prepareDirectory(ticket)
@@ -465,9 +497,6 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const sessionId = assignmentSessionId(ticket.id, assignment)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
-    if (!current()) return
-    // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
-    await this.stopped(ticket.id)
     if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
@@ -508,8 +537,10 @@ export class DshExecutor implements Executor {
   install(): void {
     const ctx = this.host.context
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
-      // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh.
+      // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh. A new turn also
+      // means an earlier expected cancel belongs to a turn that is already over, so it cannot hide this turn's native Stop.
       if (status === 'running') {
+        this.expectedStops.delete(agent)
         this.settling.get(ticketOfSession(agent.id) ?? '')?.abort()
         const ticket = this.ticketOf(agent)
         const assignment = ticket && runningAssignment(ticket)
@@ -518,12 +549,15 @@ export class DshExecutor implements Executor {
         }
         return
       }
-      // The turn a stop of the worker's subagents woke and cancelled is no turn of the worker's.
-      if (status !== 'idle' || cancelled.delete(agent) || this.host.closing()) return
+      // The turn a stop of the worker's subagents woke and cancelled is no turn of the worker's. A cancel this plugin issued
+      // for an operator stop, handoff or Project pause is expected too, so its user abort is not a second native stop.
+      if (status !== 'idle' || this.host.closing()) return
+      const expectedStop = this.expectedStops.delete(agent)
+      if (cancelled.delete(agent)) return
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (ticket && assignment && this.runsAssignment(agent, ticket, assignment) && liveTicket(ticket)) {
-        void this.background(this.workerIdle(ticket, assignment, agent))
+        void this.background(this.workerIdle(ticket, assignment, agent, expectedStop))
       }
     }))
     // A person's message typed into a worker's Session, which the ticket does not record.
@@ -645,7 +679,7 @@ export class DshExecutor implements Executor {
       }))
     }
   }
-  private async workerIdle(ticket: Ticket, idle: Assignment, agent: Agent): Promise<void> {
+  private async workerIdle(ticket: Ticket, idle: Assignment, agent: Agent, expectedStop = false): Promise<void> {
     await agent.whenIdle()
     // A turn that failed for a passing reason goes on after its backoff, which is no end of the turn.
     if (this.resuming.has(idle.id) || agent.status !== 'idle') return
@@ -666,13 +700,20 @@ export class DshExecutor implements Executor {
     const before = live()
     if (!before || this.host.closing()) return
     const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
-    if (end?.data.reason.kind === 'aborted' && end.data.reason.reason.kind === 'user'
-      && sourceTrigger(this.host, before)?.source === 'main-session') {
-      this.host.store.atomic(() => {
-        const at = new Date(end.time).toISOString()
-        this.host.engine.turnEnded(ticket.id, idle.id, at)
-        this.relay(executionStatus(before, 'interrupt_turn', agent.id, at, idle.id), before)
-      })
+    if (end?.data.reason.kind === 'aborted' && end.data.reason.reason.kind === 'user') {
+      // A cancel this plugin issued (operator stop already turning into a hard stop, a handoff, a Project hard pause, a
+      // shutdown) is not a person pressing Stop in the native DSH UI.
+      if (expectedStop) return
+      if (before.manualStop?.scope === 'project') return
+      if (!this.runsAssignment(agent, before, idle)) return
+      // A native Stop is the same hard stop as the panel's single-Worker stop: end the Assignment, write the worker stop,
+      // and let the stop path send the PM/Router execution receipt.
+      try {
+        this.host.engine.stopAssignment(before.id, idle.id)
+      } catch (error) {
+        if (error instanceof UserError && (error.code === 'assignmentEnded' || error.code === 'ticketEnded')) return
+        throw error
+      }
       return
     }
     // A turn a person started in the Session is the person's work, which goes on in the background as any turn's does.

@@ -64,8 +64,12 @@ export interface Executor {
    * or `Engine.deliveryFailed`, and through `Engine.inputsRead` once its worker's Session takes them into a step.
    */
   deliver(ticket: Ticket, assignment: Assignment): void
-  /** End an assignment's work, such as cancelling its Session's turn; called after the ticket or assignment has already ended in the domain. */
-  stop(ticket: Ticket, assignment: Assignment, reason: string): void
+  /**
+   * End an assignment's work, such as cancelling its Session's turn; called after the ticket or assignment has already ended
+   * in the domain. It may return the cleanup it started (killing shell jobs, releasing subagents) so a caller that must not
+   * start a replacement Worker (a Project hard pause or a Ticket handoff) can wait for it and report a real failure.
+   */
+  stop(ticket: Ticket, assignment: Assignment, reason: string): void | Promise<void>
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */

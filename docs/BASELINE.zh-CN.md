@@ -340,6 +340,18 @@ P3-B 只做 Agent 之间的执行权交接：同 Project 保留 Ticket/Mandate/w
 
 改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/sessions.ts`、`archive-reconcile.ts`、`runtime.ts`、`resources.ts`、`views/records.ts`、`views/tickets.ts`、`views/projects.ts`、`tools/main.ts`、`cards.ts`；`src/client/ticket.tsx`、`projects.tsx`、`locales.ts`；`docs/001`、`002`、`005`、`007`、`P3_HANDOFF`、本文件；`tests/handoff.spec.ts` 及既有 handoff 相关测试。
 
+## 已完成的 P3 审核修复
+
+本轮按审核复现日志修复 5 组问题，均未 push、未启用真实 GitHub、未动系统 DSH/profile。
+
+- **原生 DSH 停止生成 = hard stop**：`DshExecutor.workerIdle` 识别当前 Worker 的 `turn/end` 为 `aborted` + `reason.kind='user'`，调用与面板相同的 `Engine.stopAssignment`（`Tickets.hardStopWorker`，scope worker），Assignment 结束为 `stoppedByOperator`、写 `manualStop.scope='worker'`，PM/主 Session 收到 `execution_status`（`needs_user_approval`）。插件自己发起的 cancel 在发出前记录 expected，`workerIdle` 不再二次识别；Project hard pause 的 `manualStop.scope='project'`、handoff 旧 Assignment 的 turn end 也忽略。
+- **cleanup 失败不再假成功**：`Executor.stop` 可返回 cleanup Promise；`DshExecutor.track`/`stopping` 保留 rejection，launch 在准备目录、创建替换 Session 之前等待，失败则不启动。`pauseProjectReport` 等待所有 cleanup，失败 Ticket 从 `workers.stopped` 移到 `workers.failures`，API 与 `projectPausedByUser` 聚合提醒同步；同 Project transfer 在 cleanup 成功后才 start，新 Assignment 失败时结束为 `handoffCleanupFailed`、Ticket 保持 open 并记录 delivery error，不创建新 Session。
+- **Handoff 绑定 Assignment**：`HandoffEndpoint.assignmentId`（源必须、目标记录）；跨 Project 请求 id 含源 Assignment/Session，h1 后同内容生成新请求；接收时要求源 Project active、无 manualStop、latest Assignment id 与 `from.assignmentId` 一致且 Session 匹配；用户批准 + PM revive 后的旧请求拒绝。升级前无 sessionId 的 Assignment 用 `assignmentSessionId` 推导 base Session；无 assignmentId 的旧 Handoff 明确拒绝，重新请求时原地升级绑定。
+- **重复决策回执**：accepted 再 reject、rejected 再 accept 抛 `handoffHandled`；同 action 幂等；PM 工具回执按 Engine 返回的 `handoff.status` 写 accepted/rejected，不再按本次参数。
+- **同 Project Worker→PM 缺口**：新增 PM 工具 `orchestrator_project_ticket_handoff_new_ticket`（`Engine.splitTicket`）：Worker 报告越界后，PM 在同 Project 新建独立 Ticket（新 Decision/Mandate/worktree），源 Ticket 停 Worker 并以 `handedOff` 结束，无 parentId。PM 工具边界现为 9 个。
+
+改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/http.ts`、`tools/main.ts`、`sessions.ts`；`src/client/locales.ts`；`docs/001`、`002`、`007`、`P3_HANDOFF`、本文件；新增 `tests/p3-audit-fixes.spec.ts`，更新 handoff/manual-stop/core-engine/model-surface 等测试。
+
 ## 验证
 
 P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本机验证记录：
@@ -368,6 +380,12 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - 既有 `projects`、`project-tickets`、`manual-stop`、`http`、`panel-project`、`pm-tools`、`locales`、`archive-reconcile` 定向通过。
 - `runtime` 定向 99 项中 98 通过，唯一失败仍是既有 Windows Git 配置路径转义项。
 
+2026-11-11 在本机验证 P3 审核修复：
+
+- `tsc --noEmit` 通过；`tsdown` 打包通过。
+- 新增 `tests/p3-audit-fixes.spec.ts` 14 项全通过：原生 DSH user abort 变 hard stop（Assignment/标签/PM 回执）；插件 cancel 与 handoff 旧 Session turn 不误识别；project hard pause cleanup rejection 进入 API `workers.failures` 与 Router notice、`stopped` 不含该项；transfer cleanup 失败不创建 replacement Session、旧 job 保持、新 Assignment `handoffCleanupFailed`；旧请求在 allow-resume + revive 后拒绝、h1 后同内容新请求、pre-P3 无 sessionId 推导、无 assignmentId 旧记录拒绝并原地升级；矛盾决策 `handoffHandled` 与工具回执按实际状态；同 Project split 源票 `handedOff` 且无 parentId，并验证 PM 工具入口。
+- `handoff`、`manual-stop`、`projects`、`project-tickets`、`core-engine`、`model-surface`、`archive-reconcile`、`http`、`pm-tools`、`locales`、`views`、`panel-project` 定向与 `runtime`（除既有 Git 配置路径转义 1 项）通过。
+
 ## 后续顺序
 
 1. 权限控制（初版已完成）
@@ -383,7 +401,7 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 11. P2.9 Project 状态变更 domain events（已完成；仅审计/测试，不 relay）
 12. 任务交接 P3-A 人工停止标签 / Project hard pause / PM revive / 用户批准（已完成）
 13. 任务交接 P3-B 同 Project 换执行者、跨 Project 新 Ticket（已完成；设计见 [P3_HANDOFF.zh-CN.md](P3_HANDOFF.zh-CN.md)）
-14. PM 直接回答 child attention、同 Project Worker→PM 新 Ticket 独立入口（留待后续；目前 PM 可用 `orchestrator_project_ticket_create` 建新票）
+14. PM 直接回答 child attention（留待后续；同 Project Worker→PM 新 Ticket 已由 `orchestrator_project_ticket_handoff_new_ticket` 补齐）
 15. 意外中断与恢复
 16. 再扩展新功能
 

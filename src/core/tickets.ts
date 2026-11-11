@@ -31,6 +31,16 @@ export interface HardStopWorkerOptions {
   assignmentId?: string
   /** The Project whose hard pause stops the Worker. */
   projectId?: string
+  /** Receives the Executor's background cleanup, which a Project hard pause waits for before reporting the Worker stopped. */
+  cleanups?: { ticketId: string; work: Promise<void> }[]
+}
+/** A transfer that has recorded its Handoff and ended the old Worker, but has not started the new Assignment yet. */
+export interface TransferStart {
+  ticket: Ticket
+  assignmentId: string
+  handoffId: string
+  /** The Executor's cleanup of the old Worker's background work, which the next Worker must wait for. */
+  work?: Promise<void>
 }
 
 /**
@@ -257,7 +267,14 @@ export class Tickets extends EnginePart {
     }
     if (!labelled && options.scope === 'worker') return this.require(ticketId)
     ticket.updatedAt = this.now()
-    if (assignment) this.options.executor.stop(ticket, assignment, OPERATOR_STOP)
+    if (assignment) {
+      const cleanup = this.options.executor.stop(ticket, assignment, OPERATOR_STOP)
+      if (cleanup && options.cleanups) {
+        const work: Promise<void> = Promise.resolve(cleanup)
+        work.catch(() => {})
+        options.cleanups.push({ ticketId, work })
+      }
+    }
     this.repo.tickets.save(ticket)
     if (labelled) this.emit('ticket.manualStopSet', { ticketId, scope: options.scope })
     return this.require(ticketId)
@@ -318,13 +335,15 @@ export class Tickets extends EnginePart {
     return this.require(ticketId)
   }
   /**
-   * Move a Ticket to a new Worker inside its Project: end the current Assignment with `handedOff` and stop its Session,
-   * record the transfer on both sides of the same Ticket, brief the new Worker, and start one new Assignment under the
-   * unchanged Mandate and worktree with Session `worker-<ticketId>-h<seq>`. The Ticket stays open; no Decision is created.
+   * Move a Ticket to a new Worker inside its Project: end the current Assignment with `handedOff` and ask the Executor to
+   * stop its Session, record the transfer on both sides of the same Ticket, brief the new Worker, and create (but do not yet
+   * start) one new Assignment under the unchanged Mandate and worktree in Session `worker-<ticketId>-h<seq>`. The caller waits
+   * for `work` before `completeTransfer`, so a failed cleanup cannot start a replacement Worker over the old one's work.
    * @throws UserError when the ticket is unknown or ended, is not the Project's, carries a manual stop, or has no running or
    * pending Assignment to hand over.
    */
-  transfer(ticketId: string, projectId: string, pmSessionId: string, request: { reason: string; summary: string; unfinished?: string[] }): Ticket {
+  beginTransfer(ticketId: string, projectId: string, pmSessionId: string,
+    request: { reason: string; summary: string; unfinished?: string[] }): TransferStart {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     if (ticket.projectId !== projectId) throw new UserError('notProjectTicket')
@@ -332,14 +351,13 @@ export class Tickets extends EnginePart {
     const latest = latestAssignment(ticket)
     if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
     const at = this.now()
-    const handoff = (seq: number): Handoff => ({ id: key('handoff', ticketId, 'transfer', String(seq), request.summary),
+    const seq = this.transferCount(ticket) + 1
+    const record: Handoff = { id: key('handoff', ticketId, 'transfer', String(seq), request.summary),
       at, kind: 'transfer', status: 'accepted',
-      from: { ticketId, projectId, sessionId: assignmentSessionId(ticketId, latest) },
+      from: { ticketId, projectId, assignmentId: latest.id, sessionId: assignmentSessionId(ticketId, latest) },
       to: { ticketId, projectId, sessionId: workerSessionId(ticketId, seq) },
       reason: request.reason, summary: request.summary, ...request.unfinished?.length ? { unfinished: request.unfinished } : {},
-      approvedBy: { kind: 'pm', sessionId: pmSessionId }, decidedAt: at })
-    const seq = this.transferCount(ticket) + 1
-    const record = handoff(seq)
+      approvedBy: { kind: 'pm', sessionId: pmSessionId }, decidedAt: at }
     this.endAssignment(ticket, latest, 'handedOff')
     this.requeueUntaken(ticket, latest)
     if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
@@ -348,12 +366,41 @@ export class Tickets extends EnginePart {
     ticket.handoffs = [...ticket.handoffs ?? [], record]
     this.briefHandoff(ticket, record)
     const assignment = this.newAssignment(ticket)
+    record.to.assignmentId = assignment.id
     ticket.updatedAt = at
+    const cleanup = this.options.executor.stop(ticket, latest, 'handedOff')
     this.repo.tickets.save(ticket)
-    this.options.executor.stop(ticket, latest, 'handedOff')
+    return { ticket: this.require(ticketId), assignmentId: assignment.id, handoffId: record.id, ...cleanup ? { work: cleanup } : {} }
+  }
+  /**
+   * Start the Assignment `beginTransfer` created, once the old Worker's background cleanup succeeded, and report the handoff.
+   * @throws UserError when the ticket ended meanwhile or the Assignment is no longer pending.
+   */
+  completeTransfer(ticketId: string, assignmentId: string, handoffId: string): Ticket {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const assignment = ticket.assignments.find(item => item.id === assignmentId)
+    if (!assignment) throw new UserError('assignmentEnded')
+    if (assignment.state === 'running') return ticket
+    if (assignment.state !== 'pending') throw new UserError('assignmentEnded')
     this.options.executor.start(ticket, assignment)
-    this.emit('ticket.handedOff', { ticketId, handoffId: record.id, kind: 'transfer', toTicketId: ticketId,
-      toSessionId: record.to.sessionId! })
+    const handoff = ticket.handoffs?.find(item => item.id === handoffId)
+    this.emit('ticket.handedOff', { ticketId, handoffId, kind: 'transfer', toTicketId: ticketId,
+      toSessionId: handoff?.to.sessionId ?? assignmentSessionId(ticketId, assignment) })
+    return this.require(ticketId)
+  }
+  /**
+   * A transfer whose old Worker could not be cleaned up keeps its Ticket open with no replacement Worker: the new Assignment
+   * ends as `handoffCleanupFailed` and the failure stays on the Ticket until a person retries. It does not start anything.
+   */
+  failTransfer(ticketId: string, assignmentId: string, error: string): Ticket {
+    const ticket = this.require(ticketId)
+    const assignment = ticket.assignments.find(item => item.id === assignmentId)
+    if (!assignment || assignment.state !== 'pending') return ticket
+    this.endAssignment(ticket, assignment, 'handoffCleanupFailed')
+    ticket.delivery = { error: error.slice(0, 300), at: this.now() }
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
     return this.require(ticketId)
   }
   /**

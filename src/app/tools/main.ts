@@ -3,8 +3,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { UserError, HANDOFF, PROJECT_TICKETS, followupOwners, key, latestSessionId, reasonText, type Decision, type DecisionKind,
-  type EngineForMainSession, type EngineForPM, type EngineForPeople, type ProjectProfile, type ProjectTicketTask, type Ticket }
-  from '../../core/index.ts'
+  type EngineForMainSession, type EngineForPM, type EngineForPeople, type ProjectProfile, type ProjectTicketTask,
+  type Ticket, type TicketSplitRequest } from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
@@ -352,6 +352,38 @@ function projectTicketHandoffTool(host: MainToolsHost, project: ProjectProfile):
   })
 }
 /**
+ * `orchestrator_project_ticket_handoff_new_ticket`: a Worker reported work beyond its Ticket; the PM creates an independent
+ * Ticket for it in the same Project and ends the source Ticket as handedOff. No parent Ticket is created.
+ */
+function projectTicketSplitTool(host: MainToolsHost, project: ProjectProfile): Tool {
+  return tool({
+    name: 'orchestrator_project_ticket_handoff_new_ticket',
+    description: 'When a Worker reports work beyond its Ticket, create an independent Ticket for that work in this Project and '
+      + 'end the source Ticket as handedOff. The new Ticket gets its own Decision, Mandate, worktree and Worker, and the two '
+      + 'Tickets are peers (no parent Ticket). Only this Project\'s PM may call it; a Worker can only report the need.',
+    schema: z.object({
+      ticket_id: z.string().min(1).max(200),
+      title: z.string().trim().min(1).max(PROJECT_TICKETS.title).describe('The title of the new independent Ticket.'),
+      goal: z.string().trim().min(1).max(PROJECT_TICKETS.goal).describe('The outcome the new Ticket must reach.'),
+      scope: z.string().trim().max(PROJECT_TICKETS.scope).optional(),
+      worktree_name: WorktreeNameSchema.optional(),
+      reason: z.string().trim().min(1).max(500).describe('Why the work is beyond the source Ticket.'),
+      summary: HandoffSummarySchema.describe('What the new Worker needs: the work, decisions and links.'),
+      unfinished: HandoffUnfinishedSchema,
+    }).strict(),
+    execute: async args => {
+      const ticket = host.store.tickets.get(args.ticket_id)
+      if (!ticket || ticket.projectId !== project.id) throw new UserError('notProjectTicket')
+      const result = await host.quietly(() => host.engine.splitTicket(project.id, project.pmSessionId, args.ticket_id,
+        args as TicketSplitRequest))
+      host.requestPass()
+      return { handoff_id: result.handoff.id, ticket: result.ticket ? projectTicketCard(result.ticket) : undefined,
+        source_ticket_id: args.ticket_id,
+        note: 'The source Ticket ended as handedOff; the new independent Ticket and its Worker start separately.' }
+    },
+  })
+}
+/**
  * `orchestrator_project_ticket_handoff_to_project`: the source PM asks another Project's PM to take over work beyond this
  * Project. The target PM decides; nothing ends or moves until it accepts.
  */
@@ -413,17 +445,19 @@ function projectHandoffDecideTool(host: MainToolsHost, project: ProjectProfile):
     execute: async args => {
       const result = await host.quietly(() => host.engine.decideProjectHandoff(project.id, project.pmSessionId, args.handoff_id,
         { action: args.action, ...args.reason ? { reason: args.reason } : {} }))
+      // The Engine is authoritative: a repeated same action keeps the record's status, and a contradictory one was refused.
+      const status = result.handoff.status
       const sourceProject = host.store.projects.get(result.handoff.from.projectId)
       const sourceTicket = result.handoff.from.ticketId ? host.store.tickets.get(result.handoff.from.ticketId) : undefined
-      const payload = { kind: 'handoff_decision', handoff_id: result.handoff.id, action: args.action,
+      const payload = { kind: 'handoff_decision', handoff_id: result.handoff.id, action: status,
         from_ticket_id: result.handoff.from.ticketId, to_ticket_id: result.handoff.to.ticketId, to_project_id: project.id,
         ...result.handoff.decisionReason ? { reason: result.handoff.decisionReason } : {} }
-      host.sessions.relay(`handoff-decision:${result.handoff.id}:${args.action}`, JSON.stringify(payload),
-        `Handoff ${args.action === 'accept' ? 'accepted' : 'rejected'}: ${result.handoff.request?.title ?? result.handoff.id}`,
+      host.sessions.relay(`handoff-decision:${result.handoff.id}:${status}`, JSON.stringify(payload),
+        `Handoff ${status === 'accepted' ? 'accepted' : 'rejected'}: ${result.handoff.request?.title ?? result.handoff.id}`,
         relaySession(sourceTicket, sourceProject))
       host.requestPass()
       return { handoff: result.handoff, ...result.ticket ? { ticket: projectTicketCard(result.ticket) } : {},
-        note: args.action === 'accept'
+        note: status === 'accepted'
           ? 'A new independent Ticket was created in this Project; its Worker starts separately. The source Ticket ended as handedOff.'
           : 'The request is rejected; the source Ticket keeps running.' }
     },
@@ -633,6 +667,7 @@ export function pmTools(host: MainToolsHost, project: ProjectProfile): Tool[] {
     projectTicketMessageTool(host, project),
     projectTicketReviveTool(host, project),
     projectTicketHandoffTool(host, project),
+    projectTicketSplitTool(host, project),
     projectHandoffRequestTool(host, project),
     projectHandoffDecideTool(host, project),
     tool({

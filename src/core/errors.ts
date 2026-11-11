@@ -36,6 +36,7 @@ export const USER_ERRORS = {
   handoffHandled: ['refused', 'This handoff was already decided'],
   handoffTarget: ['refused', 'A handoff needs another active Project in this installation; it cannot target its own Project'],
   invalidHandoff: ['refused', 'Invalid handoff request: {reason}'],
+  handoffCleanupFailed: ['refused', 'The background work of the old Worker could not be stopped ({error}); no replacement Worker was started and the Ticket stays open for a retry'],
   sourceThread: ['refused', 'This is the thread the ticket started on; it stays subscribed'],
   followedThread: ['refused', 'This thread is the ticket\'s own, such as its pull request\'s; it stays subscribed'],
   notFollowing: ['refused', 'This ticket does not follow that thread'],

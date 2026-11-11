@@ -1,6 +1,6 @@
 # P3 任务交接设计
 
-> 状态：P3-A（人工停止标签、Project hard pause、PM revive、用户批准）与 P3-B（同 Project 换执行者、跨 Project 新 Ticket）均已实现。本文保留设计边界与决策记录；实现细节见 `docs/001`、`docs/002`、`docs/005`、`docs/007` 与 BASELINE。
+> 状态：P3-A、P3-B 与 P3 审核修复（原生 DSH 停止、cleanup 失败传播、Handoff assignment 绑定、同 Project split）均已实现。本文保留设计边界与决策记录；实现细节见 `docs/001`、`docs/002`、`docs/005`、`docs/007` 与 BASELINE。
 
 ## 1. 先区分三种“交接”
 
@@ -99,6 +99,8 @@
 
 这条不是 handoff，不创建 `Handoff` 记录；它只复用 hard stop 流程并增加 parent notification。
 
+P3 审核补充：真实 DSH 的“停止生成”会让 `turn/end` 为 `aborted` + `reason.kind='user'`，但不会自动结束 Assignment。`DshExecutor.workerIdle` 把它识别为人工 hard stop，调用同一个 `Engine.stopAssignment`，从而结束 Assignment、写 `manualStop.scope='worker'` 并发 `execution_status`（带 `needs_user_approval`）。插件自己发起的 cancel（operator stop、handoff、Project hard pause、shutdown、后台清理）必须在发出前标记 expected，`workerIdle` 不得再识别；已有 `manualStop.scope='project'` 的 Ticket 和 handoff 旧 Assignment 的 turn end 也忽略。
+
 ### 3.4 PM 的“项目暂停”按钮
 
 Project 控制中增加专门的**项目暂停**入口，按下后明确选择：
@@ -173,6 +175,13 @@ P3-B 实现补充：
 - 跨 Project：源 PM 用 `orchestrator_project_ticket_handoff_to_project` 写 pending 并通知目标 PM；目标 PM 用 `orchestrator_project_ticket_handoff_decide` 接收/拒绝。接收时经正常 delegated 路径在目标 Project 新建独立 Ticket（新 Decision/Mandate/worktree），双向写 accepted Handoff，源 Ticket 停止 Worker 并以 `handedOff` 结束；不移动/复制 worktree，不传未提交改动。目标 paused/archived/ended 或非其 PM 均拒绝。
 - PM 工具边界增加 `orchestrator_project_ticket_handoff`、`orchestrator_project_ticket_handoff_to_project`、`orchestrator_project_ticket_handoff_decide`；Worker 只能报告需要接手，没有换 Session 的工具。
 
+P3 审核修复补充：
+
+- `HandoffEndpoint.assignmentId`：源端必须记录请求时的 Assignment id，目标端在接收时记录目标 Ticket 的首个 Assignment。跨 Project 请求 id 包含源 Assignment/Session；transfer 后换到 `-h1` 的同一 Ticket 再发同样内容会得到新请求。接收时必须 `latestAssignment(origin).id === from.assignmentId` 且 Session 匹配；用户批准 + PM revive 后的新 Assignment 会拒绝。升级前没有 `sessionId` 的 Assignment 用 `assignmentSessionId` 推导 base Session；没有 `assignmentId` 的旧 Handoff 记录明确拒绝并要求重新请求，不静默绑定新 Assignment。
+- 后台 cleanup 失败传播：`Executor.stop` 可返回 cleanup Promise；`DshExecutor.track`/`stopping` 保留 rejection，launch 在准备目录/创建 Session 前等待，失败即不启动替换 Worker。Project hard pause 的 `pauseProjectReport` 等待 cleanup，失败项从 `workers.stopped` 移到 `workers.failures`，Router `projectPausedByUser` 与 API 同步。同 Project transfer 在 cleanup 成功后才启动新 Assignment；失败时新 Assignment 结束为 `handoffCleanupFailed`、Ticket 保持 open 并记录 delivery error，不创建新 Session。
+- 重复决策：已 accepted 再 reject、已 rejected 再 accept 抛 `handoffHandled`；同一 action 幂等。PM 工具的回执按 Engine 返回的 `handoff.status` 写 accepted/rejected，不按本次请求参数。
+- 同 Project Worker→PM 缺口：新增 `orchestrator_project_ticket_handoff_new_ticket`。Worker 报告越界工作后，PM 可在同 Project 新建独立 Ticket（新 Decision/Mandate/worktree），源 Ticket 停止 Worker 并以 `handedOff` 结束；两个 Ticket 通过 Handoff 关联，无 parentId。PM 工具边界现为 9 个。
+
 ## 5. 批准层级
 
 | 场景 | 批准者 |
@@ -190,6 +199,7 @@ P3-B 实现补充：
 - `orchestrator_trigger_handback` 保持不变，只处理消息退回。
 - 同 Project transfer 新增 PM 工具 `orchestrator_project_ticket_handoff`（P3-B 已实现）；Worker 只能报告，不能调用。
 - 跨 Project 新增 PM-to-PM 请求/决定工具 `orchestrator_project_ticket_handoff_to_project` 与 `orchestrator_project_ticket_handoff_decide`（P3-B 已实现；目标 PM 接收/拒绝）；不需要 Router 单独批准。
+- 同 Project Worker→PM 越界新增 PM 工具 `orchestrator_project_ticket_handoff_new_ticket`（审核修复已实现）：目标 Ticket 与源 Ticket 都留在本 Project，源 Ticket 以 `handedOff` 结束，不建父子关系。
 - 人要求暂停任务：建议新增 PM/Router 的 stop 工具（例如 `orchestrator_project_ticket_stop`，mode=`assignment`|`ticket`），因为当前 PM 只有读取/建单/消息/汇报工具，主入口也没有 stop 工具；否则“上级终止任务”只能走面板 API。
 - 人工直接停止：面板/API 走 hard stop，并在父级写入 `userStopped` 提醒；不新增 handoff 工具。
 - PM 的“项目暂停”：Project 控制/PM 面板增加 soft/hard 二选一入口，复用 `POST projects/:id/pause`；hard 额外写 Router `projectPausedByUser` 提醒，并只清除 `scope: 'project'` 标签。
@@ -200,7 +210,7 @@ P3-B 实现补充：
 ## 7. 验收场景（草案）
 
 1. 同 Project Worker→Worker：旧 Assignment `handedOff`，新 Session `...-h1`，Ticket/worktree/Mandate 不变，旧 Session 停止。
-2. 同 Project Worker→PM：PM 新建独立 Ticket，源 Ticket `handedOff` 结束，不建父子关系。
+2. 同 Project Worker→PM：PM 用 `orchestrator_project_ticket_handoff_new_ticket` 新建独立 Ticket，源 Ticket `handedOff` 结束，不建父子关系（审核修复已实现）。
 3. 跨 Project：目标 PM 接收，目标 Project 新建 Ticket/Mandate；源 Ticket `handedOff`；无 parentId。
 4. 权限：handoff 不能扩大 `allowTools`/Mandate；paused/archived/ended Project 拒绝。
 5. 旧 Session：历史保留、自动回合停止；handoff 摘要和批准记录可读。
