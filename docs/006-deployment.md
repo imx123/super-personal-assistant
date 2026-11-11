@@ -75,12 +75,14 @@ Run this block once, on a machine that has no `superagent` profile yet:
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.1-rc.3
 git clone <this repository> dsh-superagent && cd dsh-superagent
-pnpm install && pnpm build
+pnpm install
 dsh superagent --from-default-profile web --dump-config > /dev/null
 dsh plugin --profile superagent add "link:$PWD"
 ```
 
 The pinned version above is public; other versions must satisfy `engines.dsh` in `package.json`.
+
+`pnpm install` runs the `prepare` script, which builds `lib/` after the dependencies are installed, so the bundle is loadable without a separate build step. Run `pnpm build` after you edit the source.
 
 The fourth command creates `~/.dsh/profiles/superagent` from the DeepSeek Harness Web template. The fifth installs this bundle. Set `DSH_HOME` to relocate the default `~/.dsh` directory.
 
@@ -241,7 +243,7 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 
 1. Wait until no Executor is in the middle of a turn.
 2. Back up `<stateDir>/orchestrator.sqlite`.
-3. Run `git pull && pnpm install && pnpm build`.
+3. Run `git pull && pnpm install`; `install` rebuilds `lib/` through `prepare`.
 4. Run `scripts/dsh-superagent restart` and inspect its status.
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.

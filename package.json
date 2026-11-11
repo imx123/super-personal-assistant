@@ -8,6 +8,9 @@
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "bin": {
+    "dsh-superagent": "./scripts/dsh-superagent"
+  },
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",
@@ -28,7 +31,9 @@
     "LICENSE-MIT",
     "NOTICE",
     "prompts",
-    "skills"
+    "skills",
+    "scripts",
+    "examples"
   ],
   "dsh": {
     "bundle": {
@@ -49,6 +54,8 @@
   },
   "scripts": {
     "build": "tsdown",
+    "prepare": "tsdown",
+    "prepack": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "pnpm typecheck && pnpm test && pnpm build"

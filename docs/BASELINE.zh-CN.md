@@ -376,7 +376,7 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - `model-surface` 通过，orchestrator 预算 61,500 未变。
 - 定向 `runtime`（除既有 Git 配置路径转义 1 项）、`projects`、`project-tickets`、`settings`、`panel-settings`、`role-models` 通过。
 - 全量 63 个测试文件、1251 项：1203 通过，48 失败。失败仍全是既有 Windows 环境问题：sandbox `spawn EPERM`（`service-script`、`sources` 事件消费者、`environment` 等）、Windows 路径分隔符/权限位（`docs` 3 项、`store` 1 项、`runtime` Git 配置转义 1 项）以及 `prompts` 的绝对路径读取 1 项；没有新增逻辑失败。
-- 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录，测试用本地 `node node_modules/vitest/vitest.mjs --pool=threads` 运行；`vitest` 默认 forks 池会 `spawn EPERM`，这是环境限制，不是测试失败。
+- 本机 `pnpm`/corepack 在 sandbox 下无法创建临时目录；`vitest.config.ts` 已将 `pool` 固定为 `'threads'`，默认 `node node_modules/vitest/vitest.mjs run` 不再需要 `--pool=threads`；若 sandbox 加载 Vitest 配置仍 `spawn EPERM`，用 `--configLoader runner`，这是 runner 限制，不是测试失败。
 
 2026-11-10 在本机验证 P3-A：
 
@@ -403,7 +403,7 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - `npx tsc --noEmit` 通过；`tsdown` 打包通过（`lib/index.js` 607 kB 及声明文件）。
 - `tests/p3-audit-fixes.spec.ts` 从 14 项扩到 28 项全通过：新增 split 与跨 Project 接收的 cleanup 失败（无目标 Ticket、Handoff `failed`、delivery error）、cleanup 成功前不创建目标（手动控制 cleanup Promise，非计时）、跨 Project accept 等待期间 reject 被 `handoffHandled` 拒绝、并发 retry 已接管时 `failHandoffAway` 不写当前 Worker 的 delivery error、transfer 等待期间 stop 替代 Assignment 与第二次 transfer 抢先（Handoff `failed`、失败可见、第二次仍完成）、失败 transfer 的重试仍使用预留的 `-h1` Session、重启恢复（用 seed 写入三份 `starting` 状态后由新 Runtime 重开同一 SQLite store：split/accept/transfer 均变为 `failed` + delivery error、不创建目标 Ticket、不启动替代 Worker、三张源 Ticket 均可 retry，恢复第二次调用返回 0）、idle 时停止后原生 Stop、重复 idle 不二次停止、cancel 后新回合识别原生 Stop、main-session Ticket 原生 Stop 保留 `idleAt`/`interruptedAt` 与回执。
 - `handoff` 13 项、`manual-stop` 15 项、`projects` 15 项、`core-engine` 115 项、`project-tickets` 27 项、`pm-tools`、`http` 5 项、`views` 15 项、`archive-reconcile` 5 项、`model-surface` 7 项、`locales` 全通过；`runtime` 159/160，唯一失败仍是既有 Windows Git 配置路径转义项（与本次改动无关）。
-- 全量 67 个文件、1320 项：1272 通过、48 失败；失败全部集中在既有 Windows 环境问题（`spawn EPERM` 的 `service-script`/`sources`/`environment`/`commands`/`deployment`、路径分隔符导致的 `docs` 3 项、路径/权限导致的 `store`/`prompts`/`runtime` 各 1 项），无新增逻辑失败。运行方式：`node node_modules/vitest/vitest.mjs run --configLoader runner`（默认 config 打包在本 sandbox 会 `spawn EPERM`）。
+- 全量 67 个文件、1320 项：1272 通过、48 失败；失败全部集中在既有 Windows 环境问题（`spawn EPERM` 的 `service-script`/`sources`/`environment`/`commands`/`deployment`、路径分隔符导致的 `docs` 3 项、路径/权限导致的 `store`/`prompts`/`runtime` 各 1 项），无新增逻辑失败。运行方式：`pnpm test`（`vitest.config.ts` 已设 `pool: 'threads'`，无需再传 `--pool=threads`）；本 sandbox 加载配置若 `spawn EPERM`，用 `node node_modules/vitest/vitest.mjs run --configLoader runner`（runner 限制，不是测试失败）。
 
 ## 后续顺序
 

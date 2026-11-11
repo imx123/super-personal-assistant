@@ -87,14 +87,16 @@ cordis.patch.yml  预设（router / worker / PM）
 在仓库根目录：
 
 ```bash
+pnpm install     # prepare 钩子在依赖装好后自动构建 lib/
+pnpm test        # 默认命令；vitest.config.ts 已固定 pool: 'threads'
 node node_modules/typescript/bin/tsc --noEmit
 node node_modules/tsdown/dist/run.mjs
-node node_modules/vitest/vitest.mjs run --pool=threads
+node node_modules/vitest/vitest.mjs run
 ```
 
 本机 Windows 环境的已知问题：
 
-- Vitest 默认 forks 池可能 `spawn EPERM`，用 `--pool=threads`；
+- `vitest.config.ts` 已设置 `pool: 'threads'`，默认 `pnpm test` / `node node_modules/vitest/vitest.mjs run` 不再需要 `--pool=threads`；若本 sandbox 在加载 Vitest 配置时仍 `spawn EPERM`，用 `node node_modules/vitest/vitest.mjs run --configLoader runner`（runner 限制，不是测试失败）；
 - sandbox 下 `pnpm`/corepack 可能无法建临时目录；
 - 全量约 1251 项中，约 48 项既有失败，均为 Windows 路径分隔符、权限位、`spawn EPERM`、绝对路径读取等环境问题，不是新增逻辑失败；
 - `docs.spec` 的 3 项路径分隔符失败属于同一类。

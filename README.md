@@ -36,7 +36,16 @@ Read the numbered documents in order; each builds only on the ones before it.
 
 ## Development
 
-`pnpm check` runs the typecheck, the tests and the build.
+`pnpm install` installs the dependencies and builds `lib/` through the `prepare` script, so a clean clone is loadable. `pnpm check` runs the typecheck, the tests and the build; run `pnpm build` on its own after editing the source.
+
+`pnpm test` runs Vitest with the `threads` pool set in `vitest.config.ts`, which avoids the Windows forks-pool `spawn EPERM`. Tests that start real processes may still fail where the sandbox forbids them.
+
+`pnpm pack` runs `prepack` first and ships the fresh `lib/`, the deployment `scripts/` and `examples/`. To check a tarball without installing it:
+
+```sh
+pnpm pack --pack-destination .artifacts
+tar -tf .artifacts/dsh-superagent-0.1.0.tgz
+```
 
 ## License
 
