@@ -158,11 +158,11 @@ Setup must succeed before polling or work starts. Overview lists missing require
 
 ### Management API
 
-The panel uses a local HTTP API that agents can also call. `SETUP.md` uses it to save settings, and the service script reads `GET state`.
+The panel uses a local HTTP API. Reads answer local status tools, such as `scripts/dsh-superagent status` and `GET state`. Every request that changes state is admitted only as the signed DSH Web browser session: the host-only `dsh-auth-…` cookie that `dsh web` sets when you open the URL it prints (the one with the one-time `?token=`). The panel sends that cookie automatically. A local process that has no such session receives 401 even when it sets every header below; a host without the DSH Connection service refuses changes with 503 rather than trusting an unauthenticated caller.
 
-Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. The host must be `127.0.0.1:<port>` or `localhost:<port>`. Missing headers or an `Origin` from another site receive 403.
+Send requests to `http://127.0.0.1:<port>/orchestrator/api/` with `x-orchestrator-request: 1`. The host must be `127.0.0.1:<port>` or `localhost:<port>`, and a state-changing request must also carry an `Origin` naming that same authority. A missing or foreign `Host`, `Origin` or custom header receives 403.
 
-API saves have the panel's permissions. They can change execution environment and setup account fields, unlike saves made through the main Session's tools.
+A save admitted with the browser session has the panel's permissions: it can change execution environment and setup account fields, unlike a save made through the main Session's tools. Those two are what must not be reachable from an unauthenticated local client; the browser session is what makes the caller the operator.
 
 Agents may rely on these routes and fields. The other routes in `src/app/api.ts` serve the panel and change with it.
 
@@ -193,9 +193,14 @@ Health entries are grouped by responsibility:
 A refusal has a status and `error`, its English text:
 
 - 400: an invalid value (`issues`, each with its `path`), a failed account check (`setup`), a fixed refusal (`code` and `values`), or a body that is not JSON or is too large.
+- 401: a state-changing request without the DSH Web browser session.
+- 403: a request whose `Host`, `Origin` or custom header does not name this loopback listener, or a browser request from another site.
 - 404: something that does not exist.
 - 409: a stale revision.
 - 500: anything else.
+- 503: a state-changing request on a host that provides no DSH Connection service to authenticate it.
+
+Errors can quote a CLI or a request. Before a problem, health entry or 500 response is stored or returned, credentials (`token=…`, `Authorization:` headers, known token formats), query-string values and absolute filesystem paths are replaced with `[redacted]` and `<path>`. The raw text is not kept with the error; rerun the failing CLI by hand to see what it prints.
 
 The blocks:
 
@@ -207,9 +212,11 @@ The blocks:
 Changing a repository or CLI runs the corresponding setup check first. A failed check returns 400 with details in `setup`. A successful account change, or any save while setup is pending, returns `restarting: true`. The API is temporarily unavailable while the application restarts.
 
 ```sh
-api=http://127.0.0.1:3082/orchestrator/api
+curl -s -c dsh-cookies -o /dev/null "http://127.0.0.1:<port>/?token=<token>"
+api=http://127.0.0.1:<port>/orchestrator/api
 rev=$(curl -s -H 'x-orchestrator-request: 1' $api/settings | jq '.sources[] | select(.id == "github") | .revision')
-curl -s -X PUT -H 'x-orchestrator-request: 1' -H 'content-type: application/json' $api/settings/source:github \
+curl -s -b dsh-cookies -X PUT -H 'origin: http://127.0.0.1:<port>' -H 'x-orchestrator-request: 1' \
+  -H 'content-type: application/json' $api/settings/source:github \
   -d "{\"value\": {\"enabled\": true, \"config\": {\"repository\": \"acme/widgets\", \"cli\": \"$HOME/.local/bin/gh-agent\"}}, \"revision\": $rev}"
 ```
 
@@ -256,7 +263,7 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `The agent GitHub CLI cannot read its account` | Sign the wrapper in with `auth login` |
 | `@… cannot read …` or `@… cannot push to …` | Give the agent account write access to the repository |
 | `The GitHub Source names no repository.` | Set the repository, `owner/name`, on the GitHub card |
-| A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket |
+| A Ticket fails with `The prepare command failed: …` | The output names the cause, such as a wrong clone path; fix the command, then retry the Ticket. Credentials, query values and absolute paths in that output are replaced before the Ticket and panel show it; run the command by hand to see its raw output |
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
 | `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |

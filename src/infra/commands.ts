@@ -4,6 +4,7 @@ import { basename } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { Deployment } from '../deployment.ts'
+import { redact } from './redact.ts'
 
 const exec = promisify(execFile)
 const TIMEOUT_MS = 90_000
@@ -14,7 +15,11 @@ const TIMEOUT_MS = 90_000
 export class CliError extends Error {
   constructor(message: string, readonly code?: number, readonly exitCode?: number) { super(message) }
 }
-/** Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text. */
+/**
+ * Extracts a sanitized error from a failed subprocess without echoing argv, which may contain message text.
+ * CLI diagnostics can hold tokens, request URLs and machine paths, so the retained message is redacted for storage
+ * and panel display; the raw stderr is not kept with the error.
+ */
 export function commandError(error: unknown, program = 'command'): Error {
   if (error instanceof Error && error.name === 'AbortError') return error
   const exitCode = error && typeof error === 'object' && 'code' in error && typeof error.code === 'number' ? error.code : undefined
@@ -24,9 +29,9 @@ export function commandError(error: unknown, program = 'command'): Error {
     try { parsed = JSON.parse(stderr.slice(stderr.indexOf('{'))) as typeof parsed }
     catch { /* Non-JSON CLI diagnostics are retained below. */ }
     const code = parsed?.error?.code
-    if (parsed?.error?.message) return new CliError(`${parsed.error.message}${code ? ` (${code})` : ''}`, code, exitCode)
+    if (parsed?.error?.message) return new CliError(redact(`${parsed.error.message}${code ? ` (${code})` : ''}`), code, exitCode)
     // `gh` exits non-zero on HTTP errors (such as `gh: Not Found (HTTP 404)`) and on `gh: HTTP 304`, which ETag polling relies on.
-    if (stderr) return new CliError(stderr.slice(0, 2000), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
+    if (stderr) return new CliError(redact(stderr.slice(0, 2000)), Number(/\bHTTP (\d{3})\b/.exec(stderr)?.[1]) || undefined, exitCode)
   }
   return new CliError(`${basename(program)} ${ended(error)}`, undefined, exitCode)
 }
@@ -107,7 +112,7 @@ export class Commands {
       .catch((error: unknown) => { throw membership(error) })
     const result = JSON.parse(output) as { ok: boolean; data: T; error?: { code?: number; message?: string } }
     const code = result.error?.code
-    if (!result.ok) throw membership(new CliError(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`, code))
+    if (!result.ok) throw membership(new CliError(redact(`${result.error?.message ?? 'Feishu command failed'}${code ? ` (${code})` : ''}`), code))
     return result.data
   }
   /** Runs `git` on PATH using the agent's isolated git environment and credential helper. */

@@ -10,6 +10,7 @@ import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Execu
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
+import { redact } from '../infra/redact.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
@@ -404,7 +405,7 @@ export class DshExecutor implements Executor {
             const action = cancelledByOperator ? 'cancel_ticket' : 'stop_assignment'
             void finished.then(
               () => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id), ticket),
-              (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, String(error)), ticket),
+              (error: unknown) => this.host.closing() || this.relay(executionStatus(ticket, action, sessionId, now(), assignment.id, redact(String(error))), ticket),
             ).catch(() => {})
           }
           this.left.get(ticket.id)?.collect.abort(); this.left.delete(ticket.id); this.personal.delete(ticket.id)
@@ -473,12 +474,14 @@ export class DshExecutor implements Executor {
   }
   /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
   private failed(ticketId: string, assignmentId: string, summary: string): void {
+    // A failed report is durable and shown in the panel; only its redacted diagnostic is kept.
+    const detail = redact(summary)
     this.host.store.atomic(() => {
       const ticket = this.host.store.tickets.get(ticketId)
       const assignment = ticket && latestAssignment(ticket)
       if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state === 'ended') return
-      const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
-      this.relay(resultRelay(updated, 'failed', summary), updated)
+      const updated = this.host.engine.report(ticketId, { state: 'failed', summary: detail })
+      this.relay(resultRelay(updated, 'failed', detail), updated)
     })
   }
   /**

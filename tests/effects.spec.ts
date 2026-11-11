@@ -205,3 +205,19 @@ it('refuses a second handler for a kind', () => {
   effects.handle('relay', async () => {})
   expect(() => effects.handle('relay', async () => {})).toThrow('The relay effects already have a handler')
 })
+
+it('stores only a redacted diagnostic for a failed effect, and reports the same redacted text', async () => {
+  effects.handle('notice', async () => {
+    throw new Error('lark-cli failed token=abc123 at https://api.feishu.cn/x?access_token=z while reading /home/me/.config/lark')
+  }, { retry: [1000, 1000] })
+  effects.enqueue('notice', 'secret', { value: {}, summary: 'Notice' })
+  for (let attempt = 0; attempt < 3; attempt++) { await effects.idle(); clock += 1000 }
+  const row = store.db.prepare("SELECT error FROM effect WHERE kind = 'notice' AND key = 'secret'").get() as { error: string }
+  expect(row.error).toContain('lark-cli failed')
+  expect(row.error).toContain('[redacted]')
+  expect(row.error).not.toContain('abc123')
+  expect(row.error).not.toContain('access_token=z')
+  expect(row.error).not.toContain('/home/me')
+  expect(health.notice).toMatchObject({ state: 'error', detail: expect.stringContaining('lark-cli failed') })
+  expect(String((health.notice as { detail: string }).detail)).not.toContain('abc123')
+})

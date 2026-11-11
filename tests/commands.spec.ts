@@ -213,3 +213,20 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
 })
+
+it('redacts credentials, query values and machine paths a CLI prints, keeping the status code and category', () => {
+  const leaky = commandError({ stderr: 'gh: Bad credentials (HTTP 401)\ntoken=abc123\nGET https://api.github.com/user?access_token=z\nat /home/me/.config/gh/hosts.yml', code: 1 })
+  expect(leaky).toBeInstanceOf(CliError)
+  expect(leaky.message).toContain('gh: Bad credentials (HTTP 401)')
+  expect(leaky.message).toContain('token=[redacted]')
+  expect(leaky.message).toContain('access_token=[redacted]')
+  expect(leaky.message).toContain('<path>')
+  expect(leaky.message).not.toContain('abc123')
+  expect(leaky.message).not.toContain('access_token=z')
+  expect(leaky.message).not.toContain('/home/me')
+  expect((leaky as CliError).code).toBe(401)
+  // A JSON error message is redacted the same way, and its code still drives the caller's handling.
+  const json = commandError({ stderr: JSON.stringify({ error: { code: 232011, message: 'bot at https://open.feishu.cn/x?token=abc123 is not in the chat' } }) })
+  expect(json).toMatchObject({ code: 232011 })
+  expect(json.message).not.toContain('abc123')
+})

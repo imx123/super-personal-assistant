@@ -6,6 +6,7 @@ export class Later extends Error {}
 /** Consecutive failures before an effect kind reports an error, matching the Sources poll failure threshold. */
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
+import { redact } from '../infra/redact.ts'
 import type { Store } from './store.ts'
 
 export interface EffectPayloads {
@@ -139,14 +140,15 @@ export class Effects {
       this.store.db.prepare(`UPDATE effect SET due = ? WHERE ${own}`).run(this.now() + handler.retry[0], ...ownRow)
     } else {
       const delay = Math.min(handler.retry[1], handler.retry[0] * 2 ** Math.min(row.attempts, 16))
+      // The column is durable and read by the panel and state snapshots: keep a redacted diagnostic, not the raw error.
       this.store.db.prepare(`UPDATE effect SET attempts = attempts + 1, error = ?, due = ? WHERE ${own}`)
-        .run(String(failure.error).slice(0, 1000), this.now() + delay, ...ownRow)
+        .run(redact(String(failure.error)).slice(0, 1000), this.now() + delay, ...ownRow)
     }
     if (!this.stopped) this.report(kind)
   }
   private failed(kind: EffectKind, error: unknown): void {
     this.broken.add(kind)
-    this.health.get(kind)?.set({ state: 'error', detail: `The effect queue failed: ${String(error)}`, at: new Date(this.now()).toISOString() })
+    this.health.get(kind)?.set({ state: 'error', detail: `The effect queue failed: ${redact(String(error))}`, at: new Date(this.now()).toISOString() })
   }
   private report(kind: EffectKind): void {
     const row = this.store.db.prepare(`SELECT COUNT(*) AS waiting, MIN(since) AS since, MAX(attempts) AS attempts,
@@ -155,7 +157,7 @@ export class Effects {
     const failing = Number(row?.attempts ?? 0) >= FAILURES_BEFORE_ERROR && !this.handlers.get(kind)?.quiet
     const detail = waiting ? `${waiting} waiting since ${String(row?.since)}` : 'Nothing waiting'
     this.health.get(kind)?.set(failing
-      ? { state: 'error', detail: `${detail}; the last failure: ${String(row?.error)}`, at: new Date(this.now()).toISOString() }
+      ? { state: 'error', detail: `${detail}; the last failure: ${redact(String(row?.error))}`, at: new Date(this.now()).toISOString() }
       : { state: 'ready', detail, at: new Date(this.now()).toISOString() })
   }
 }

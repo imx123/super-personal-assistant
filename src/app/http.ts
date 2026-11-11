@@ -12,6 +12,7 @@ import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
 import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
+import { redact, redactError, redactValues } from '../infra/redact.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
@@ -74,22 +75,46 @@ async function readBody(req: IncomingMessage, maxBytes = 128 * 1024): Promise<un
 function json(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }); res.end(JSON.stringify(value))
 }
-export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number): boolean {
+/**
+ * Whether a request carries the headers the management panel sends: `Host` naming this loopback listener, the custom
+ * `x-orchestrator-request: 1`, and, when present, an `Origin` naming that same listener. Browsers omit `Origin` on
+ * same-origin `GET`/`HEAD`, so `mutating` requests must carry it while reads may omit it.
+ */
+export function sameOrigin(req: Pick<IncomingMessage, 'headers'>, port: number, protocol: 'http:' | 'https:' = 'http:',
+  mutating = false): boolean {
   const host = req.headers.host
-  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return false
-  return req.headers['x-orchestrator-request'] === '1' && (req.headers.origin === undefined || req.headers.origin === `http://${host}`)
+  if (host === undefined || (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`)) return false
+  if (req.headers['x-orchestrator-request'] !== '1') return false
+  const origin = req.headers.origin
+  if (origin === undefined) return !mutating
+  return origin === `${protocol}//${host}`
+}
+/** The part of DSH's Connection service that authenticates a management request as the operator's browser session. */
+export interface ManagementSession {
+  /** 401/403 when the request carries no browser session for this host, or undefined when it is the authenticated operator. */
+  requestRejection(request: Pick<IncomingMessage, 'headers'>): 401 | 403 | undefined
+}
+/**
+ * Resolve the host's browser-session authority. It is read per request because Connection may mount after this plugin.
+ * A host without it leaves management writes closed instead of trusting an anonymous caller (see `registerHttp`).
+ */
+export function managementSession(ctx: Context): ManagementSession | undefined {
+  const get = (ctx as unknown as { get?: (name: string) => unknown }).get
+  const value = typeof get === 'function' ? get.call(ctx, 'connection') : undefined
+  const session = value as Partial<ManagementSession> | undefined
+  return typeof session?.requestRejection === 'function' ? session as ManagementSession : undefined
 }
 /** Maps errors to HTTP status codes and structured payloads that the panel localizes in the interface language. */
 function failure(error: unknown): [number, Record<string, unknown>] {
   if (error instanceof z.ZodError) {
-    const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: issue.message }))
+    const issues = error.issues.map(issue => ({ path: issue.path.join('.'), message: redact(issue.message) }))
     return [400, { error: `Invalid settings: ${issues.map(issue => issue.path).join(', ')}`, issues }]
   }
   if (error instanceof SetupError) return [400, { error: error.message, setup: error.problem }]
   if (error instanceof RouteError) return [error.status, { error: error.message }]
-  if (error instanceof UserError) return [error.missing ? 404 : 400, { error: error.message, code: error.code, values: error.values }]
+  if (error instanceof UserError) return [error.missing ? 404 : 400, { error: redact(error.message), code: error.code, values: redactValues(error.values) }]
   if (error instanceof SettingsConflict || error instanceof PromptConflict) return [409, { error: error.message }]
-  return [500, { error: error instanceof Error ? error.message : String(error) }]
+  return [500, { error: redactError(error) }]
 }
 
 function machineView({ stateDir, promptMaxChars, admissionContextMaxPages, admissionContextTimeoutMs }: Machine) {
@@ -245,6 +270,8 @@ function routes(runtime: HttpHost): Routes {
       const known = !block.startsWith('source:') || runtime.sources.instances().some(instance => `source:${instance.id}` === block)
       if (!known) throw new RouteError(404, 'Source not found')
       const request = SaveRequest.parse(await body())
+      // registerHttp admitted the request as the DSH Web browser session, so this save speaks for the operator's panel
+      // and may change the execution environment and account CLIs. Main-Session tool saves pass 'tool' and stay restricted.
       return runtime.settings.save(block, request.value, request.revision, 'panel')
     },
     'GET policy/history': () => policyHistory(store, runtime.sources, policyVersion(store.settings())),
@@ -281,10 +308,29 @@ export function registerHttp(ctx: Context, runtime: HttpHost): () => void {
     ctx.webServer.register({ kind: 'prefix', path: '/orchestrator', handler: async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (!url.pathname.startsWith('/orchestrator/api/')) { res.writeHead(404); res.end(); return }
-      if (!sameOrigin(req, ctx.webServer.port)) { json(res, 403, { error: 'Same-origin management request required' }); return }
+      const method = req.method ?? 'GET'
+      // Reads stay open to local tools such as `scripts/dsh-superagent status`; every state change must be the operator.
+      const changing = method !== 'GET' && method !== 'HEAD'
+      if (!sameOrigin(req, ctx.webServer.port, ctx.webServer.protocol, changing)) {
+        json(res, 403, { error: 'Same-origin management request required' }); return
+      }
+      if (changing) {
+        const session = managementSession(ctx)
+        if (!session) {
+          json(res, 503, { error: 'Management changes need the DSH Web Connection service, which this host does not provide' })
+          return
+        }
+        const rejection = session.requestRejection(req)
+        if (rejection !== undefined) {
+          json(res, rejection, { error: rejection === 401
+            ? 'The DSH Web browser session is required to change management state; open the URL printed by dsh web and retry from the panel'
+            : 'Management changes require a request from this DSH Web authority' })
+          return
+        }
+      }
       try {
         await runtime.ready
-        const route = match(table, req.method ?? 'GET', url.pathname.slice('/orchestrator/api/'.length).split('/'))
+        const route = match(table, method, url.pathname.slice('/orchestrator/api/'.length).split('/'))
         if (!route) throw new RouteError(404, 'Unknown operation')
         const query = Object.fromEntries(url.searchParams)
         json(res, 200, await route.run({ params: route.params as never, query, body: maxBytes => readBody(req, maxBytes) }))

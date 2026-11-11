@@ -159,6 +159,23 @@ describe('ticket directory check', () => {
     expect(error).toBeInstanceOf(CliError)
     expect(error).toMatchObject({ message: 'nope', exitCode: 3 })
   })
+  it('reports a failed command without echoing its arguments, and redacts what stderr printed', async () => {
+    const exited = (exitCode: number | null, stderr: string): SubprocessRuntime => ({
+      spawn: () => ({ done: Promise.resolve({ exitCode, signal: null }), collected: {
+        stdout: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        stderr: { readFrom: () => ({ text: stderr, nextOffset: 0, lossy: false }) } } }),
+    }) as unknown as SubprocessRuntime
+    const silent = await runAsWorker(exited(5, ''), ['sh', '-c', 'exit 5', 'secret ticket text'], dir, signal)
+      .catch((error: unknown) => error)
+    expect(silent).toBeInstanceOf(CliError)
+    expect((silent as CliError).message).toBe('sh exited with 5')
+    expect(String(silent)).not.toContain('secret ticket text')
+    const leaky = await runAsWorker(exited(4, 'token=abc123 at /home/me/.config/x\n'), ['sh', '-c', 'exit 4', 'secret'], dir, signal)
+      .catch((error: unknown) => error)
+    expect((leaky as CliError).message).toContain('token=[redacted]')
+    expect((leaky as CliError).message).toContain('<path>')
+    expect((leaky as CliError).message).not.toContain('abc123')
+  })
 })
 
 describe('the repository the host\'s environment names', () => {

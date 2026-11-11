@@ -270,7 +270,7 @@ Each model request binds the Session to the current prompt revision. The revisio
 ## Dependency rules
 
 - **Explicit, narrow dependencies.** Each class receives an interface that names what it uses, mostly as `Pick` types of other classes: `ExecutorHost`, `AssessorHost`, `SessionsHost`, `SettingsHost`, `SetupHost`, `PassesHost` and `OutboxHost` for the core classes, and `HttpHost`, `MainToolsHost`, `ExecutorToolsHost`, `ResourceHost`, `LinkHost` and `SourceContextDeps` for the glue, with the Engine as the `Pick` of the role that calls it. The Runtime passes itself only behind such an interface. A Source plugin injects the `orchestrator` service, which its type names as a `SourceHost`: the registry and `context(kind)`; its kind's code sees only its `SourceContext`.
-- **What may import what.** `src/core` imports nothing outside itself apart from Node's hashing, and does no I/O. `src/sources` imports nothing from `src/app`. The panel imports only types from the host side, and the plain values of `src/admission.ts`, `src/limits.ts`, `src/setup.ts`, `src/navigation.ts`, `src/sources/host.ts`, `src/core/errors.ts`, `src/core/reasons.ts` and the filter lists of `src/app/api.ts`.
+- **What may import what.** `src/core` imports nothing outside itself apart from Node's hashing and the pure `src/infra/redact.ts` (no I/O), and does no I/O. `src/sources` imports nothing from `src/app`. The panel imports only types from the host side, and the plain values of `src/admission.ts`, `src/limits.ts`, `src/setup.ts`, `src/navigation.ts`, `src/sources/host.ts`, `src/core/errors.ts`, `src/core/reasons.ts` and the filter lists of `src/app/api.ts`.
 - **One writer per state.** Each kind of state has one writer, and the others read it or ask that writer.
 
   | State | Writer |
@@ -307,7 +307,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | --- | --- |
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
-| `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it and the English text the log, the main Session and the panel share |
+| `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it, the English text the log, the main Session and the panel share, and a redacted CLI output instead of the raw one |
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
 | `src/admission.ts` | The admission table's values, each cell's options and defaults, shared with the panel |
 | `src/limits.ts` | The limits of the values a person sets, which the settings schemas check and the panel's fields offer |
@@ -358,7 +358,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools, including Project archive/unarchive, and the Project PM's read, Ticket-creation, Ticket-message and report tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools, whose reports route to its Project PM or the main Session |
-| `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure, including Project `pause`, `stop`, `archive` and `unarchive` |
+| `src/app/http.ts` | The `/orchestrator/api` routes: the loopback same-origin check, the DSH browser-session admission of every state change, request limits and one status per kind of failure, including Project `pause`, `stop`, `archive` and `unarchive` |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
 | `src/app/views/records.ts` | The rows the views share: Triggers, Tickets, Threads, Decisions and Channel links, and `ownersOf`, the owners of follow-ups as one request reads them |
@@ -370,11 +370,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions`; its `relay` routes a Ticket's report to its PM or the main Session |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
-| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
+| `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list. A retained diagnostic is redacted |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
 | `src/infra/text.ts` | Word counts and the chat message limit, `fill` and `sameName` |
-| `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer |
+| `src/infra/health.ts` | The `HealthBoard`, every part's health entry, each claimed by its one writer; a stored detail or value is redacted |
+| `src/infra/redact.ts` | `redact`, `redactError` and `redactValues`: credentials, query values, URL userinfo and absolute paths removed from diagnostics before they are stored in a health entry, an effect row, a Ticket report or a setup problem, or returned by the management API |
 | `src/sources/kind.ts` | The `SourceKind` protocol |
 | `src/sources/internal.ts` | The built-in `internal` Source kind: one Trigger per delegated Project Ticket, no configuration, channel, poll, health entry or context reader |
 | `src/sources/main-session.ts` | The built-in User Session Source: the configurable operator, the Policy part that admits it, and the scope; it has no polls, Channel or thread context |
@@ -428,13 +429,13 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
-| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
+| `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls; the redacted diagnostics a failing CLI leaves |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
-| `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
+| `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown; a failed effect stores and reports only a redacted diagnostic |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
 | `tests/outbox.spec.ts` | The Outbox on a running Runtime: messages wait while processing is paused or their Source is not installed |
 | `tests/cache.spec.ts` | `TextCache` |
@@ -446,14 +447,15 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/p3-audit-fixes.spec.ts` | P3 audit reproductions: a native DSH user abort becomes a worker hard stop with `idleAt`/`interruptedAt`, label and PM receipt while a plugin-issued cancel and an old handoff Session turn are not re-read; the cancel marker is scoped to its Assignment and turn (stop while idle, repeated idle events, a new running turn); a rejecting background cleanup moves a Worker from `stopped` to `failures` in the hard-pause API and Router notice and starts no replacement Worker; splits and cross-Project accepts create their target only after the source cleanup succeeds and record a `failed` Handoff plus delivery error when it fails, while a concurrent reject is refused as `handoffHandled`; a host restart (a seeded SQLite store reopened by a fresh Runtime) fails `starting` split/accept/transfer records without creating target Tickets or starting Workers and leaves every source retryable; a transfer rechecks its Handoff and latest Assignment after the await and records the failure even after a concurrent stop or second transfer; Handoff requests bind to the exact source Assignment (including pre-P3 assignments without `sessionId`, legacy records without `assignmentId`, and a fresh request after `worker-h1`); contradictory handoff decisions refuse and their PM receipts keep the recorded status; a same-Project split ends the source Ticket |
 | `tests/handoff.spec.ts` | P3-B handoffs: Session-id suffix resolution, a same-Project transfer keeping the Ticket/Mandate/worktree and starting `worker-h1` (then h2), guards, a pending cross-Project request and its idempotency, target rejection, acceptance into an independent Ticket with a new Mandate/worktree and both Handoff records, no parent link, target/PM refusals, read views, and the Runtime's new Session, report routing, old-Session cancel, ticket page links, tool boundary and archive coverage |
 | `tests/archive-reconcile.spec.ts` | Native DSH archive reconciliation: the activity waterfall pass-through, PM archive/unarchive changing the Project, worker archive ending only its Assignment with a single pending note, the note in and then cleared from the PM prompt, repeated reconcile without a duplicate, retrying a child archive a pass missed before the snapshot advances, worker unarchive without retry, a missing snapshot, and no self-archive loop |
-| `tests/health.spec.ts` | One health entry per part, each cleared by its own next success |
+| `tests/health.spec.ts` | One health entry per part, each cleared by its own next success; stored details and values are redacted |
+| `tests/redact.spec.ts` | Redaction of diagnostics: credentials, query values, URL userinfo and absolute paths, idempotence, and the redacted `SetupError` problem |
 | `tests/delivery.spec.ts` | `AgentDelivery` |
 | `tests/retry-health.spec.ts`, `tests/role-models.spec.ts` | Model budget retries, and the models of the main/PM/worker roles |
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/pm-tools.spec.ts` | The Project PM's tool boundary against DSH's real tool registry: `restrict` rejects the PM's scope-local tool names, inherited tools are hidden, and only the nine PM tools execute |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
-| `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
+| `tests/http.spec.ts` | The loopback and same-origin checks, the DSH browser-session admission of every state change (a forged header-only request is refused), redacted setup and 500 responses, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, an invalid PM model refused, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
 | `tests/timeline.spec.ts` | A Thread's pages and a Trigger's neighbours by time and then id, with every received Trigger's time in one form |
@@ -462,7 +464,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/prompts.spec.ts` | Prompt validation, assembly and versions |
 | `tests/cards.spec.ts` | The rules the built-in text must state, file by file |
 | `tests/model-surface.spec.ts` | Everything models read: tools, prompts, skills and inputs, checked against the tool schemas, the execution environment and the glossary, within a size budget per role |
-| `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup, the agent's process environment, the plugin entry |
+| `tests/deployment.spec.ts`, `tests/environment.spec.ts`, `tests/index.spec.ts` | The plugin configuration and setup (including redacted CLI output in a setup problem), the agent's process environment, the plugin entry |
 | `tests/service-script.spec.ts` | `scripts/dsh-superagent` against fake `ps`, `tmux` and `dsh` |
 | `tests/client.spec.tsx`, `tests/navigation.spec.ts`, `tests/controls.spec.tsx` | The client plugin's registration and polling, Session navigation and route memory, the local controls, and the panel's imports, which have no cycle |
 | `tests/panel-overview.spec.tsx`, `panel-source.spec.tsx`, `panel-trigger.spec.tsx`, `panel-eval.spec.tsx`, `panel-execution.spec.tsx`, `panel-project.spec.tsx` | Each page of the panel, against a fake management API answered by route |

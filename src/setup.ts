@@ -1,5 +1,6 @@
 /** Structured startup and configuration errors with the settings location where the operator can fix them. */
 import { fill } from './infra/text.ts'
+import { redact } from './infra/redact.ts'
 
 export type SetupPlace = 'deployment' | 'github' | 'feishu'
 export const SETUP_PROBLEMS = {
@@ -26,14 +27,19 @@ export interface SetupProblem { place: SetupPlace; code: SetupCode; values: Reco
 /**
  * Thrown by deployment and account verification checks when a required CLI, account, or repository check fails.
  * `Setup` records it for the management overview, and the HTTP layer returns `problem` so the panel can localize it.
+ * CLI output (`values.output`) can carry credentials, request data and machine paths, so the stored problem keeps only
+ * its redacted form; the raw text is not persisted or returned.
  */
 export class SetupError extends Error {
   readonly place: SetupPlace
-  constructor(readonly code: SetupCode, readonly values: Record<string, string> = {}) {
+  readonly values: Record<string, string>
+  constructor(readonly code: SetupCode, values: Record<string, string> = {}) {
     const [place, text] = SETUP_PROBLEMS[code]
+    const stored = values.output === undefined ? values : { ...values, output: redact(values.output) }
     const sentence = fill(text, values)
-    super(values.output ? `${sentence}\n${values.output}` : sentence)
+    super(stored.output ? `${sentence}\n${stored.output}` : sentence)
     this.place = place
+    this.values = stored
   }
   get problem(): SetupProblem { return { place: this.place, code: this.code, values: this.values, detail: this.message } }
 }

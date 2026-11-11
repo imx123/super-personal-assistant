@@ -20,6 +20,9 @@ import { testMachine } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
 export const CHAT = 'oc_team'
+/** The browser-session cookie the fixture's fake Connection service admits, and the headers the panel sends. */
+export const PANEL_COOKIE = 'dsh-auth-127.0.0.1:3082=fixture'
+export const PANEL_HEADERS = { host: '127.0.0.1:3082', origin: 'http://127.0.0.1:3082', 'x-orchestrator-request': '1', cookie: PANEL_COOKIE }
 
 /** Build a Feishu mention trigger from Alice in `oc_team`, using the digits in `id` as the timestamp offset in seconds. */
 export function feishu(id: string, text: string, overrides: Record<string, unknown> = {}): Trigger {
@@ -249,6 +252,9 @@ export async function startRuntime(seed?: (store: Store) => void) {
     archived: archivedSessions, get archivedSessionIds() { return [...archivedSessions] } }
   const services = { agents, llm: { resolveCallConfig: vi.fn(async (value: unknown) => value) }, sessionController: controller,
     sessionPersistence: persistence, workspaceRegistry: workspace, permissionPresets: permissions, subprocess, webServer,
+    // Management writes are admitted only as the operator's browser session, as DSH's Connection service does.
+    connection: { requestRejection: (request: { headers: Record<string, string | undefined> }) =>
+      request.headers.cookie === PANEL_COOKIE ? undefined : 401 },
     jobs: jobs.service, subagents: subagents.service }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
@@ -293,7 +299,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   async function api(method: string, path: string, json?: unknown) {
     let status = 0, text = ''
     const chunks = json === undefined ? [] : [Buffer.from(JSON.stringify(json))]
-    const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
+    const req = { method, url: `/orchestrator/api/${path}`, headers: PANEL_HEADERS, async *[Symbol.asyncIterator]() { yield* chunks } }
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }

@@ -1,11 +1,26 @@
 /** Runtime health reporting: per-component error states and recovery on subsequent success. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
+import { HealthBoard } from '../src/infra/health.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
 afterEach(async () => { await h.stop() })
+
+it('redacts credentials, request data and machine paths when a health entry is stored', () => {
+  const board = new HealthBoard()
+  const entry = board.claim('demo')
+  entry.set({ state: 'error', code: 'pollFailures', detail: 'poll failed token=abc123 at /home/me/.config/gh/hosts.yml',
+    values: { count: '2', error: 'GET https://api.github.com/user?access_token=z' } })
+  expect(board.all.demo).toMatchObject({ state: 'error', code: 'pollFailures' })
+  expect(board.all.demo?.detail).toContain('poll failed')
+  expect(board.all.demo?.detail).not.toContain('abc123')
+  expect(board.all.demo?.detail).toContain('<path>')
+  expect(board.all.demo?.values).toMatchObject({ count: '2' })
+  expect(board.all.demo?.values?.error).not.toContain('access_token=z')
+  expect(board.all.demo?.values?.error).toContain('access_token=[redacted]')
+})
 
 /** Advance fake `Date.now()` by `ms` and pump due runtime work. */
 async function at(ms: number) {

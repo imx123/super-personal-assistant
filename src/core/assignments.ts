@@ -6,6 +6,7 @@ import type { ReportState, Ticket } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { automatic, type Tickets } from './tickets.ts'
+import { redact } from '../infra/redact.ts'
 
 /** What an Assignment reports: a worker's report, or the Executor's own (`waiting` after an idle turn, `failed` after an error). */
 export interface WorkerReport {
@@ -81,7 +82,8 @@ export class Assignments extends EnginePart {
   deliveryFailed(ticketId: string, assignmentId: string, error: string): void {
     const ticket = this.running(ticketId, assignmentId)
     if (!ticket) return
-    ticket.delivery = { error: error.slice(0, 300), at: this.now() }
+    // A delivery failure is durable and shown in the panel, so it keeps only a redacted diagnostic.
+    ticket.delivery = { error: redact(error).slice(0, 300), at: this.now() }
     this.repo.tickets.save(ticket)
   }
   /**

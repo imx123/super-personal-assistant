@@ -9,6 +9,7 @@ import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
+import { redact } from '../infra/redact.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
@@ -415,18 +416,20 @@ export class Tickets extends EnginePart {
   failTransfer(ticketId: string, assignmentId: string, handoffId: string, error: string): Ticket {
     const ticket = this.require(ticketId)
     const at = this.now()
+    // Handoff failures are durable and shown in the panel; keep only the redacted diagnostic.
+    const diagnostic = redact(error)
     const handoff = ticket.handoffs?.find(item => item.id === handoffId)
     if (handoff && (handoff.status === 'starting' || handoff.status === 'accepted' || handoff.status === 'pending')) {
       handoff.status = 'failed'
       handoff.decidedAt = at
-      handoff.failure = error.slice(0, 1000)
+      handoff.failure = diagnostic.slice(0, 1000)
     }
     const assignment = ticket.assignments.find(item => item.id === assignmentId)
     if (assignment?.state === 'pending') this.endAssignment(ticket, assignment, 'handoffCleanupFailed')
     const latest = latestAssignment(ticket)
     const superseded = !!latest && latest.id !== assignmentId && latest.state !== 'ended'
     // An archived Ticket also keeps the error so a later unarchive leaves it retryable; only an ended one drops it.
-    if (!ticket.ended && !superseded) ticket.delivery = { error: error.slice(0, 300), at }
+    if (!ticket.ended && !superseded) ticket.delivery = { error: diagnostic.slice(0, 300), at }
     ticket.updatedAt = at
     this.repo.tickets.save(ticket)
     return this.require(ticketId)
@@ -479,17 +482,18 @@ export class Tickets extends EnginePart {
     const ticket = this.repo.tickets.get(ticketId)
     if (!ticket) return undefined
     const at = this.now()
+    const diagnostic = redact(error)
     const handoff = ticket.handoffs?.find(item => item.id === handoffId)
     if (handoff && (handoff.status === 'starting' || handoff.status === 'pending' || handoff.status === 'accepted')) {
       handoff.status = 'failed'
       handoff.decidedAt = at
-      handoff.failure = error.slice(0, 1000)
+      handoff.failure = diagnostic.slice(0, 1000)
     }
     const latest = latestAssignment(ticket)
     const from = handoff?.from.assignmentId
     const superseded = !!latest && !!from && latest.id !== from && latest.state !== 'ended'
     // An archived Ticket also keeps the error so a later unarchive leaves it retryable; only an ended one drops it.
-    if (!ticket.ended && !superseded) ticket.delivery = { error: error.slice(0, 300), at }
+    if (!ticket.ended && !superseded) ticket.delivery = { error: diagnostic.slice(0, 300), at }
     ticket.updatedAt = at
     this.repo.tickets.save(ticket)
     return this.require(ticketId)

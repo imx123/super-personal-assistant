@@ -51,9 +51,12 @@ let guards: Map<string, Guard>
 let restricts: Map<string, unknown[]>
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
+/** The browser-session cookie the fixture's fake Connection service admits, and the headers the panel sends. */
+const PANEL_HEADERS = { host: '127.0.0.1:3082', origin: 'http://127.0.0.1:3082', 'x-orchestrator-request': '1',
+  cookie: 'dsh-auth-127.0.0.1:3082=fixture' }
 async function api(method: string, path: string): Promise<{ status: number; body: unknown }> {
   let status = 0, text = ''
-  const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' } }
+  const req = { method, url: `/orchestrator/api/${path}`, headers: PANEL_HEADERS }
   await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
   return { status, body: JSON.parse(text) }
 }
@@ -228,7 +231,10 @@ beforeEach(async () => {
   }
   jobs = jobRegistry()
   permissions = { names: ['danger-full-access'], set: vi.fn() }
-  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }), archiveSession: async () => {}, unarchiveSession: async () => {}, get archivedSessionIds() { return [] } }, permissionPresets: permissions, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } }, jobs: jobs.service }
+  services = { agents, llm: { resolveCallConfig: vi.fn(async value => value) }, sessionController: controller, sessionPersistence: { flush: vi.fn(async () => {}), open: vi.fn(async () => ({ read: async () => ({ events: [] }), [Symbol.asyncDispose]: async () => {} })) }, workspaceRegistry: { create: async (cwd: string) => ({ id: cwd }), archiveSession: async () => {}, unarchiveSession: async () => {}, get archivedSessionIds() { return [] } }, permissionPresets: permissions, subprocess, webServer: { host: '127.0.0.1', port: 3082, register: (route: { handler: HttpHandler }) => { http = route.handler; return () => {} } },
+    // Management writes are admitted only as the operator's browser session, as DSH's Connection service does.
+    connection: { requestRejection: (request: { headers: Record<string, string | undefined> }) =>
+      request.headers.cookie === PANEL_HEADERS.cookie ? undefined : 401 }, jobs: jobs.service }
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
@@ -1401,7 +1407,7 @@ it('refuses a settings save with an unknown model or a Source kind that is not i
   const request = async (method: string, path: string, body?: unknown) => {
     let status = 0, text = ''
     const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body))]
-    const req = { method, url: `/orchestrator/api/${path}`, headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
+    const req = { method, url: `/orchestrator/api/${path}`, headers: PANEL_HEADERS, async *[Symbol.asyncIterator]() { yield* chunks } }
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
@@ -1487,7 +1493,7 @@ it('applies a changed prompt size limit to the next save and request without a r
   const put = async (config: unknown) => {
     let status = 0, text = ''
     const chunks = [Buffer.from(JSON.stringify({ config, baseRevision: next.prompts.current().revision }))]
-    const req = { method: 'PUT', url: '/orchestrator/api/prompts', headers: { host: '127.0.0.1:3082', 'x-orchestrator-request': '1' }, async *[Symbol.asyncIterator]() { yield* chunks } }
+    const req = { method: 'PUT', url: '/orchestrator/api/prompts', headers: PANEL_HEADERS, async *[Symbol.asyncIterator]() { yield* chunks } }
     await http(req, { writeHead: (code: number) => { status = code }, end: (data: string) => { text = data } })
     return { status, body: JSON.parse(text) as Record<string, unknown> }
   }
