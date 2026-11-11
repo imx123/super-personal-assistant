@@ -534,6 +534,21 @@ export class Engine {
       }
       const origin = this.repo.tickets.get(handoff.from.ticketId!)
       if (!origin || !liveTicket(origin)) throw new UserError('ticketEnded')
+      // The target PM may end the source Ticket, so the source must still be active and the requested Assignment current.
+      // This prevents a target from finalizing a handoff after the source Project was paused/archived, its Worker was
+      // manually stopped, or the source Ticket moved on to another Assignment/Session.
+      const sourceProject = this.repo.projects.get(handoff.from.projectId)
+      if (!sourceProject) throw new UserError('unknownProject')
+      if (sourceProject.status === 'archived') throw new UserError('projectArchived')
+      if (sourceProject.status === 'paused') throw new UserError('projectPaused')
+      if (sourceProject.status !== 'active') throw new UserError('projectEnded')
+      if (origin.projectId !== handoff.from.projectId) throw new UserError('notProjectTicket')
+      if (origin.manualStop) throw new UserError(origin.manualStop.scope === 'worker'
+        ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+      const current = latestAssignment(origin)
+      if (!current || current.state === 'ended' || assignmentSessionId(origin.id, current) !== handoff.from.sessionId) {
+        throw new UserError('notHandoffable')
+      }
       const request = handoff.request
       if (!request) throw new UserError('invalidHandoff', { reason: 'the request names no Ticket task' })
       const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: request.title, goal: request.goal,

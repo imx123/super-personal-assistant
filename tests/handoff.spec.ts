@@ -226,6 +226,20 @@ describe('cross-Project handoff', () => {
       { action: 'accept' })).toThrow(new UserError('handoffHandled'))
   })
 
+  it('refuses a target accept after the source Project pauses or its Worker gets a manual stop', () => {
+    const h = twoProjects()
+    const sourceTicket = h.source.tickets[0]!
+    const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, sourceTicket.id,
+      { ...request, targetProjectId: h.target.project.id })
+    h.engine.pauseProject(h.source.project.id, true)
+    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).toThrow(new UserError('projectPaused'))
+    h.engine.pauseProject(h.source.project.id, false)
+    h.engine.stopAssignment(sourceTicket.id, sourceTicket.assignments[0]!.id)
+    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).toThrow(new UserError('manualStopNeedsUserApproval'))
+  })
+
   it('accepts into a new independent Ticket, links both records, and ends the source as handedOff', () => {
     const h = twoProjects()
     const sourceTicket = h.source.tickets[0]!
