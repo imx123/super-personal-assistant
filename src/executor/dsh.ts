@@ -81,6 +81,19 @@ export interface ExecutorHost {
 /** Looks up a ticket's origin trigger in Store. */
 export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
   host.store.triggers.get(ticket.origin.triggerId)
+/**
+ * The number of the turn `agent` is in now, which its next `turn/end` closes; while it is idle, the number of the turn it
+ * last ended. Undefined when its Session recorded no turn yet, which only an idle Session or a test double does.
+ */
+function openTurn(agent: Agent): number | undefined {
+  const events = agent.session.snapshotEvents()
+  const start = events.findLast(event => event.type === 'turn/start')
+  if (start?.type === 'turn/start') return start.data.turn
+  const end = events.findLast(event => event.type === 'turn/end')
+  if (end?.type !== 'turn/end') return undefined
+  // A turn/end as the last event is the turn an idle (or just-idle) Session last ended; a running turn began after it.
+  return events.at(-1)?.type === 'turn/end' ? end.data.turn : end.data.turn + 1
+}
 
 /**
  * Returns additional system-prompt mandate instructions for a worker beyond the request: for work accepted proactively under
@@ -221,10 +234,12 @@ export class DshExecutor implements Executor {
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
   private readonly personal = new Map<string, string>()
   /**
-   * Agents whose current turn this plugin cancelled itself (operator stop, handoff, Project pause, shutdown), so the next
-   * `turn/end` with a user abort is not mistaken for a person pressing Stop in the native DSH UI.
+   * The turn each Agent had running when this plugin cancelled it itself (operator stop, handoff, Project pause,
+   * shutdown), so that turn's user abort is not mistaken for a person pressing Stop in the native DSH UI. The marker names
+   * the exact Assignment and turn it belongs to: a later turn's end is never attributed to it, and repeated idle events
+   * for that same turn keep being recognized until a newer turn ends.
    */
-  private readonly expectedStops = new WeakSet<Agent>()
+  private readonly expectedStops = new WeakMap<Agent, { assignmentId: string; turn?: number }>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
@@ -375,8 +390,10 @@ export class DshExecutor implements Executor {
           this.settling.get(ticket.id)?.abort()
           const agent = this.host.context.agents.get(sessionId as SessionId)
           if (!ownTurn && agent) {
-            // The abort that follows is ours: workerIdle must not turn it into a second, single-Worker native stop.
-            if (agent.status !== 'idle') this.expectedStops.add(agent)
+            // The abort that follows is ours: workerIdle must not turn it into a second, single-Worker native stop. The
+            // marker names this Assignment and the turn being cancelled, also when the agent is already idle, so a later
+            // turn's native Stop is still recognized.
+            this.expectedStops.set(agent, { assignmentId: assignment.id, turn: openTurn(agent) })
             agent.cancel({ kind: 'user' }, { keepInbox: false })
           }
           // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
@@ -537,10 +554,9 @@ export class DshExecutor implements Executor {
   install(): void {
     const ctx = this.host.context
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
-      // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh. A new turn also
-      // means an earlier expected cancel belongs to a turn that is already over, so it cannot hide this turn's native Stop.
+      // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh. An expected
+      // cancel is not cleared here: an unrelated running event does not end the turn the cancel was issued for.
       if (status === 'running') {
-        this.expectedStops.delete(agent)
         this.settling.get(ticketOfSession(agent.id) ?? '')?.abort()
         const ticket = this.ticketOf(agent)
         const assignment = ticket && runningAssignment(ticket)
@@ -552,10 +568,17 @@ export class DshExecutor implements Executor {
       // The turn a stop of the worker's subagents woke and cancelled is no turn of the worker's. A cancel this plugin issued
       // for an operator stop, handoff or Project pause is expected too, so its user abort is not a second native stop.
       if (status !== 'idle' || this.host.closing()) return
-      const expectedStop = this.expectedStops.delete(agent)
-      if (cancelled.delete(agent)) return
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
+      const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
+      const endTurn = end?.type === 'turn/end' ? end.data.turn : undefined
+      const expected = this.expectedStops.get(agent)
+      // The marker names one turn of one Assignment: only that turn's user abort is ours, and repeated idle events for the
+      // same turn stay ours until a newer turn ends. A newer turn's end means the marked turn is over, so the marker goes.
+      const expectedStop = !!expected && expected.assignmentId === assignment?.id
+        && (expected.turn === endTurn || (expected.turn === undefined && endTurn === undefined))
+      if (expected?.turn !== undefined && endTurn !== undefined && endTurn > expected.turn) this.expectedStops.delete(agent)
+      if (cancelled.delete(agent)) return
       if (ticket && assignment && this.runsAssignment(agent, ticket, assignment) && liveTicket(ticket)) {
         void this.background(this.workerIdle(ticket, assignment, agent, expectedStop))
       }
@@ -706,8 +729,11 @@ export class DshExecutor implements Executor {
       if (expectedStop) return
       if (before.manualStop?.scope === 'project') return
       if (!this.runsAssignment(agent, before, idle)) return
-      // A native Stop is the same hard stop as the panel's single-Worker stop: end the Assignment, write the worker stop,
-      // and let the stop path send the PM/Router execution receipt.
+      // A native Stop is the same hard stop as the panel's single-Worker stop, and it keeps the turn record the earlier
+      // interrupt-only path wrote: the turn's own end time as `idleAt`/`interruptedAt`, before the hard stop ends the
+      // Assignment. The hard stop then sends the execution receipt. This covers every Ticket source, not only main-session.
+      const at = typeof end.time === 'number' ? new Date(end.time).toISOString() : now()
+      this.host.engine.turnEnded(before.id, idle.id, at)
       try {
         this.host.engine.stopAssignment(before.id, idle.id)
       } catch (error) {

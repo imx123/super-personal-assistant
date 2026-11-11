@@ -337,8 +337,10 @@ export class Tickets extends EnginePart {
   /**
    * Move a Ticket to a new Worker inside its Project: end the current Assignment with `handedOff` and ask the Executor to
    * stop its Session, record the transfer on both sides of the same Ticket, brief the new Worker, and create (but do not yet
-   * start) one new Assignment under the unchanged Mandate and worktree in Session `worker-<ticketId>-h<seq>`. The caller waits
-   * for `work` before `completeTransfer`, so a failed cleanup cannot start a replacement Worker over the old one's work.
+   * start) one new Assignment under the unchanged Mandate and worktree in Session `worker-<ticketId>-h<seq>`. The Handoff
+   * stays `starting` until `completeTransfer` decides it with the launch, so a restart can fail it instead of leaving an
+   * accepted record with no Worker. The caller waits for `work` before `completeTransfer`, so a failed cleanup cannot
+   * start a replacement Worker over the old one's work.
    * @throws UserError when the ticket is unknown or ended, is not the Project's, carries a manual stop, or has no running or
    * pending Assignment to hand over.
    */
@@ -353,7 +355,7 @@ export class Tickets extends EnginePart {
     const at = this.now()
     const seq = this.transferCount(ticket) + 1
     const record: Handoff = { id: key('handoff', ticketId, 'transfer', String(seq), request.summary),
-      at, kind: 'transfer', status: 'accepted',
+      at, kind: 'transfer', status: 'starting',
       from: { ticketId, projectId, assignmentId: latest.id, sessionId: assignmentSessionId(ticketId, latest) },
       to: { ticketId, projectId, sessionId: workerSessionId(ticketId, seq) },
       reason: request.reason, summary: request.summary, ...request.unfinished?.length ? { unfinished: request.unfinished } : {},
@@ -374,53 +376,166 @@ export class Tickets extends EnginePart {
   }
   /**
    * Start the Assignment `beginTransfer` created, once the old Worker's background cleanup succeeded, and report the handoff.
-   * @throws UserError when the ticket ended meanwhile or the Assignment is no longer pending.
+   * It rechecks the whole record, not just the Assignment: the Handoff must still be the `starting` transfer that created
+   * this Assignment and the Assignment must still be the Ticket's pending latest one, so a stop, a retry or a second
+   * transfer during the cleanup can never start a Worker over the newer state.
+   * @throws UserError when the ticket ended meanwhile, the Handoff is no longer starting or is not this transfer, or the
+   * Assignment is no longer the Ticket's pending latest one.
    */
   completeTransfer(ticketId: string, assignmentId: string, handoffId: string): Ticket {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+    const handoff = ticket.handoffs?.find(item => item.id === handoffId)
+    if (!handoff || handoff.kind !== 'transfer' || handoff.status !== 'starting' || handoff.to.assignmentId !== assignmentId) {
+      throw new UserError('handoffHandled')
+    }
     const assignment = ticket.assignments.find(item => item.id === assignmentId)
     if (!assignment) throw new UserError('assignmentEnded')
+    if (latestAssignment(ticket)?.id !== assignmentId) throw new UserError('assignmentEnded')
     if (assignment.state === 'running') return ticket
     if (assignment.state !== 'pending') throw new UserError('assignmentEnded')
+    // The transfer is decided only here, together with the launch it starts; a crash before this leaves it `starting` for
+    // startup recovery to fail, never an accepted record with no Worker.
+    handoff.status = 'accepted'
+    handoff.decidedAt = this.now()
+    ticket.updatedAt = this.now()
+    this.repo.tickets.save(ticket)
     this.options.executor.start(ticket, assignment)
-    const handoff = ticket.handoffs?.find(item => item.id === handoffId)
     this.emit('ticket.handedOff', { ticketId, handoffId, kind: 'transfer', toTicketId: ticketId,
-      toSessionId: handoff?.to.sessionId ?? assignmentSessionId(ticketId, assignment) })
+      toSessionId: handoff.to.sessionId ?? assignmentSessionId(ticketId, assignment) })
     return this.require(ticketId)
   }
   /**
-   * A transfer whose old Worker could not be cleaned up keeps its Ticket open with no replacement Worker: the new Assignment
-   * ends as `handoffCleanupFailed` and the failure stays on the Ticket until a person retries. It does not start anything.
+   * A transfer that did not start its replacement Worker: the Handoff becomes `failed` so no accepted record claims
+   * success, the new Assignment ends as `handoffCleanupFailed` while it is still pending, and the failure stays on the
+   * Ticket as `delivery.error` for a person to retry. The failure is recorded even when a concurrent stop or a newer
+   * transfer already changed the Assignment; only a newer, still-active Assignment keeps its own delivery state, since
+   * the failed Handoff already carries the error. It starts nothing.
    */
-  failTransfer(ticketId: string, assignmentId: string, error: string): Ticket {
+  failTransfer(ticketId: string, assignmentId: string, handoffId: string, error: string): Ticket {
     const ticket = this.require(ticketId)
+    const at = this.now()
+    const handoff = ticket.handoffs?.find(item => item.id === handoffId)
+    if (handoff && (handoff.status === 'starting' || handoff.status === 'accepted' || handoff.status === 'pending')) {
+      handoff.status = 'failed'
+      handoff.decidedAt = at
+      handoff.failure = error.slice(0, 1000)
+    }
     const assignment = ticket.assignments.find(item => item.id === assignmentId)
-    if (!assignment || assignment.state !== 'pending') return ticket
-    this.endAssignment(ticket, assignment, 'handoffCleanupFailed')
-    ticket.delivery = { error: error.slice(0, 300), at: this.now() }
-    ticket.updatedAt = this.now()
+    if (assignment?.state === 'pending') this.endAssignment(ticket, assignment, 'handoffCleanupFailed')
+    const latest = latestAssignment(ticket)
+    const superseded = !!latest && latest.id !== assignmentId && latest.state !== 'ended'
+    // An archived Ticket also keeps the error so a later unarchive leaves it retryable; only an ended one drops it.
+    if (!ticket.ended && !superseded) ticket.delivery = { error: error.slice(0, 300), at }
+    ticket.updatedAt = at
     this.repo.tickets.save(ticket)
     return this.require(ticketId)
   }
   /**
-   * End a source Ticket handed to another Project: end its current Assignment with `handedOff` and stop its Session, then
-   * end the Ticket with outcome `handedOff`. The Ticket is not archived or deleted, and its Handoff records stay.
-   * @throws UserError when the ticket is unknown or ended.
+   * Stop the source Worker of a Ticket being handed away, before its target exists: end its latest Assignment with
+   * `handedOff`, put back the messages no step took, clear its question and delivery error, and ask the Executor to cancel
+   * the turn and stop its background work. The Ticket stays open; the caller waits for `work` and then either
+   * `completeHandoffAway` or `failHandoffAway`, so no target Worker starts over work that still runs.
    */
-  handoffAway(ticketId: string, reason?: string): Ticket {
+  beginHandoffAway(ticketId: string, reason?: string): { ticket: Ticket; work?: Promise<void> } {
     const ticket = this.require(ticketId)
-    if (!liveTicket(ticket)) return ticket
+    if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     const latest = latestAssignment(ticket)
+    let work: Promise<void> | undefined
     if (latest && latest.state !== 'ended') {
       this.endAssignment(ticket, latest, 'handedOff')
       this.requeueUntaken(ticket, latest)
+      if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
+      delete ticket.attention
+      delete ticket.delivery
       ticket.updatedAt = this.now()
       this.repo.tickets.save(ticket)
-      this.options.executor.stop(ticket, latest, 'handedOff')
+      let cleanup: void | Promise<void>
+      try { cleanup = this.options.executor.stop(ticket, latest, 'handedOff') } catch (error) { cleanup = Promise.reject(error) }
+      if (cleanup) {
+        work = Promise.resolve(cleanup)
+        // The caller awaits it; an ignored failure must not become an unhandled rejection.
+        work.catch(() => {})
+      }
     }
+    return { ticket: this.require(ticketId), ...work ? { work } : {} }
+  }
+  /**
+   * End a source Ticket whose Worker stopped cleanly for a split or a cross-Project handoff. The caller runs it in the
+   * transaction that records the accepted Handoff, so the Ticket ends only after the target Ticket existed.
+   * @throws UserError when the ticket is unknown or ended.
+   */
+  completeHandoffAway(ticketId: string, reason?: string): Ticket {
     this.end(ticketId, 'executor', 'handedOff', this.now(), reason)
     return this.require(ticketId)
+  }
+  /**
+   * Record that a split or cross-Project handoff could not finish: its Handoff becomes `failed` and, unless a newer
+   * still-active Assignment now owns the Ticket, the Ticket keeps `delivery.error` for a person to retry, so it never
+   * looks handed off. A concurrent retry that already owns the Ticket keeps its own delivery state; the failed Handoff
+   * records the error for its history. Nothing starts, and a concurrent stop may already have ended the Ticket.
+   */
+  failHandoffAway(ticketId: string, handoffId: string, error: string): Ticket | undefined {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket) return undefined
+    const at = this.now()
+    const handoff = ticket.handoffs?.find(item => item.id === handoffId)
+    if (handoff && (handoff.status === 'starting' || handoff.status === 'pending' || handoff.status === 'accepted')) {
+      handoff.status = 'failed'
+      handoff.decidedAt = at
+      handoff.failure = error.slice(0, 1000)
+    }
+    const latest = latestAssignment(ticket)
+    const from = handoff?.from.assignmentId
+    const superseded = !!latest && !!from && latest.id !== from && latest.state !== 'ended'
+    // An archived Ticket also keeps the error so a later unarchive leaves it retryable; only an ended one drops it.
+    if (!ticket.ended && !superseded) ticket.delivery = { error: error.slice(0, 300), at }
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return this.require(ticketId)
+  }
+  /**
+   * Recover Handoffs a host restart interrupted between their first transaction and their completion (see
+   * `recoverTicketHandoffs`). Idempotent and safe to call at startup: it starts no Worker and creates no Ticket.
+   * @returns how many in-flight Handoffs it recovered.
+   */
+  recoverStartingHandoffs(at = this.now()): number {
+    let recovered = 0
+    for (const ticket of this.repo.tickets.list()) {
+      if (!ticket.handoffs?.some(handoff => handoff.status === 'starting')) continue
+      recovered += this.repo.atomic(() => this.recoverTicketHandoffs(ticket.id, at))
+    }
+    return recovered
+  }
+  /**
+   * Fail the `starting` Handoffs of one Ticket: the source Worker stopped and its cleanup was awaited, but the process
+   * ended before the replacement Worker or target Ticket was committed. A transfer's pending replacement Assignment ends
+   * `handoffCleanupFailed`; an open Ticket keeps a delivery error so a person can retry, unless a newer active Assignment
+   * already owns it. It never starts the target or replacement.
+   */
+  private recoverTicketHandoffs(ticketId: string, at: string): number {
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket) return 0
+    const starting = (ticket.handoffs ?? []).filter(handoff => handoff.status === 'starting')
+    if (!starting.length) return 0
+    const message = 'The host restarted while this handoff was starting, so it did not complete and no Worker was started over it.'
+    for (const handoff of starting) {
+      handoff.status = 'failed'
+      handoff.decidedAt = at
+      handoff.failure = message
+      if (handoff.kind !== 'transfer' || !handoff.to.assignmentId) continue
+      // The replacement was reserved by the first transaction but never launched; a retry reuses its `-h<seq>` slot.
+      const assignment = ticket.assignments.find(item => item.id === handoff.to.assignmentId)
+      if (assignment?.state === 'pending') this.endAssignment(ticket, assignment, 'handoffCleanupFailed')
+    }
+    const latest = latestAssignment(ticket)
+    const sources = new Set(starting.flatMap(handoff => handoff.from.assignmentId ? [handoff.from.assignmentId] : []))
+    const superseded = !!latest && latest.state !== 'ended' && !sources.has(latest.id)
+    // An archived Ticket also keeps the error so a later unarchive leaves it retryable; only an ended one drops it.
+    if (!ticket.ended && !superseded) ticket.delivery = { error: message, at }
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    return starting.length
   }
   /**
    * Add the new Worker's briefing as a text Input, under the Handoff's id, so the receiving Session reads why it has the work
@@ -440,10 +555,12 @@ export class Tickets extends EnginePart {
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
   }
-  /** The number of accepted transfers a Ticket had, which numbers its next Worker Session. */
+  /**
+   * The number of transfer Handoffs a Ticket recorded, which numbers its next Worker Session. A failed transfer still used
+   * its slot, so a retry after it starts the same `-h<seq>` Session the replacement would have had, not the old Worker's.
+   */
   private transferCount(ticket: Pick<Ticket, 'id' | 'handoffs'>): number {
-    return ticket.handoffs?.filter(handoff => handoff.kind === 'transfer' && handoff.status === 'accepted'
-      && handoff.to.ticketId === ticket.id).length ?? 0
+    return ticket.handoffs?.filter(handoff => handoff.kind === 'transfer' && !!handoff.to.sessionId).length ?? 0
   }
   /** Record the stop that guards the Worker's automatic resume; a Project stop leaves an earlier `worker` stop in place. */
   private writeManualStop(ticket: Ticket, options: HardStopWorkerOptions): void {

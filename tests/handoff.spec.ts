@@ -211,11 +211,11 @@ describe('cross-Project handoff', () => {
       targetProjectId: liveTarget.id })).toThrow(new UserError('notProjectTicket'))
   })
 
-  it('lets the target PM reject without changing the source Ticket', () => {
+  it('lets the target PM reject without changing the source Ticket', async () => {
     const h = twoProjects()
     const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, h.source.tickets[0]!.id,
       { ...request, targetProjectId: h.target.project.id })
-    const result = h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+    const result = await h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
       { action: 'reject', reason: 'Not our Project' })
     expect(result.handoff).toMatchObject({ status: 'rejected', decisionReason: 'Not our Project' })
     expect(result.ticket).toBeUndefined()
@@ -224,31 +224,31 @@ describe('cross-Project handoff', () => {
     expect(source.handoffs![0]).toMatchObject({ status: 'rejected', decisionReason: 'Not our Project' })
     expect(assignmentOf(h.repo, h.source.tickets[0]!)).toMatchObject({ state: 'running' })
     expect(h.stops).toEqual([])
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('handoffHandled'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('handoffHandled'))
   })
 
-  it('refuses a target accept after the source Project pauses or its Worker gets a manual stop', () => {
+  it('refuses a target accept after the source Project pauses or its Worker gets a manual stop', async () => {
     const h = twoProjects()
     const sourceTicket = h.source.tickets[0]!
     const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, sourceTicket.id,
       { ...request, targetProjectId: h.target.project.id })
     h.engine.pauseProject(h.source.project.id, true)
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('projectPaused'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('projectPaused'))
     h.engine.pauseProject(h.source.project.id, false)
     h.engine.stopAssignment(sourceTicket.id, sourceTicket.assignments[0]!.id)
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('manualStopNeedsUserApproval'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('manualStopNeedsUserApproval'))
   })
 
-  it('accepts into a new independent Ticket, links both records, and ends the source as handedOff', () => {
+  it('accepts into a new independent Ticket, links both records, and ends the source as handedOff', async () => {
     const h = twoProjects()
     const sourceTicket = h.source.tickets[0]!
     const sourceBefore = h.repo.tickets.get(sourceTicket.id)!
     const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, sourceTicket.id,
       { ...request, targetProjectId: h.target.project.id })
-    const result = h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id, { action: 'accept' })
+    const result = await h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id, { action: 'accept' })
     expect(result.ticket).toBeDefined()
     const target = h.repo.tickets.get(result.ticket!.id)!
     expect(target.id).not.toBe(sourceTicket.id)
@@ -278,29 +278,29 @@ describe('cross-Project handoff', () => {
       .toEqual([{ ticketId: sourceTicket.id, handoffId: handoff.id, kind: 'split', toTicketId: target.id,
         toSessionId: workerSessionId(target.id) }])
     // Accepting again returns the same target Ticket and creates no second one.
-    const again = h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id, { action: 'accept' })
+    const again = await h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id, { action: 'accept' })
     expect(again.ticket?.id).toBe(target.id)
     expect(h.repo.tickets.list().filter(ticket => ticket.projectId === h.target.project.id)).toHaveLength(2)
   })
 
-  it('refuses a decision from another PM, for a request addressed elsewhere, or after the source ended', () => {
+  it('refuses a decision from another PM, for a request addressed elsewhere, or after the source ended', async () => {
     const h = twoProjects()
     const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, h.source.tickets[0]!.id,
       { ...request, targetProjectId: h.target.project.id })
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.source.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('notProjectPm'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.source.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('notProjectPm'))
     const third = h.projectWith('p3')
-    expect(() => h.engine.decideProjectHandoff(third.project.id, third.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('notProjectTicket'))
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, 'missing',
-      { action: 'accept' })).toThrow(new UserError('unknownHandoff'))
+    await expect(h.engine.decideProjectHandoff(third.project.id, third.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('notProjectTicket'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, 'missing',
+      { action: 'accept' })).rejects.toThrow(new UserError('unknownHandoff'))
     h.engine.pauseProject(h.target.project.id, true)
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('projectPaused'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('projectPaused'))
     h.engine.pauseProject(h.target.project.id, false)
     h.engine.stopTicket(h.source.tickets[0]!.id)
-    expect(() => h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
-      { action: 'accept' })).toThrow(new UserError('ticketEnded'))
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new UserError('ticketEnded'))
   })
 })
 
@@ -318,6 +318,12 @@ describe('handoff read views through the Store views', () => {
     const targetView = projectDetail(store, target.project.id)!
     expect(targetView.handoffRequests).toEqual([expect.objectContaining({ handoff_id: handoff.id, ticket_id: source.tickets[0]!.id,
       title: source.tickets[0]!.title, summary: 'Summary text' })])
+    // A same-Project split is pending only while its source cleanup runs; it is not a request the Project's PM decides.
+    const stored = h.repo.tickets.get(source.tickets[0]!.id)!
+    stored.handoffs = [...stored.handoffs ?? [], { ...handoff, id: 'same-project-pending', status: 'pending' as const,
+      to: { projectId: source.project.id } }]
+    h.repo.tickets.save(stored)
+    expect(projectDetail(store, source.project.id)!.handoffRequests ?? []).toEqual([])
   })
 })
 

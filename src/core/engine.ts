@@ -352,16 +352,18 @@ export class Engine {
    * Pause or resume a Project: active ↔ paused only. An ended or archived Project ignores the change.
    * A soft pause blocks new Tickets and Assignments while running Assignments finish; a hard pause stops the Project's
    * Workers one by one through `Tickets.hardStopWorker`, so each ends exactly as a person's single stop would, records a
-   * `project` manual stop unless it already carries a `worker` one, and asks the Executor to stop it. A Worker that fails to
-   * stop, or whose background cleanup cannot finish, is reported and the rest still stop; the Project is paused either way.
+   * `project` manual stop unless it already carries a `worker` one, and asks the Executor to stop it. A Worker that fails
+   * to stop, or whose background cleanup cannot finish, is reported and the rest still stop; the Project is paused either way.
    * Resuming clears only its Workers' `project` stops, never their `worker` stops, and adds one `resumedFromHard` note for
-   * the PM; it restarts nothing. This synchronous form reports only failures known at commit; the async
-   * `pauseProjectReport` also waits for background cleanup.
+   * the PM; it restarts nothing.
+   *
+   * This synchronous state-only form does not wait for the started background cleanups and emits no
+   * `project.pausedByUser`: that aggregate notice claims `stopped`, which is only true after the cleanups. Use
+   * `pauseProjectReport` for the report and the Router notice.
    * @throws UserError when the Project is unknown or the mode is not `soft`/`hard`.
    */
   pauseProject(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): ProjectProfile {
     const begun = this.repo.atomic(() => this.pauseProjectNow(projectId, paused, mode))
-    if (begun.hardChanged) this.emitPausedByUser(begun)
     return begun.report.project
   }
   /**
@@ -475,8 +477,9 @@ export class Engine {
   /**
    * A Project PM moves one of its Tickets to a new Worker: the same Ticket, Mandate and worktree, a new Session named
    * `worker-<ticketId>-h<seq>`, and the old Assignment and Session stopped. The new Assignment starts only after the old
-   * Worker's background cleanup succeeds; a cleanup failure ends it as `handoffCleanupFailed` and starts no replacement
-   * Session over the old one's work. Only the PM may call it; a Worker can only report that it needs another Worker.
+   * Worker's background cleanup succeeds; a cleanup failure, or a stop, retry or second transfer during the cleanup,
+   * ends it as `handoffCleanupFailed` or fails its Handoff instead of starting a replacement Session over work that may
+   * still run. Only the PM may call it; a Worker can only report that it needs another Worker.
    * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, or the Ticket is not
    * its own, is ended, carries a manual stop, or has no running or pending Assignment; or when the cleanup fails.
    */
@@ -501,7 +504,7 @@ export class Engine {
         await begun.work
       } catch (error) {
         const message = errorText(error)
-        this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId, message))
+        this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId, begun.handoffId, message))
         throw new UserError('handoffCleanupFailed', { error: message.slice(0, 300) })
       }
     }
@@ -515,7 +518,7 @@ export class Engine {
         return this.tickets.completeTransfer(ticketId, begun.assignmentId, begun.handoffId)
       })
     } catch (error) {
-      this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId,
+      this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId, begun.handoffId,
         `The handoff could not start its replacement Worker: ${errorText(error)}`))
       throw error
     }
@@ -525,11 +528,18 @@ export class Engine {
    * and ending the source Ticket as `handedOff`: a `split` Handoff binds the exact source Assignment/Session to the new
    * Ticket's first Assignment, the new Ticket gets its own Delegated Decision, Mandate, worktree and briefing, and the two
    * Tickets are peers (no parent). The PM chooses the new task; a Worker can only report the need.
+   *
+   * It stops the source Worker first and waits for its background cleanup: the new Ticket, its Handoff and the source
+   * Ticket's `handedOff` end commit only after that cleanup succeeded, so no Worker starts over work that still runs. A
+   * failed cleanup, or a stop or Project change during it, leaves the source Ticket open with a `failed` Handoff and a
+   * `delivery.error` and starts nothing.
    * @throws UserError when the Project is unknown or not active, the caller is not its PM, the source Ticket is not its own,
-   * ended or manually stopped, its latest Assignment ended, or the new task is invalid or reuses the Project's worktree name.
+   * ended or manually stopped, its latest Assignment ended, or the new task is invalid or reuses the Project's worktree
+   * name; or when the source Worker's background cleanup fails.
    */
-  splitTicket(projectId: string, pmSessionId: string, ticketId: string, input: TicketSplitRequest): ProjectHandoffResult {
-    return this.repo.atomic(() => {
+  async splitTicket(projectId: string, pmSessionId: string, ticketId: string, input: TicketSplitRequest): Promise<ProjectHandoffResult> {
+    const prepared = prepareHandoff({ ...input, targetProjectId: projectId })
+    const begun = this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
@@ -543,39 +553,94 @@ export class Engine {
         ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
       const latest = latestAssignment(source)
       if (!latest || latest.state === 'ended') throw new UserError('notHandoffable')
-      const prepared = prepareHandoff({ ...input, targetProjectId: projectId })
+      // The new Ticket's worktree must be free before the source Worker stops, so a refused task cannot also stop it.
+      this.assertWorktreeFree(projectId, prepared.request.title, prepared.request.worktree_name)
       const at = this.options.now?.() ?? new Date().toISOString()
-      const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: prepared.request.title,
-        goal: prepared.request.goal, scope: prepared.request.scope, worktree_name: prepared.request.worktree_name,
-        note: `Split from Ticket ${ticketId} after its Worker reported work beyond it. Read the handoff summary and unfinished `
-          + 'work in this Ticket\'s handoff briefing.' }])
-      const target = this.repo.tickets.get(created!.id)!
-      const targetAssignment = target.assignments.at(-1)
-      const accepted: Handoff = { id: key('handoff', ticketId, 'split', target.id), at, kind: 'split', status: 'accepted',
+      // The Handoff is `starting` while the source Worker stops; a host restart leaves it for startup recovery to fail,
+      // never a pending record whose Assignment already ended.
+      const starting: Handoff = { id: key('handoff', ticketId, 'split', latest.id, at), at, kind: 'split', status: 'starting',
         from: { ticketId, projectId, assignmentId: latest.id, sessionId: assignmentSessionId(ticketId, latest) },
-        to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {},
-          sessionId: targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id) },
-        reason: prepared.reason, summary: prepared.summary, ...prepared.unfinished ? { unfinished: prepared.unfinished } : {},
-        approvedBy: { kind: 'pm', sessionId: pmSessionId }, decidedAt: at }
-      const sourceTicket = this.repo.tickets.get(ticketId)!
-      sourceTicket.handoffs = [...sourceTicket.handoffs ?? [], accepted]
-      sourceTicket.updatedAt = at
-      this.repo.tickets.save(sourceTicket)
-      target.handoffs = [...target.handoffs ?? [], accepted]
-      target.updatedAt = at
-      this.repo.tickets.save(target)
-      this.tickets.briefHandoff(target, accepted, false)
-      const siblings = this.repo.tickets.get(ticketId)!
-      siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id !== accepted.id && item.status === 'pending' && item.kind === 'split'
-        ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Split into Ticket ${target.id}` }
-        : item)
-      siblings.updatedAt = at
-      this.repo.tickets.save(siblings)
-      this.tickets.handoffAway(ticketId, `Split into Ticket ${target.id}`)
-      this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId, handoffId: accepted.id, kind: 'split',
-        toTicketId: target.id, toSessionId: accepted.to.sessionId! } })
-      return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
+        to: { projectId }, reason: prepared.reason, summary: prepared.summary,
+        ...prepared.unfinished ? { unfinished: prepared.unfinished } : {}, request: prepared.request,
+        approvedBy: { kind: 'pm', sessionId: pmSessionId } }
+      source.handoffs = [...source.handoffs ?? [], starting]
+      source.updatedAt = at
+      this.repo.tickets.save(source)
+      const { work } = this.tickets.beginHandoffAway(ticketId, 'Split into a new Ticket in this Project')
+      return { handoff: starting, work }
     })
+    if (begun.work) {
+      try {
+        await begun.work
+      } catch (error) {
+        const message = errorText(error)
+        this.repo.atomic(() => this.tickets.failHandoffAway(ticketId, begun.handoff.id, message))
+        throw new UserError('handoffCleanupFailed', { error: message.slice(0, 300) })
+      }
+    }
+    try {
+      return this.repo.atomic(() => this.completeSplit(projectId, pmSessionId, ticketId, begun.handoff.id))
+    } catch (error) {
+      this.repo.atomic(() => this.tickets.failHandoffAway(ticketId, begun.handoff.id, errorText(error)))
+      throw error
+    }
+  }
+  /**
+   * Finish a split after its source Worker's cleanup: recheck the source Ticket and its pending Handoff, create the
+   * independent Ticket and only then end the source Ticket `handedOff`. It runs in the same transaction as the accepted
+   * Handoff on both sides, so an interrupted attempt leaves neither a target Ticket nor an accepted record.
+   */
+  private completeSplit(projectId: string, pmSessionId: string, ticketId: string, handoffId: string): ProjectHandoffResult {
+    const project = this.repo.projects.get(projectId)
+    if (!project) throw new UserError('unknownProject')
+    if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+    if (project.status === 'archived') throw new UserError('projectArchived')
+    if (project.status === 'paused') throw new UserError('projectPaused')
+    if (project.status !== 'active') throw new UserError('projectEnded')
+    const source = this.repo.tickets.get(ticketId)
+    if (!source || source.projectId !== projectId) throw new UserError('notProjectTicket')
+    if (!liveTicket(source)) throw new UserError('ticketEnded')
+    if (source.manualStop) throw new UserError(source.manualStop.scope === 'worker'
+      ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+    const pending = source.handoffs?.find(item => item.id === handoffId)
+    if (!pending || pending.kind !== 'split' || pending.status !== 'starting') throw new UserError('handoffHandled')
+    const latest = latestAssignment(source)
+    if (!latest || latest.id !== pending.from.assignmentId || latest.state !== 'ended' || latest.endedReason !== 'handedOff') {
+      throw new UserError('notHandoffable')
+    }
+    const request = pending.request
+    if (!request) throw new UserError('invalidHandoff', { reason: 'the handoff names no Ticket task' })
+    const at = this.options.now?.() ?? new Date().toISOString()
+    const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: request.title,
+      goal: request.goal, scope: request.scope, worktree_name: request.worktree_name,
+      note: `Split from Ticket ${ticketId} after its Worker reported work beyond it. Read the handoff summary and unfinished `
+        + "work in this Ticket's handoff briefing." }])
+    const target = this.repo.tickets.get(created!.id)!
+    const targetAssignment = target.assignments.at(-1)
+    const accepted: Handoff = { ...pending, status: 'accepted', decidedAt: at,
+      to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {},
+        sessionId: targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id) } }
+    const siblings = this.repo.tickets.get(ticketId)!
+    siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id === accepted.id ? accepted
+      : item.status === 'pending' && item.kind === 'split'
+        ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Split into Ticket ${target.id}` } : item)
+    siblings.updatedAt = at
+    this.repo.tickets.save(siblings)
+    target.handoffs = [...target.handoffs ?? [], accepted]
+    target.updatedAt = at
+    this.repo.tickets.save(target)
+    this.tickets.briefHandoff(target, accepted, false)
+    this.tickets.completeHandoffAway(ticketId, `Split into Ticket ${target.id}`)
+    this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId, handoffId: accepted.id, kind: 'split',
+      toTicketId: target.id, toSessionId: accepted.to.sessionId! } })
+    return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
+  }
+  /** Refuse a split or accepted handoff whose target Ticket would reuse a worktree name of the target Project. */
+  private assertWorktreeFree(projectId: string, title: string, requested?: string): void {
+    const name = requested || worktreeName(title, 0)
+    const taken = this.repo.tickets.list().some(ticket => ticket.projectId === projectId && !!ticket.execution
+      && worktreeOf(ticket) === name)
+    if (taken) throw new UserError('duplicateWorktree', { name })
   }
   /**
    * A source Project's PM asks another Project's PM to take over work beyond its Project: the request names the new Ticket
@@ -635,15 +700,20 @@ export class Engine {
   }
   /**
    * The target Project's PM decides a pending cross-Project handoff. Rejecting marks it rejected and leaves the source
-   * Ticket running. Accepting creates a new, independent Ticket in the target Project under its own Mandate and worktree
-   * (new Decision, no parent), records the accepted Handoff on both Tickets, and ends the source Ticket with outcome
-   * `handedOff` after stopping its Assignment and Session. Links carry over; worktrees and uncommitted changes do not.
-   * @throws UserError when the target Project is unknown, paused, archived or ended, the caller is not its PM, the Handoff
-   * is unknown, already decided or not addressed to this Project, or the source Ticket is no longer open.
+   * Ticket running. Accepting claims the request as `starting` (a concurrent decision refuses), stops the source Worker
+   * and waits for its background cleanup; only then does it create
+   * a new, independent Ticket in the target Project under its own Mandate and worktree (new Decision, no parent), record
+   * the accepted Handoff on both Tickets, and end the source Ticket with outcome `handedOff` after its Assignment and
+   * Session stopped. A failed cleanup, or a change to either Ticket during it, leaves a `failed` Handoff and a
+   * `delivery.error` on the source Ticket and starts nothing. Links carry over; worktrees and uncommitted changes do not.
+   * @throws UserError when either Project is unknown, paused, archived or ended, the caller is not the target PM, the
+   * Handoff is unknown, already decided or not addressed to this Project, the source Ticket or its Assignment is no longer
+   * current, or the source Worker's background cleanup fails.
    */
-  decideProjectHandoff(projectId: string, pmSessionId: string, handoffId: string,
-    decision: { action: 'accept' | 'reject'; reason?: string }): ProjectHandoffResult {
-    return this.repo.atomic(() => {
+  async decideProjectHandoff(projectId: string, pmSessionId: string, handoffId: string,
+    decision: { action: 'accept' | 'reject'; reason?: string }): Promise<ProjectHandoffResult> {
+    const begun = this.repo.atomic((): { decided?: ProjectHandoffResult; accept?: { handoffId: string; originId: string };
+      work?: Promise<void> } => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
       if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
@@ -658,15 +728,15 @@ export class Engine {
       if (!source || !handoff) throw new UserError('unknownHandoff')
       if (handoff.kind !== 'split' || handoff.to.projectId !== projectId) throw new UserError('notProjectTicket')
       // A decided request answers only its own action: accepting an accepted request is idempotent, rejecting it is a
-      // contradiction, and so is accepting a rejected one.
+      // contradiction, and so is accepting a rejected or failed one.
       if (handoff.status === 'accepted') {
         if (decision.action !== 'accept') throw new UserError('handoffHandled')
         const ticket = handoff.to.ticketId ? this.repo.tickets.get(handoff.to.ticketId) : undefined
-        return { handoff, ...ticket ? { ticket } : {} }
+        return { decided: { handoff, ...ticket ? { ticket } : {} } }
       }
       if (handoff.status === 'rejected') {
         if (decision.action !== 'reject') throw new UserError('handoffHandled')
-        return { handoff }
+        return { decided: { handoff } }
       }
       if (handoff.status !== 'pending') throw new UserError('handoffHandled')
       const at = this.options.now?.() ?? new Date().toISOString()
@@ -674,7 +744,7 @@ export class Engine {
         const rejected: Handoff = { ...handoff, status: 'rejected', decidedAt: at,
           ...(decision.reason?.trim() ? { decisionReason: decision.reason.trim().slice(0, 1000) } : {}) }
         this.replaceHandoff(source, rejected)
-        return { handoff: rejected }
+        return { decided: { handoff: rejected } }
       }
       const origin = this.repo.tickets.get(handoff.from.ticketId!)
       if (!origin || !liveTicket(origin)) throw new UserError('ticketEnded')
@@ -701,33 +771,95 @@ export class Engine {
       }
       const request = handoff.request
       if (!request) throw new UserError('invalidHandoff', { reason: 'the request names no Ticket task' })
-      const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: request.title, goal: request.goal,
-        scope: request.scope, worktree_name: request.worktree_name,
-        note: `Handoff from Project ${handoff.from.projectId}, Ticket ${handoff.from.ticketId}. Read the handoff summary and `
-          + 'unfinished work in this Ticket\'s handoff briefing.' }])
-      const target = this.repo.tickets.get(created!.id)!
-      const targetAssignment = target.assignments.at(-1)
-      const sessionId = targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id)
-      const accepted: Handoff = { ...handoff, status: 'accepted', decidedAt: at,
-        to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {}, sessionId },
-        approvedBy: { kind: 'pm', sessionId: pmSessionId } }
-      this.replaceHandoff(origin, accepted)
-      target.handoffs = [...target.handoffs ?? [], accepted]
-      target.updatedAt = at
-      this.repo.tickets.save(target)
-      this.tickets.briefHandoff(target, accepted, false)
-      // A source Ticket hands its work to one place only: its other pending requests are no longer actionable.
-      const siblings = this.repo.tickets.get(origin.id)!
-      siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id !== accepted.id && item.status === 'pending' && item.kind === 'split'
-        ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Handed off to Project ${projectId}` }
-        : item)
-      siblings.updatedAt = at
-      this.repo.tickets.save(siblings)
-      this.tickets.handoffAway(origin.id, `Handed off to Project ${projectId}`)
-      this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId: origin.id, handoffId: accepted.id, kind: 'split',
-        toTicketId: target.id, toSessionId: sessionId } })
-      return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
+      // Refuse a taken worktree before stopping the source Worker; the target Ticket is created only after the cleanup.
+      this.assertWorktreeFree(projectId, request.title, request.worktree_name)
+      // Claim the request for this accept while the source Worker stops: a concurrent decision must be refused, and a host
+      // restart leaves a `starting` record for startup recovery rather than a `pending` request nobody can decide safely.
+      this.replaceHandoff(origin, { ...handoff, status: 'starting' })
+      const { work } = this.tickets.beginHandoffAway(origin.id, `Handed off to Project ${projectId}`)
+      return { accept: { handoffId: handoff.id, originId: origin.id }, ...work ? { work } : {} }
     })
+    if (begun.decided) return begun.decided
+    const accept = begun.accept!
+    if (begun.work) {
+      try {
+        await begun.work
+      } catch (error) {
+        const message = errorText(error)
+        this.repo.atomic(() => this.tickets.failHandoffAway(accept.originId, accept.handoffId, message))
+        throw new UserError('handoffCleanupFailed', { error: message.slice(0, 300) })
+      }
+    }
+    try {
+      return this.repo.atomic(() => this.acceptProjectHandoff(projectId, pmSessionId, accept.handoffId, accept.originId))
+    } catch (error) {
+      this.repo.atomic(() => this.tickets.failHandoffAway(accept.originId, accept.handoffId, errorText(error)))
+      throw error
+    }
+  }
+  /**
+   * Finish a cross-Project accept after its source Worker's cleanup: recheck both Projects, the source Ticket, its now
+   * stopped Assignment and the still-pending Handoff, create the target Ticket, and only then end the source Ticket
+   * `handedOff`. It runs in one transaction with the accepted Handoff on both Tickets.
+   */
+  private acceptProjectHandoff(projectId: string, pmSessionId: string, handoffId: string, originId: string): ProjectHandoffResult {
+    const project = this.repo.projects.get(projectId)
+    if (!project) throw new UserError('unknownProject')
+    if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+    if (project.status === 'archived') throw new UserError('projectArchived')
+    if (project.status === 'paused') throw new UserError('projectPaused')
+    if (project.status !== 'active') throw new UserError('projectEnded')
+    const origin = this.repo.tickets.get(originId)
+    if (!origin || !liveTicket(origin)) throw new UserError('ticketEnded')
+    const sourceProject = this.repo.projects.get(origin.projectId ?? '')
+    if (!sourceProject) throw new UserError('unknownProject')
+    if (sourceProject.status === 'archived') throw new UserError('projectArchived')
+    if (sourceProject.status === 'paused') throw new UserError('projectPaused')
+    if (sourceProject.status !== 'active') throw new UserError('projectEnded')
+    if (origin.manualStop) throw new UserError(origin.manualStop.scope === 'worker'
+      ? 'manualStopNeedsUserApproval' : 'manualStopProjectPaused')
+    const handoff = origin.handoffs?.find(item => item.id === handoffId)
+    if (!handoff || handoff.to.projectId !== projectId) throw new UserError('notProjectTicket')
+    if (handoff.status !== 'starting') throw new UserError('handoffHandled')
+    if (!handoff.from.assignmentId) throw new UserError('notHandoffable')
+    const current = latestAssignment(origin)
+    const currentSession = current ? assignmentSessionId(origin.id, current) : undefined
+    const expectedSession = handoff.from.sessionId ?? currentSession
+    // The source Assignment was stopped before this transaction; a different state or id means a stop, retry or another
+    // handoff changed the Ticket during the cleanup, and this accept must not start target work over that change.
+    if (!current || current.id !== handoff.from.assignmentId || current.state !== 'ended'
+      || current.endedReason !== 'handedOff' || currentSession !== expectedSession) {
+      throw new UserError('notHandoffable')
+    }
+    const request = handoff.request
+    if (!request) throw new UserError('invalidHandoff', { reason: 'the request names no Ticket task' })
+    const at = this.options.now?.() ?? new Date().toISOString()
+    const [created] = this.createProjectTickets(projectId, pmSessionId, [{ title: request.title, goal: request.goal,
+      scope: request.scope, worktree_name: request.worktree_name,
+      note: `Handoff from Project ${handoff.from.projectId}, Ticket ${handoff.from.ticketId}. Read the handoff summary and `
+        + "unfinished work in this Ticket's handoff briefing." }])
+    const target = this.repo.tickets.get(created!.id)!
+    const targetAssignment = target.assignments.at(-1)
+    const sessionId = targetAssignment ? assignmentSessionId(target.id, targetAssignment) : workerSessionId(target.id)
+    const accepted: Handoff = { ...handoff, status: 'accepted', decidedAt: at,
+      to: { ticketId: target.id, projectId, ...targetAssignment ? { assignmentId: targetAssignment.id } : {}, sessionId },
+      approvedBy: { kind: 'pm', sessionId: pmSessionId } }
+    this.replaceHandoff(origin, accepted)
+    target.handoffs = [...target.handoffs ?? [], accepted]
+    target.updatedAt = at
+    this.repo.tickets.save(target)
+    this.tickets.briefHandoff(target, accepted, false)
+    // A source Ticket hands its work to one place only: its other pending requests are no longer actionable.
+    const siblings = this.repo.tickets.get(origin.id)!
+    siblings.handoffs = (siblings.handoffs ?? []).map(item => item.id !== accepted.id && item.status === 'pending' && item.kind === 'split'
+      ? { ...item, status: 'rejected' as const, decidedAt: at, decisionReason: `Handed off to Project ${projectId}` }
+      : item)
+    siblings.updatedAt = at
+    this.repo.tickets.save(siblings)
+    this.tickets.completeHandoffAway(origin.id, `Handed off to Project ${projectId}`)
+    this.options.emit?.({ type: 'ticket.handedOff', at, data: { ticketId: origin.id, handoffId: accepted.id, kind: 'split',
+      toTicketId: target.id, toSessionId: sessionId } })
+    return { handoff: accepted, ticket: this.repo.tickets.get(target.id)! }
   }
   /** Save a decided Handoff on its source Ticket, replacing the pending record in place. */
   private replaceHandoff(source: Ticket, handoff: Handoff): void {
@@ -808,6 +940,14 @@ export class Engine {
     })
   }
 
+  /**
+   * Recover Handoffs a host restart interrupted after their first transaction: their source Worker was already stopped, but
+   * the replacement Worker or target Ticket was never committed. Each `starting` Handoff becomes `failed` and its still
+   * open Ticket keeps a delivery error for a person to retry; a transfer's reserved but never launched Assignment ends
+   * `handoffCleanupFailed`. It starts nothing and is idempotent, so Runtime calls it once before resuming work.
+   * @returns how many in-flight Handoffs it recovered.
+   */
+  recoverInterruptedHandoffs(): number { return this.tickets.recoverStartingHandoffs() }
   /**
    * A child Worker Session was archived outside the Project's own commands: end its current Assignment with
    * `sessionArchived`, leave the Ticket open, and add one pending note for the PM's next prompt. It does not start or wake

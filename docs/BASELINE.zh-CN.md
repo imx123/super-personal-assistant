@@ -315,7 +315,7 @@ P3-A 把人停止 Worker 与 Project hard pause 收拢到同一个 `Tickets.hard
 
 - `Ticket.manualStop?: { at, scope: 'worker' | 'project', by, sessionId?, reason? }`。单 Worker 停止写 `worker`；Project hard pause 写 `project`，若已有 `worker` 标签则保留不覆盖。
 - `Tickets.hardStopWorker(ticketId, options)`：结束当前 Assignment（`endedReason: 'stoppedByOperator'`）、回填未被步骤取走的 Input、清 attention/delivery、写标签、调用 `executor.stop`（取消当前 turn 并停止后台任务）。单 Worker 停止 `Engine.stopAssignment` 与 Project hard pause 的逐 Worker 循环都只调用它，因此两条路径的 Assignment/Session/Ticket 结果一致，只有标签 scope 不同。
-- `Engine.pauseProjectReport(projectId, paused, mode)`：hard 先置 paused，再对每个 open project Ticket 在自己的 savepoint 中调用原语；单个失败被收集、其余继续，返回 `workers.stopped/failures`；随后发出 `project.pausedByUser`（含 stopped/failures）。`pauseProject` 仍返回 ProjectProfile，保持旧调用兼容。
+- `Engine.pauseProjectReport(projectId, paused, mode)`：hard 先置 paused，再对每个 open project Ticket 在自己的 savepoint 中调用原语；单个失败被收集、其余继续，返回 `workers.stopped/failures`；等待所有已启动 cleanup 后才发出 `project.pausedByUser`（含最终 stopped/failures）。同步 `pauseProject` 只返回 ProjectProfile、不等待 cleanup，也不发 `project.pausedByUser`，避免提前把失败 cleanup 报成已停止；HTTP `POST projects/:id/pause` 使用异步版。
 - Runtime 把 `project.pausedByUser` 转成发给 Router 的 durable `projectPausedByUser` relay；hard pause 的逐 Worker `execution_status` 回执被抑制，不向已被暂停的 PM 逐个投递。单 Worker 停止仍发 execution_status，并附 `manual_stop` 与 `needs_user_approval`。
 - Resume 只清除本 Project 的 `scope: 'project'` 标签，不清 `worker`；不自动重启任何 Worker；hard resume 仍写 `resumedFromHard` pendingNote。
 - `Tickets.newAssignment`/`retry`/`wake` 统一拒绝带标签的自动恢复：worker 标签抛 `manualStopNeedsUserApproval`，project 标签抛 `manualStopProjectPaused`。
@@ -331,10 +331,10 @@ P3-B 只做 Agent 之间的执行权交接：同 Project 保留 Ticket/Mandate/w
 
 已实现：
 
-- `Handoff`（`kind: transfer|split`、`status: pending|accepted|rejected`、`from/to`、`reason`、`summary`、`unfinished`、目标 Ticket 的 `request`、`approvedBy`、`decidedAt/decisionReason`）写入 `Ticket.handoffs`；`Assignment.endedReason` 新增 `handedOff`，`Ticket.ended.outcome` 新增 `handedOff`；没有 `parentId`、Dispatch 或独立表。
+- `Handoff`（`kind: transfer|split`、`status: pending|starting|accepted|rejected|failed`、`failure`、`from/to`、`reason`、`summary`、`unfinished`、目标 Ticket 的 `request`、`approvedBy`、`decidedAt/decisionReason`）写入 `Ticket.handoffs`；`Assignment.endedReason` 新增 `handedOff`，`Ticket.ended.outcome` 新增 `handedOff`；没有 `parentId`、Dispatch 或独立表。`starting` 表示源 Worker 已停止、等待 cleanup 或第二阶段提交；启动恢复会把崩溃遗留的 `starting` 变为 `failed`。
 - `Assignment.sessionId` 记录派工实际运行的 Worker Session；`workerSessionId(ticketId, seq)` 生成 `worker-<ticketId>` / `-h<n>`，`ticketOfSession` 解析后缀，`latestSessionId`/`workerSessionsOf` 覆盖启动、投递、报告路由、面板链接、归档/暂停/关停与旧 Session 工具守卫。
-- `Engine.transferTicket`/PM 工具 `orchestrator_project_ticket_handoff`：同 Ticket/Mandate/worktree；旧 Assignment `handedOff`、旧 Session 取消并停后台；新 Assignment 用 `-h<seq>`，收到交接摘要 Input；Ticket 保持 open，不建 Decision。多次交接递增 h1/h2。
-- 跨 Project：`Engine.requestProjectHandoff` + `orchestrator_project_ticket_handoff_to_project` 写 pending 记录并通知目标 PM（需要时启动目标 PM Session）；`Engine.decideProjectHandoff` + `orchestrator_project_ticket_handoff_decide` 由目标 PM 拒绝或接收。接收时经正常 delegated 路径在目标 Project 新建独立 Ticket（新 Decision/Mandate/worktree），双向保存同一 accepted Handoff，源 Ticket 停 Worker 并以 `handedOff` 结束；只传摘要/未完成项/链接。
+- `Engine.transferTicket`/PM 工具 `orchestrator_project_ticket_handoff`：同 Ticket/Mandate/worktree；旧 Assignment `handedOff`、旧 Session 取消并停后台；新 Assignment 用 `-h<seq>`，收到交接摘要 Input；Ticket 保持 open，不建 Decision。多次交接递增 h1/h2。cleanup 等待结束后重新校验 Handoff 与最新 pending Assignment；被并发 stop/retry/第二次 handoff 改写时该 Handoff 记为 `failed`，不启动替代 Worker。
+- 跨 Project：`Engine.requestProjectHandoff` + `orchestrator_project_ticket_handoff_to_project` 写 pending 记录并通知目标 PM（需要时启动目标 PM Session）；`Engine.decideProjectHandoff` + `orchestrator_project_ticket_handoff_decide` 由目标 PM 拒绝或接收。接收时先停源 Worker 并等待 cleanup，成功后才经正常 delegated 路径在目标 Project 新建独立 Ticket（新 Decision/Mandate/worktree），双向保存同一 accepted Handoff，源 Ticket 以 `handedOff` 结束；cleanup 失败或等待期间状态被改写时 Handoff 为 `failed`、源 Ticket 保持 open 并写 delivery error，目标 Ticket 不创建。只传摘要/未完成项/链接。
 - 守卫：源/目标 Project 必须 active（paused/archived/ended 各有错误）；源 Ticket 必须 open 且最新 Assignment 未结束；目标只能是另一个 Project；目标 PM 才能决定；同一接受重复调用返回同一目标 Ticket；接收后源 Ticket 不再被 human 消息自动唤醒。
 - PM 工具边界扩大为 8 个（新增 3 个 handoff 工具）；Worker/主 Session 无 handoff 工具。面板 Ticket 页显示交接历史与每个 Assignment 的 Session 链接，Project 页显示待处理跨 Project 交接请求与来源链接。
 
@@ -351,6 +351,18 @@ P3-B 只做 Agent 之间的执行权交接：同 Project 保留 Ticket/Mandate/w
 - **同 Project Worker→PM 缺口**：新增 PM 工具 `orchestrator_project_ticket_handoff_new_ticket`（`Engine.splitTicket`）：Worker 报告越界后，PM 在同 Project 新建独立 Ticket（新 Decision/Mandate/worktree），源 Ticket 停 Worker 并以 `handedOff` 结束，无 parentId。PM 工具边界现为 9 个。
 
 改动文件：`src/core/model.ts`、`ports.ts`、`errors.ts`、`tickets.ts`、`engine.ts`、`index.ts`；`src/executor/dsh.ts`；`src/app/http.ts`、`tools/main.ts`、`sessions.ts`；`src/client/locales.ts`；`docs/001`、`002`、`007`、`P3_HANDOFF`、本文件；新增 `tests/p3-audit-fixes.spec.ts`，更新 handoff/manual-stop/core-engine/model-surface 等测试。
+
+## 已完成的 R2 P3 审核修复
+
+第二轮审核（`AUDIT_FINDINGS_2026-11-11-R2.md` 的 R2-N1/N2/N4/N5/N7）已修复，仍未 push、未创建提交、未启用真实 GitHub、未动系统 DSH/profile。
+
+- **R2-N1 两类 handoff 也等待源 cleanup，并可从崩溃恢复**：`Engine.splitTicket` 与 `Engine.decideProjectHandoff`（accept 分支）改为异步两阶段。阶段一在一个事务里写 `starting` Handoff、结束源 Assignment 并取得 `Executor.stop` 的 cleanup Promise；cleanup 成功后才在阶段二事务里创建目标 Ticket、双向写 accepted Handoff 并结束源 Ticket。失败时 `Tickets.failHandoffAway` 把 Handoff 记为 `failed`（写 `failure`）并给仍 open 的源 Ticket 写 `delivery.error`，目标 Ticket/目标 Worker 都不创建。`HandoffStatus` 增加 `starting`/`failed`，面板用 `handoffStarting`/`handoffFailed` 显示；`Handoff` 增加 `failure`。`Runtime.initialize` 在任何 Worker resume 前调用 `Engine.recoverInterruptedHandoffs()`，把上一进程遗留的 `starting` 记录改为 `failed`（transfer 预留的 pending Assignment 结束为 `handoffCleanupFailed`），源 Ticket 保持 open + delivery error 且可 retry；恢复不创建目标 Ticket、不启动 Worker、幂等。同 Project transfer 原有的等待语义保持不变。
+- **R2-N2 同步暂停不再提前报停止**：`Engine.pauseProject` 只做状态事务并返回 Profile，不再发 `project.pausedByUser`；该聚合事件只由 `pauseProjectReport` 在等待每个 cleanup 后发出，失败项只进 `failures`。HTTP pause 仍走异步版；既有测试改为经异步入口断言同一事件序列，并新增同步入口不发聚合事件的用例。
+- **R2-N4 transfer 两事务之间重新校验**：transfer 第一阶段写 `starting` Handoff；`completeTransfer` 要求 Handoff 仍是 `starting` transfer、`to.assignmentId` 与传入 Assignment 一致、且该 Assignment 仍是 Ticket 最新的 pending Assignment，才在同一事务里改成 `accepted` 并 start，否则抛错且不 start。`failTransfer(ticketId, assignmentId, handoffId, error)` 现在总是把对应 Handoff 标为 `failed` 并可写 `failure`；只要该 Ticket 仍归本次尝试（没有被更新的 Assignment 接管）就写 `delivery.error`，不再因 Assignment 非 pending 而静默返回。`transferCount` 把失败/恢复的 transfer 也计入，重试仍使用该 transfer 预留的 `-h<seq>` Session，不会回到旧 Worker 的 base Session。新增确定性并发用例：等待期间 stop 替代 Assignment、第二次 transfer 抢先、以及跨 Project accept 等待期间 reject 被 `handoffHandled` 拒绝，均由测试手动控制 cleanup Promise，不依赖计时。
+- **R2-N5 expected cancel 标记按 Assignment + 回合绑定**：`WeakSet<Agent>` 改为 `WeakMap<Agent, { assignmentId, turn? }>`。`stop()` 在发出 cancel 前记录标记（agent 已 idle 也记录）；`agent/status running` 不再清标记；idle 处理按最近 `turn/end` 的回合号比较，同一回合的重复 idle 仍视为 expected，更晚回合的 end 丢弃标记并按原生 Stop 处理。新增测试：idle 时停止后仍识别原生 Stop、重复 idle 不触发二次 stop、cancel 后新回合的原生 Stop 被识别。
+- **R2-N7 原生 Stop 保留回合记录与回执语义**：`workerIdle` 在 hard stop 前调用 `Engine.turnEnded(ticketId, assignmentId, at)`，保留 `idleAt`/`interruptedAt`，随后仍调用 `Engine.stopAssignment` 并由 hard-stop 路径发 `execution_status`（`manual_stop`/`needs_user_approval`）。该行为对所有 Ticket 来源生效（不只 main-session），新增 main-session Ticket 的定向用例；`findLast` / 旧 `interrupt_turn` 回执不再使用，因为 Assignment 现在确实被 hard stop。
+
+改动文件：`src/core/model.ts`、`tickets.ts`、`engine.ts`；`src/executor/dsh.ts`；`src/app/runtime.ts`、`tools/main.ts`、`views/projects.ts`；`src/client/locales.ts`；`docs/001`、`002`、`007`、`P3_HANDOFF`、本文件；`tests/p3-audit-fixes.spec.ts`、`handoff.spec.ts`、`manual-stop.spec.ts`、`projects.spec.ts`。
 
 ## 验证
 
@@ -385,6 +397,13 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 - `tsc --noEmit` 通过；`tsdown` 打包通过。
 - 新增 `tests/p3-audit-fixes.spec.ts` 14 项全通过：原生 DSH user abort 变 hard stop（Assignment/标签/PM 回执）；插件 cancel 与 handoff 旧 Session turn 不误识别；project hard pause cleanup rejection 进入 API `workers.failures` 与 Router notice、`stopped` 不含该项；transfer cleanup 失败不创建 replacement Session、旧 job 保持、新 Assignment `handoffCleanupFailed`；旧请求在 allow-resume + revive 后拒绝、h1 后同内容新请求、pre-P3 无 sessionId 推导、无 assignmentId 旧记录拒绝并原地升级；矛盾决策 `handoffHandled` 与工具回执按实际状态；同 Project split 源票 `handedOff` 且无 parentId，并验证 PM 工具入口。
 - `handoff`、`manual-stop`、`projects`、`project-tickets`、`core-engine`、`model-surface`、`archive-reconcile`、`http`、`pm-tools`、`locales`、`views`、`panel-project` 定向与 `runtime`（除既有 Git 配置路径转义 1 项）通过。
+
+2026-11-11 在本机验证 R2 P3 审核修复：
+
+- `npx tsc --noEmit` 通过；`tsdown` 打包通过（`lib/index.js` 607 kB 及声明文件）。
+- `tests/p3-audit-fixes.spec.ts` 从 14 项扩到 28 项全通过：新增 split 与跨 Project 接收的 cleanup 失败（无目标 Ticket、Handoff `failed`、delivery error）、cleanup 成功前不创建目标（手动控制 cleanup Promise，非计时）、跨 Project accept 等待期间 reject 被 `handoffHandled` 拒绝、并发 retry 已接管时 `failHandoffAway` 不写当前 Worker 的 delivery error、transfer 等待期间 stop 替代 Assignment 与第二次 transfer 抢先（Handoff `failed`、失败可见、第二次仍完成）、失败 transfer 的重试仍使用预留的 `-h1` Session、重启恢复（用 seed 写入三份 `starting` 状态后由新 Runtime 重开同一 SQLite store：split/accept/transfer 均变为 `failed` + delivery error、不创建目标 Ticket、不启动替代 Worker、三张源 Ticket 均可 retry，恢复第二次调用返回 0）、idle 时停止后原生 Stop、重复 idle 不二次停止、cancel 后新回合识别原生 Stop、main-session Ticket 原生 Stop 保留 `idleAt`/`interruptedAt` 与回执。
+- `handoff` 13 项、`manual-stop` 15 项、`projects` 15 项、`core-engine` 115 项、`project-tickets` 27 项、`pm-tools`、`http` 5 项、`views` 15 项、`archive-reconcile` 5 项、`model-surface` 7 项、`locales` 全通过；`runtime` 159/160，唯一失败仍是既有 Windows Git 配置路径转义项（与本次改动无关）。
+- 全量 67 个文件、1320 项：1272 通过、48 失败；失败全部集中在既有 Windows 环境问题（`spawn EPERM` 的 `service-script`/`sources`/`environment`/`commands`/`deployment`、路径分隔符导致的 `docs` 3 项、路径/权限导致的 `store`/`prompts`/`runtime` 各 1 项），无新增逻辑失败。运行方式：`node node_modules/vitest/vitest.mjs run --configLoader runner`（默认 config 打包在本 sandbox 会 `spawn EPERM`）。
 
 ## 后续顺序
 

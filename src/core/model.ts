@@ -416,8 +416,13 @@ export interface ManualStop {
 }
 /** Whether a Handoff moved a Ticket to a new Worker (`transfer`) or split work into another Project (`split`). */
 export type HandoffKind = 'transfer' | 'split'
-/** A cross-Project request waits for its target PM; a transfer or accepted split is decided. */
-export type HandoffStatus = 'pending' | 'accepted' | 'rejected'
+/**
+ * A cross-Project request waits for its target PM (`pending`); a transfer, split or accepted request is being started
+ * (`starting`: its source Worker has stopped while the replacement or target commits), then decided (`accepted`); a
+ * target may reject a `pending` request; a Handoff whose Worker cleanup or start failed, or that a host restart
+ * interrupted while `starting`, is `failed`, so no accepted record claims success.
+ */
+export type HandoffStatus = 'pending' | 'starting' | 'accepted' | 'rejected' | 'failed'
 /**
  * One side of a Handoff: its Ticket and Project, the Assignment that produced or receives the work, and that Assignment's
  * Worker Session. `assignmentId` binds the record to the exact Assignment: a request must not finalize after the source
@@ -447,6 +452,8 @@ export interface Handoff {
   approvedBy?: { kind: 'pm' | 'router'; sessionId?: string }
   decidedAt?: string
   decisionReason?: string
+  /** Why a `failed` Handoff did not complete, such as a background cleanup error; the Ticket also keeps `delivery.error`. */
+  failure?: string
 }
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {

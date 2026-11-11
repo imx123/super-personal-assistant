@@ -52,7 +52,7 @@ describe('Project creation', () => {
       data: { projectId: project.id, decisionId: project.decisionId, pmSessionId: project.pmSessionId } }))
   })
 
-  it('emits one Project state event per real transition, including pause mode upgrades, and none for no-ops', () => {
+  it('emits one Project state event per real transition, including pause mode upgrades, and none for no-ops', async () => {
     const h = harness()
     h.engine.recordTriggerForRouting(trigger('p1'))
     const first = h.engine.createProject('p1', 'Website', 'Ship the new site')
@@ -65,12 +65,12 @@ describe('Project creation', () => {
     expect(projectEvents().at(-1)).toEqual({ type: 'project.paused', at, data: { projectId: first.id, mode: 'soft' } })
     h.engine.pauseProject(first.id, true)
     expect(projectEvents()).toHaveLength(2)
-    h.engine.pauseProject(first.id, true, 'hard')
+    await h.engine.pauseProjectReport(first.id, true, 'hard')
     // The Project state event, then the aggregate notice event for its Workers (none here).
     expect(projectEvents().slice(-2)).toEqual([
       { type: 'project.paused', at, data: { projectId: first.id, mode: 'hard', from: 'soft' } },
       { type: 'project.pausedByUser', at, data: { projectId: first.id, mode: 'hard', stopped: [], failures: [] } }])
-    h.engine.pauseProject(first.id, true, 'hard')
+    await h.engine.pauseProjectReport(first.id, true, 'hard')
     h.engine.pauseProject(first.id, true, 'soft')
     expect(projectEvents()).toHaveLength(4)
     // Resume from hard, then end with a reason; repeated calls add nothing.
@@ -339,7 +339,7 @@ describe('Project persistence and read views', () => {
         { trigger_id: request.id, title: 'Quiet events', goal: 'Keep state events for audit only' }) as { project: { project_id: string } }
       const project = host.runtime.store.projects.get(result.project.project_id)!
       host.runtime.engine.pauseProject(project.id, true)
-      host.runtime.engine.pauseProject(project.id, true, 'hard')
+      await host.runtime.engine.pauseProjectReport(project.id, true, 'hard')
       const notice = () => host.deliveries.mock.calls.map(([call]) => call)
         .filter(call => (JSON.parse(call.text) as { kind?: string }).kind === 'projectPausedByUser')
       await vi.waitFor(() => expect(notice()).toHaveLength(1))

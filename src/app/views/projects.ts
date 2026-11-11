@@ -38,7 +38,9 @@ export type ProjectRow = ReturnType<typeof projectRow>
 /** Cross-Project handoff requests this Project's PM has not decided yet, read from the source Tickets that hold them. */
 function pendingHandoffs(store: Pick<Store, 'tickets'>, projectId: string): ProjectHandoffRow[] {
   return store.tickets.list().flatMap(ticket => (ticket.handoffs ?? [])
-    .filter(handoff => handoff.kind === 'split' && handoff.status === 'pending' && handoff.to.projectId === projectId)
+    // A same-Project split is pending only while its source cleanup runs and is the PM's own call, not a request to decide.
+    .filter(handoff => handoff.kind === 'split' && handoff.status === 'pending' && handoff.to.projectId === projectId
+      && handoff.from.projectId !== projectId)
     .map(handoff => ({ handoff_id: handoff.id, at: handoff.at, ticket_id: ticket.id, title: ticket.title, project_id: ticket.projectId,
       ...handoff.reason ? { reason: handoff.reason } : {}, summary: handoff.summary,
       ...handoff.unfinished?.length ? { unfinished: handoff.unfinished } : {}, ...handoff.request ? { request: handoff.request } : {} })))

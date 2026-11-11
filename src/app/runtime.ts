@@ -253,6 +253,9 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    // Fail any Handoff a previous process left `starting` before setup or any Worker resume could act on it; it starts
+    // nothing, so a crash between a handoff's two transactions can never leave a stuck Ticket or a surprise Worker.
+    this.engine.recoverInterruptedHandoffs()
     if (!await this.setup.run(this.store.settings())) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return

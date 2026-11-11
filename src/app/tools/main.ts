@@ -453,7 +453,7 @@ function projectHandoffDecideTool(host: MainToolsHost, project: ProjectProfile):
         from_ticket_id: result.handoff.from.ticketId, to_ticket_id: result.handoff.to.ticketId, to_project_id: project.id,
         ...result.handoff.decisionReason ? { reason: result.handoff.decisionReason } : {} }
       host.sessions.relay(`handoff-decision:${result.handoff.id}:${status}`, JSON.stringify(payload),
-        `Handoff ${status === 'accepted' ? 'accepted' : 'rejected'}: ${result.handoff.request?.title ?? result.handoff.id}`,
+        `Handoff ${status === 'accepted' ? 'accepted' : status === 'failed' ? 'failed' : status === 'starting' ? 'starting' : 'rejected'}: ${result.handoff.request?.title ?? result.handoff.id}`,
         relaySession(sourceTicket, sourceProject))
       host.requestPass()
       return { handoff: result.handoff, ...result.ticket ? { ticket: projectTicketCard(result.ticket) } : {},

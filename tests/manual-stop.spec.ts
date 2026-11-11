@@ -385,6 +385,29 @@ describe('a Project PM stop and revive through the runtime', () => {
   })
 })
 
+describe('a synchronous pause does not claim Workers stopped before cleanup', () => {
+  it('emits no aggregate notice until pauseProjectReport has awaited every cleanup', async () => {
+    const h = harness()
+    const first = h.projectWith('p1')
+    const second = h.projectWith('p2')
+    for (const { tickets } of [first, second]) h.engine.assignmentStarted(tickets[0]!.id, tickets[0]!.assignments[0]!.id)
+    h.events.length = 0
+    h.executor.stop = vi.fn(() => Promise.reject(new Error('cleanup denied')))
+    // The synchronous entry changes the Project state; it cannot vouch for a Worker whose cleanup is still running.
+    h.engine.pauseProject(first.project.id, true, 'hard')
+    expect(h.repo.tickets.get(first.tickets[0]!.id)!.manualStop).toMatchObject({ scope: 'project' })
+    expect(h.events.some(event => event.type === 'project.pausedByUser')).toBe(false)
+    const report = await h.engine.pauseProjectReport(second.project.id, true, 'hard')
+    expect(report.workers.stopped).toEqual([])
+    expect(report.workers.failures).toEqual([{ ticketId: second.tickets[0]!.id, error: 'cleanup denied' }])
+    // Only the async form, after waiting, tells the Router what really stopped.
+    const aggregates = h.events.filter(event => event.type === 'project.pausedByUser')
+    expect(aggregates).toHaveLength(1)
+    expect(aggregates[0]!.data).toMatchObject({ projectId: second.project.id, stopped: [],
+      failures: [{ ticketId: second.tickets[0]!.id, error: 'cleanup denied' }] })
+  })
+})
+
 describe('a revoked Project refuses new work after a stop', () => {
   it('does not pause or stop a Worker in an ended or archived Project', () => {
     const h = harness()
