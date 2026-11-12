@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { mkdir, rmdir, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { assignmentSessionId, CLEANUP_TIMEOUT_MS, key, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP,
   runningAssignment, threadKey, ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
@@ -277,8 +277,10 @@ export class DshExecutor implements Executor {
     return { ...ticket, execution: ticketExecution(ticket, outcome, this.host.store.settings(), this.host.machine.stateDir) }
   }
   /**
-   * Runs the configured `executor.prepare` command for a new ticket workspace in its parent directory with the ticket's
-   * execution environment variables, then verifies the directory as the worker sees it.
+   * Runs the configured `executor.prepare` command for a new ticket workspace in a private per-ticket staging directory
+   * under the execution root, with the ticket's execution environment variables, then verifies the directory as the worker
+   * sees it. The staging directory is removed after the command, so a relative path in the operator's command cannot
+   * accidentally operate on another Ticket's workspace.
    * The operator's command is the only shell program. External Trigger values reach it only as environment data: values are
    * normalized (control characters and newlines replaced, length capped) and never interpolated into the command text.
    * A failed prepare command throws `PrepareFailed`, which is not retried automatically; an empty directory it left is removed, a non-empty one kept.
@@ -286,17 +288,24 @@ export class DshExecutor implements Executor {
    */
   private async prepareDirectory(ticket: Ticket): Promise<void> {
     const directory = ticket.execution?.directory ?? ''
-    await mkdir(dirname(directory), { recursive: true })
+    const root = dirname(directory)
+    await mkdir(root, { recursive: true })
     const command = this.host.store.settings().executor.prepare.trim()
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, environmentValue(variable.value)]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
-      .catch(async (error: unknown) => {
+    if (command) {
+      const staging = await mkdtemp(join(root, '.dsh-superagent-prepare-'))
+      try {
+        await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], staging, signal, env)
+      } catch (error) {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
         await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })
         throw new PrepareFailed(`The prepare command failed: ${error instanceof Error ? error.message : String(error)}`)
-      })
+      } finally {
+        await rm(staging, { recursive: true, force: true }).catch(() => { /* Best effort: the next prepare uses a new staging directory. */ })
+      }
+    }
     await mkdir(directory, { recursive: true })
     await verifyDirectory(directory, this.host.context.subprocess, this.host.lifetime)
   }

@@ -1197,13 +1197,18 @@ it('leaves auto-merge to the delivery requirements, with the agent\'s own gh and
   expect(runtime.prompts.preview(runtime.prompts.current().config).worker).not.toContain('gh-merge')
 })
 
-it('runs the prepare command once for a new ticket, under the execution root with the ticket\'s environment, and fails the ticket with its output', async () => {
+it('runs the prepare command once for a new ticket, in a private staging directory with the ticket\'s environment, and fails the ticket with its output', async () => {
   const prepare = (command: string) => runtime.store.saveSettings({ ...runtime.store.settings(), executor: { ...runtime.store.settings().executor, prepare: command } })
   const runs = () => subprocess.spawn.mock.calls.map(([spec]) => spec as { argv: string[]; cwd: string; env?: Record<string, string> }).filter(spec => spec.argv[0] === 'sh')
   prepare('git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"')
   const { ticket } = await acceptedTicket()
-  expect(runs()).toEqual([expect.objectContaining({ argv: ['sh', '-c', 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"'], cwd: join(directory, 'work'),
-    env: expect.objectContaining({ DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_NAME: ticket.execution!.name, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'acme/widgets', DSH_SUPERAGENT_FEISHU_CHAT: CHAT }) })])
+  const run = runs()[0]!
+  expect(runs()).toHaveLength(1)
+  expect(run).toMatchObject({ argv: ['sh', '-c', 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"'],
+    env: expect.objectContaining({ DSH_SUPERAGENT_DIR: ticket.execution!.directory, DSH_SUPERAGENT_NAME: ticket.execution!.name, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'acme/widgets', DSH_SUPERAGENT_FEISHU_CHAT: CHAT }) })
+  expect(run.cwd.startsWith(join(directory, 'work'))).toBe(true)
+  expect(run.cwd).toContain('.dsh-superagent-prepare-')
+  expect(run.cwd).not.toBe(join(directory, 'work'))
   // A retry reuses the prepared directory.
   await runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'failed', summary: 'offline' })
   await runtime.engine.retryTicket(ticket.id)
@@ -1233,7 +1238,8 @@ it('passes external Trigger values to the prepare command as one environment val
   expect(runs).toHaveLength(1)
   // The operator's command is the only shell program and is passed unchanged; no external text was interpolated into it.
   expect(runs[0]!.argv).toEqual(['sh', '-c', prepare])
-  expect(runs[0]!.cwd).toBe(join(directory, 'work'))
+  expect(runs[0]!.cwd.startsWith(join(directory, 'work'))).toBe(true)
+  expect(runs[0]!.cwd).toContain('.dsh-superagent-prepare-')
   expect(runs[0]!.env!.DSH_SUPERAGENT_FEISHU_CHAT).toBe(`oc_team; touch ${marker} $(touch ${marker})`)
   expect(ticket.execution!.directory).toBe(join(directory, 'work', ticket.execution!.name))
 })

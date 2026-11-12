@@ -48,7 +48,7 @@ Worker subagents, including nested ones, use DeepSeek Harness's `standard` prese
 
 ### Preparing a Ticket directory
 
-Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in the execution root. It has ten minutes to finish. Without a prepare command, the worker starts in an empty directory.
+Before the first Assignment, if the Ticket directory does not exist, the prepare command runs once with `sh` in a private staging directory under the execution root. It has ten minutes to finish, and the staging directory is removed afterwards; use the absolute `DSH_SUPERAGENT_DIR` for the Ticket workspace. Without a prepare command, the worker starts in an empty directory.
 
 A failed command fails the Ticket and records a redacted form of its output (credentials, query values and absolute paths replaced; 006 Deployment describes the redaction). A retry or a person's message on one of the Ticket's Threads tries preparation again. A typical command uses `git worktree` to create a checkout. A pull request belongs to the Ticket when its branch's last path segment matches the Ticket's short name.
 
