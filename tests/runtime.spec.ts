@@ -37,6 +37,17 @@ import { preview, readable } from '../src/app/views/text.ts'
 import { decisionList, search, threadDetail, threadList } from '../src/app/views/threads.ts'
 import { executorLoad, ticketDetail, ticketList } from '../src/app/views/tickets.ts'
 
+/** The `onCompromised` callbacks each Runtime passed to proper-lockfile, so a test can trigger the real wiring. */
+const lockHooks = vi.hoisted(() => ({ compromised: [] as ((error: Error) => void)[], failRelease: false }))
+vi.mock('proper-lockfile', async importOriginal => {
+  const actual = await importOriginal<typeof import('proper-lockfile')>()
+  return { ...actual, lockSync: (file: string, options?: { onCompromised?: (error: Error) => void }) => {
+    if (options?.onCompromised) lockHooks.compromised.push(options.onCompromised)
+    const release = actual.lockSync(file, options)
+    return () => { if (lockHooks.failRelease) throw new Error('lock release failed'); return release() }
+  } }
+})
+
 let runtime: Runtime
 const viewsOf = (value: Runtime) => ({ store: value.store, sources: value.sources, links: value.links() })
 const overviewOf = (value: Runtime) => overview(viewsOf(value), value.health, policyVersion(value.store.settings()), executorLoad(value.store, value.executor.activeCount()), value.setupProblem ?? value.feishuProblem)
@@ -174,6 +185,8 @@ beforeEach(async () => {
   }
   const ctx = new Context()
   agents = new Map()
+  // DSH's AgentRegistry exposes `list()`; the Map fixture does too, so shutdown can find loaded workers without the Store.
+  Object.assign(agents, { list: () => [...agents.values()] })
   tools = new Map()
   sections = new Map()
   guards = new Map()
@@ -1973,4 +1986,48 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
+})
+
+it('fails closed when the state directory lock is compromised', async () => {
+  expect(runtime.health.runtime).toMatchObject({ state: 'ready' })
+  const compromised = lockHooks.compromised.at(-1)
+  expect(compromised).toBeTypeOf('function')
+  expect(runtime.store.closed).toBe(false)
+  compromised!(new Error('lockfile was compromised'))
+  // The runtime aborts its lifetime and reports an error the host can see; it never exits the process itself.
+  expect(runtime.lifetime.aborted).toBe(true)
+  expect(runtime.health.runtime).toMatchObject({ state: 'error', detail: expect.stringContaining('lockfile was compromised') })
+  expect(runtime.store.closed).toBe(true)
+  // A closed database refuses reads and writes, so no further state change can succeed and race the new lock holder.
+  expect(() => runtime.store.set(KV.runtime.masterId, 'after-compromise')).toThrow()
+  expect(() => runtime.store.settings()).toThrow()
+  expect(() => runtime.engine.projectReport(key('project', 'missing'), 'after compromise')).toThrow()
+  // stop() is idempotent and tolerates the already-closed Store and a lock release that also fails.
+  lockHooks.failRelease = true
+  await expect(runtime.stop()).resolves.toBeUndefined()
+  lockHooks.failRelease = false
+  await expect(runtime.stop()).resolves.toBeUndefined()
+  expect(runtime.store.closed).toBe(true)
+  expect(runtime.health.runtime).toMatchObject({ state: 'error' })
+})
+
+it('keeps tearing down after a compromise even when an earlier teardown step fails', async () => {
+  const { sessionId } = await acceptedTicket()
+  const worker = agents.get(sessionId)!
+  worker.status = 'running'
+  worker.cancel.mockClear()
+  const compromised = lockHooks.compromised.at(-1)!
+  compromised(new Error('lockfile was compromised'))
+  expect(runtime.store.closed).toBe(true)
+  expect(() => runtime.store.tickets.list()).toThrow()
+  // The archive reconciler is the first Store-adjacent teardown step; its failure must not skip the Executor or workers.
+  const reconciler = (runtime as unknown as { archiveReconciler: { stop: () => Promise<void> } }).archiveReconciler
+  vi.spyOn(reconciler, 'stop').mockRejectedValue(new Error('archive stop failed'))
+  const dispose = vi.spyOn(runtime.executor, 'dispose')
+  lockHooks.failRelease = true
+  await expect(runtime.stop()).resolves.toBeUndefined()
+  lockHooks.failRelease = false
+  expect(dispose).toHaveBeenCalledTimes(1)
+  expect(worker.cancel).toHaveBeenCalledWith({ kind: 'user' }, { keepInbox: true })
+  await expect(runtime.stop()).resolves.toBeUndefined()
 })

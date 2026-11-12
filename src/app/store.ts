@@ -119,8 +119,18 @@ export class Store implements Repositories {
     }
     if (!columns('effect').has('generation')) this.db.exec('ALTER TABLE effect ADD COLUMN generation INTEGER NOT NULL DEFAULT 0')
   }
-  /** Closes the underlying SQLite database connection. */
-  close(): void { this.db.close() }
+  private closedFlag = false
+  /** Whether the database connection was closed; every later read or write fails, and a second `close` is a no-op. */
+  get closed(): boolean { return this.closedFlag }
+  /**
+   * Closes the underlying SQLite database connection. Idempotent, so a lock compromise can close the database at once and a
+   * later shutdown can close it again; once closed, every read and write is refused by SQLite.
+   */
+  close(): void {
+    if (this.closedFlag) return
+    this.closedFlag = true
+    this.db.close()
+  }
   /** Parses JSON `value` columns returned by `sql`. */
   private values<T>(sql: string, ...parameters: SQLInputValue[]): T[] {
     return this.db.prepare(sql).all(...parameters).map(row => JSON.parse(String(row.value)) as T)

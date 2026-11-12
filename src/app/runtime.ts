@@ -54,6 +54,11 @@ import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 // Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
 declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
+/** Limits a host may pass to the Runtime; production keeps the defaults and tests inject shorter waits. */
+export interface RuntimeOptions {
+  /** How long a pause or handoff waits for a Worker's background cleanup before treating it as failed. */
+  cleanupTimeoutMs?: number
+}
 
 /**
  * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
@@ -85,22 +90,28 @@ export class Runtime extends Service implements SourceHost {
   private releaseLock?: () => Promise<void>
   private closingFlag = false
   private stopping?: Promise<void>
+  /** Set once the state directory lock is compromised: the Store is closed and the runtime must not write again. */
+  private compromisedError?: Error
   private readonly sourceDeps: SourceContextDeps
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void) {
+  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: RuntimeOptions = {}) {
     super(ctx, 'orchestrator')
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
-    const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
+    let opened: Store | undefined
+    // A compromised lock is fatal: close the database at once, so no read or write can race the process that may now hold
+    // the state directory, report the failure to the host, and abort the runtime lifetime. The host stops the plugin.
+    const compromised = (error: Error) => { this.failClosed(error, opened) }
     const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
     this.releaseLock = async () => { release() }
-    let opened: Store | undefined
     try {
       const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
       const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      // The lock can be compromised while this synchronous constructor runs (or by a lock check just after acquiring it).
+      if (this.compromisedError) throw this.compromisedError
       const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
@@ -154,8 +165,8 @@ export class Runtime extends Service implements SourceHost {
       this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
         sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
-        lifetime: this.lifetime, sessions, closing: () => this.closing(), paused: () => this.paused(), environment, sourceLink: link,
-        repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+        lifetime: this.lifetime, cleanupTimeoutMs: options.cleanupTimeoutMs, sessions, closing: () => this.closing(), paused: () => this.paused(),
+        environment, sourceLink: link, repliedTo: trigger => repliedTo({ store, sources }, trigger) })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -163,7 +174,7 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       // A delegated Ticket's authority is its Project's PM Mandate: the Policy must be able to see the Project to revalidate it.
       const policy = () => settingsPolicy(store.settings(), sources, projectId => store.projects.get(projectId))
-      const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor,
+      const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, cleanupTimeoutMs: options.cleanupTimeoutMs,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
           // A Project Ticket's lifecycle stays in its Project: the PM reads it, and the Router is not told about every child.
@@ -249,15 +260,36 @@ export class Runtime extends Service implements SourceHost {
   reconcileArchives(): Promise<void> { return this.archiveReconciler.reconcile() }
   sendReplies(): Promise<void> { return this.outbox.sent() }
   private closing(): boolean { return this.closingFlag }
+  /**
+   * Fail closed after the state directory lock is reported compromised: abort the lifetime, report the failure, and close
+   * the database at once so this process cannot read or write state that another process may now own. Closing is
+   * idempotent, so a later `stop()` closes it again harmlessly. This never calls `process.exit`: the host reads the error
+   * health state and stops the plugin, and `stop()` still tries to release the (already compromised) lock.
+   */
+  private failClosed(error: Error, store?: Store): void {
+    if (!this.compromisedError) this.compromisedError = error
+    this.closingFlag = true
+    this.runtimeHealth.set({ state: 'error', detail: `Lost the state directory lock: ${error.message}`, at: now() })
+    this.stopped.abort()
+    if (!store) return
+    try { store.close() } catch (failure) {
+      // Closing can fail while another operation is in flight; log it and never reopen or keep using the database.
+      this.ctx.logger.warn('dsh-superagent could not close its database after losing the state directory lock: %s', String(failure))
+    }
+  }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
   private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
   private async initialize(): Promise<void> {
+    if (this.compromisedError) return
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
     // Fail any Handoff a previous process left `starting` before setup or any Worker resume could act on it; it starts
     // nothing, so a crash between a handoff's two transactions can never leave a stuck Ticket or a surprise Worker.
     this.engine.recoverInterruptedHandoffs()
-    if (!await this.setup.run(this.store.settings())) {
+    const configured = await this.setup.run(this.store.settings())
+    // A compromise during setup already reported the error and closed the Store; do not overwrite it with `paused` or `ready`.
+    if (this.compromisedError) return
+    if (!configured) {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
@@ -266,7 +298,7 @@ export class Runtime extends Service implements SourceHost {
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
-    if (this.closing()) return
+    if (this.closing() || this.compromisedError) return
     this.executor.resume()
     this.passes.start()
     this.archiveReconciler.start()
@@ -286,27 +318,61 @@ export class Runtime extends Service implements SourceHost {
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
   private async shutdown(): Promise<void> {
     this.closingFlag = true; const passes = this.passes.stop(); this.stopped.abort()
-    try {
-      this.assessor.stop()
-      await this.archiveReconciler.stop()
-      const ids = [this.masterId, ...this.store.tickets.list().flatMap(ticket => workerSessionsOf(ticket))]
-      const agents = ids.map(id => this.ctx.agents.get(id as SessionId)).filter((agent): agent is Agent => agent !== undefined)
-      for (const agent of agents) agent.cancel({ kind: 'user' }, { keepInbox: true })
-      await Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())])
-      // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
-      await this.executor.shutdown()
-      this.executor.dispose()
-      this.sessions.dispose()
-      for (const dispose of this.disposers.reverse()) dispose()
-      await this.ctx.sessionPersistence.flush()
-    } finally {
-      // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released.
-      this.setup.restore()
-      try { this.store.close() } finally {
-        const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',
-          String(error)) }
-        await this.releaseLock?.().catch(unreleased)
+    const failures: unknown[] = []
+    /** Run one teardown step; a failure is logged and later steps still run, so a closed Store cannot skip them. */
+    const attempt = async (what: string, run: () => unknown | Promise<unknown>): Promise<void> => {
+      try { await run() } catch (error) {
+        failures.push(error)
+        this.ctx.logger.warn('dsh-superagent could not %s while stopping: %s', what, String(error))
       }
+    }
+    const agents: Agent[] = []
+    try {
+      await attempt('stop the assessor', () => this.assessor.stop())
+      await attempt('stop archive reconciliation', () => this.archiveReconciler.stop())
+      await attempt('cancel the master and worker Sessions', () => {
+        // A compromised lock already closed the Store; there is nothing left to read, so only the master Session is named
+        // here. The Executor keeps its loaded worker Sessions and cancels those in its own shutdown below.
+        const ids = [this.masterId, ...(this.store.closed ? [] : this.store.tickets.list().flatMap(ticket => workerSessionsOf(ticket)))]
+        const failed: unknown[] = []
+        for (const id of ids) {
+          const agent = this.ctx.agents.get(id as SessionId)
+          if (!agent) continue
+          agents.push(agent)
+          try { agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch (error) { failed.push(error) }
+        }
+        // Every loaded Session got its cancel; one failing still lets the rest stop.
+        if (failed.length) throw failed[0]
+      })
+      await attempt('wait for running Sessions', () =>
+        Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())]))
+      // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
+      // The Executor uses its in-memory loaded Sessions when the Store is closed, so a compromised lock still cancels them.
+      await attempt('stop the Executor', () => this.executor.shutdown())
+      await attempt('dispose the Executor', () => this.executor.dispose())
+      await attempt('dispose Sessions', () => this.sessions.dispose())
+      await attempt('dispose HTTP routes and listeners', () => {
+        const failed: unknown[] = []
+        for (const dispose of this.disposers.splice(0).reverse()) {
+          try { dispose() } catch (error) { failed.push(error) }
+        }
+        if (failed.length) throw failed[0]
+      })
+      await attempt('flush Session persistence', () => this.ctx.sessionPersistence.flush())
+      // A normal shutdown still reports its first teardown failure after every step was attempted; after a compromised
+      // lock the failure is already logged and stop() must resolve so the host can finish stopping.
+      if (!this.store.closed && failures.length) throw failures[0]
+    } finally {
+      // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released, and close is idempotent.
+      try { this.setup.restore() } catch (error) {
+        this.ctx.logger.warn('dsh-superagent could not restore its process environment while stopping: %s', String(error))
+      }
+      try { this.store.close() } catch (error) {
+        this.ctx.logger.warn('dsh-superagent could not close its database while stopping: %s', String(error))
+      }
+      const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',
+        String(error)) }
+      await this.releaseLock?.().catch(unreleased)
     }
   }
 }

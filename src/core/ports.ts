@@ -70,6 +70,11 @@ export interface Executor {
    * start a replacement Worker (a Project hard pause or a Ticket handoff) can wait for it and report a real failure.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void | Promise<void>
+  /**
+   * The caller stopped waiting for this Ticket's cleanup after its timeout. An implementation that keeps the cleanup
+   * should refuse to start a replacement over it and report the wait as a failure instead of queuing the launch forever.
+   */
+  cleanupTimedOut?(ticketId: string): void
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */

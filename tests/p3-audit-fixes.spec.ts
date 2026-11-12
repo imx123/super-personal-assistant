@@ -4,17 +4,26 @@
  * Handoff answers only its own action.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, UserError, assignmentSessionId, latestAssignment, workerSessionId, type Assessor,
+import { Engine, MemoryRepositories, UserError, assignmentSessionId, latestAssignment, ticketStage, workerSessionId, type Assessor,
   type Candidate, type DomainEvent, type Executor, type Policy, type ProjectProfile, type Repositories, type Ticket,
   type Trigger } from '../src/core/index.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
-const cleanup = vi.hoisted(() => ({ fail: false, error: 'cleanup denied' }))
+const cleanup = vi.hoisted(() => {
+  const releases: (() => void)[] = []
+  return {
+    fail: false, error: 'cleanup denied', hang: false,
+    /** A cleanup that never settles until `release`, as a stuck job or subagent join; every hung call shares it. */
+    pending: () => new Promise<void>(resolve => { releases.push(resolve) }),
+    release: () => { for (const resolve of releases.splice(0)) resolve() },
+  }
+})
 vi.mock('../src/executor/background.ts', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/executor/background.ts')>()
   return { ...actual, stopBackground: (ctx: Parameters<typeof actual.stopBackground>[0], sessionId: string, reason: string,
-    keepInbox = false) => cleanup.fail ? Promise.reject(new Error(cleanup.error))
-    : actual.stopBackground(ctx, sessionId, reason, keepInbox) }
+    keepInbox = false) => cleanup.hang ? cleanup.pending()
+    : cleanup.fail ? Promise.reject(new Error(cleanup.error))
+      : actual.stopBackground(ctx, sessionId, reason, keepInbox) }
 })
 
 const actor = { source: 'main-session', id: 'dsh-user' }
@@ -23,7 +32,7 @@ function trigger(id: string): Trigger {
     at: '2026-11-10T00:00:00.000Z', text: `Create a project ${id}`, meta: {} }
 }
 /** An Engine on `repo`, for tests that reopen a Runtime's SQLite store or need to inspect its parts. */
-function engineOn(repo: Repositories) {
+function engineOn(repo: Repositories, options: { cleanupTimeoutMs?: number } = {}) {
   const events: DomainEvent[] = []
   const assessor: Assessor = { request: vi.fn((_candidate: Candidate) => {}), release: vi.fn() }
   const executor: Executor = { start: vi.fn(), deliver: vi.fn(), stop: vi.fn() }
@@ -33,13 +42,14 @@ function engineOn(repo: Repositories) {
     revalidate: () => true, admitsInferred: () => false }
   const outbox = { send: vi.fn(), status: () => undefined, withdraw: vi.fn() }
   const engine = new Engine({ repo, scope: { scope: () => ({ listened: true, observed: false }) }, policy: () => policy, assessor, executor, outbox,
+    cleanupTimeoutMs: options.cleanupTimeoutMs,
     prepareTicket: (ticket, outcome) => ({ ...ticket, execution: { name: `${outcome.name}-${ticket.id.slice(0, 12)}`,
       directory: `/work/${outcome.name}-${ticket.id.slice(0, 12)}`, assignment: outcome.scope } }),
     emit: event => { events.push(event) }, now: () => '2026-11-10T00:00:00.000Z' })
   return { repo, engine, events, executor }
 }
-function harness() {
-  const { repo, engine, events, executor } = engineOn(new MemoryRepositories())
+function harness(options: { cleanupTimeoutMs?: number } = {}) {
+  const { repo, engine, events, executor } = engineOn(new MemoryRepositories(), options)
   const projectWith = (id: string, tasks: { title: string; goal: string }[] = [{ title: `Work ${id}`, goal: `Do ${id}` }]) => {
     engine.recordTriggerForRouting(trigger(id))
     const project = engine.createProject(id, `Project ${id}`, `Goal ${id}`)
@@ -49,8 +59,8 @@ function harness() {
   return { repo, engine, events, executor, projectWith }
 }
 /** Two Projects with one running source Ticket each, for cross-Project handoff tests. */
-function twoProjects() {
-  const h = harness()
+function twoProjects(options: { cleanupTimeoutMs?: number } = {}) {
+  const h = harness(options)
   const source = h.projectWith('p1')
   const target = h.projectWith('p2')
   h.engine.assignmentStarted(source.tickets[0]!.id, source.tickets[0]!.assignments[0]!.id)
@@ -471,6 +481,213 @@ describe('a split or cross-Project accept waits for the source Worker cleanup', 
     expect(h.repo.tickets.get(sourceTicket.id)).toMatchObject({ ended: { outcome: 'handedOff' } })
     expect(result.handoff.status).toBe('accepted')
     expect(h.repo.tickets.list().filter(ticket => ticket.projectId === h.target.project.id)).toHaveLength(2)
+  })
+})
+
+describe('a cleanup that never settles is bounded by cleanupTimeoutMs', () => {
+  const TIMEOUT = 20
+  /** A never-settling cleanup whose late outcome the test can still trigger, to prove it changes nothing. */
+  const pendingCleanup = () => {
+    const gate = Promise.withResolvers<void>()
+    return { gate, stop: vi.fn(() => gate.promise) }
+  }
+  const failureOf = (handoff: { failure?: string }) => handoff.failure ?? ''
+
+  it('reports a Project hard pause Worker as failed instead of waiting forever', async () => {
+    const h = harness({ cleanupTimeoutMs: TIMEOUT })
+    const { project, tickets: [ticket] } = h.projectWith('p1')
+    h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
+    const { stop } = pendingCleanup()
+    h.executor.stop = stop
+    const started = Date.now()
+    const report = await h.engine.pauseProjectReport(project.id, true, 'hard')
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(report.workers.stopped).toEqual([])
+    expect(report.workers.failures).toEqual([{ ticketId: ticket!.id,
+      error: expect.stringContaining(`did not finish within ${TIMEOUT} ms`) }])
+    expect(h.repo.projects.get(project.id)).toMatchObject({ status: 'paused', pauseMode: 'hard' })
+    expect(h.repo.tickets.get(ticket!.id)!.manualStop).toMatchObject({ scope: 'project' })
+    // The pause only stops Workers: the timed-out cleanup starts no replacement.
+    expect(h.executor.start).toHaveBeenCalledTimes(1)
+    const notice = h.events.find(event => event.type === 'project.pausedByUser') as
+      { data: { stopped: string[]; failures: { ticketId: string; error: string }[] } }
+    expect(notice.data.stopped).toEqual([])
+    expect(notice.data.failures).toEqual(report.workers.failures)
+  })
+
+  it('fails a transfer after the timeout, handles a late rejection, and leaves the Ticket retryable', async () => {
+    const h = harness({ cleanupTimeoutMs: TIMEOUT })
+    const { project, tickets: [ticket] } = h.projectWith('p1')
+    h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
+    const { gate, stop } = pendingCleanup()
+    h.executor.stop = stop
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    await expect(h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id,
+      { reason: 'Stuck', summary: 'Continue on a new Worker' })).rejects.toThrow(new RegExp(`did not finish within ${TIMEOUT} ms`))
+    const after = h.repo.tickets.get(ticket!.id)!
+    expect(after.ended).toBeUndefined()
+    expect(after.handoffs![0]).toMatchObject({ kind: 'transfer', status: 'failed' })
+    expect(failureOf(after.handoffs![0]!)).toContain(`did not finish within ${TIMEOUT} ms`)
+    expect(after.delivery?.error).toContain(`did not finish within ${TIMEOUT} ms`)
+    expect(after.assignments.at(-1)).toMatchObject({ state: 'ended', endedReason: 'handoffCleanupFailed' })
+    // No replacement Session is prepared or started over the cleanup that may still run.
+    expect(h.executor.start).toHaveBeenCalledTimes(starts)
+    // The abandoned cleanup may reject later; that must be observed and must not rewrite the failed Handoff.
+    gate.reject(new Error('late cleanup failure'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(h.repo.tickets.get(ticket!.id)!.handoffs![0]!.status).toBe('failed')
+    // Retryability: the Ticket is still open with a delivery error, and the failure keeps its -h1 slot.
+    const retried = h.engine.retryTicket(ticket!.id)
+    expect(retried.assignments.at(-1)).toMatchObject({ state: 'pending', sessionId: `${workerSessionId(ticket!.id)}-h1` })
+  })
+
+  it('starts no replacement Worker when a transfer cleanup succeeds after the timeout', async () => {
+    const h = harness({ cleanupTimeoutMs: TIMEOUT })
+    const { project, tickets: [ticket] } = h.projectWith('p1')
+    h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
+    const { gate, stop } = pendingCleanup()
+    h.executor.stop = stop
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    await expect(h.engine.transferTicket(project.id, project.pmSessionId, ticket!.id,
+      { reason: 'Stuck', summary: 'Continue on a new Worker' })).rejects.toThrow(new RegExp(`did not finish within ${TIMEOUT} ms`))
+    gate.resolve()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const after = h.repo.tickets.get(ticket!.id)!
+    expect(after.ended).toBeUndefined()
+    expect(after.handoffs![0]!.status).toBe('failed')
+    expect(after.assignments.at(-1)).toMatchObject({ state: 'ended', endedReason: 'handoffCleanupFailed' })
+    expect(h.executor.start).toHaveBeenCalledTimes(starts)
+    expect(h.events.some(event => event.type === 'ticket.handedOff')).toBe(false)
+  })
+
+  it('fails a split after the timeout, starts no target, and ignores a late successful cleanup', async () => {
+    const h = harness({ cleanupTimeoutMs: TIMEOUT })
+    const { project, tickets: [ticket] } = h.projectWith('p1')
+    h.engine.assignmentStarted(ticket!.id, ticket!.assignments[0]!.id)
+    const { gate, stop } = pendingCleanup()
+    h.executor.stop = stop
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    await expect(h.engine.splitTicket(project.id, project.pmSessionId, ticket!.id, { title: 'Footer follow-up',
+      goal: 'Finish the footer', reason: 'Beyond the header', summary: 'Footer remains', worktree_name: 'fix-footer' }))
+      .rejects.toThrow(new RegExp(`did not finish within ${TIMEOUT} ms`))
+    const after = h.repo.tickets.get(ticket!.id)!
+    expect(after.ended).toBeUndefined()
+    expect(after.handoffs![0]).toMatchObject({ kind: 'split', status: 'failed' })
+    expect(failureOf(after.handoffs![0]!)).toContain(`did not finish within ${TIMEOUT} ms`)
+    expect(after.delivery?.error).toContain(`did not finish within ${TIMEOUT} ms`)
+    expect(h.repo.tickets.list().map(item => item.id)).toEqual([ticket!.id])
+    expect(h.executor.start).toHaveBeenCalledTimes(starts)
+    // A cleanup that succeeds after the timeout cannot create the target or claim the split completed.
+    gate.resolve()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(h.repo.tickets.list().map(item => item.id)).toEqual([ticket!.id])
+    expect(h.repo.tickets.get(ticket!.id)!.handoffs![0]!.status).toBe('failed')
+    expect(h.events.some(event => event.type === 'ticket.handedOff')).toBe(false)
+    expect(h.executor.start).toHaveBeenCalledTimes(starts)
+    expect(h.engine.retryTicket(ticket!.id).assignments.at(-1)).toMatchObject({ state: 'pending' })
+  })
+
+  it('fails a cross-Project accept after the timeout, starts no target, and leaves the source retryable', async () => {
+    const h = twoProjects({ cleanupTimeoutMs: TIMEOUT })
+    const sourceTicket = h.source.tickets[0]!
+    const handoff = h.engine.requestProjectHandoff(h.source.project.id, h.source.project.pmSessionId, sourceTicket.id,
+      { ...request, targetProjectId: h.target.project.id })
+    const { gate, stop } = pendingCleanup()
+    h.executor.stop = stop
+    const starts = vi.mocked(h.executor.start).mock.calls.length
+    await expect(h.engine.decideProjectHandoff(h.target.project.id, h.target.project.pmSessionId, handoff.id,
+      { action: 'accept' })).rejects.toThrow(new RegExp(`did not finish within ${TIMEOUT} ms`))
+    const source = h.repo.tickets.get(sourceTicket.id)!
+    expect(source.ended).toBeUndefined()
+    expect(source.handoffs![0]).toMatchObject({ id: handoff.id, status: 'failed' })
+    expect(failureOf(source.handoffs![0]!)).toContain(`did not finish within ${TIMEOUT} ms`)
+    expect(source.delivery?.error).toContain(`did not finish within ${TIMEOUT} ms`)
+    const targetTickets = h.repo.tickets.list().filter(ticket => ticket.projectId === h.target.project.id)
+    expect(targetTickets.map(ticket => ticket.id)).toEqual([h.target.tickets[0]!.id])
+    expect(targetTickets.flatMap(ticket => ticket.handoffs ?? [])).toEqual([])
+    expect(h.executor.start).toHaveBeenCalledTimes(starts)
+    // A late success of the source cleanup cannot create the target Ticket or emit a handedOff receipt.
+    gate.resolve()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(h.repo.tickets.list().filter(ticket => ticket.projectId === h.target.project.id)).toHaveLength(1)
+    expect(h.repo.tickets.get(sourceTicket.id)!.handoffs![0]!.status).toBe('failed')
+    expect(h.events.some(event => event.type === 'ticket.handedOff')).toBe(false)
+    expect(h.engine.retryTicket(sourceTicket.id).assignments.at(-1)).toMatchObject({ state: 'pending' })
+  })
+})
+
+describe('a stuck cleanup does not hang the Project pause API', () => {
+  it('returns the hard-pause report after the configured timeout', async () => {
+    cleanup.hang = false
+    const host = await startRuntime(undefined, { cleanupTimeoutMs: 25 })
+    try {
+      const { project, tickets: [ticket] } = await createProject(host, '120', 'Timeout pause', [{
+        title: 'Header', goal: 'Fix the header', worktree_name: 'fix-header' }])
+      await vi.waitFor(() => expect(host.runtime.store.tickets.get(ticket!.id)?.assignments.at(-1)?.state).toBe('running'))
+      cleanup.hang = true
+      const started = Date.now()
+      const response = await host.api('POST', `projects/${project.id}/pause`, { paused: true, mode: 'hard' })
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(response.body).toMatchObject({ paused: true, mode: 'hard', workers: { stopped: [],
+        failures: [{ ticketId: ticket!.id, error: expect.stringContaining('did not finish within 25 ms') }] } })
+      // The pause still committed, and the failure is visible in the Project state the panel reads.
+      expect(host.runtime.store.projects.get(project.id)).toMatchObject({ status: 'paused', pauseMode: 'hard' })
+      expect(host.runtime.store.tickets.get(ticket!.id)!.manualStop).toMatchObject({ scope: 'project' })
+    } finally { cleanup.hang = false; await host.stop() }
+  })
+})
+
+describe('a timed-out cleanup does not queue a retry launch forever', () => {
+  it('fails the retry with an explicit failed report and starts no Worker, even when the cleanup later succeeds', async () => {
+    cleanup.hang = false
+    const host = await startRuntime(undefined, { cleanupTimeoutMs: 30 })
+    try {
+      const { project, tickets: [ticket] } = await createProject(host, '121', 'Pending cleanup', [{
+        title: 'Header', goal: 'Fix the header', worktree_name: 'fix-header' }])
+      await vi.waitFor(() => expect(host.runtime.store.tickets.get(ticket!.id)?.assignments.at(-1)?.state).toBe('running'))
+      const base = workerSessionId(ticket!.id)
+      cleanup.hang = true
+      await expect(host.runtime.engine.transferTicket(project.id, project.pmSessionId, ticket!.id,
+        { reason: 'Stuck', summary: 'Continue on a new Worker' })).rejects.toThrow(/did not finish within 30 ms/)
+      // The retry is accepted, but its launch must not wait forever behind the cleanup the Engine abandoned.
+      const retried = host.runtime.engine.retryTicket(ticket!.id)
+      expect(retried.assignments.at(-1)).toMatchObject({ state: 'pending' })
+      await host.runtime.idle()
+      const failed = host.runtime.store.tickets.get(ticket!.id)!
+      expect(failed.assignments.at(-1)!.report).toMatchObject({ state: 'failed' })
+      expect(ticketStage(failed)).toEqual({ stage: 'person', action: 'failed' })
+      expect(host.agents.has(`${base}-h1`)).toBe(false)
+      expect(host.tools.get(`${base}-h1`)).toBeUndefined()
+      // The cleanup succeeding after the timeout cannot start the retry's Worker.
+      cleanup.release()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      await host.runtime.idle()
+      const after = host.runtime.store.tickets.get(ticket!.id)!
+      expect(after.assignments.at(-1)).toMatchObject({ state: 'pending', report: { state: 'failed' } })
+      expect(host.agents.has(`${base}-h1`)).toBe(false)
+      expect(host.tools.get(`${base}-h1`)).toBeUndefined()
+      expect(host.deliveries.mock.calls.some(([call]) => call.sessionId === `${base}-h1`)).toBe(false)
+    } finally { cleanup.hang = false; cleanup.release(); await host.stop() }
+  })
+
+  it('bounds its own launch wait even when no Engine wait observed the cleanup', async () => {
+    cleanup.hang = false
+    const host = await startRuntime(undefined, { cleanupTimeoutMs: 30 })
+    try {
+      const { tickets: [ticket] } = await createProject(host, '122', 'Executor cleanup wait', [{
+        title: 'Header', goal: 'Fix the header', worktree_name: 'fix-header' }])
+      await vi.waitFor(() => expect(host.runtime.store.tickets.get(ticket!.id)?.assignments.at(-1)?.state).toBe('running'))
+      const current = host.runtime.store.tickets.get(ticket!.id)!
+      cleanup.hang = true
+      // A direct single-worker stop starts a cleanup no Engine wait observes; the retry's launch must still time out.
+      host.runtime.engine.stopAssignment(ticket!.id, current.assignments.at(-1)!.id)
+      host.runtime.engine.allowResume(ticket!.id)
+      host.runtime.engine.retryTicket(ticket!.id)
+      await host.runtime.idle()
+      const after = host.runtime.store.tickets.get(ticket!.id)!
+      expect(after.assignments.at(-1)!.report).toMatchObject({ state: 'failed' })
+      expect(ticketStage(after)).toEqual({ stage: 'person', action: 'failed' })
+    } finally { cleanup.hang = false; cleanup.release(); await host.stop() }
   })
 })
 

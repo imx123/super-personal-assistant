@@ -4,8 +4,8 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { assignmentSessionId, key, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP, runningAssignment, threadKey,
-  ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
+import { assignmentSessionId, CLEANUP_TIMEOUT_MS, key, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP,
+  runningAssignment, threadKey, ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
@@ -40,6 +40,17 @@ const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ?
  * DshExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
  */
 class PrepareFailed extends Error {}
+/**
+ * Internal error thrown when a launch or delivery would start over a Worker cleanup the Engine already stopped waiting
+ * for. It is not transient: the Ticket is marked failed and waits for a person or a retry, rather than queueing behind a
+ * cleanup that may never settle. The retry itself fails the same way until the cleanup really ends.
+ */
+class CleanupPending extends Error {
+  constructor() {
+    super("The previous Worker's background cleanup is still running; no replacement Worker starts until it stops")
+    this.name = 'CleanupPending'
+  }
+}
 const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
   'network error', 'overloaded', 'rate limit', '\\b(?:408|429|50[0-4])\\b'].join('|'), 'i')
 /**
@@ -61,13 +72,15 @@ export interface ExecutorHost {
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'turnBegan' | 'deliveryFailed' | 'report'
     | 'assignmentInterrupted' | 'stopAssignment'>
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'projects' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
+  readonly store: Pick<Store, 'closed' | 'tickets' | 'triggers' | 'projects' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
+  /** How long a launch waits for a previous Worker's cleanup before it fails rather than queueing behind it. */
+  readonly cleanupTimeoutMs?: number
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
   readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
   closing(): boolean
@@ -232,6 +245,10 @@ export class DshExecutor implements Executor {
   private readonly settling = new Map<string, AbortController>()
   /** The stops of tickets' background work that run, by ticket, which a launch or a delivery of the ticket waits for. */
   private readonly stopping = new Map<string, Promise<void>>()
+  /** Tickets whose cleanup the Engine stopped waiting for; their launches fail without starting until that stop settles. */
+  private readonly abandoned = new Set<string>()
+  /** Worker Session ids this Executor loaded, kept so shutdown can cancel them even after a compromised lock closes the Store. */
+  private readonly loaded = new Set<SessionId>()
   /** The jobs workers left to a person when they handed off, by ticket, and the collecting of their ends. */
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
@@ -336,6 +353,7 @@ export class DshExecutor implements Executor {
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            this.loaded.add(sessionId as SessionId)
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -436,25 +454,70 @@ export class DshExecutor implements Executor {
   private track(ticketId: string, stop: Promise<void>): void {
     const earlier = this.stopping.get(ticketId)
     const entry: Promise<void> = Promise.all([earlier?.then(() => {}, () => {}), stop]).then(() => {})
-      .finally(() => { if (this.stopping.get(ticketId) === entry) this.stopping.delete(ticketId) })
+      .finally(() => {
+        if (this.stopping.get(ticketId) !== entry) return
+        this.stopping.delete(ticketId)
+        // The stop really ended, so a later retry may launch over finished work again.
+        this.abandoned.delete(ticketId)
+      })
     this.stopping.set(ticketId, entry)
     // The entry is awaited where it matters; keep an ignored failure from surfacing as an unhandled rejection.
     entry.catch(() => {})
     void this.background(stop)
   }
-  /** Wait for a stop of the ticket's background work that runs, unless the host stops first; its failure propagates. */
+  /**
+   * The Engine stopped waiting for this Ticket's cleanup after its timeout. Mark the still-running stop, so a launch or a
+   * delivery fails with an explicit `failed`/delivery error instead of queueing forever behind it; once the cleanup really
+   * ends, `track` clears the mark and a later retry may start.
+   */
+  cleanupTimedOut(ticketId: string): void {
+    if (this.stopping.has(ticketId)) this.abandoned.add(ticketId)
+  }
+  /** The bounded wait for a cleanup, kept in step with the Engine's own. */
+  private cleanupTimeoutMs(): number {
+    const configured = this.host.cleanupTimeoutMs
+    return configured !== undefined && Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : CLEANUP_TIMEOUT_MS
+  }
+  /**
+   * Wait for a stop of the ticket's background work that runs, unless the host stops first; its failure propagates. A wait
+   * the Engine already abandoned fails at once, and one that outlives `cleanupTimeoutMs` is abandoned here as well, so a
+   * retry's launch never queues forever behind a cleanup that never settles.
+   */
   private async stopped(ticketId: string): Promise<void> {
     const stopping = this.stopping.get(ticketId)
-    if (stopping) await until(stopping, this.host.lifetime)
+    if (!stopping) { this.abandoned.delete(ticketId); return }
+    if (this.abandoned.has(ticketId)) throw new CleanupPending()
+    if (await until(stopping, this.host.lifetime, this.cleanupTimeoutMs()) !== false) {
+      this.abandoned.delete(ticketId)
+      return
+    }
+    // The host stopping cancels the wait; closing and closing-time re-queues handle it, not a cleanup failure.
+    if (this.host.lifetime.aborted) return
+    this.abandoned.add(ticketId)
+    throw new CleanupPending()
   }
   /**
    * On a host stop, for a bounded time: stop each loaded worker's background work, keeping its inbox; then end the collecting
    * of the jobs left to a person, which were killed, and cancel a worker turn that started meanwhile, keeping its inbox.
    */
+  /** Worker agents the DSH registry still has loaded, found without the Store (a compromised lock closes it). */
+  private liveWorkers(): Agent[] {
+    const registry = this.host.context.agents as unknown as { list?: () => Agent[] }
+    return (registry.list?.() ?? []).filter(agent => ticketOfSession(agent.id) !== undefined)
+  }
   async shutdown(): Promise<void> {
-    const agents = this.host.store.tickets.list().flatMap(ticket => workerSessionsOf(ticket))
-      .map(sessionId => this.host.context.agents.get(sessionId as SessionId))
-      .filter((agent): agent is Agent => agent !== undefined)
+    // A compromised state directory lock closes the Store before shutdown; loaded worker Sessions are still in memory.
+    const sessions = new Set<SessionId>(this.loaded)
+    if (!this.host.store.closed) {
+      for (const ticket of this.host.store.tickets.list()) for (const sessionId of workerSessionsOf(ticket)) sessions.add(sessionId as SessionId)
+    }
+    const byId = new Map<SessionId, Agent>()
+    for (const sessionId of sessions) {
+      const agent = this.host.context.agents.get(sessionId)
+      if (agent) byId.set(sessionId, agent)
+    }
+    for (const agent of this.liveWorkers()) byId.set(agent.id as SessionId, agent)
+    const agents = [...byId.values()]
     const stop = async () => {
       await Promise.allSettled(agents.map(agent => stopBackground(this.host.context, agent.id, 'dsh-superagent stopped', true)))
       for (const { collect } of this.left.values()) collect.abort()
@@ -521,6 +584,7 @@ export class DshExecutor implements Executor {
     if (!current()) return
     const sessionId = assignmentSessionId(ticket.id, assignment)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+    this.loaded.add(sessionId as SessionId)
     if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
@@ -561,6 +625,8 @@ export class DshExecutor implements Executor {
   install(): void {
     const ctx = this.host.context
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
+      // Keep every loaded worker Session in memory, so a host stop can cancel it even after the Store had to close.
+      if (ticketOfSession(agent.id) !== undefined) this.loaded.add(agent.id as SessionId)
       // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh. An expected
       // cancel is not cleared here: an unrelated running event does not end the turn the cancel was issued for.
       if (status === 'running') {
@@ -620,6 +686,9 @@ export class DshExecutor implements Executor {
     for (const dispose of this.disposers.splice(0)) dispose()
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
+    this.loaded.clear()
+    this.abandoned.clear()
+    this.stopping.clear()
   }
   /**
    * Reconciles running and pending assignments across open tickets after a host restart: notifies Engine of interrupted
@@ -635,6 +704,7 @@ export class DshExecutor implements Executor {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.
         const sessionId = assignmentSessionId(ticket.id, running)
+        this.loaded.add(sessionId as SessionId)
         const agent = this.host.context.agents.get(sessionId as SessionId)
         if (agent?.status === 'running') { cancelled.add(agent); agent.cancel({ kind: 'user' }, { keepInbox: true }) }
         this.stopWork(ticket.id, sessionId, 'dsh-superagent restarted', true)

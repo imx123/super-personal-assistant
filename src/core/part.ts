@@ -13,6 +13,8 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /** How long a pause or handoff waits for a Worker's background cleanup before treating it as failed. */
+  cleanupTimeoutMs?: number
   now?: () => string
   emit?: (event: DomainEvent) => void
 }

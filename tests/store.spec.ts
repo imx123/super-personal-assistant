@@ -45,6 +45,19 @@ const ticket = (id: string, state: 'open' | 'ended', assignments: Pick<Assignmen
 const thread = (id: string, source: string, fields: Partial<Thread> = {}): Thread =>
   ({ key: `${source}:${id}`, ref: { source, id }, createdAt: '', subscriptions: [], correlated: [], pending: [], meta: {}, ...fields })
 const ids = (items: { id?: string; key?: string }[]) => items.map(item => item.id ?? item.key).sort()
+it('closes once and refuses every later read and write', () => {
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  store.set('a', 1)
+  expect(store.closed).toBe(false)
+  store.close()
+  expect(store.closed).toBe(true)
+  expect(() => store.close()).not.toThrow()
+  expect(store.closed).toBe(true)
+  expect(() => store.get('a')).toThrow()
+  expect(() => store.set('b', 2)).toThrow()
+  expect(() => store.atomic(() => store.set('c', 3))).toThrow()
+  expect(() => store.tickets.save(ticket('closed', 'open', [{ state: 'pending' }]))).toThrow()
+})
 it('reads the working sets alone, in SQLite as in memory, and follows each save', () => {
   const store = new Store(join(directory, 'orchestrator.sqlite'))
   for (const repo of [store, new MemoryRepositories()] as Repositories[]) {

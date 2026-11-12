@@ -130,6 +130,20 @@ function errorText(error: unknown): string {
   }
   return error instanceof Error ? error.message : String(error)
 }
+/** How long a cleanup wait takes when the Engine is not configured with `cleanupTimeoutMs`. */
+export const CLEANUP_TIMEOUT_MS = 30_000
+/** The sentinel the timeout timer resolves with, which no cleanup promise can resolve to. */
+const CLEANUP_EXPIRED = Symbol('cleanup-expired')
+/**
+ * A Worker's background cleanup did not settle within the configured time. The cleanup itself may still run; every caller
+ * treats this exactly as a cleanup failure, so no replacement or target Worker starts and no Handoff is left accepted.
+ */
+export class CleanupTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`The Worker's background cleanup did not finish within ${timeoutMs} ms`)
+    this.name = 'CleanupTimeoutError'
+  }
+}
 
 /** One validated task, with its deterministic index, the tools it allows, and the Threads it subscribes to, deduplicated. */
 interface PreparedProjectTask {
@@ -209,6 +223,38 @@ export class Engine {
     this.assignments = new Assignments(options, this.tickets, this.replies)
     this.evals = new Evals(options, this.tickets)
     this.intake = new Intake(options, this.tickets)
+  }
+  /**
+   * Wait for a background cleanup the Executor started, for at most `cleanupTimeoutMs` (default `CLEANUP_TIMEOUT_MS`).
+   * A cleanup that rejects propagates its error unchanged. One that does not settle in time throws `CleanupTimeoutError`,
+   * which every caller treats exactly as a cleanup failure: the pause reports the Worker as failed, and a handoff records
+   * its Handoff as failed, ends a reserved pending Assignment and starts no replacement or target Worker.
+   *
+   * The abandoned cleanup may still settle. Its late rejection is observed here so it cannot surface unhandled, and its
+   * late success cannot resume the handoff or emit its success receipt: this wait has already thrown, so the caller's
+   * completion step (start the replacement, create the target Ticket, end the source) never runs. The Executor's own
+   * `stopping` registry still owns the cleanup, so a later retry's launch waits for it before starting over the work: it is
+   * told `cleanupTimedOut` so a launch fails with an explicit `failed` report instead of queuing behind a cleanup that may
+   * never end.
+   */
+  private async awaitCleanup(work: Promise<void>, ticketId: string): Promise<void> {
+    const configured = this.options.cleanupTimeoutMs
+    const timeoutMs = configured !== undefined && Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : CLEANUP_TIMEOUT_MS
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const expired = new Promise<typeof CLEANUP_EXPIRED>(resolve => {
+      timer = setTimeout(() => resolve(CLEANUP_EXPIRED), timeoutMs)
+      timer.unref?.()
+    })
+    try {
+      const result = await Promise.race([work, expired])
+      if (result !== CLEANUP_EXPIRED) return
+      // This wait is over, but the cleanup may still settle later; observe a late rejection instead of leaving it unhandled.
+      void work.catch(() => {})
+      this.options.executor.cleanupTimedOut?.(ticketId)
+      throw new CleanupTimeoutError(timeoutMs)
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   // Sources
@@ -368,18 +414,26 @@ export class Engine {
   }
   /**
    * `pauseProject`, with the Workers a hard pause stopped and the ones it failed to stop, after waiting for every started
-   * background cleanup. A cleanup that rejects moves its Ticket from `stopped` to `failures`, so neither the API result nor
-   * the Router notice claims a Worker was stopped while its jobs may still run.
+   * background cleanup, each for at most `cleanupTimeoutMs`. A cleanup that rejects or times out moves its Ticket from
+   * `stopped` to `failures`, so neither the API result nor the Router notice claims a Worker was stopped while its jobs may
+   * still run. The wait itself is bounded, so a cleanup that never settles cannot hold the HTTP request forever.
    */
   async pauseProjectReport(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'): Promise<ProjectPauseReport> {
     const begun = this.repo.atomic(() => this.pauseProjectNow(projectId, paused, mode))
-    for (const { ticketId, work } of begun.cleanups) {
+    // Wait for every cleanup at once, each bounded on its own: one stuck Worker cannot push the request past one timeout, and
+    // a failure only moves its own Ticket from stopped to failures.
+    const outcomes = await Promise.all(begun.cleanups.map(async ({ ticketId, work }) => {
       try {
-        await work
+        await this.awaitCleanup(work, ticketId)
+        return undefined
       } catch (error) {
-        begun.report.workers.stopped = begun.report.workers.stopped.filter(id => id !== ticketId)
-        begun.report.workers.failures.push({ ticketId, error: errorText(error) })
+        return { ticketId, error: errorText(error) }
       }
+    }))
+    for (const failure of outcomes) {
+      if (!failure) continue
+      begun.report.workers.stopped = begun.report.workers.stopped.filter(id => id !== failure.ticketId)
+      begun.report.workers.failures.push(failure)
     }
     if (begun.hardChanged) this.emitPausedByUser(begun)
     return begun.report
@@ -477,11 +531,11 @@ export class Engine {
   /**
    * A Project PM moves one of its Tickets to a new Worker: the same Ticket, Mandate and worktree, a new Session named
    * `worker-<ticketId>-h<seq>`, and the old Assignment and Session stopped. The new Assignment starts only after the old
-   * Worker's background cleanup succeeds; a cleanup failure, or a stop, retry or second transfer during the cleanup,
-   * ends it as `handoffCleanupFailed` or fails its Handoff instead of starting a replacement Session over work that may
-   * still run. Only the PM may call it; a Worker can only report that it needs another Worker.
+   * Worker's background cleanup succeeds within `cleanupTimeoutMs`; a cleanup failure or timeout, or a stop, retry or second
+   * transfer during the cleanup, ends it as `handoffCleanupFailed` or fails its Handoff instead of starting a replacement
+   * Session over work that may still run. Only the PM may call it; a Worker can only report that it needs another Worker.
    * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, or the Ticket is not
-   * its own, is ended, carries a manual stop, or has no running or pending Assignment; or when the cleanup fails.
+   * its own, is ended, carries a manual stop, or has no running or pending Assignment; or when the cleanup fails or times out.
    */
   async transferTicket(projectId: string, pmSessionId: string, ticketId: string, request: TicketHandoffRequest): Promise<Ticket> {
     const summary = typeof request?.summary === 'string' ? request.summary.trim() : ''
@@ -501,7 +555,7 @@ export class Engine {
     })
     if (begun.work) {
       try {
-        await begun.work
+        await this.awaitCleanup(begun.work, ticketId)
       } catch (error) {
         const message = errorText(error)
         this.repo.atomic(() => this.tickets.failTransfer(ticketId, begun.assignmentId, begun.handoffId, message))
@@ -529,13 +583,13 @@ export class Engine {
    * Ticket's first Assignment, the new Ticket gets its own Delegated Decision, Mandate, worktree and briefing, and the two
    * Tickets are peers (no parent). The PM chooses the new task; a Worker can only report the need.
    *
-   * It stops the source Worker first and waits for its background cleanup: the new Ticket, its Handoff and the source
-   * Ticket's `handedOff` end commit only after that cleanup succeeded, so no Worker starts over work that still runs. A
-   * failed cleanup, or a stop or Project change during it, leaves the source Ticket open with a `failed` Handoff and a
-   * `delivery.error` and starts nothing.
+   * It stops the source Worker first and waits for its background cleanup, bounded by `cleanupTimeoutMs`: the new Ticket,
+   * its Handoff and the source Ticket's `handedOff` end commit only after that cleanup succeeded, so no Worker starts over
+   * work that still runs. A failed or timed-out cleanup, or a stop or Project change during it, leaves the source Ticket
+   * open with a `failed` Handoff and a `delivery.error` and starts nothing.
    * @throws UserError when the Project is unknown or not active, the caller is not its PM, the source Ticket is not its own,
    * ended or manually stopped, its latest Assignment ended, or the new task is invalid or reuses the Project's worktree
-   * name; or when the source Worker's background cleanup fails.
+   * name; or when the source Worker's background cleanup fails or times out.
    */
   async splitTicket(projectId: string, pmSessionId: string, ticketId: string, input: TicketSplitRequest): Promise<ProjectHandoffResult> {
     const prepared = prepareHandoff({ ...input, targetProjectId: projectId })
@@ -571,7 +625,7 @@ export class Engine {
     })
     if (begun.work) {
       try {
-        await begun.work
+        await this.awaitCleanup(begun.work, ticketId)
       } catch (error) {
         const message = errorText(error)
         this.repo.atomic(() => this.tickets.failHandoffAway(ticketId, begun.handoff.id, message))
@@ -701,14 +755,14 @@ export class Engine {
   /**
    * The target Project's PM decides a pending cross-Project handoff. Rejecting marks it rejected and leaves the source
    * Ticket running. Accepting claims the request as `starting` (a concurrent decision refuses), stops the source Worker
-   * and waits for its background cleanup; only then does it create
+   * and waits for its background cleanup, bounded by `cleanupTimeoutMs`; only then does it create
    * a new, independent Ticket in the target Project under its own Mandate and worktree (new Decision, no parent), record
    * the accepted Handoff on both Tickets, and end the source Ticket with outcome `handedOff` after its Assignment and
-   * Session stopped. A failed cleanup, or a change to either Ticket during it, leaves a `failed` Handoff and a
+   * Session stopped. A failed or timed-out cleanup, or a change to either Ticket during it, leaves a `failed` Handoff and a
    * `delivery.error` on the source Ticket and starts nothing. Links carry over; worktrees and uncommitted changes do not.
    * @throws UserError when either Project is unknown, paused, archived or ended, the caller is not the target PM, the
    * Handoff is unknown, already decided or not addressed to this Project, the source Ticket or its Assignment is no longer
-   * current, or the source Worker's background cleanup fails.
+   * current, or the source Worker's background cleanup fails or times out.
    */
   async decideProjectHandoff(projectId: string, pmSessionId: string, handoffId: string,
     decision: { action: 'accept' | 'reject'; reason?: string }): Promise<ProjectHandoffResult> {
@@ -783,7 +837,7 @@ export class Engine {
     const accept = begun.accept!
     if (begun.work) {
       try {
-        await begun.work
+        await this.awaitCleanup(begun.work, accept.originId)
       } catch (error) {
         const message = errorText(error)
         this.repo.atomic(() => this.tickets.failHandoffAway(accept.originId, accept.handoffId, message))

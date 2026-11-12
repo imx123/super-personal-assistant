@@ -141,6 +141,9 @@ Once a person's message reached a blocked or failed Ticket, the Executor has the
 A retry ends the current Assignment and starts a new one in the same Executor Session, directory, branch and pull request.
 
 The Executor model applies only when a Session is created; an existing Session keeps its model.
+### Stopping and handoffs
+
+A single-Worker stop, a Project hard pause, and every handoff wait for the Worker's background cleanup — its shell jobs and subagents — for at most `EngineOptions.cleanupTimeoutMs`, 30 seconds by default; a hard pause waits for all its Workers' cleanups concurrently, each with its own deadline. A cleanup that has not settled by then counts as failed: a hard pause reports that Worker under `failures` instead of `stopped`, and a transfer, split or cross-Project accept records a `failed` Handoff and a delivery error on the still-open source Ticket and starts no replacement or target Worker. The abandoned cleanup remains owned by the Executor: until it really ends, a later retry's launch is refused at once with an explicit `failed` report instead of queueing behind it or starting over live jobs, and a late success cannot revive the failed Handoff or emit a success receipt. Shutdown has its own 10-second bound, described above.
 ### Restart
 
 Running Assignments end with "host restarted" and new ones start with a recovery note that tells the Executor to check its directory, git history and GitHub before repeating any outside action, oldest Ticket first.
