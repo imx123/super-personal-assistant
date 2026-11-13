@@ -1,8 +1,8 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import { transcriptEntry, type SessionEventView } from './session-view.ts'
 import { UserError, assignmentSessionId, key, latestReport, latestSessionId, reached, runningAssignment, threadKey, type Ticket,
   type Trigger } from '../core/index.ts'
-import { batchOf, inputMessage, triggerMessage } from '../executor/dsh.ts'
+import { batchOf, inputMessage, triggerMessage } from './tool-messages.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
@@ -10,9 +10,7 @@ import { feishuTriggerId } from '../sources/feishu-trigger.ts'
 import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, projectCard, projectTicketCard, textPage,
   threadCard, ticketCard, ticketDetails, triggerCard, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
-import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
 import type { Sessions } from './sessions.ts'
@@ -60,13 +58,31 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
 
+/** The host model catalog fields the models resources read; a host catalog satisfies it structurally. */
+export interface ModelCatalogView {
+  /** The model an unconfigured Session uses. */
+  readonly default: unknown
+  /** Providers whose catalog lookup failed. */
+  readonly failures: readonly unknown[]
+  readonly groups: readonly ModelGroupView[]
+}
+/** One provider and its loaded models, as the models resources list it. */
+export interface ModelGroupView {
+  readonly id: string
+  readonly name: string
+  readonly models: readonly unknown[]
+}
+
 export interface ResourceHost {
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'projects' | 'replyStatus'>
   readonly pages: TextCache
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
   readonly commands: Commands
   readonly masterId: string
-  readonly context: Context
+  /** The events of one DSH Session, for reading its transcript. */
+  sessionEvents(sessionId: string): Promise<readonly SessionEventView[]>
+  /** The host's model catalog, for the models resources. */
+  modelCatalog(): Promise<ModelCatalogView>
   promptVersion(sessionId: string): PromptVersion
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
@@ -125,7 +141,7 @@ const triggerLine = (trigger: Trigger) => ({ trigger_id: trigger.id, actor: trig
 async function transcript(host: ResourceHost, ticketId: string) {
   const ticket = host.store.tickets.get(ticketId)
   const sessionId = ticket ? latestSessionId(ticket) : `worker-${ticketId}`
-  return (await host.context.sessionController.inspect(sessionId as SessionId)).events
+  return host.sessionEvents(sessionId)
 }
 
 const ROUTES: readonly Route[] = [
@@ -224,13 +240,13 @@ const ROUTES: readonly Route[] = [
     return text(read, body)
   }],
   ['models', async read => {
-    const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
+    const host = main(read), catalog = await host.modelCatalog(), settings = host.store.settings()
     const roles = { orchestrator: settings.eval.model, pm: settings.eval.pmModel ?? settings.eval.model, worker: settings.executor.model }
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })) }
   }],
   ['models/', async read => {
-    const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
+    const models = (await main(read).modelCatalog()).groups.find(group => group.id === read.rest)?.models
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
   }],

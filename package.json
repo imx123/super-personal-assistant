@@ -58,6 +58,8 @@
     "prepack": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "control": "node lib/control.js",
+    "node": "node lib/node.js",
     "check": "pnpm typecheck && pnpm test && pnpm build"
   },
   "engines": {

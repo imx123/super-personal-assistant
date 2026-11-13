@@ -1,7 +1,7 @@
 /** Built-in prompt sections, role policies, and transcript projections for orchestrator and worker Sessions. */
 import { bundledSkills, promptFile } from './skill-files.ts'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
 export { textPage } from './cards.ts'
+export { transcriptEntry } from './session-view.ts'
 
 /** Built-in host-delivery and tool-usage rules shared by all Sessions; a team may override them (`builtInParts`). */
 export const sharedPrompt = promptFile('shared')
@@ -26,10 +26,3 @@ const handoff = { shared: promptFile('handoff'), orchestrator: promptFile('hando
 export const handoffPolicy = (role: 'orchestrator' | 'worker'): string => `${handoff.shared}\n${handoff[role]}`
 
 export const autoMergeThreshold = (lines: number): string => `it changes fewer than ${lines} lines (additions plus deletions);`
-
-/** Retains message content while omitting streamed chunks, usage accounting, and reasoning blocks. */
-export function transcriptEntry(event: SessionEvent) {
-  if (event.type !== 'user/message' && event.type !== 'tool/result' && event.type !== 'assistant/message') return undefined
-  const message = event.type === 'user/message' ? event.data : event.data.message
-  return { type: event.type, message: { role: message.role, content: message.content.filter(block => block.type !== 'reasoning') } }
-}

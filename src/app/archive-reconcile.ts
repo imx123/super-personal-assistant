@@ -1,20 +1,23 @@
 /** Reconciling native DSH Session archives with Project and Ticket state, without changing state from the event itself. */
-import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-workspace'
 import type { Engine, ProjectProfile } from '../core/index.ts'
-import { projectOfSession, workerSessionsOf } from '../core/index.ts'
-import { ticketOfSession } from '../executor/dsh.ts'
+import { projectOfSession, ticketOfSession, workerSessionsOf } from '../core/index.ts'
 import { KV } from '../kv.ts'
 import type { Sessions } from './sessions.ts'
 import type { Store } from './store.ts'
 
 export interface ArchiveReconcileHost {
-  readonly context: Context
+  readonly logger: { warn(format: unknown, ...param: unknown[]): void }
   readonly store: Pick<Store, 'projects' | 'tickets' | 'get' | 'set'>
   readonly engine: Pick<Engine, 'archiveProject' | 'unarchiveProject' | 'workerSessionArchived' | 'workerSessionUnarchived'>
   readonly sessions: Pick<Sessions, 'archiveProject' | 'unarchiveProject' | 'archivedSession'>
   configured(): boolean
   closing(): boolean
+  /** Registers a listener for a Session about to be archived, and returns its disposer. */
+  onSessionActivity(listener: (sessionId: string) => void): () => void
+  /** Registers a listener for a Session whose work the host stops after an archive, and returns its disposer. */
+  onSessionStop(listener: (sessionId: string) => void): () => void
+  /** The host's durable archive set, or undefined when the host offers none. */
+  archivedSessionIds(): readonly string[] | undefined
 }
 
 /** How often an unarchive that emits no event is found anyway; event handlers request an earlier pass. */
@@ -39,14 +42,10 @@ export class ArchiveReconciler {
   private unavailableLogged = false
   constructor(private readonly host: ArchiveReconcileHost) {}
 
-  /** Record the native archive events without changing any state; the waterfall listener must pass through `next`. */
+  /** Record the native archive events without changing any state; the platform keeps the waterfall pass-through. */
   install(): void {
-    this.disposers.push(this.host.context.on('workspace/session-activity', (request, next) => {
-      this.record(String(request.sessionId))
-      // A waterfall listener that does not call next would block every other provider and the archive itself.
-      return next()
-    }))
-    this.disposers.push(this.host.context.on('workspace/session-stop', request => { this.record(String(request.sessionId)) }))
+    this.disposers.push(this.host.onSessionActivity(sessionId => { this.record(sessionId) }))
+    this.disposers.push(this.host.onSessionStop(sessionId => { this.record(sessionId) }))
   }
   /** Start the low-frequency fallback pass, and one pass now for Sessions archived before this process started. */
   start(): void {
@@ -66,7 +65,7 @@ export class ArchiveReconciler {
   reconcile(): Promise<void> {
     if (this.running) { this.again = true; return this.running }
     const running = this.run().catch(error => {
-      this.host.context.logger.warn('dsh-superagent could not reconcile Project archives: %s', String(error))
+      this.host.logger.warn('dsh-superagent could not reconcile Project archives: %s', String(error))
     }).finally(() => {
       if (this.running !== running) return
       this.running = undefined
@@ -91,15 +90,15 @@ export class ArchiveReconciler {
   }
   private async run(): Promise<void> {
     if (this.stopped || this.host.closing() || !this.host.configured()) return
-    const registry = this.host.context.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
-    if (!registry || !Array.isArray(registry.archivedSessionIds)) {
+    const archived = this.host.archivedSessionIds()
+    if (!archived) {
       if (!this.unavailableLogged) {
         this.unavailableLogged = true
-        this.host.context.logger.warn('dsh-superagent: the host offers no archivedSessionIds; Project archive reconciliation waits')
+        this.host.logger.warn('dsh-superagent: the host offers no archivedSessionIds; Project archive reconciliation waits')
       }
       return
     }
-    const current = [...new Set(registry.archivedSessionIds.map(String))]
+    const current = [...new Set(archived.map(String))]
     const snapshot = this.host.store.get(KV.archive.sessionSnapshot)
     const first = snapshot === undefined
     const previous = new Set(snapshot ?? [])
@@ -111,7 +110,7 @@ export class ArchiveReconciler {
     const attempt = async (run: () => Promise<void> | void): Promise<void> => {
       try { await run() } catch (error) {
         ok = false
-        this.host.context.logger.warn('dsh-superagent could not reconcile an archived Session: %s', String(error))
+        this.host.logger.warn('dsh-superagent could not reconcile an archived Session: %s', String(error))
       }
     }
     // A restored PM goes first, then a newly archived PM, so its child workers see the Project's definitive state.
@@ -125,8 +124,8 @@ export class ArchiveReconciler {
     // Only a clean pass advances the snapshot; a failed application step is retried on the next event or timer. Re-read the
     // host set because archiving or unarchiving the Project changed its child Sessions during this pass.
     if (ok) {
-      const settled = [...new Set(registry.archivedSessionIds.map(String))]
-      this.host.store.set(KV.archive.sessionSnapshot, settled)
+      const settled = this.host.archivedSessionIds()
+      if (settled) this.host.store.set(KV.archive.sessionSnapshot, [...new Set(settled.map(String))])
     }
   }
   private async archiveProject(sessionId: string): Promise<void> {
@@ -186,6 +185,6 @@ export class ArchiveReconciler {
   private warn(detail: string): void {
     if (this.warned.has(detail)) return
     this.warned.add(detail)
-    this.host.context.logger.warn('dsh-superagent: %s', detail)
+    this.host.logger.warn('dsh-superagent: %s', detail)
   }
 }

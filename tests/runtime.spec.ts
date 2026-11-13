@@ -9,6 +9,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
+import { runtimePlatform } from '../src/node/platform.ts'
 import { PM_TOOLS } from '../src/app/sessions.ts'
 import { jobRegistry } from './fixtures/host.ts'
 import { evalsHealth } from '../src/app/views/overview.ts'
@@ -124,7 +125,7 @@ async function restart(machine: Partial<Machine> = {}, accounts: Accounts = {}):
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store, accounts); store.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-  runtime = new Runtime(ctx, testMachine({ stateDir: directory, ...machine }), restarts)
+  runtime = new Runtime(runtimePlatform(ctx), testMachine({ stateDir: directory, ...machine }), restarts, { ctx })
   return runtime
 }
 let deliveries: ReturnType<typeof vi.fn<(request: { sessionId: string; mode: 'queue' | 'steer'; id: string; text: string }) => void>>
@@ -251,7 +252,7 @@ beforeEach(async () => {
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
   for (const cli of [AGENT(), OTHER(), BOT()]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
   const store = new Store(join(directory, 'orchestrator.sqlite')); seed(store); store.close()
-  runtime = new Runtime(ctx, testMachine({ stateDir: directory }), restarts)
+  runtime = new Runtime(runtimePlatform(ctx), testMachine({ stateDir: directory }), restarts, { ctx })
   await runtime.ready
   // Source kinds are normally registered by plugins that are not loaded in unit tests.
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
@@ -1524,7 +1525,7 @@ it('refuses a second process on the same state directory before it opens the dat
   db.close()
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-  expect(() => new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())).toThrow(/already being held/)
+  expect(() => new Runtime(runtimePlatform(ctx), testMachine({ stateDir: directory }), vi.fn(), { ctx })).toThrow(/already being held/)
   expect(runtime.store.get(KV.store.schema)).toBe(10)
   runtime.store.set(KV.store.schema, SCHEMA_VERSION)
 })
@@ -1559,12 +1560,14 @@ it('releases the database and the state directory lock when it fails to start, s
   db.prepare("UPDATE kv SET value='99' WHERE key='schema'").run()
   db.close()
   const context = () => { const ctx = new Context(); for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service); return ctx }
-  expect(() => new Runtime(context(), testMachine({ stateDir: directory }), vi.fn())).toThrow('Unsupported orchestrator database version 99')
+  const failing = context()
+  expect(() => new Runtime(runtimePlatform(failing), testMachine({ stateDir: directory }), vi.fn(), { ctx: failing })).toThrow('Unsupported orchestrator database version 99')
   const fixed = new DatabaseSync(join(directory, 'orchestrator.sqlite'))
   fixed.prepare('UPDATE kv SET value=? WHERE key=?').run(String(SCHEMA_VERSION), 'schema')
   fixed.close()
   // A lock kept by the failed start would make this throw that the lock is already held.
-  runtime = new Runtime(context(), testMachine({ stateDir: directory }), vi.fn())
+  const retry = context()
+  runtime = new Runtime(runtimePlatform(retry), testMachine({ stateDir: directory }), vi.fn(), { ctx: retry })
   await runtime.ready
   expect(runtime.store.get(KV.store.schema)).toBe(SCHEMA_VERSION)
 })

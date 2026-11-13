@@ -4,15 +4,16 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, mkdtemp, rm, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { assignmentSessionId, CLEANUP_TIMEOUT_MS, key, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP,
-  runningAssignment, threadKey, ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
+import { assignmentSessionId, CLEANUP_TIMEOUT_MS, latestAssignment, latestReport, latestSessionId, liveTicket, OPERATOR_STOP,
+  runningAssignment, ticketOfSession, UserError, waitsForPerson, workerSessionsOf } from '../core/index.ts'
+import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import { redact } from '../infra/redact.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
+import { sourceTrigger } from '../app/source-trigger.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { environmentValue, executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
@@ -20,9 +21,11 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { executionStatus, relaySession, resultRelay, type Relay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { batchLine, batchOf, capped, inputMessage, inputResource, triggerMessage } from '../app/tool-messages.ts'
 
 const now = (): string => new Date().toISOString()
 export { ticketOfSession, workerSessionId } from '../core/index.ts'
+export { batchLine, batchOf, inputMessage, inputResource, triggerMessage } from '../app/tool-messages.ts'
 /** Maximum runtime for a workspace prepare command. */
 const PREPARE_TIMEOUT_MS = 10 * 60_000
 /** Maximum transient retry attempts for a launch or worker turn, and the initial backoff before resuming a turn. */
@@ -92,9 +95,7 @@ export interface ExecutorHost {
   /** Stored Trigger of the message `trigger` replies to, when it replies to one. */
   repliedTo(trigger: Trigger): Trigger | undefined
 }
-/** Looks up a ticket's origin trigger in Store. */
-export const sourceTrigger = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger | undefined =>
-  host.store.triggers.get(ticket.origin.triggerId)
+export { sourceTrigger }
 /**
  * The number of the turn `agent` is in now, which its next `turn/end` closes; while it is idle, the number of the turn it
  * last ended. Undefined when its Session recorded no turn yet, which only an idle Session or a test double does.
@@ -134,61 +135,9 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
     : note.trim()
   return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
 }
-/** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
-const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600
-/** Returns `text` up to `limit` characters, or a truncated preview with total character count and the resource path to read the full text. */
-const capped = (text: string, limit: number, read: string) =>
-  text.length <= limit ? { text } : { text: `${text.slice(0, limit)}…`, chars: text.length, read }
-/**
- * Formats a Trigger for worker delivery: author, thread, timestamp, text up to `TRIGGER_CHARS`, source message link,
- * optional routing note, and a preview of the replied-to message when the worker has not yet seen it.
- */
-export function triggerMessage(trigger: Trigger, link: { source_url?: string; source_url_read?: string }, note?: string, repliesTo?: Trigger) {
-  return { trigger_id: trigger.id, from: trigger.actor.id, thread: threadKey(trigger.threads[0]!), at: trigger.at,
-    ...capped(trigger.text, TRIGGER_CHARS, `trigger/${trigger.id}`), ...link, ...(note ? { routing_note: note } : {}),
-    ...(repliesTo ? { replies_to: { trigger_id: repliesTo.id, preview: repliesTo.text.replace(/\s+/g, ' ').slice(0, 160) } } : {}) }
-}
-/** Formats a peer trigger from the ticket's acceptance batch with author, timestamp, 160-character preview, and read resource path. */
-export const batchLine = (trigger: Trigger) => ({ trigger_id: trigger.id, from: trigger.actor.id, at: trigger.at,
-  preview: trigger.text.replace(/\s+/g, ' ').slice(0, 160), read: `trigger/${trigger.id}` })
-/** Returns the other triggers in a ticket's origin batch (excluding the primary `origin.triggerId`), oldest first. */
-export const batchOf = (host: { store: Pick<Store, 'triggers'> }, ticket: Ticket): Trigger[] => ticket.origin.triggerIds
-  .filter(id => id !== ticket.origin.triggerId).flatMap(id => host.store.triggers.get(id) ?? [])
-const RESUMED = 'This ticket ended earlier and the message that follows, on its thread, resumed it under the same mandate. If it asks for '
-  + 'more within the original scope, inspect the worktree, git history and PR state and continue; if it asks for work beyond that scope or '
-  + 'for another ticket, hand it back with orchestrator_trigger_handback and report dropped; if it needs nothing, such as thanks, '
-  + 'report dropped without a message. Report ready when the follow-up is done. Do not repeat completed work.'
+/** Character limit for inline assignment text in a worker message; longer text is read via its resource. */
+const ASSIGNMENT_CHARS = 1500
 const RETRIED = 'A person retried this ticket. Continue the assignment from the current worktree, git history and PR state.'
-/** Formats a policy-change input for the worker; inputs recorded before `effect` existed fall back to a general notice. */
-function policyMessage(effect?: PolicyEffect): string {
-  if (!effect) return 'Policy change: the access or admission rules changed. Check that the remaining work stays within the assignment.'
-  return ['Policy change:',
-    ...(effect.rules ?? []).map(rule => rule.change === 'disabled'
-      ? `Rule ${rule.name} (${rule.id}), which this ticket was accepted under, no longer applies: finish only a change within it, or report dropped.`
-      : `Rule ${rule.name} (${rule.id}), which this ticket was accepted under, changed. Keep the remaining work within it as it reads now: ${rule.instruction}`),
-    ...effect.proactive === false ? ['Work inferred from a rule is no longer accepted, as the accept mode is no longer auto: finish only '
-      + 'what is in progress within the assignment, or report dropped, and take on nothing new.'] : [],
-    ...effect.delegatedAuthority === false ? ['The Project PM Mandate that authorized this delegated ticket no longer holds: finish only work '
-      + 'already in progress within the assignment, or report dropped, and take on nothing new.'] : [],
-    ...effect.requesterAllowed === false ? [`The sender this ticket is for, ${effect.requester ? `${effect.requester.id} on ${effect.requester.source}` : 'who '
-      + 'asked for it'}, may no longer start work here: finish the assignment within its scope, and take no new requests from them on it.`] : []].join('\n')
-}
-/** Resource path under which a worker session reads the full text of a ticket input. */
-export const inputResource = (ticketId: string, inputId: string): string => `ticket/${ticketId}/input/${key(inputId)}`
-/**
- * Formats a ticket input for worker delivery: a `trigger` rendered via `trigger` (or by its ID and read path when absent),
- * a `policy-changed` notice, a `resumed` notice, an orchestrator `note`, or a `text` input as written.
- * Returns `undefined` for legacy `reopen` inputs, which are historical only because the schema 11 migration converted pending reopen inputs into text inputs.
- */
-export function inputMessage(input: TicketInput, trigger?: object): string | undefined {
-  // Mark triggers arriving on context-only subscriptions so the worker knows they are not addressed to the ticket.
-  if (input.kind === 'trigger') return JSON.stringify({ ...trigger ?? { trigger_id: input.triggerId, read: `trigger/${input.triggerId}` },
-    ...input.context ? { context: true } : {} })
-  if (input.kind === 'policy-changed') return policyMessage(input.effect)
-  if (input.kind === 'resumed') return RESUMED
-  if (input.kind === 'note') return `Note from the orchestrator, for context only: ${input.text}`
-  return input.kind === 'text' ? input.text : undefined
-}
 /**
  * Tracks active and starting worker sessions against the configured concurrency limit: a ticket holds a slot while its
  * worker's turn runs, while its shell jobs or subagents run after that turn ended, and while a launch or wake starts that worker.

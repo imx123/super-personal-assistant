@@ -1,14 +1,12 @@
 /** Block-scoped settings validation, optimistic concurrency saves, processing pause control, and source policy synchronization. */
-import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import { UserError, type EngineForSettings } from '../core/index.ts'
 import { EvalConfigSchema, ExecutorConfigSchema, PolicyConfigSchema, SettingsSchema, policyEffects, policyVersion } from '../policy.ts'
-import type { Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
+import type { RoleModel, Settings as SettingsValue, SettingsBlock, SettingsOrigin, SettingsSave } from '../policy.ts'
 import type { SourceHost } from '../sources/host.ts'
 import { MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
-import { resolveRoleModel } from './role-models.ts'
 import { changedPaths, settingsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
 import { setupChanged, type Setup } from './setup.ts'
@@ -61,8 +59,8 @@ export interface SettingsHost {
   readonly engine: EngineForSettings
   /** Health board where each source's policy sync reports under `sync:<id>`. */
   readonly health: Pick<HealthBoard, 'claim'>
-  /** DSH Cordis context used to validate and resolve role models. */
-  readonly context: Context
+  /** Validates a configured model route through the live provider, rejecting an unavailable one. */
+  resolveRoleModel(model: RoleModel): Promise<void>
   readonly lifetime: AbortSignal
   /** Session manager through which the main Session is notified of saved settings. */
   readonly sessions: Pick<Sessions, 'notify' | 'delivery'>
@@ -163,7 +161,7 @@ export class Settings {
       : block === 'executor' ? [{ model: candidate.executor.model, previous: current.executor.model }] : []
     for (const { model, previous } of models) {
       if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-        try { await resolveRoleModel(this.host.context, model) }
+        try { await this.host.resolveRoleModel(model) }
         catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
       }
     }

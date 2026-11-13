@@ -24,7 +24,7 @@ flowchart TB
   effects --> store
 ```
 
-`Runtime` (`src/app/runtime.ts`) constructs the application, supplies dependencies, and owns startup and shutdown, after locking the state directory; a lock reported compromised closes the Store at once (fail-closed), and shutdown attempts each teardown step independently so a closed-Store failure cannot skip cancelling loaded Sessions. `Engine` constructs its own internal parts. The Executor and Assessor call back into the Engine, so Runtime gives them getters rather than requiring construction in a circular order.
+`Runtime` (`src/app/runtime.ts`) constructs the application, supplies dependencies, and owns startup and shutdown, after locking the state directory; it creates `ControlPlaneOwner` first, so the control plane owns the Store and Engine while the node side only receives the `ControlPlaneHost` and `NodeHost` boundaries. A lock reported compromised closes the Store at once (fail-closed), and shutdown attempts each teardown step independently so a closed-Store failure cannot skip cancelling loaded Sessions. `Engine` constructs its own internal parts. The Executor and Assessor call back into the Engine, so Runtime gives them getters rather than requiring construction in a circular order.
 
 ### Runtime
 
@@ -307,6 +307,28 @@ Some generic modules still refer directly to GitHub or Feishu:
 | Path | Responsibility |
 | --- | --- |
 | `src/index.ts` | The main plugin entry: reads the machine settings, starts the Runtime, and gives it the restart that a save of a Source's account uses |
+| `src/shared/protocol.ts` | The backend-neutral node protocol: `NodeCommand`, `NodeEvent`, `SessionRecord`, `RoleProfile`, `ToolContext`, `NodePort` and the protocol version |
+| `src/shared/session-token.ts` | Short-lived HMAC session tokens: claims, issuance and verification, with no DSH dependency |
+| `src/control/control-plane.ts` | The standalone control-plane kernel: Store, Engine, Session records, tokens and the NodePort |
+| `src/control/owner.ts` | `ControlPlaneOwner`: opens the Store, attaches exactly one Engine, and closes both |
+| `src/control/host.ts` | `ControlPlaneHost`: the in-process boundary the node side may use for Store, Engine, Effects and Outbox |
+| `src/control/domain.ts` | The kernel's minimal Policy, SourceScope, Assessor, Executor and in-memory Outbox |
+| `src/control/roles.ts` | The `pm.v1`, `worker.v1` and `scout.v1` role profiles sent to a node |
+| `src/control/executor.ts` | `NodeExecutor`: the Engine's Executor over the kernel's `NodePort` — one Worker Session per Assignment, delivery of waiting inputs, cancellation on stop, and `assignmentStarted`/`assignmentFailed` callbacks |
+| `src/control/server.ts` | The loopback HTTP API and bearer-token check for the kernel |
+| `src/control/http-node.ts` | `HttpNodePort`: the control side's `NodePort` over the node's HTTP transport, sending each command to `POST /commands` and reading events from the `/events` SSE stream with the node bearer token |
+| `src/control/main.ts` | The standalone kernel entry point built as `lib/control.js`; with `SUPERAGENT_NODE_URL` it talks to a separate node process instead of an in-process FakeNode |
+| `src/control/start.ts` | `startControlPlane`: builds the kernel and HTTP API, registers with the node, and only then listens; a failed registration closes both halves before the error escapes |
+| `src/node/fake-node.ts` | An in-process NodePort that records Session commands and emits ordered events for tests |
+| `src/node/http-server.ts` | `startNodeHttpServer`: the node's HTTP facade over a `NodePort` — authenticated `POST /commands`, `GET /events` SSE with keepalives, and a public `/health` |
+| `src/node/command-validation.ts` | `validateNodeCommand` and `NodeCommandError`: runtime checks of a `NodeCommand`'s envelope and per-type fields, and the error codes a transport maps to 400/422/500 |
+| `src/node/main.ts` | The standalone node entry point built as `lib/node.js`, hosting a FakeNode behind the HTTP facade until the real DSH adapter lands |
+| `src/node/host.ts` | `NodeHost`: the in-process boundary the control side may use for Sessions and the Executor; `RuntimePlatform` is what the host hands the DSH-free Runtime |
+| `src/node/dsh-node.ts` | `createDshNode`: builds the DSH-backed `NodeRuntime` (Sessions and the Executor) and fixes its startup, cancellation and teardown order |
+| `src/node/dsh-port.ts` | `DshNodePort`: the backend-neutral `NodePort` over a DSH node — command-to-host mapping, workspace containment, per-port idempotency, and protocol envelopes around host events |
+| `src/node/dsh-port-host.ts` | `createDshPortHost`: the DSH-backed host behind `DshNodePort`, using `Sessions`, `agents`, `workspaceRegistry` and `permissionPresets`; the only node transport file that imports `@deepseek-ai/*` |
+| `src/node/platform.ts` | `runtimePlatform`: keeps the Cordis context in its closure and gives the Runtime logger, HTTP registration, the node runtime factory, lifetime and narrow ports for setup probes, archive events and session reads |
+| `src/node/orchestrator-service.ts` | `OrchestratorService`: registers the Runtime as the `orchestrator` Cordis service for Source plugins, delegating every `SourceHost` method |
 | `src/deployment.ts` | The plugin `Config` and `Machine`; `resolveDeployment` and `resolveFeishuBot` read the repository and the accounts from the Source settings, each CLI run as Executor shells run it; `SETUP_FIELDS` lists the Source fields setup reads. The code names no person, account or organization |
 | `src/setup.ts` | Setup problems: `SetupError`, with a code, the place that fixes it, the English text the log, the main Session and the panel share, and a redacted CLI output instead of the raw one |
 | `src/policy.ts` | The Policy: the settings schemas by block, the Policy version, the gate and Mandate revalidation |
@@ -336,6 +358,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/notices.ts` | The notices and relays for the main Session or a Project PM: `eventNotice`, `reportRelay`, `resultRelay`, `followupRelay` and `relaySession` |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox; its generated `open`/`active` Ticket sets exclude archived Tickets |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
+| `src/app/source-trigger.ts` | `sourceTrigger`: the Trigger a Ticket came from, looked up without DSH |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
 | `src/app/effects.ts` | Effects, including a `relay` payload that names its target Session |
 | `src/app/versions.ts` | `Versions`: a record kept as numbered snapshots with a pointer to the current one, for the settings and the prompts |
@@ -343,7 +366,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/settings.ts` | Settings |
 | `src/app/settings-history.ts` | `policyHistory`: each saved settings revision with what it changed from the one before |
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override (including the PM role), and `promptParts`, the order of a role's prompt sections and a PM's Project section |
-| `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
+| `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and re-exports of `textPage` and `transcriptEntry` |
+| `src/app/session-view.ts` | `SessionEventView`: the DSH-free view of a Session event, `transcriptEntry`, the transcript entries `orchestrator_read` serves, and `currentTurnUserMessage`, the direct human message a turn carried |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
 | `src/app/sessions.ts` | Sessions: the main, worker and Project PM Session roles, their prompts, tools and presets; `workOnly` narrows an Executor's `WORK_TOOLS` by its Ticket Mandate's `allowTools`, and a subagent inherits the same restriction; `archiveProject`/`unarchiveProject` change the PM and child Sessions through `workspaceRegistry` and report failures; `pauseProject` sends the soft PM notice or cancels loaded turns on a hard pause; a PM's next prompt clears its delivered `pendingNotes` |
 | `src/app/archive-reconcile.ts` | `ArchiveReconciler`: records `workspace/session-activity`/`session-stop` candidates without changing state, reconciles `archivedSessionIds` against the KV snapshot on events and a 30-second unref fallback, and routes PM/worker additions and removals to the Engine and Sessions |
@@ -355,6 +379,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/source-context.ts` | `sourceContextOf`: each Source kind's `SourceContext` |
 | `src/app/links.ts` | `sourceLink`, the page of a Trigger's message, and `candidateCard` |
 | `src/app/cards.ts` | Compact cards of Triggers, Tickets, Projects, Project Tickets, Threads and Decisions for models, the closed set of ticket card states `TICKET_STATES`, and `textPage` |
+| `src/app/tool-messages.ts` | Worker-facing message text without DSH: `triggerMessage`, `batchOf`, `batchLine`, `inputResource`, `inputMessage` and `capped`, which `executor/dsh.ts` also re-exports |
 | `src/app/resources.ts` | `RESOURCES` and `readResource`: what `orchestrator_read` reads, for each role, including Projects and a Project's Tickets |
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools, including Project archive/unarchive, and the Project PM's read, Ticket-creation, Ticket-message and report tools |
@@ -426,6 +451,25 @@ Some generic modules still refer directly to GitHub or Feishu:
 | Test | Covers |
 | --- | --- |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
+| `tests/protocol.spec.ts` | The node protocol's version and Session/command shapes, and session-token round-trip, expiry, tampering, malformed input and invalid lifetimes |
+| `tests/fake-node.spec.ts` | The in-process NodePort: registration, heartbeat, workspace containment, PM/Worker creation, messages, idempotency, cancel, archive, permission and tool events |
+| `tests/node-http.spec.ts` | The node HTTP facade and `HttpNodePort`: the PM/Worker lifecycle over HTTP with events streamed back over SSE, bearer-token and malformed-command refusals, event fan-out and unsubscribe, and the public health check |
+| `tests/dsh-port.spec.ts` | `DshNodePort` with a fake host: register/heartbeat status, workspace containment, PM/Worker ensures, message/cancel/archive/permission mapping, idempotency, protocol-version refusal, event envelopes and one host subscription per listener, plus the adapter behind the node HTTP server with SSE |
+| `tests/dsh-port-idempotency.spec.ts` | `DshNodePort.send` retries: a completed key is acknowledged without a host call, a duplicate during the run awaits the same Promise, a failed run stays retryable (including concurrent duplicates), and distinct keys each execute once |
+| `tests/node-command-results.spec.ts` | Command results through `DshNodePort` and the node HTTP facade: a key recorded only after the host accepted a message, refused delivery/prompt/archive failures, `session.inspect` echoing its request key, validation refusals (unknown type 400, invalid fields 422, protocol 400), and the archive status only after the host archived |
+| `tests/control-plane.spec.ts` | The standalone kernel: PM/Worker Session creation, token claims, message/cancel/archive/permission, and the authenticated HTTP API |
+| `tests/control-plane-persistence.spec.ts` | Session records written to the Store KV area and reloaded after a restart: PM and Worker records, a re-issued token for a loaded Session, and archived status persisted across restarts |
+| `tests/control-plane-retry.spec.ts` | Retrying a failed PM or Worker ensure instead of returning the failed record: reset to `starting`, a fresh token, the HTTP API answering 500/502 until the node recovers and 200 after, and distinct message/heartbeat keys on a fixed clock |
+| `tests/control-plane-lost-ack.spec.ts` | An ensure whose acknowledgement is lost after the node reported `idle`: the idle status is kept; a failed or persisted `starting` record is retried with `*-confirm` keys; HTTP answers 200 or 502; the Worker path behaves the same |
+| `tests/control-plane-crosslayer.spec.ts` | Cross-layer recovery: a lost ensure acknowledgement and status confirmed by `session.inspect` (including the command/event fallback), one shared ensure for concurrent requests, an idle Session whose role installation failed answered 502, no `sent:true` for a rejected message, an archive recorded without its status event, and a startup that fails fast on registration and listens only after it |
+| `tests/control-plane-executor.spec.ts` | `NodeExecutor`: creates the Assignment's Worker Session and reports `assignmentStarted`, delivers the waiting text input, and reports a refused `worker.create` as a failed Assignment instead of leaving it pending |
+| `tests/control-plane-e2e.spec.ts` | One simulated DSH chain: the PM tool API creates a Ticket, `NodeExecutor` starts its Worker with the full task prompt, and the Worker tool API reports ready onto the same Ticket and Assignment; a foreign Assignment is refused without changing the Ticket |
+| `tests/control-plane-tools.spec.ts` | The Session-token tool API and the node's proxy tools: a PM creating Tickets in its own Project, a PM reading its own Project and Tickets (and never another Project's, with a Worker token refused and the derived Ticket status), a Worker report written to the current Assignment (question and clear), operator/wrong-role/expired/unknown-Session refusals, unknown or foreign Tickets, another Assignment and invalid reports, and `control_report`/`control_create_tickets`/`control_project` URL, method, header, body, error propagation, one registration per Agent and the end-to-end route |
+| `tests/http-node-inspect-timeout.spec.ts` | `HttpNodePort.inspect` timing out over the whole operation: no SSE response headers, an SSE connection whose command never answers, and the normal path; the timeout aborts and cleans up without an unhandled rejection |
+| `tests/control-plane-deps.spec.ts` | The kernel and FakeNode import no DSH, Runtime or domain modules |
+| `tests/app-dsh-boundary.spec.ts` | The resources, Session tools and archive reconciler import no DSH type and no `executor/dsh.ts`, and the shared helpers import no DSH either |
+| `tests/control-plane-owner.spec.ts` | `ControlPlaneOwner` opens the Store before the Engine, attaches one Engine, and refuses a second |
+| `tests/control-plane-boundary.spec.ts` | Runtime uses `ControlPlaneOwner` rather than constructing Store/Engine, node-side files do not construct them, and Runtime implements both hosts |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |
 | `tests/registry.spec.ts` | `SourceRegistry`: instances, validation, Policy parts, Channels and Thread context |

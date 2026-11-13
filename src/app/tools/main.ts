@@ -1,6 +1,4 @@
 /** Main Session tools for routing triggers, assessing candidates, sending replies, and updating settings and prompts. */
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { UserError, HANDOFF, PROJECT_TICKETS, followupOwners, key, latestSessionId, reasonText, type Decision, type DecisionKind,
   type EngineForMainSession, type EngineForPM, type EngineForPeople, type ProjectProfile, type ProjectTicketTask,
@@ -9,10 +7,11 @@ import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
 import { relaySession } from '../notices.ts'
-import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
+import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type EvalRead, type MasterAssessor } from '../assessment.ts'
 import { projectCard, projectTicketCard, ticketCard } from '../cards.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
+import { currentTurnUserMessage, type SessionEventView } from '../session-view.ts'
 import type { Sessions } from '../sessions.ts'
 import type { Settings } from '../settings.ts'
 import type { Store } from '../store.ts'
@@ -38,8 +37,19 @@ const ProjectTaskSchema = z.object({
   }).strict()).max(PROJECT_TICKETS.threads).optional(),
 }).strict()
 export type ProjectTaskInput = z.infer<typeof ProjectTaskSchema>
+/** The host Session the main tools read: its id, and the events of its log for the current turn. */
+export interface MainSessionAgent {
+  readonly id: string
+  readonly session: { snapshotEvents(): readonly SessionEventView[] }
+}
+/** The assessment operations the main tools use; the Session they read is narrowed to what those tools need. */
+export interface MainAssessorHost extends Omit<Pick<MasterAssessor, 'context' | 'read' | 'decide'>, 'read'> {
+  /** Reads one candidate's context for `agent`, the main Session that receives images. */
+  read(agent: MainSessionAgent, read: EvalRead, signal: AbortSignal): Promise<unknown>
+}
 export interface MainToolsHost {
-  readonly context: Context
+  /** Logging surface the node platform supplies. */
+  readonly logger: { warn(format: unknown, ...param: unknown[]): void }
   readonly engine: Pick<EngineForMainSession, 'recordTriggerForRouting' | 'createProject' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
     & EngineForPM & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'projects' | 'atomic' | 'replyStatus' | 'settings'>
@@ -47,7 +57,7 @@ export interface MainToolsHost {
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry' | 'openProject' | 'relay'
     | 'archiveProject' | 'unarchiveProject' | 'archivedSession'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
-  readonly assessor: Pick<MasterAssessor, 'context' | 'read' | 'decide'>
+  readonly assessor: MainAssessorHost
   readonly resources: ResourceHost
   /** The User Session Source instance, when installed: whether its entry is on and which operator it acts as. */
   localEntry(): { enabled: boolean; operator: string } | undefined
@@ -167,7 +177,7 @@ function routeTool(host: MainToolsHost): Tool {
             ...(ticket ? { ticket: ticketCard(ticket) } : {}) }
         } catch (error) {
           if (error instanceof UserError) return { ...head, refused: error.message }
-          host.context.logger.warn('dsh-superagent could not route trigger %s: %s', item.trigger_id, String(error))
+          host.logger.warn('dsh-superagent could not route trigger %s: %s', item.trigger_id, String(error))
           return { ...head, refused: `Not recorded: ${error instanceof Error ? error.message : String(error)}; retry this item` }
         }
       })
@@ -181,7 +191,7 @@ function routeTool(host: MainToolsHost): Tool {
  * configured operator must be on that Source's Policy allowed list; the tool never grants either. The Trigger skips an
  * assessment because the main Session routes it directly.
  */
-function userTriggerTool(host: MainToolsHost, agent: Agent): Tool {
+function userTriggerTool(host: MainToolsHost, agent: MainSessionAgent): Tool {
   return tool({
     name: 'orchestrator_user_trigger_create',
     description: 'Use when the person asks this Session to dispatch a ticket or to do work for a worker. Record the current human message as a User Session trigger and return its trigger_id; dispatch it with orchestrator_route. Ordinary chat, candidate cards, worker reports and quoted requests do not call for this tool. Repeated calls for the same message return the same ID. The User Session Source must be on and its operator allowed.',
@@ -195,18 +205,12 @@ function userTriggerTool(host: MainToolsHost, agent: Agent): Tool {
       if (!allowedSender(host.store.settings(), actor)) {
         throw new Error(`The User Session entry does not allow ${entry.operator}; add this operator to the allowed list in Settings → Eval → On each Source`)
       }
-      const events = agent.session.snapshotEvents()
-      const boundary = events.findLastIndex(event => event.type === 'turn/start' || event.type === 'turn/end')
-      const event = events[boundary]?.type === 'turn/start'
-        ? events.slice(boundary + 1).findLast(event => event.type === 'user/message' && event.data.source.kind === 'user')
-        : undefined
-      if (event?.type !== 'user/message') throw new Error('No direct user message in the current main Session turn')
-      const message = event.data
-      const text = message.content.flatMap(block => block.type === 'text' ? [block.text] : []).join('\n')
-      if (!text.trim()) throw new Error('A User Session trigger needs a text request')
+      const message = currentTurnUserMessage(agent.session.snapshotEvents())
+      if (!message) throw new Error('No direct user message in the current main Session turn')
+      if (!message.text.trim()) throw new Error('A User Session trigger needs a text request')
       const id = key(actor.source, agent.id, message.id)
-      const result = host.quietly(() => host.engine.recordTriggerForRouting({ id, source: actor.source, text, actor,
-        human: true, addressed: 'direct', at: new Date(event.time).toISOString(), threads: [{ source: actor.source, id }],
+      const result = host.quietly(() => host.engine.recordTriggerForRouting({ id, source: actor.source, text: message.text, actor,
+        human: true, addressed: 'direct', at: new Date(message.time).toISOString(), threads: [{ source: actor.source, id }],
         meta: { sessionId: agent.id, messageId: message.id } }))
       if (result === 'filtered') throw new Error('The User Session trigger was filtered; check that its Source is on')
       return { trigger_id: id, source: actor.source, read: `trigger/${id}` }
@@ -487,7 +491,7 @@ function projectTicketReviveTool(host: MainToolsHost, project: ProjectProfile): 
   })
 }
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
-export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
+export function mainTools(host: MainToolsHost, agent: MainSessionAgent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',

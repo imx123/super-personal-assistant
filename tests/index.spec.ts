@@ -20,6 +20,8 @@ function context() {
   const ctx = {
     on: vi.fn((name: string, handler: () => void) => { handlers.set(name, handler) }),
     inject: vi.fn((_services: string[], callback: (child: unknown) => void) => { callback({ effect: (effect: () => unknown) => effect(), settings: { configure } }) }),
+    // The OrchestratorService registers itself through Cordis's service API.
+    reflect: { provide: vi.fn() },
     effect: vi.fn(),
     fiber: { restart: vi.fn(async () => {}) },
     get: vi.fn((name: string) => name === 'settings' ? { describe } : undefined),

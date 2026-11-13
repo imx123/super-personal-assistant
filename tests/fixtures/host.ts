@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { vi, type Mock } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { Runtime, type RuntimeOptions } from '../../src/app/runtime.ts'
+import { runtimePlatform } from '../../src/node/platform.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../../src/sources/feishu.ts'
@@ -267,7 +268,7 @@ export async function startRuntime(seed?: (store: Store) => void, options?: Runt
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
   seeded.close()
-  const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn(), options)
+  const runtime = new Runtime(runtimePlatform(ctx), testMachine({ stateDir: directory }), vi.fn(), { ...options, ctx })
   await runtime.ready
   runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
   const settings = runtime.store.settings()

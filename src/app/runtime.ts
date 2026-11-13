@@ -1,20 +1,12 @@
 /** Application composition root and lifecycle manager for dsh-superagent. */
-import { Service, type Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SessionId } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-api-session-controller'
-import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-workspace'
-import type {} from '@deepseek-ai/dsh-permission-presets'
-import type {} from '@deepseek-ai/dsh-system-prompt'
-import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-skill'
-import type {} from '@deepseek-ai/dsh-subprocess'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Engine, key, latestSessionId, reasonText, workerSessionsOf, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger }
   from '../core/index.ts'
+import type { ControlPlaneHost } from '../control/host.ts'
+import { ControlPlaneOwner } from '../control/owner.ts'
+import type { NodeHost, NodeRuntime, RuntimePlatform } from '../node/host.ts'
 import { policyVersion, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
 import { DEFAULT_MAIN_SESSION_OPERATOR, mainSessionKind, MAIN_SESSION_SOURCE, syncMainSessionOperator } from '../sources/main-session.ts'
@@ -23,7 +15,7 @@ import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
-import { DshExecutor, sourceTrigger, triggerMessage } from '../executor/dsh.ts'
+import { sourceTrigger } from './source-trigger.ts'
 import { ticketCard } from './cards.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
@@ -32,7 +24,7 @@ import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
 import { Effects } from './effects.ts'
 import { Prompts } from './prompts.ts'
-import { registerHttp, type HttpHost } from './http.ts'
+import type { HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, executionStatus, followupNotice, projectPauseRelay, relaySession } from './notices.ts'
@@ -44,42 +36,44 @@ import { Setup } from './setup.ts'
 import { ArchiveReconciler } from './archive-reconcile.ts'
 import { feishuSettings } from '../sources/feishu.ts'
 import { health, type Health, type SourceContext, type SourceHost } from '../sources/host.ts'
-import { Sessions } from './sessions.ts'
 import { Settings } from './settings.ts'
 import { sourceContextOf, type SourceContextDeps } from './source-context.ts'
 import type { ResourceHost } from './resources.ts'
 import { mainTools, pmTools, type MainToolsHost } from './tools/main.ts'
 import { executorTools, type ExecutorToolsHost } from './tools/executor.ts'
 
-// Source plugins interact with dsh-superagent exclusively through the `SourceHost` service interface.
-declare module '@deepseek-ai/cordis' { interface Context { orchestrator: SourceHost } }
 const now = (): string => new Date().toISOString()
 /** Limits a host may pass to the Runtime; production keeps the defaults and tests inject shorter waits. */
 export interface RuntimeOptions {
   /** How long a pause or handoff waits for a Worker's background cleanup before treating it as failed. */
   cleanupTimeoutMs?: number
+  /** The Cordis context, passed only by tests that drive DSH events through `Runtime.ctx`; production passes none. */
+  ctx?: unknown
 }
 
 /**
- * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Sessions`, `Settings`, `Prompts`, `DshExecutor`, and `MasterAssessor`.
- * Exposes the `SourceHost` service on the Cordis context for source plugins and coordinates startup, setup checks, HTTP route registration, and graceful shutdown.
+ * Composition root of dsh-superagent that connects `Store`, `Setup`, `Engine`, `SourceRegistry`, `Effects`, `Outbox`, `Passes`, `Settings`, `Prompts`, and `MasterAssessor`.
+ * It is deliberately DSH-free: the host hands it a `RuntimePlatform` (see `node/host.ts`), and the node runtime behind that
+ * platform owns DSH's Context, Sessions and Executor. `node/orchestrator-service.ts` exposes it as the `orchestrator`
+ * service for source plugins.
+ * Coordinates startup, setup checks, HTTP route registration, and graceful shutdown.
  * Locks the state directory before opening SQLite so concurrent processes cannot corrupt or double-migrate state.
  */
-export class Runtime extends Service implements SourceHost {
-  readonly store: Store
+export class Runtime implements SourceHost, ControlPlaneHost, NodeHost {
+  readonly control: ControlPlaneOwner
   readonly setup: Setup
   readonly prompts: Prompts
   readonly effects: Effects
   readonly sources: SourceRegistry
   readonly commands: Commands
-  readonly sessions: Sessions
   readonly settings: Settings
-  readonly executor: DshExecutor
   readonly assessor: MasterAssessor
   readonly outbox: Outbox
-  readonly engine: Engine
   readonly passes: Passes
   readonly ready: Promise<void>
+  /** The Cordis context, kept only so tests can drive DSH events; the Runtime never passes it to a control-plane component. */
+  readonly ctx: unknown
+  private readonly node!: NodeRuntime
   private readonly archiveReconciler: ArchiveReconciler
   private readonly board = new HealthBoard()
   private readonly runtimeHealth = this.board.claim('runtime', { state: 'starting', detail: '' })
@@ -96,8 +90,11 @@ export class Runtime extends Service implements SourceHost {
   private readonly toolHost: MainToolsHost & ExecutorToolsHost
   /** Non-zero while a main-Session tool is executing an Engine command, suppressing self-triggered domain event notices. */
   private quiet = 0
-  constructor(ctx: Context, readonly machine: Machine, restart: () => void, options: RuntimeOptions = {}) {
-    super(ctx, 'orchestrator')
+  constructor(private readonly platform: RuntimePlatform, readonly machine: Machine, restart: () => void, options: RuntimeOptions = {}) {
+    this.ctx = options.ctx
+    // Follow a host that aborts the plugin lifetime before stop() was called; stopping aborts this signal itself.
+    if (platform.lifetime.aborted) this.stopped.abort()
+    else platform.lifetime.addEventListener('abort', () => { this.stopped.abort() }, { once: true })
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
@@ -108,11 +105,14 @@ export class Runtime extends Service implements SourceHost {
     const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
     this.releaseLock = async () => { release() }
     try {
-      const report = (error: unknown) => { ctx.logger.warn('dsh-superagent: %s', String(error)) }
-      const store = opened = this.store = new Store(join(machine.stateDir, 'orchestrator.sqlite'), report)
+      const report = (error: unknown) => { platform.logger.warn('dsh-superagent: %s', String(error)) }
+      const control = this.control = new ControlPlaneOwner({ dbPath: join(machine.stateDir, 'orchestrator.sqlite'), report })
+      const store = opened = control.store
       // The lock can be compromised while this synchronous constructor runs (or by a lock check just after acquiring it).
       if (this.compromisedError) throw this.compromisedError
-      const setup = this.setup = new Setup({ context: ctx, machine, lifetime: this.lifetime, restart })
+      const setup = this.setup = new Setup({ machine, logger: platform.logger, restart,
+        probe: () => platform.probe(machine.stateDir, this.lifetime),
+        verifyEnvironment: deployment => platform.verifyEnvironment(deployment, this.lifetime) })
       const deployed = () => setup.configured()
         ? environmentOf({ deployment: setup.deployment, sources: this.sources, settings: store.settings() }) : undefined
       const feishu = () => setup.configured() && !!setup.deployment.feishu
@@ -153,20 +153,22 @@ export class Runtime extends Service implements SourceHost {
       const links: LinkHost = { store, links: this.sourceLinks, commands, sources, lifetime: this.lifetime }
       const link = (trigger: Trigger, signal?: AbortSignal) => sourceLink(links, trigger, signal)
       const environment = (ticket: Ticket) => this.ticketEnvironment(ticket)
-      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId, context: ctx,
+      const resources: ResourceHost = { store, pages: new TextCache(4_000_000), prompts, commands, masterId,
+        sessionEvents: sessionId => platform.sessionEvents(sessionId), modelCatalog: () => platform.modelCatalog(),
         promptVersion: id => this.sessions.promptVersion(id), mayRead: (id, revision) => this.sessions.mayRead(id, revision),
         feishuPageSize: () => feishuSettings(sources).readPageSize, sourceLink: link }
-      const sessions = this.sessions = new Sessions({ context: ctx, store, prompts, effects, health: board.claim('models'), masterId,
-        stateDir: machine.stateDir, lifetime: this.lifetime,
-        closing: () => this.closing(), environment,
-        tools: (agent, target) => target.ticket ? executorTools(this.toolHost, target.ticket)
-          : target.project ? pmTools(this.toolHost, target.project) : mainTools(this.toolHost, agent) })
+      // The node runtime owns DSH's Sessions and Executor; the control plane only drives it through NodeRuntime.
+      const node = this.node = platform.node({ store, prompts, effects, masterId, stateDir: machine.stateDir, machine,
+        lifetime: this.lifetime, cleanupTimeoutMs: options.cleanupTimeoutMs, closing: () => this.closing(), paused: () => this.paused(),
+        environment, tools: (agent, target) => target.ticket ? executorTools(this.toolHost, target.ticket)
+          : target.project ? pmTools(this.toolHost, target.project) : mainTools(this.toolHost, agent),
+        engine: () => runtime.engine, sourceLink: link, repliedTo: trigger => repliedTo({ store, sources }, trigger),
+        health: { models: board.claim('models'), worker: board.claim('worker') } })
+      const sessions = node.sessions
       const policyChanged: EngineForSettings['policyChanged'] = (from, to, effects) => { this.engine.policyChanged(from, to, effects) }
-      this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, context: ctx, lifetime: this.lifetime, sessions,
-        sourceHost: this, setup, requestPass: () => { this.passes.request() } })
-      this.executor = new DshExecutor({ context: ctx, get engine() { return runtime.engine }, store, effects, health: board.claim('worker'), machine,
-        lifetime: this.lifetime, cleanupTimeoutMs: options.cleanupTimeoutMs, sessions, closing: () => this.closing(), paused: () => this.paused(),
-        environment, sourceLink: link, repliedTo: trigger => repliedTo({ store, sources }, trigger) })
+      this.settings = new Settings({ store, sources, engine: { policyChanged }, health: board, lifetime: this.lifetime,
+        resolveRoleModel: model => platform.resolveRoleModel(model),
+        sessions, sourceHost: this, setup, requestPass: () => { this.passes.request() } })
       this.assessor = new MasterAssessor({ get engine() { return runtime.engine }, commands, get deployment() { return setup.deployment }, effects,
         settings: () => store.settings(), paused: () => this.paused(), threadContext: trigger => sources.threadContext(trigger),
         deliver: (id, text) => sessions.prompt(masterId, id, text, 'steer'), candidateCard: candidate => candidateCard(links, candidate) })
@@ -174,7 +176,7 @@ export class Runtime extends Service implements SourceHost {
       const { assessor, executor } = this
       // A delegated Ticket's authority is its Project's PM Mandate: the Policy must be able to see the Project to revalidate it.
       const policy = () => settingsPolicy(store.settings(), sources, projectId => store.projects.get(projectId))
-      const engine = this.engine = new Engine({ repo: store, scope: sources, policy, assessor, executor, cleanupTimeoutMs: options.cleanupTimeoutMs,
+      const engine = this.control.attach({ scope: sources, policy, assessor, executor, cleanupTimeoutMs: options.cleanupTimeoutMs,
         outbox, prepareTicket: (ticket, outcome) => executor.prepare(ticket, outcome), emit: event => {
           // Notify the main Session only about domain events it did not initiate itself.
           // A Project Ticket's lifecycle stays in its Project: the PM reads it, and the Router is not told about every child.
@@ -213,13 +215,15 @@ export class Runtime extends Service implements SourceHost {
       const evaluateDue = () => { engine.evaluateDue(); evals.set(evalsHealth(store)) }
       const passes = this.passes = new Passes({ engine: { receive: trigger => engine.receive(trigger), evaluateDue }, effects,
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
-      this.archiveReconciler = new ArchiveReconciler({ context: ctx, store, engine, sessions,
+      this.archiveReconciler = new ArchiveReconciler({ store, engine, sessions, logger: platform.logger,
+        onSessionActivity: listener => platform.onSessionActivity(listener), onSessionStop: listener => platform.onSessionStop(listener),
+        archivedSessionIds: () => platform.archivedSessionIds(),
         configured: () => setup.configured(), closing: () => this.closing() })
       this.archiveReconciler.install()
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
-      this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
+      this.toolHost = { logger: platform.logger, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         localEntry: () => { const instance = sources.instance<{ operator: string }>(MAIN_SESSION_SOURCE)
           return instance ? { enabled: instance.enabled, operator: instance.config.operator } : undefined },
@@ -232,6 +236,16 @@ export class Runtime extends Service implements SourceHost {
       throw error
     }
   }
+  /** The node-side Session manager, which owns DSH's Sessions; the control plane only reads and drives it. */
+  get sessions(): NodeRuntime['sessions'] { return this.node.sessions }
+  /** The node-side Executor, which owns DSH's worker Sessions; the control plane only reads and drives it. */
+  get executor(): NodeRuntime['executor'] { return this.node.executor }
+  /** The node runtime the control plane drives, read-only, so the host can put a `NodePort` in front of it. */
+  get nodeRuntime(): NodeRuntime { return this.node }
+  /** The domain Store owned by the control plane. */
+  get store(): Store { return this.control.store }
+  /** The domain Engine owned by the control plane; attached after the node-side ports exist. */
+  get engine(): Engine { return this.control.engine }
   get health(): Readonly<Record<string, Health>> { return this.board.all }
   /** Aborted when dsh-superagent stops or loses its state directory lock, cancelling running reads and subprocesses. */
   get lifetime(): AbortSignal { return this.stopped.signal }
@@ -274,7 +288,7 @@ export class Runtime extends Service implements SourceHost {
     if (!store) return
     try { store.close() } catch (failure) {
       // Closing can fail while another operation is in flight; log it and never reopen or keep using the database.
-      this.ctx.logger.warn('dsh-superagent could not close its database after losing the state directory lock: %s', String(failure))
+      this.platform.logger.warn('dsh-superagent could not close its database after losing the state directory lock: %s', String(failure))
     }
   }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
@@ -282,7 +296,7 @@ export class Runtime extends Service implements SourceHost {
   private async initialize(): Promise<void> {
     if (this.compromisedError) return
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
-    this.disposers.push(registerHttp(this.ctx, this.httpHost()))
+    this.disposers.push(this.platform.registerHttp(this.httpHost()))
     // Fail any Handoff a previous process left `starting` before setup or any Worker resume could act on it; it starts
     // nothing, so a crash between a handoff's two transactions can never leave a stuck Ticket or a surprise Worker.
     this.engine.recoverInterruptedHandoffs()
@@ -293,13 +307,12 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
-    this.sessions.install()
-    this.executor.install()
+    this.node.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing() || this.compromisedError) return
-    this.executor.resume()
+    this.node.resume()
     this.passes.start()
     this.archiveReconciler.start()
     this.effects.start()
@@ -312,7 +325,7 @@ export class Runtime extends Service implements SourceHost {
       get deployment() { return setup.deployment },
       get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
       configured: () => setup.configured(), links: () => runtime.links(), ticketEnvironment: ticket => runtime.ticketEnvironment(ticket),
-      checkSetup: () => { setup.check() }, requestPass: () => { passes.request() }, models: () => this.ctx.sessionController.modelCatalog() }
+      checkSetup: () => { setup.check() }, requestPass: () => { passes.request() }, models: () => this.node.models() }
   }
   /** Idempotent stop; concurrent or repeated calls share the same shutdown promise. */
   stop(): Promise<void> { return this.stopping ??= this.shutdown() }
@@ -323,10 +336,9 @@ export class Runtime extends Service implements SourceHost {
     const attempt = async (what: string, run: () => unknown | Promise<unknown>): Promise<void> => {
       try { await run() } catch (error) {
         failures.push(error)
-        this.ctx.logger.warn('dsh-superagent could not %s while stopping: %s', what, String(error))
+        this.platform.logger.warn('dsh-superagent could not %s while stopping: %s', what, String(error))
       }
     }
-    const agents: Agent[] = []
     try {
       await attempt('stop the assessor', () => this.assessor.stop())
       await attempt('stop archive reconciliation', () => this.archiveReconciler.stop())
@@ -334,23 +346,15 @@ export class Runtime extends Service implements SourceHost {
         // A compromised lock already closed the Store; there is nothing left to read, so only the master Session is named
         // here. The Executor keeps its loaded worker Sessions and cancels those in its own shutdown below.
         const ids = [this.masterId, ...(this.store.closed ? [] : this.store.tickets.list().flatMap(ticket => workerSessionsOf(ticket)))]
-        const failed: unknown[] = []
-        for (const id of ids) {
-          const agent = this.ctx.agents.get(id as SessionId)
-          if (!agent) continue
-          agents.push(agent)
-          try { agent.cancel({ kind: 'user' }, { keepInbox: true }) } catch (error) { failed.push(error) }
-        }
-        // Every loaded Session got its cancel; one failing still lets the rest stop.
-        if (failed.length) throw failed[0]
+        this.node.cancelLoaded(ids)
       })
       await attempt('wait for running Sessions', () =>
-        Promise.allSettled([passes, this.effects.drain(), ...agents.map(agent => agent.whenIdle())]))
+        Promise.allSettled([passes, this.effects.drain(), this.node.waitIdle()]))
       // The workers' jobs and subagents stop too: their ends would start worker turns without the tool limits released below.
       // The Executor uses its in-memory loaded Sessions when the Store is closed, so a compromised lock still cancels them.
-      await attempt('stop the Executor', () => this.executor.shutdown())
-      await attempt('dispose the Executor', () => this.executor.dispose())
-      await attempt('dispose Sessions', () => this.sessions.dispose())
+      await attempt('stop the Executor', () => this.node.stopExecutor())
+      await attempt('dispose the Executor', () => this.node.disposeExecutor())
+      await attempt('dispose Sessions', () => this.node.disposeSessions())
       await attempt('dispose HTTP routes and listeners', () => {
         const failed: unknown[] = []
         for (const dispose of this.disposers.splice(0).reverse()) {
@@ -358,19 +362,19 @@ export class Runtime extends Service implements SourceHost {
         }
         if (failed.length) throw failed[0]
       })
-      await attempt('flush Session persistence', () => this.ctx.sessionPersistence.flush())
+      await attempt('flush Session persistence', () => this.node.flushPersistence())
       // A normal shutdown still reports its first teardown failure after every step was attempted; after a compromised
       // lock the failure is already logged and stop() must resolve so the host can finish stopping.
       if (!this.store.closed && failures.length) throw failures[0]
     } finally {
       // Close the database before releasing the directory lock so another process cannot open the database mid-write; a compromised lock may already be released, and close is idempotent.
       try { this.setup.restore() } catch (error) {
-        this.ctx.logger.warn('dsh-superagent could not restore its process environment while stopping: %s', String(error))
+        this.platform.logger.warn('dsh-superagent could not restore its process environment while stopping: %s', String(error))
       }
       try { this.store.close() } catch (error) {
-        this.ctx.logger.warn('dsh-superagent could not close its database while stopping: %s', String(error))
+        this.platform.logger.warn('dsh-superagent could not close its database while stopping: %s', String(error))
       }
-      const unreleased = (error: unknown) => { this.ctx.logger.warn('dsh-superagent could not release its state directory lock: %s',
+      const unreleased = (error: unknown) => { this.platform.logger.warn('dsh-superagent could not release its state directory lock: %s',
         String(error)) }
       await this.releaseLock?.().catch(unreleased)
     }

@@ -1,5 +1,4 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
-import type { SessionId } from '@deepseek-ai/dsh-session'
 import { z } from 'zod'
 import { latestAssignment, liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
