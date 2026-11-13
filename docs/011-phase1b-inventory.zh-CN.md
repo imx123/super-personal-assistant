@@ -190,6 +190,16 @@ Settings -> Sessions (通知)
 - 新增 control-plane-tools 用例：PM 读自己的 Project/Tickets、不读别的 Project、Worker token 403、控制面 token 401，以及 `control_project` 的 GET/URL/token 传播。
 - 这解决了 PM 首轮被要求读取 Project/Tickets 却没有远端读取工具的缺口。
 
+## 1B 真实 DSH 全链路：通过
+
+- 使用隔离 DSH profile、独立控制面进程、真实 DSH 插件和真实模型 `opencode-go/deepseek-v4.1-flash` 完成：
+  - PM 首轮通过 `control_project` 读取 Project/Tickets，并产出 Project report；
+  - PM 通过 `control_create_tickets` 建单；
+  - NodeExecutor 创建 Worker Session；
+  - Worker 通过 `control_report` 以 `ready` 回写同一 Ticket/当前 Assignment，Ticket completed。
+- 证据：`.artifacts/phase1-live-run-BzkxEa/acceptance.json`（ticket `ec8bb645…`、assignment `39801d00…`、report `ready`）。
+- 仍属 Phase 2：独立 DSH 节点进程、token 刷新、`inputsRead`/turn 细节、stop 清理、生产面板认证/TLS/SSE 重连。
+
 ## 1B 模拟 DSH 全链路：已完成
 
 - 新增 `tests/control-plane-e2e.spec.ts`（2 个）：

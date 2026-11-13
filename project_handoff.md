@@ -15,6 +15,7 @@
 - Phase 1B 后续修复：failed PM/Worker 记录可重置并重新 ensure，HTTP 对 failed 返回 502；控制面命令幂等键改为 `前缀:scope:进程UUID:序号`；`DshNodePort` 用 `done`/`inflight` 保证并发同键只执行一次、失败可重试；节点已上报 `idle` 后命令回执丢失时保留该状态，`failed`/`starting` 用 `*-confirm` 键重试确认。
 - 跨层修复：`session.inspect` 显式确认、同一 Session 创建单飞、角色安装失败 502、消息/归档结果回传、未知命令 400/422/500、`startControlPlane` 注册失败 fail-fast；`NodeExecutor` 已让独立 Engine 的 Assignment 创建 Worker Session 并回写 `assignmentStarted`。
 - 工具桥：`control_project` / `control_create_tickets` / `control_report` 通过 session token 调用控制面 `/v1/tools/*`；PM 可读取自己的 Project 和已有 Ticket，建单进 `createProjectTickets`，Worker Report 回原 Ticket/Assignment；RoleProfile prompt/tools 已接入。NodeExecutor 的 Worker 首条消息含 Ticket/Goal/Scope/Note/Assignment，`deliver` 成功后 `inputsDelivered` 清 undelivered。
+- 真实 DSH + 真实模型全链路已通过：隔离 profile、独立控制面、真实 DSH 插件、`opencode-go/deepseek-v4.1-flash`；PM 读取 Project → `control_create_tickets` → NodeExecutor Worker → `control_report` 同一 Ticket/Assignment → completed。证据：`.artifacts/phase1-live-run-BzkxEa/acceptance.json`。
 - 尚未完成：独立 DSH 节点进程、生产面板认证/TLS、SSE 重连/seq 回放；这些属于 Phase 2。
 
 ## 这是什么
@@ -161,7 +162,7 @@ pnpm node        # lib/node.js；需要 SUPERAGENT_NODE_TOKEN
 ## 已知边界 / Phase 2
 
 - `lib/node.js` 仍是 FakeNode；真实 DSH 节点服务目前在插件内通过 env 启动，尚未做成独立 DSH 进程。
-- 工具桥已接，且 `tests/control-plane-e2e.spec.ts` 已跑通模拟 DSH 全链路（PM tool API 建单 → NodeExecutor Worker → Worker tool API Report 回原 Ticket/Assignment）；真实 DSH Agent + 真实模型的同一链路仍需隔离 profile 真机验收。
+- 工具桥已接，且真实 DSH + 真实模型全链路已通过（见上）；独立 DSH 节点进程、token 刷新、`inputsRead`/turn 细节、stop cleanup 仍属 Phase 2。
 - Session token 默认 1 小时且没有刷新通道；长任务 Report 可能 401。
 - 可选 `GET /v1/tools/context` 未实现；Ticket/Assignment id 由角色 prompt 随工具说明下发。
 - 控制面 API 已有 bearer 鉴权；生产面板认证/TLS、SSE 重连与 seq 回放未做。
