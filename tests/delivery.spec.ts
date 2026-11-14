@@ -46,7 +46,7 @@ function fixture(history: Recorded[] = []) {
     ctx.emit('session/event', agent.session, splicedEvent(inserted))
   }
   return { agent, agents, inbox, steer, followup, injected, open, read, close, flush, send, inject, holds, consume,
-    consumeSpliced, signal }
+    consumeSpliced, signal, ctx, session: agent.session }
 }
 
 it.each(['queue', 'steer'] as const)('delivers %s as an orchestrator relay, deduplicating pending and consumed messages', async mode => {
@@ -203,6 +203,43 @@ it('ignores malformed spliced payloads instead of failing the read', async () =>
 
   await f.send('request')
   expect(f.steer).toHaveBeenCalledOnce()
+})
+
+it('reports a delivery from the inbox event inside followup, before the call returns', async () => {
+  const f = fixture()
+  const order: string[] = []
+  f.followup.mockImplementation((message: UserMessage) => {
+    f.inbox.nextTurn.push(message)
+    // DSH inserts the message and logs it as a splice from inside the delivery call, before its turn starts.
+    f.ctx.emit('session/event', f.session, splicedEvent([message]))
+    order.push('followup')
+  })
+  const delivered = vi.fn(() => { order.push('delivered') })
+
+  await f.send('request', 'queue', delivered)
+
+  // The insertion event, not the line after followup, is what reports the delivery; the fallback does not repeat it.
+  expect(delivered).toHaveBeenCalledOnce()
+  expect(order).toEqual(['delivered', 'followup'])
+})
+
+it('reports a delivery after the backend call when it sends no insertion event', async () => {
+  const f = fixture()
+  const delivered = vi.fn()
+
+  await f.send('request', 'queue', delivered)
+
+  // A backend that inserts without reporting a splice is still covered by the fallback after its call returns.
+  expect(delivered).toHaveBeenCalledOnce()
+})
+
+it('does not report a delivery whose insertion throws before it reaches the inbox', async () => {
+  const f = fixture()
+  f.followup.mockImplementation(() => { throw new Error('inbox closed') })
+  const delivered = vi.fn()
+
+  await expect(f.send('request', 'queue', delivered)).rejects.toThrow('inbox closed')
+  expect(delivered).not.toHaveBeenCalled()
 })
 
 it('reports a message as delivered once it is in the inbox, and again while a retry finds it waiting', async () => {

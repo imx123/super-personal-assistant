@@ -58,11 +58,26 @@ function eventDeliveryIds(event: SessionEvent): string[] {
  */
 export class AgentDelivery {
   private readonly seen = new WeakMap<Session, Seen>()
+  /**
+   * The callback waiting for one in-flight delivery's message to reach the Session's inbox, by message id.
+   *
+   * DSH inserts a message from inside `followup`/`steer`/`inject` and reports it as `agent/inbox/spliced` (or a
+   * `user/message`) before the call returns — and before the `turn/start` of the turn it wakes. The Session listener below
+   * is therefore where a delivery is known to have reached the worker, not the line after the backend call returns.
+   */
+  private readonly delivering = new Map<string, () => void>()
   constructor(private readonly ctx: Context) {
     ctx.on('session/event', (session, event) => {
+      const ids = eventDeliveryIds(event)
       const seen = this.seen.get(session)
-      if (!seen) return
-      for (const id of eventDeliveryIds(event)) seen.ids.add(id)
+      if (seen) for (const id of ids) seen.ids.add(id)
+      for (const id of ids) {
+        const notify = this.delivering.get(id)
+        if (!notify) continue
+        // One insertion reports one delivery: a second event for the same id must not call its producer back again.
+        this.delivering.delete(id)
+        notify()
+      }
     })
   }
   private async history(agent: Agent): Promise<Seen> {
@@ -92,10 +107,12 @@ export class AgentDelivery {
    * Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence
    * before acknowledging the producer.
    *
-   * `onDelivered` reports that the message is now in the Session's inbox: it runs right after this call inserted it, or
-   * when a retry finds the same message still waiting there. A message the Session already took into its history is not a
-   * new delivery, and neither is a call that failed before insertion. The callback runs before the persistence flush,
-   * because the inserted message may start a turn before that flush returns.
+   * `onDelivered` reports that the message is now in the Session's inbox. It fires from the insertion event DSH emits
+   * inside `followup`/`steer`/`inject` — before that call returns and before the turn it starts — with the return of the
+   * call as the fallback for a backend that inserts without reporting the event. A retry that finds the same message
+   * still waiting in the inbox also counts; a message only present in the persisted history, or a call that failed
+   * before insertion, does not. The callback precedes the persistence flush, because the inserted message may start a
+   * turn before that flush returns.
    */
   async send(agent: Agent, requestId: string, text: string, mode: DeliveryMode, signal: AbortSignal, authorize?: () => void,
     accepted?: () => void, onDelivered?: () => void): Promise<void> {
@@ -111,11 +128,24 @@ export class AgentDelivery {
         summary: 'inject' in mode ? mode.inject : mode.steer }
         : { kind: 'dsh-superagent' as const, form: 'relay' as const }
       const message = freezeMessage({ id, role: 'user' as const, content: [{ type: 'text' as const, text }], source })
-      if (typeof mode === 'object' && 'inject' in mode) { agent.inject(message); seen.ids.add(id) }
-      else if (mode === 'steer' || typeof mode === 'object') agent.steer(message)
-      else agent.followup(message)
-      // The message is in the inbox from here on: its turn may start before the flush below resolves.
-      onDelivered?.()
+      let notified = false
+      const once = (): void => {
+        if (notified) return
+        notified = true
+        this.delivering.delete(String(id))
+        onDelivered?.()
+      }
+      // Registered before the call: DSH may report the insertion from inside it, before the backend call even returns.
+      this.delivering.set(String(id), once)
+      try {
+        if (typeof mode === 'object' && 'inject' in mode) { agent.inject(message); seen.ids.add(id) }
+        else if (mode === 'steer' || typeof mode === 'object') agent.steer(message)
+        else agent.followup(message)
+        // A backend that inserted without reporting the splice has still put the message in the inbox by now.
+        once()
+      } finally {
+        this.delivering.delete(String(id))
+      }
     } else if (pending) {
       // A retry found the very message this request would insert still waiting in the inbox: the worker has it.
       onDelivered?.()

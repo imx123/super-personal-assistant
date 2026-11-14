@@ -443,6 +443,36 @@ describe('createDshPortHost turn start input ids', () => {
     }
   })
 
+  it('reports the Inputs when the inbox splice arrives before the turn it starts', async () => {
+    const fake = fakeContext()
+    const events: DshPortEvent[] = []
+    const sessions = {
+      async ensure() { return {} },
+      async prompt(sessionId: string, idempotencyKey: string, _text: string, _mode: 'queue', onDelivered?: () => void) {
+        // NodeSessions' AgentDelivery listens for the insertion splice and reports it before the turn starts.
+        let reported = false
+        fake.context.on('session/event', (_session, event) => {
+          if (reported || (event as { type?: string }).type !== 'agent/inbox/spliced') return
+          reported = true
+          onDelivered?.()
+        })
+        fake.emit('session/event', { id: sessionId }, { type: 'agent/inbox/spliced',
+          data: { inserted: [{ id: `dsh-superagent:${idempotencyKey}`, role: 'user', content: [],
+            source: { kind: 'dsh-superagent', form: 'relay' } }] } })
+        fake.emit('session/event', { id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+      },
+    }
+    const portHost = createDshPortHost({ context: fake.context, nodeRuntime: { sessions }, nodeId: NODE_ID, root })
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1'])
+      expect(events).toHaveLength(1)
+      expect(dataOf(events[0]!)).toEqual({ turn: 1, inputIds: ['input-1'] })
+    } finally {
+      dispose()
+    }
+  })
+
   it('reports no Inputs for a turn that starts before a refused insertion, and none on a later turn', async () => {
     const fake = fakeContext()
     const events: DshPortEvent[] = []
