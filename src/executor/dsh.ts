@@ -625,10 +625,17 @@ export class DshExecutor implements Executor {
       const ticketId = ticketOfSession(session.id)
       if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
       const message = event.data
+      // The Assignment this Session belongs to: a late message from a replaced Worker must not mark the current Worker's
+      // Inputs read (see `Engine.inputsRead`). The running Assignment wins when legacy records share the base Session id.
+      const ticket = this.host.store.tickets.get(ticketId)
+      const running = ticket && runningAssignment(ticket)
+      const assignment = running && assignmentSessionId(ticketId, running) === String(session.id)
+        ? running
+        : ticket?.assignments.find(item => assignmentSessionId(ticketId, item) === String(session.id))
       void this.background(Promise.resolve().then(() => {
         const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
           && this.host.sessions.promptedId(input.id) === message.id).map(input => input.id) ?? []
-        if (read.length) this.host.engine.inputsRead(ticketId, read)
+        if (read.length) this.host.engine.inputsRead(ticketId, read, assignment?.id)
       }))
     }))
     this.disposers.push(ctx.on('agent/error', ({ agent, error }) => {

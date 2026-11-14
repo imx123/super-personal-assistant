@@ -106,7 +106,9 @@ export class FakeNode implements NodePort {
         const at = this.now()
         const session: SessionRecord = {
           sessionId: command.sessionId,
-          backendSessionId: `fake-${command.sessionId}`,
+          // The fake mirrors the DSH host: the backend's own resume id is the Session id the host resolved, so a control
+          // plane inspecting a created Session learns a real backend id rather than a placeholder.
+          backendSessionId: command.sessionId,
           projectId: command.project.id,
           role: 'pm',
           nodeId: this.options.nodeId,
@@ -127,7 +129,7 @@ export class FakeNode implements NodePort {
         const at = this.now()
         const session: SessionRecord = {
           sessionId: command.sessionId,
-          backendSessionId: `fake-${command.sessionId}`,
+          backendSessionId: command.sessionId,
           projectId: command.projectId,
           assignmentId: command.assignmentId,
           role: 'worker',
@@ -149,6 +151,8 @@ export class FakeNode implements NodePort {
         if (session.status === 'archived' || session.status === 'stopped') {
           throw new Error(`session ${command.sessionId} is ${session.status}`)
         }
+        // The optional token is only passed through, but the fake keeps it as the latest one the way a real node would.
+        if (command.sessionToken !== undefined) this.tokens.set(command.sessionId, command.sessionToken)
 
         const texts = this.messages.get(command.sessionId) ?? []
         texts.push(command.text)

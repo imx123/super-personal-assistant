@@ -15,6 +15,11 @@ import type { BackendKind, SessionRole } from './protocol.ts'
 export interface SessionTokenClaims {
   /** Token format version; a verifier rejects anything else as `unsupported`. */
   v: 1
+  /**
+   * Token generation of its Session: every refresh increments it, so a refreshed token never equals the one it replaced
+   * even when both were issued within the same second. A token without it predates token generations and is rejected.
+   */
+  tv: number
   /** Session id: the control-plane primary key for the acting Session. */
   sid: string
   /** Project id the Session works for. */
@@ -32,6 +37,19 @@ export interface SessionTokenClaims {
 
 /** Why a token could not be issued or verified. */
 export type SessionTokenErrorCode = 'malformed' | 'bad-signature' | 'expired' | 'unsupported'
+
+/** Options that relax verification for the one route that needs it; an ordinary verifier passes none. */
+export interface SessionTokenVerifyOptions {
+  /**
+   * Accept a token whose `exp` passed at most this many seconds ago.
+   *
+   * This exists only for the refresh route. A long task can outlive its short-lived token before it notices, and without a
+   * nudged deadline that Session would be stranded: the token is expired, yet the only route that could rotate it refuses
+   * it too. Every ordinary tool and message route verifies with the strict default (`0`), so an expired token still gets a
+   * 401 there. The grace is a bounded number of seconds, never "expired tokens are accepted".
+   */
+  allowExpiredSeconds?: number
+}
 
 /** A rejected token. The message never contains the token or the secret. */
 export class SessionTokenError extends Error {
@@ -67,6 +85,7 @@ function isClaims(value: unknown): value is SessionTokenClaims {
   if (typeof value !== 'object' || value === null) return false
   const claims = value as Record<string, unknown>
   return typeof claims.v === 'number'
+    && typeof claims.tv === 'number' && Number.isInteger(claims.tv) && claims.tv >= 0
     && typeof claims.sid === 'string' && claims.sid.length > 0
     && typeof claims.pid === 'string' && claims.pid.length > 0
     && typeof claims.role === 'string' && ROLES.has(claims.role)
@@ -80,9 +99,13 @@ function isClaims(value: unknown): value is SessionTokenClaims {
 /**
  * Sign one Session's claims. `ttlSeconds` must be a positive finite number, so `exp` is never earlier
  * than `iat` (a TTL below one second rounds down and therefore produces an already-expiring token).
+ *
+ * `tv` is the Session token generation; it defaults to 0 so a Session's first token matches a record whose
+ * `tokenVersion` is absent. A refresh passes the record's incremented generation, which keeps a token issued
+ * in the same second as its predecessor distinct.
  */
 export function issueSessionToken(
-  claims: Omit<SessionTokenClaims, 'v' | 'iat' | 'exp'>,
+  claims: Omit<SessionTokenClaims, 'v' | 'iat' | 'exp' | 'tv'> & { tv?: number },
   secret: string,
   ttlSeconds: number,
   nowSeconds?: number,
@@ -91,11 +114,15 @@ export function issueSessionToken(
   if (typeof ttlSeconds !== 'number' || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
     throw new SessionTokenError('malformed', 'session token ttl must be a positive finite number of seconds')
   }
+  const tv = claims.tv ?? 0
+  if (!Number.isInteger(tv) || tv < 0) {
+    throw new SessionTokenError('malformed', 'session token generation must be a non-negative integer')
+  }
   const now = currentSeconds(nowSeconds)
   const iat = Math.floor(now)
   const exp = Math.floor(now + ttlSeconds)
   if (exp <= iat) throw new SessionTokenError('malformed', 'session token ttl must be at least one second')
-  const payload: SessionTokenClaims = { ...claims, v: 1, iat, exp }
+  const payload: SessionTokenClaims = { ...claims, tv, v: 1, iat, exp }
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
   return `${encoded}.${sign(encoded, secret).toString('base64url')}`
 }
@@ -103,12 +130,20 @@ export function issueSessionToken(
 /**
  * Verify a token and return its claims.
  *
- * Rejects in a fixed order: shape (`malformed`), signature (`bad-signature`), version (`unsupported`),
- * then expiry (`expired`). The signature is checked before the payload is trusted as a claim set.
+ * Rejects in a fixed order: shape (`malformed`), signature (`bad-signature`), version (`unsupported`), then expiry
+ * (`expired`). The signature is checked before the payload is trusted as a claim set. Expiry is strict unless
+ * `options.allowExpiredSeconds` admits a token that expired within that many seconds; that option is for the refresh route
+ * alone, so an ordinary tool or message route still refuses every expired token. The error messages never contain the
+ * token or the secret.
  */
-export function verifySessionToken(token: string, secret: string, nowSeconds?: number): SessionTokenClaims {
+export function verifySessionToken(token: string, secret: string, nowSeconds?: number,
+  options: SessionTokenVerifyOptions = {}): SessionTokenClaims {
   requireSecret(secret)
   const now = currentSeconds(nowSeconds)
+  const allowExpiredSeconds = options.allowExpiredSeconds ?? 0
+  if (typeof allowExpiredSeconds !== 'number' || !Number.isFinite(allowExpiredSeconds) || allowExpiredSeconds < 0) {
+    throw new SessionTokenError('unsupported', 'session token expiry grace must be a non-negative finite number of seconds')
+  }
   if (typeof token !== 'string' || token.length === 0) {
     throw new SessionTokenError('malformed', 'session token is empty')
   }
@@ -143,7 +178,9 @@ export function verifySessionToken(token: string, secret: string, nowSeconds?: n
   if (parsed.exp <= parsed.iat) {
     throw new SessionTokenError('malformed', 'session token expires before it was issued')
   }
-  if (parsed.exp <= now) {
+  // A token is invalid at `exp`; the grace moves that boundary later by at most `allowExpiredSeconds`. With the strict
+  // default this is exactly `parsed.exp <= now`.
+  if (parsed.exp + allowExpiredSeconds <= now) {
     throw new SessionTokenError('expired', 'session token has expired')
   }
   return parsed

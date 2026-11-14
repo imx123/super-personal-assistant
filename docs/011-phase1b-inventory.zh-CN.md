@@ -73,7 +73,7 @@ Settings -> Sessions (通知)
 - 新增 `tests/control-plane-persistence.spec.ts`，覆盖创建/重启加载/token 重签/归档持久化。
 - 剩余风险：
   - 恢复假设同一个 node 仍持有 Session；`openProject` 命中已加载记录时直接返回，不重新发 `pm.ensure`，真实 node 重启后 PM 不会自动恢复。
-  - 重签的 token 只进内核内存，`session.message` 协议不带 token，真实 node 上的旧 token 会沿用到过期。
+  - 重签的 token 只进内核内存，`session.message` 协议不带 token，真实 node 上的旧 token 会沿用到过期（P2-A1 已给 `session.message` 增加可选 token，可随消息更新节点工具凭据）。
   - 每条 Session 事件都会写一次 KV（含消息引发的 running/idle），存在写入放大；当前量级可接受。
 
 ## 1B-3c：已完成（传输与进程拆分；真实 DSH 适配留 Phase 2）
@@ -89,7 +89,7 @@ Settings -> Sessions (通知)
   - SSE 无重连/seq 回放：断线期间的事件不补发，订阅方需自行重连。
   - 明文 loopback HTTP：仅适合本机或受信网络，跨机需 TLS 或隧道。
   - 跨进程默认根目录要显式对齐：控制面的 `SUPERAGENT_WORKSPACE_ROOT` 默认在 `.superagent-control/workspaces`，节点默认 `SUPERAGENT_NODE_ROOT` 是 `.superagent-node`，两者必须指向同一工作区树，否则节点会拒绝越界 workspace。
-  - `session.message` 协议仍不带 token，节点上的旧 token 会沿用到过期。
+  - `session.message` 协议仍不带 token，节点上的旧 token 会沿用到过期（P2-A1 已补可选 token）。
 
 ## 1B-3d：已完成（真实 DSH NodePort 适配）
 
@@ -152,7 +152,7 @@ Settings -> Sessions (通知)
   - 真实 DSH Agent + 真实模型的 PM 建单 → Worker 执行 → Report 回写同一 Ticket/Assignment 尚未在真机跑通；
   - `inputsRead` 与模型 turn 细节未回写；
   - stop cleanup（Worker 侧后台清理）未完成；
-  - Session token 默认 1h 且无刷新通道；长任务 Report 可能 401。
+  - Session token 默认 1h 且无刷新通道；长任务 Report 可能 401（P2-A1 已提供 TTL 配置与 401 自动刷新）。
 
 ## 1B 并发与 inspect 超时修复：已完成
 
@@ -172,7 +172,7 @@ Settings -> Sessions (通知)
 - PM：`control_create_tickets` → `engine.createProjectTickets`；Worker：`control_report` → `engine.report`，回写原 Ticket/当前 Assignment。
 - `DshPortHost.ensureSession` 在 Session 上注册 `control_create_tickets` / `control_report`；RoleProfile prompt/tools 增加这两个名字；`SUPERAGENT_CONTROL_URL` 存在时才注册。
 - 新增 `tests/control-plane-tools.spec.ts`（14 个），覆盖 token/角色/Assignment/Ticket 校验与工具 HTTP 调用。
-- 未覆盖：真实 DSH + 真实模型端到端；token TTL 刷新。
+- 未覆盖：真实 DSH + 真实模型端到端；token TTL 刷新（P2-A1 已补专门测试）。
 
 ## 1B PM 上下文读取工具：已完成
 
@@ -198,7 +198,7 @@ Settings -> Sessions (通知)
   - NodeExecutor 创建 Worker Session；
   - Worker 通过 `control_report` 以 `ready` 回写同一 Ticket/当前 Assignment，Ticket completed。
 - 证据：`.artifacts/phase1-live-run-BzkxEa/acceptance.json`（ticket `ec8bb645…`、assignment `39801d00…`、report `ready`）。
-- 仍属 Phase 2：独立 DSH 节点进程、token 刷新、`inputsRead`/turn 细节、stop 清理、生产面板认证/TLS/SSE 重连。
+- 仍属 Phase 2：独立 DSH 节点进程、token 刷新（P2-A1 已补）、`inputsRead`/turn 细节、stop 清理、生产面板认证/TLS/SSE 重连。
 
 ## 1B 模拟 DSH 全链路：已完成
 
@@ -206,9 +206,52 @@ Settings -> Sessions (通知)
   - PM tool API 建 Ticket → NodeExecutor 创建 `worker-<assignmentId>` → 检查 Worker 首条 prompt 含 Ticket/Goal/Scope/Note → Worker tool API `ready` Report 回写同一 Ticket/Assignment，Ticket 完成；
   - 错误 Assignment 的 Report 返回 400/403，Ticket 不变。
 - 这是模拟 DSH 宿主 + 真实 `ControlPlaneServer`/fetch/FakeNode 的链路，不是真实模型端到端。
-- 仍未覆盖：真实 DSH Agent + 真实模型、token TTL 刷新、`inputsRead`/turn 细节、stop cleanup。
+- 仍未覆盖：真实 DSH Agent + 真实模型、token TTL 刷新（P2-A1 已补专门测试）、`inputsRead`/turn 细节、stop cleanup。
+
+## Phase 2 P2-A（Session token 生命周期）：P2-A1 已完成
+
+- `ControlPlaneOptions.sessionTokenTtlSeconds`：Session token 的 TTL，默认 3600 秒；`issueToken` 统一读取它（兼容旧的 `tokenTtlSeconds` 别名）。
+- `ControlPlane.refreshToolToken(sessionId)`：确认 Session 记录存在后，按其当前 claims 重新签发并写入 `tokens` map，返回新 token。
+- 新增 `POST /v1/tools/token/refresh`：只认当前 Session token（有效、未过期、与 Session 记录一致），不读请求体、不限角色；返回 `{ token, expiresAt }`，`expiresAt` 由刷新后 claims 的 `exp` 计算为 ISO 时间。
+- 节点侧 `control_project` / `control_create_tickets` / `control_report` 共享一个可变的 `ControlCredential`：注册时来自 ensure，重复 ensure 原地更新；`requestControl` 遇 401（且不是刷新请求）调用 `refreshToken(baseUrl, token, fetch)` 一次，更新 credential 后用新 token 重放原请求。刷新失败或重试仍 401 时抛原工具错误，刷新本身不递归、不再重试。
+- `session.message` 新增可选 `sessionToken`：`ControlPlane.sendMessage` 传当前 `tokens` map 中的 token；`DshNodePort` 透传给 host，host 用它更新已注册工具的 credential。节点没有 secret，这一步只传递，不本地验签；验签仍在控制面 `/v1/tools/*`。
+- 新增测试：`tests/control-plane-token-refresh.spec.ts`（6 个）与 `tests/dsh-port-token-refresh.spec.ts`（8 个）；`tests/dsh-port.spec.ts` 增加 message token 透传用例。
+- 旧 token 语义：不主动拉黑。刷新只重新签发相同 claims 与新 `exp`，旧 token 在自身 `exp` 前仍被接受；同一秒内刷新得到完全相同的 token 字符串。
+- 剩余（P2-A2）：旧 token 立即失效需要 token 版本/吊销列表；节点本地验签需要节点获得可验证凭据（secret 或非对称公钥）；真实 DSH + 真实模型下的长任务刷新链路待跑。
+
+## Phase 2 P2-B（执行事实回写）：B1 已完成
+
+- `ControlPlane.receive` 处理 `session.event` 的 `turn-start` / `turn-end`：按 SessionRecord.assignmentId 找到 Ticket，调用 `engine.turnBegan` / `engine.turnEnded`；旧 Assignment、未知 Ticket、已结束 Ticket 静默忽略。
+- `DshPortHost.cancelSession` 改为 `Promise<void>`：`agent.cancel` 后 await `agent.whenIdle()`；`DshNodePort` 的 `session.cancel` await host，因此命令成功即代表当前 turn 已结束。
+- `NodeExecutor.stop` 仍 await `control.cancelSession`，清理失败会传播。
+- 新增 `tests/control-plane-turn-facts.spec.ts`（1 个）与 `dsh-port.spec.ts` 的 cancel 等待用例；定向 30/30 通过。
+- 剩余（P2-B2）：Worker idle 状态回写、stop cleanup 的后台任务/子代理清理仍未做（`inputsRead` 已完成，见下节）。
+
+## Phase 2 P2-B2（Input id 回写 / inputsRead）：已完成
+
+- `session.message` 新增可选 `inputIds`：`NodeExecutor.deliver` 把本次投递的 Input id 一并下发，`ControlPlane.sendMessage` 只在非空时写入命令；`DshNodePort` 透传给 host。
+- `DshPortHost.promptSession` 把 ids 记入该 Session 的 pending 集合并集去重（同一 id 投递两次只报一次，两条消息各带各自 id 也不会互相覆盖）；投递被后端拒绝时撤回本次新增的 id，避免下一 turn 把没送到的 Input 报成已读。
+- `portEvent` 在 `turn/start` 把 pending ids 放进 `data.inputIds` 并清空该 Session 的 pending；没有 pending 的 turn 保持原样（不带 `inputIds` 键），一个 turn 只报一次。
+- `ControlPlane.receive` 的 `turn-start` 分支只接受非空字符串数组（非字符串、空串与结构不符的 payload 一律忽略），按 SessionRecord.assignmentId 找到 Ticket 后调用 `engine.inputsRead` → `Assignments.read` 给 trigger Input 写 `readAt`；未知 Session/旧 Assignment 静默忽略，`turnBegan` 照旧先执行。
+- 新增 `tests/control-plane-inputs-read.spec.ts`（4 个：投递带 id 且 turn-start 后 `readAt` 由 null 变时间戳、连续两个 Input 的 id 不丢、不可归属的 turn 被忽略且无 id 的 turn 仍回写 turn 事实、只取字符串并过滤非法值）；`tests/dsh-port.spec.ts` 增加 input id 透传与 `DshPortHost` pending 合并/消费/撤回用例（15 个）。
+- 剩余（P2-B2）：Worker idle 状态回写、stop cleanup 的后台任务/子代理清理。
+
+## Phase 2 P2-C（控制面 SSE 事件流）：SSE 与断线回放已完成，面板认证/TLS 待做
+
+- `ControlPlane.subscribe(listener)`：`receive` 先把事件 push 进 `events`，同步应用状态后在同一调用里通知全部订阅者（`node.status`、`session.*`、`tool.call` 一视同仁）；每个监听者单独 try/catch，抛错写 stderr 并跳过，不会打断 `receive`、状态机或别的订阅者；`close()` 清空订阅表。
+- `GET /v1/events/stream`：只认控制面 API bearer token（`SUPERAGENT_CONTROL_TOKEN`），Session token 不走这里；`after` 查询参数或 `Last-Event-ID` 请求头给出已见游标（两者同时出现时 query 优先），先回放 `control.events` 中 `seq > after` 的事件，再跟随实时事件。
+- 帧格式 `id: <seq>\ndata: <json>\n\n`；连接建立即写 `: connected`，空闲每 15 秒写 `: keepalive`（`ControlPlaneServerOptions.keepaliveMs` 可缩短，供测试用）。事件 JSON 就是 `NodeEvent` 本身，不含 token（token 从不进入 Session 记录或事件）。
+- 回放与实时无缝隙：先订阅、再同步回放，两者在同一事件循环 tick 内完成，事件不会漏也不会重复；客户端带最后 `id` 重连即从下一条继续。
+- 清理：客户端断开（`close`/`error`）时清 keepalive timer、退订、从流集合移除；`ControlPlaneServer.close()` 先 `end()` 所有在开流并 `closeAllConnections()`，SSE 长连接不会让关闭挂住。
+- 原有 `GET /v1/events` 轮询接口保持不变（过滤 `seq > after` 的语义相同）。
+- 新增 `tests/control-plane-events.spec.ts`（4 个）：订阅通知/抛错隔离/退订；回放+实时+断线续传（`after` 与 `Last-Event-ID` 两条路径，id 单调且不重复）；无 token/错误 token/Session token 401、非法游标 400、轮询仍可用；keepalive 生效且 `close()` 结束流并退订。
+- 剩余（P2-C 其余部分）：
+  - 面板认证仍待做：控制面 API token 是运维凭据，不是面板用户角色；面板写操作的角色校验与 403 未实现。
+  - TLS 未做：仍是明文 loopback HTTP，跨机需反代或隧道；`redact` 已覆盖诊断脱敏，部署文档未覆盖 TLS。
+  - SSE 压力测试未做；面板前端仍用轮询，尚未接这条流。
+  - 事件 `seq` 由节点侧单调产生且只在内存：节点重启后从 1 重新计数、控制面重启后 `events` 清空，跨重启的 `Last-Event-ID` 游标不可靠（与 1B 已知边界一致）。
 
 ## 还没做（Phase 2）
 
 - `src/app/assessment.ts` 仍有 DSH 的 `Agent` 类型依赖（`orchestrator_eval_read` 的图片投递需要真实 Agent），下一步继续收窄。
-- 进程入口已拆出（`lib/control.js` / `lib/node.js`），但独立节点进程默认仍用 FakeNode；真实 DSH NodePort 已由 1B-3d 在插件进程内提供，面板认证、TLS/SSE 重连与生产级部署属于 Phase 2。
+- 进程入口已拆出（`lib/control.js` / `lib/node.js`），但独立节点进程默认仍用 FakeNode；真实 DSH NodePort 已由 1B-3d 在插件进程内提供，面板认证、TLS 与生产级部署属于 Phase 2（控制面 SSE 断线回放已完成，见上文 P2-C 节）。

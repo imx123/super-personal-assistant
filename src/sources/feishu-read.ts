@@ -169,6 +169,6 @@ export const feishuThreadContext: ThreadContext<{ readPageSize: number }> = {
     return { messages, next, body: { ...body }, status: body.status }
   },
   images: admissionImageKeys,
-  image: (agent, commands, trigger, message, key, stateDir, signal) =>
-    readAdmissionImage(agent, commands, { ...sourceRef(trigger), messageId: message.id }, message.text, key, stateDir, signal),
+  image: (target, commands, trigger, message, key, stateDir, signal) =>
+    readAdmissionImage(target, commands, { ...sourceRef(trigger), messageId: message.id }, message.text, key, stateDir, signal),
 }

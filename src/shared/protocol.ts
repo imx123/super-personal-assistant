@@ -49,6 +49,21 @@ export interface SessionRecord {
   /** Absolute path of the Session's workspace on its node; a location, not an identity. */
   workspace: string
   status: SessionStatus
+  /**
+   * The control-plane node generation the Session's last ensure was confirmed under.
+   *
+   * A generation changes when the control plane starts and whenever the node comes back from offline, so a record left
+   * over from an earlier generation is re-ensured once instead of being returned as if the node still knew it. The
+   * field is optional so records persisted before it existed still load and count as stale.
+   */
+  nodeGeneration?: string
+  /**
+   * Generation of the Session's current token, advanced by every refresh.
+   *
+   * A token carries the generation it was signed with: the control plane accepts only the current one for tools, and the
+   * one immediately before it for a refresh. The field is optional so records persisted before generations load as 0.
+   */
+  tokenVersion?: number
   /** `RoleProfile.name` the Session was created with. */
   toolProfile: string
   model?: string
@@ -135,7 +150,8 @@ interface CommandEnvelope {
  * Commands the control plane sends to a node, discriminated by `type`.
  *
  * Commands that create a Session carry that Session's short-lived `sessionToken`; the node hands it to
- * the Session's tools and never parses or logs it.
+ * the Session's tools and never parses or logs it. `session.message` may carry the latest token too, so a
+ * node can keep its proxy tools current; it is opaque there as well because a node has no signing secret.
  */
 export type NodeCommand =
   | (CommandEnvelope & { type: 'node.register'; registration: NodeRegistration })
@@ -161,7 +177,8 @@ export type NodeCommand =
     sessionToken: string
     prompt: string
   })
-  | (CommandEnvelope & { type: 'session.message'; sessionId: string; text: string })
+  | (CommandEnvelope & { type: 'session.message'; sessionId: string; text: string; sessionToken?: string
+    inputIds?: readonly string[] })
   | (CommandEnvelope & { type: 'session.cancel'; sessionId: string; reason?: string })
   | (CommandEnvelope & { type: 'session.archive'; sessionId: string })
   | (CommandEnvelope & { type: 'session.inspect'; sessionId: string })

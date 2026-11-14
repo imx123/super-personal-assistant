@@ -1,0 +1,186 @@
+# Example profile for an execution node that runs in its own DSH process.
+# Copy this file to $DSH_HOME/profiles/superagent-node/cordis.patch.yml and replace every
+# <placeholder>. See examples/profile.node/README.md and docs/015-node-deployment.zh-CN.md.
+#
+# The profile loads the dsh-base bundle and only what a node-only Session needs: the workspace
+# service, the agent preset registry with the PM and Worker presets, and this repository's
+# node plugin. It deliberately mounts no Web app, panel, session controller, or the
+# dsh-superagent Runtime (Store/Engine/Sources), because the control plane is a separate
+# process with its own database.
+#
+# The PM and Worker preset rows are the bundle's own definitions (cordis.patch.yml at the
+# repository root). Keep them in sync with that file when the presets change.
+#
+# The two model rows below are optional but required for any Session that runs a model turn:
+# without them the node's first turn fails with "agent ... has no provider/model". The key
+# itself belongs in $DSH_HOME/.credentials.yaml (or the environment named by apiKeyEnv), never
+# in this file.
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: <provider id from your DSH model configuration>
+    model: <model id>
+    reasoningEffort: high
+
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      '<provider id from your DSH model configuration>':
+        apiKeyEnv: <ENVIRONMENT VARIABLE HOLDING THE API KEY>
+
+- insert:
+    - id: node-workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+    - id: node-preset-registry
+      name: '@deepseek-ai/dsh-agent-preset-registry'
+      config:
+        default: dsh-superagent-worker
+
+    # The agent preset of every Executor Session (WORKER_PRESET in src/app/sessions.ts). A node has no
+    # main Session, so this profile carries only the Worker and PM presets. It is DSH's `standard`
+    # preset with only what a worker needs, and a shell whose foreground command moves to a background job
+    # after 5 seconds, so a long command does not hold back a person's message, which the Session takes at its next step. Left
+    # out: questions to a person, presenting, plan mode, the plugin manager and market, scheduling, goals, workflows, web fetch,
+    # and forked subagents, which would run under this preset; spawned subagents run under `standard`, whose shell moves a
+    # command to a background job only after 60 seconds, as a subagent's jobs are killed when it ends. A preset row has no
+    # setting that hides it from the preset picker, so its name and description say whom it is for.
+    - id: dsh-superagent-worker-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-worker
+        name: dsh-superagent 执行器
+        description: dsh-superagent 的执行器 Session 专用，不供手动选择。前台命令超 5 秒转入后台，只含执行工作所需的工具。
+        order: 90
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: You are a coding agent powered by the {{model}} model.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          # A foreground command waits at most 5 s, then the shell tool moves it to a background job.
+          - id: shell
+            name: cordis:group
+            group: true
+            isolate:
+              shell: true
+            config:
+              - id: bash-sandbox
+                name: '@deepseek-ai/dsh-bash-sandbox'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+              - id: pwsh-sandbox
+                name: '@deepseek-ai/dsh-pwsh-sandbox'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  timeoutMs: 5000
+                  maxTimeoutMs: 5000
+              - id: tool-bash
+                name: '@deepseek-ai/dsh-tool-bash'
+                disabled: !!js process.platform === 'win32'
+              - id: tool-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh'
+                disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          # A wait for a job ends after 5 s too; the job's end wakes the worker with its result.
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+            config:
+              waitTimeoutMs: 5000
+              maxWaitTimeoutMs: 5000
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+                  agentPreset: standard
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: false
+              searchTimeoutMs: 60000
+
+    # The agent preset of a Project's PM Session (PM_PRESET in src/app/sessions.ts). It is a small Router inside one Project:
+    # it reads records and reports on the Project, and it has no shell, file write, web, skill, todo, scheduling, goal,
+    # workflow or subagent tool. The node registers the PM's `control_project` and `control_create_tickets` tools for that
+    # Session after applying the role boundary; they are not part of this preset.
+    - id: dsh-superagent-pm-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-pm
+        name: dsh-superagent 项目经理
+        description: dsh-superagent 的项目 PM 专用，不供手动选择。只读记录、向项目汇报，不含 shell、写入、网页、子代理等工具。
+        order: 92
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+    - id: dsh-superagent-node
+      name: 'dsh-superagent/node'
+      inject: [agents, sessionQuery, sessionPersistence, workspaceRegistry, permissionPresets,
+        tools, systemPrompt, skills, subprocess, llm, agentDefaultModel, agentPresets]

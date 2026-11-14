@@ -1,5 +1,5 @@
 /** Engine's Executor port over the control plane's NodePort: one Worker Session per Assignment. */
-import type { Assignment, Executor, Ticket } from '../core/index.ts'
+import type { Assignment, Executor, Ticket, TicketInput } from '../core/index.ts'
 
 /**
  * What the Executor asks of the control plane. The callbacks keep this module free of a ControlPlane import, so the
@@ -8,8 +8,8 @@ import type { Assignment, Executor, Ticket } from '../core/index.ts'
 export interface NodeExecutorHost {
   /** Create the Worker Session for an Assignment; resolves with its control-plane Session id. */
   createWorkerSession(projectId: string, assignmentId: string, ticketId: string, prompt: string): Promise<{ sessionId: string }>
-  /** Deliver one message to a Worker Session. */
-  sendMessage(sessionId: string, text: string): Promise<void>
+  /** Deliver one message to a Worker Session, naming the Inputs it carries. */
+  sendMessage(sessionId: string, text: string, inputIds?: readonly string[]): Promise<void>
   /** Cancel a Worker Session's turn; a failure propagates to the caller that waits for the cleanup. */
   cancelSession(sessionId: string, reason: string): Promise<void>
   /** The Engine's fact that the Assignment runs. */
@@ -22,17 +22,31 @@ export interface NodeExecutorHost {
   inputsDelivered(ticketId: string, assignmentId: string, inputIds: string[]): void
   /** The Session id `createWorkerSession` gives this Assignment. */
   workerSessionId(ticketId: string, assignmentId: string): string
+  /**
+   * The text one Input contributes to a delivery. A `text` or `note` Input carries its own; a `trigger` Input names only
+   * its Trigger, so the host resolves the Trigger's message (and its newest title, goal, scope and note) from its store.
+   * Returns undefined when the Input carries no text this host can resolve.
+   */
+  inputText(input: TicketInput): string | undefined
 }
 
 /**
- * The text of one delivery's Inputs. A trigger Input carries only an id here, so only the Inputs that hold text
- * (messages from the main Session and notes) can be joined; callers use a fallback when none does.
+ * The text of one delivery's Inputs, each resolved through the host. A Trigger Input holds only an id in the Ticket, so
+ * without the host's resolution its message could never reach the Worker.
  */
-function waitingText(ticket: Ticket, inputIds: readonly string[]): string | undefined {
+function waitingText(host: NodeExecutorHost, ticket: Ticket, inputIds: readonly string[]): string | undefined {
   const byId = new Map(ticket.inputs.map(input => [input.id, input]))
   const texts = inputIds.flatMap(id => {
     const input = byId.get(id)
-    return input && (input.kind === 'text' || input.kind === 'note') ? [input.text] : []
+    if (!input) return []
+    let text: string | undefined
+    try {
+      text = host.inputText(input)
+    } catch {
+      // A host that cannot resolve this Input must not fail the delivery of the others.
+      return []
+    }
+    return text ? [text] : []
   })
   return texts.join('\n\n').trim() || undefined
 }
@@ -88,14 +102,14 @@ export class NodeExecutor implements Executor {
     if (inputIds.length === 0) return
     for (const id of inputIds) sending.add(id)
     this.sending.set(assignment.id, sending)
-    const text = waitingText(ticket, inputIds) ?? NO_TEXT
+    const text = waitingText(this.host, ticket, inputIds) ?? NO_TEXT
     const sessionId = this.host.workerSessionId(ticket.id, assignment.id)
     const settle = (): void => {
       for (const id of inputIds) sending.delete(id)
       if (sending.size === 0 && this.sending.get(assignment.id) === sending) this.sending.delete(assignment.id)
     }
     try {
-      void this.host.sendMessage(sessionId, text)
+      void this.host.sendMessage(sessionId, text, inputIds)
         .then(() => {
           settle()
           // The message went out: record its Inputs before a later delivery can include them again. A host that cannot

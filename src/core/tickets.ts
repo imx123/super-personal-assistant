@@ -21,6 +21,14 @@ export const automatic = (input: TicketInput | undefined): boolean => input?.kin
 const readBefore = (input: Extract<TicketInput, { kind: 'trigger' }>, until: string): boolean => input.readAt === undefined
   ? (input.deliveredAt && input.deliveredAt > input.at ? input.deliveredAt : input.at) <= until : !!input.readAt && input.readAt < until
 const STATUS_REQUEST = 'Report the current ticket status with orchestrator_report. This is a status-only request: do not resume implementation or perform external actions.'
+/** The useful text of a failed stop, including the causes of the Executor's `AggregateError`. */
+function failureText(error: unknown): string {
+  if (error instanceof AggregateError) {
+    const causes = error.errors.map(item => item instanceof Error ? item.message : String(item)).filter(Boolean)
+    return causes.length ? causes.join('; ') : error.message
+  }
+  return error instanceof Error ? error.message : String(error)
+}
 /** What a stop of one Worker names: who stopped it, whether for that Worker alone or for its Project, and the Assignment a
  * person selected. A Project stop names its Project and leaves the Assignment to the latest one. */
 export interface HardStopWorkerOptions {
@@ -269,16 +277,76 @@ export class Tickets extends EnginePart {
     if (!labelled && options.scope === 'worker') return this.require(ticketId)
     ticket.updatedAt = this.now()
     if (assignment) {
-      const cleanup = this.options.executor.stop(ticket, assignment, OPERATOR_STOP)
-      if (cleanup && options.cleanups) {
-        const work: Promise<void> = Promise.resolve(cleanup)
-        work.catch(() => {})
-        options.cleanups.push({ ticketId, work })
-      }
+      const work = this.stopWorker(ticket, assignment, OPERATOR_STOP)
+      // A Project hard pause waits for this cleanup before reporting the Worker stopped; `stopWorker` already keeps an
+      // ignored failure from becoming an unhandled rejection.
+      if (work && options.cleanups) options.cleanups.push({ ticketId, work })
     }
     this.repo.tickets.save(ticket)
     if (labelled) this.emit('ticket.manualStopSet', { ticketId, scope: options.scope })
     return this.require(ticketId)
+  }
+  /**
+   * Ask the Executor to stop one Assignment, and record on the Ticket whether that stop really happened.
+   *
+   * The returned promise still rejects for a caller that waits for the cleanup, such as a Project hard pause, but it always
+   * carries a rejection handler here: a stop nobody awaits can never become an unhandled rejection. A successful stop clears
+   * an earlier `stopFailure`; a failed one records it and emits `ticket.stopFailed`. Ending the Assignment is not undone:
+   * the Ticket keeps its `ended`/`stopped` state and never returns to running because a Worker's cleanup failed.
+   */
+  private stopWorker(ticket: Ticket, assignment: Assignment, reason: string): Promise<void> | undefined {
+    // A synchronous throw is the Executor refusing the stop request itself, which the caller still handles: the
+    // Assignment is not confirmed ended and the ticket must keep it, exactly as before.
+    const cleanup = this.options.executor.stop(ticket, assignment, reason)
+    if (!cleanup) {
+      // A synchronous stop reported no cleanup work: it succeeded, so a failure it superseded no longer stands.
+      delete ticket.stopFailure
+      return undefined
+    }
+    const work: Promise<void> = Promise.resolve(cleanup).then(
+      () => { this.clearStopFailure(ticket.id) },
+      (error: unknown) => {
+        this.recordStopFailure(ticket.id, assignment.id, error)
+        // Keep the failure visible to a caller that waits for the cleanup, while the handler above already observed it.
+        throw error
+      })
+    work.catch(() => {})
+    return work
+  }
+  /** Record that stopping `assignmentId` failed, for the panel and the next reader of the Ticket. */
+  private recordStopFailure(ticketId: string, assignmentId: string, error: unknown): void {
+    const at = this.now()
+    // The failure is durable and shown in the panel, so it keeps only the redacted diagnostic.
+    const diagnostic = redact(failureText(error)).slice(0, 300)
+    let recorded = false
+    try {
+      this.repo.atomic(() => {
+        const ticket = this.repo.tickets.get(ticketId)
+        if (!ticket) return
+        ticket.stopFailure = { at, assignmentId, error: diagnostic }
+        ticket.updatedAt = at
+        this.repo.tickets.save(ticket)
+        recorded = true
+      })
+    } catch {
+      // The Ticket or the Store may be gone already; an unrecordable failure must not become a rejection here either.
+      return
+    }
+    if (recorded) this.emit('ticket.stopFailed', { ticketId, assignmentId, error: diagnostic })
+  }
+  /** Clear the `stopFailure` a later, successful stop superseded: the Worker's stop is no longer outstanding. */
+  private clearStopFailure(ticketId: string): void {
+    try {
+      this.repo.atomic(() => {
+        const ticket = this.repo.tickets.get(ticketId)
+        if (!ticket?.stopFailure) return
+        delete ticket.stopFailure
+        ticket.updatedAt = this.now()
+        this.repo.tickets.save(ticket)
+      })
+    } catch {
+      // A closed Store only keeps a stale failure; the next successful stop records the newest fact.
+    }
   }
   /**
    * Clear a `worker` stop on a person's explicit approval, or a `project` stop when its Project resumes. It starts or
@@ -599,7 +667,7 @@ export class Tickets extends EnginePart {
     const assignment = this.newAssignment(ticket)
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
-    if (!stopped) this.options.executor.stop(ticket, latest, 'retried')
+    if (!stopped) this.stopWorker(ticket, latest, 'retried')
     this.options.executor.start(ticket, assignment)
     return ticket
   }
@@ -808,7 +876,7 @@ export class Tickets extends EnginePart {
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
-    for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
+    for (const assignment of stopping) this.stopWorker(ticket, assignment, reason ?? outcome)
   }
   /**
    * Whether a ticket's work has not finished at a close at `at`: its worker took up a person's message the ticket decides and

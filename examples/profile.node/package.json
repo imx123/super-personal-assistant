@@ -1,0 +1,12 @@
+{
+  "name": "dsh-profile-superagent-node",
+  "private": true,
+  "dependencies": {
+    "dsh-superagent": "file:<absolute path to this repository>"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": ["@deepseek-ai/dsh-base"]
+    }
+  }
+}

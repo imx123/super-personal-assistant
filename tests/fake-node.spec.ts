@@ -190,7 +190,7 @@ describe('FakeNode', () => {
 
     expect(node.sessions.get('pm-1')).toMatchObject({
       sessionId: 'pm-1',
-      backendSessionId: 'fake-pm-1',
+      backendSessionId: 'pm-1',
       projectId: 'project-1',
       role: 'pm',
       nodeId: NODE_ID,

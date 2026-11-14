@@ -364,7 +364,7 @@ describe('node control tools', () => {
     const { host, agents, prompts } = toolHost({ root, controlUrl: 'http://control.test/', fetch })
 
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
-      prompt: WORKER_PROFILE.prompt, sessionToken: 'worker-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
+      profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'worker-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
 
     const agent = agents.get('worker-1')!
     expect([...agent.tools.keys()]).toEqual(['control_report'])
@@ -395,7 +395,7 @@ describe('node control tools', () => {
     const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
 
     const tool = agents.get('pm-1')!.tools.get('control_create_tickets')!
     const result = await tool.execute({ tasks: [{ title: 'T', goal: 'G', scope: 'S' }] }, EXEC)
@@ -413,7 +413,7 @@ describe('node control tools', () => {
     const { host, agents, prompts } = toolHost({ root, controlUrl: 'http://control.test', fetch })
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
 
     const agent = agents.get('pm-1')!
     expect([...agent.tools.keys()]).toEqual(['control_project', 'control_create_tickets'])
@@ -438,7 +438,7 @@ describe('node control tools', () => {
     const { fetch } = recorder(() => jsonAnswer({ error: 'A PM Session token is required' }, 403))
     const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
 
     await expect(agents.get('pm-1')!.tools.get('control_project')!.execute({}, EXEC))
       .rejects.toThrow('A PM Session token is required')
@@ -449,7 +449,7 @@ describe('node control tools', () => {
     const { fetch } = recorder(() => jsonAnswer({ error: 'Unknown ticket ticket-9' }, 400))
     const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
-      prompt: WORKER_PROFILE.prompt, sessionToken: 'worker-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
+      profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'worker-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
 
     await expect(agents.get('worker-1')!.tools.get('control_report')!.execute({ ticketId: 'ticket-9',
       state: 'progress', summary: 's' }, EXEC)).rejects.toThrow('Unknown ticket ticket-9')
@@ -461,9 +461,9 @@ describe('node control tools', () => {
     const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
 
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
-      prompt: WORKER_PROFILE.prompt, sessionToken: 'first-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
+      profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'first-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
-      prompt: WORKER_PROFILE.prompt, sessionToken: 'second-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
+      profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'second-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
 
     const agent = agents.get('worker-1')!
     // DSH refuses a duplicate tool name in one Agent layer, so the second ensure must not register again.
@@ -477,7 +477,7 @@ describe('node control tools', () => {
     const { host, agents, prompts } = toolHost({ root })
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
 
     expect(agents.get('pm-1')!.tools.size).toBe(0)
     expect(prompts).toEqual([{ sessionId: 'pm-1', key: 'profile:pm-1', text: PM_PROFILE.prompt }])
@@ -491,7 +491,7 @@ describe('node control tools', () => {
       controlUrl: 'http://control.test', fetch: async () => jsonAnswer({}) })
 
     await expect(host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })).rejects.toThrow('no tool registry')
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })).rejects.toThrow('no tool registry')
     await expect(host.inspectSession('pm-1')).resolves.toMatchObject({ sessionId: 'pm-1', found: true, ready: false,
       error: expect.stringContaining('no tool registry') })
   })
@@ -504,7 +504,8 @@ describe('node control tools', () => {
     const { host, agents } = toolHost({ root, controlUrl: address.url })
 
     await host.ensureSession({ sessionId: workerSession, workspace: join(root, project.id), title: 'Worker',
-      role: 'worker', prompt: WORKER_PROFILE.prompt, sessionToken: tokenOf(workerSession), ticketId: ticket.id,
+      role: 'worker', prompt: WORKER_PROFILE.prompt, profile: WORKER_PROFILE, sessionToken: tokenOf(workerSession),
+      ticketId: ticket.id,
       assignmentId: assignment.id })
 
     const result = await agents.get(workerSession)!.tools.get('control_report')!

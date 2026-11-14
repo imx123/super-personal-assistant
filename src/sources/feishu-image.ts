@@ -1,12 +1,10 @@
 /** Downloads Feishu message images and commits them as model-visible attachments during assessment. */
 import { mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises'
 import { dirname, extname, join } from 'node:path'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { ImageAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type {} from '@deepseek-ai/dsh-llm'
 import { z } from 'zod'
 import type { Commands } from '../infra/commands.ts'
 import type { FeishuRef } from './feishu-read.ts'
+import type { ImageAttachment, ImageMediaType, ImageTarget } from './kind.ts'
 
 /** Extracts Feishu image keys from message text so keys remain paired with the originating message; arbitrary remote IDs are not accepted. */
 export function admissionImageKeys(text: string): string[] {
@@ -16,18 +14,17 @@ export function admissionImageKeys(text: string): string[] {
 export interface AdmissionImage {
   source_message_id: string
   image_key: string
-  image: ImageAttachmentRef
+  image: ImageAttachment
 }
 
-export async function readAdmissionImage(agent: Agent, commands: Commands, ref: FeishuRef, text: string, imageKey: string, stateDir: string, signal: AbortSignal): Promise<AdmissionImage> {
+export async function readAdmissionImage(target: ImageTarget, commands: Commands, ref: FeishuRef, text: string, imageKey: string, stateDir: string, signal: AbortSignal): Promise<AdmissionImage> {
   if (!admissionImageKeys(text).includes(imageKey)) throw new Error('Choose an image key from this source message')
   const messageId = z.string().regex(/^om_[a-zA-Z0-9_-]+$/).parse(ref.messageId)
-  const attachments = agent.ctx.get('attachments')
+  const attachments = target.attachments
   if (!attachments) throw new Error('Image reading is unavailable: no attachment service is mounted')
-  const route = agent.session.requestHeader()?.config
-  const provider = route?.provider ?? agent.options.provider
-  const model = route?.model ?? agent.options.model
-  const llm = agent.ctx.get('llm')
+  const provider = target.provider
+  const model = target.model
+  const llm = target.llm
   if (!llm || !provider || !model) throw new Error('Image reading is unavailable: the current model route is unresolved')
   const info = await llm.resolveModelInfo(provider, model, signal)
   if (!info.inputModalities?.includes('image')) throw new Error(`Model ${model} does not support image input; the image has not been inspected`)

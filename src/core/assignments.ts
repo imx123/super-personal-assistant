@@ -57,10 +57,15 @@ export class Assignments extends EnginePart {
     delete ticket.delivery
     this.repo.tickets.save(ticket)
   }
-  /** Records when the worker's Session of an open ticket took `inputIds` into a step, from which its model reads them. */
-  read(ticketId: string, inputIds: string[]): void {
-    const ticket = this.require(ticketId)
-    if (!liveTicket(ticket)) return
+  /**
+   * Records when the worker's Session of an open ticket took `inputIds` into a step, from which its model reads them.
+   *
+   * With `assignmentId`, the fact counts only while that Assignment runs the Ticket: a late turn of a replaced Worker
+   * names Inputs the current Worker never took, so it can no longer mark them read.
+   */
+  read(ticketId: string, inputIds: string[], assignmentId?: string): void {
+    const ticket = assignmentId === undefined ? this.require(ticketId) : this.running(ticketId, assignmentId)
+    if (!ticket || !liveTicket(ticket)) return
     for (const input of ticket.inputs) if (input.kind === 'trigger' && inputIds.includes(input.id)) input.readAt ||= this.now()
     this.repo.tickets.save(ticket)
   }

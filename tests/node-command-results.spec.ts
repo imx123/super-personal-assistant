@@ -47,7 +47,7 @@ class FakeHost implements DshPortHost {
     if (this.promptFailure) throw this.promptFailure
   }
 
-  cancelSession(): void {}
+  async cancelSession(): Promise<void> {}
 
   async archiveSession(sessionId: string): Promise<void> {
     if (this.archiveFailure) throw this.archiveFailure
@@ -300,7 +300,7 @@ describe('createDshPortHost results', () => {
     const { host, ensured } = fixture({ promptFailure: new Error('the role prompt was rejected') })
 
     await expect(host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })).rejects.toThrow('the role prompt was rejected')
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })).rejects.toThrow('the role prompt was rejected')
     expect(ensured).toHaveLength(1)
 
     // The agent reported idle before the prompt failed; inspection is what stops the control plane from trusting that.
@@ -312,7 +312,7 @@ describe('createDshPortHost results', () => {
     const { host } = fixture()
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
     await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, status: 'idle',
       backendSessionId: 'pm-1', ready: true })
     await expect(host.inspectSession('missing')).resolves.toEqual({ sessionId: 'missing', found: false })
@@ -328,7 +328,7 @@ describe('createDshPortHost results', () => {
     const host = createDshPortHost({ context, nodeRuntime: { sessions }, nodeId: NODE_ID, root })
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
     await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, ready: true })
     await expect(host.archiveSession('pm-1')).resolves.toBeUndefined()
     // Without the archive set the node cannot claim an archived status, but inspection must not throw.
@@ -339,7 +339,7 @@ describe('createDshPortHost results', () => {
     const { host, archived } = fixture()
 
     await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
-      prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
     await expect(host.archiveSession('pm-1')).resolves.toBeUndefined()
     expect(archived).toEqual(['pm-1'])
     await expect(host.inspectSession('pm-1')).resolves.toMatchObject({ found: true, status: 'archived', ready: true })

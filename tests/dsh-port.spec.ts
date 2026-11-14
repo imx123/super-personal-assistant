@@ -2,8 +2,9 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { HttpNodePort } from '../src/control/http-node.ts'
+import { createDshPortHost } from '../src/node/dsh-port-host.ts'
 import { DshNodePort, type DshPortEvent, type DshPortHost } from '../src/node/dsh-port.ts'
 import { startNodeHttpServer } from '../src/node/http-server.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodeStatus, type RoleProfile, type SessionInspection }
@@ -19,19 +20,33 @@ const WORKER_PROFILE: RoleProfile = { name: 'worker.v1', prompt: 'Do the work.',
 /** A `DshPortHost` that records every call and replays what a test emits; no DSH Context is involved. */
 class FakeHost implements DshPortHost {
   readonly ensured: Parameters<DshPortHost['ensureSession']>[0][] = []
-  readonly prompts: { sessionId: string; key: string; text: string }[] = []
+  readonly prompts: { sessionId: string; key: string; text: string; sessionToken?: string
+    inputIds?: readonly string[] }[] = []
   readonly cancelled: string[] = []
+  /** The reason each cancel carried, proving the command's own reason reaches the host. */
+  readonly cancelReasons: (string | undefined)[] = []
   readonly archived: string[] = []
   readonly permissions: { sessionId: string; permission: string }[] = []
   readonly listeners = new Set<(event: DshPortEvent) => void>()
   /** How many host subscriptions the port holds, proving one serves every listener. */
   subscriptions = 0
+  /** Optional gate a cancel command waits on, proving the command waits for cleanup. */
+  cancelGate?: Promise<void>
+  /** When set, a cancel fails with this error, proving the port reports the host's refusal. */
+  cancelError?: Error
 
   async ensureSession(input: Parameters<DshPortHost['ensureSession']>[0]): Promise<void> { this.ensured.push(input) }
-  async promptSession(sessionId: string, idempotencyKey: string, text: string): Promise<void> {
-    this.prompts.push({ sessionId, key: idempotencyKey, text })
+  async promptSession(sessionId: string, idempotencyKey: string, text: string, sessionToken?: string,
+    inputIds?: readonly string[]): Promise<void> {
+    this.prompts.push({ sessionId, key: idempotencyKey, text,
+      ...(sessionToken === undefined ? {} : { sessionToken }), ...(inputIds === undefined ? {} : { inputIds }) })
   }
-  cancelSession(sessionId: string): void { this.cancelled.push(sessionId) }
+  async cancelSession(sessionId: string, reason?: string): Promise<void> {
+    if (this.cancelGate) await this.cancelGate
+    if (this.cancelError) throw this.cancelError
+    this.cancelled.push(sessionId)
+    this.cancelReasons.push(reason)
+  }
   async archiveSession(sessionId: string): Promise<void> { this.archived.push(sessionId) }
   async inspectSession(sessionId: string): Promise<SessionInspection> {
     return { sessionId, found: false }
@@ -138,9 +153,10 @@ describe('DshNodePort', () => {
 
     expect(host.ensured).toEqual([
       { sessionId: 'pm-1', workspace: join(root, 'project-1'), title: 'Project', role: 'pm', prompt: PM_PROFILE.prompt,
-        sessionToken: 'session-token' },
+        profile: PM_PROFILE, sessionToken: 'session-token' },
       { sessionId: 'worker-1', workspace: join(root, 'project-1'), title: 'Worker ticket-1', role: 'worker',
-        prompt: 'Do the ticket', sessionToken: 'session-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' },
+        prompt: 'Do the ticket', profile: WORKER_PROFILE, sessionToken: 'session-token', ticketId: 'ticket-1',
+        assignmentId: 'assignment-1' },
     ])
     expect(existsSync(join(root, 'project-1'))).toBe(true)
   })
@@ -153,8 +169,49 @@ describe('DshNodePort', () => {
 
     expect(host.prompts).toEqual([{ sessionId: 'pm-1', key: 'message-1', text: 'Hello' }])
     expect(host.cancelled).toEqual(['pm-1'])
+    expect(host.cancelReasons).toEqual(['operator'])
     expect(host.archived).toEqual(['pm-1'])
     expect(host.permissions).toEqual([{ sessionId: 'pm-1', permission: 'workspace-write' }])
+  })
+
+  it('waits for the host cancel cleanup before acknowledging the command', async () => {
+    let release!: () => void
+    host.cancelGate = new Promise<void>(resolve => { release = resolve })
+    let settled = false
+    const command = port.send({ ...envelope('cancel-wait-1'), type: 'session.cancel', sessionId: 'pm-1', reason: 'operator' })
+    void command.then(() => { settled = true })
+    await sleep(20)
+    expect(settled).toBe(false)
+    expect(host.cancelled).toEqual([])
+    release()
+    await command
+    expect(host.cancelled).toEqual(['pm-1'])
+  })
+
+  it('fails the cancel command with the host’s cleanup error', async () => {
+    host.cancelError = new Error('the Session did not settle within 20 ms')
+    await expect(port.send({ ...envelope('cancel-failure-1'), type: 'session.cancel', sessionId: 'pm-1', reason: 'operator' }))
+      .rejects.toThrow('the Session did not settle within 20 ms')
+    // A failed cancel was never recorded as completed, so the control plane can retry the same key.
+    host.cancelError = undefined
+    await port.send({ ...envelope('cancel-failure-1'), type: 'session.cancel', sessionId: 'pm-1', reason: 'operator' })
+    expect(host.cancelled).toEqual(['pm-1'])
+  })
+
+  it('passes an optional Session token on a message through to the host', async () => {
+    await port.send({ ...envelope('message-token-1'), type: 'session.message', sessionId: 'pm-1', text: 'Hello',
+      sessionToken: 'message-token' })
+
+    expect(host.prompts).toEqual([{ sessionId: 'pm-1', key: 'message-token-1', text: 'Hello',
+      sessionToken: 'message-token' }])
+  })
+
+  it('passes the Input ids of a message through to the host', async () => {
+    await port.send({ ...envelope('message-inputs-1'), type: 'session.message', sessionId: 'pm-1', text: 'Hello',
+      inputIds: ['input-1', 'input-2'] })
+
+    expect(host.prompts).toEqual([{ sessionId: 'pm-1', key: 'message-inputs-1', text: 'Hello',
+      inputIds: ['input-1', 'input-2'] }])
   })
 
   it('executes a repeated command at most once', async () => {
@@ -234,5 +291,239 @@ describe('DshNodePort behind the node HTTP server', () => {
       unsubscribe()
       await server.close()
     }
+  })
+})
+
+/** A Cordis context stand-in: the host subscribes to Session events and reads optional services from it here. */
+type ContextListener = (...args: unknown[]) => void
+
+type FakeContext = {
+  on: (name: string, listener: ContextListener) => () => void
+  get: (name: string) => unknown
+}
+
+function fakeContext(services: Record<string, unknown> = {}): { context: FakeContext
+  emit: (name: string, ...args: unknown[]) => void } {
+  const listeners = new Map<string, Set<ContextListener>>()
+  return {
+    context: {
+      on(name, listener) {
+        const set = listeners.get(name) ?? new Set<ContextListener>()
+        set.add(listener)
+        listeners.set(name, set)
+        return () => { set.delete(listener) }
+      },
+      get: (name: string) => services[name],
+    },
+    emit(name, ...args) {
+      for (const listener of [...listeners.get(name) ?? []]) listener(...args)
+    },
+  }
+}
+
+describe('createDshPortHost turn start input ids', () => {
+  /** A real host over a fake backend and Context; the test drives the Session events it maps. */
+  function host(options: { failPrompt?: boolean; promptGate?: Promise<void> } = {}): { host: DshPortHost
+    emit: (sessionId: string, event: unknown) => void } {
+    const fake = fakeContext()
+    return {
+      host: createDshPortHost({ context: fake.context, nodeRuntime: { sessions: {
+        async ensure() { return {} },
+        async prompt() {
+          if (options.promptGate) await options.promptGate
+          if (options.failPrompt) throw new Error('the inbox is closed')
+        },
+      } }, nodeId: NODE_ID, root }),
+      emit: (sessionId, event) => fake.emit('session/event', { id: sessionId }, event),
+    }
+  }
+
+  /** The `data` a mapped event carries; the protocol leaves it `unknown`. */
+  const dataOf = (event: DshPortEvent): unknown => (event as { data?: unknown }).data
+
+  it('reports the ids a delivery carried on the next turn start and not on the one after', async () => {
+    const { host: portHost, emit } = host()
+    const events: DshPortEvent[] = []
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1', 'input-2'])
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      expect(events).toHaveLength(1)
+      expect(events[0]).toMatchObject({ type: 'session.event', kind: 'turn-start', sessionId: 'worker-1' })
+      expect(dataOf(events[0]!)).toEqual({ turn: 1, inputIds: ['input-1', 'input-2'] })
+
+      // The turn took them, so the Session's next turn reports no ids and its data is exactly what it was before.
+      emit('worker-1', { type: 'turn/start', data: { turn: 2 } })
+      expect(dataOf(events[1]!)).toEqual({ turn: 2 })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reports no Input id for a turn that starts while the delivery still waits', async () => {
+    const gate = Promise.withResolvers<void>()
+    const { host: portHost, emit } = host({ promptGate: gate.promise })
+    const events: DshPortEvent[] = []
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      const delivery = portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1'])
+      // The backend has not accepted the message yet, so the turn cannot have taken its Input.
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      expect(dataOf(events[0]!)).toEqual({ turn: 1 })
+
+      gate.resolve()
+      await delivery
+      emit('worker-1', { type: 'turn/start', data: { turn: 2 } })
+      expect(dataOf(events[1]!)).toEqual({ turn: 2, inputIds: ['input-1'] })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('merges the ids of deliveries waiting for one turn, per Session', async () => {
+    const { host: portHost, emit } = host()
+    const events: DshPortEvent[] = []
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await portHost.promptSession('worker-1', 'message-1', 'first', undefined, ['input-1'])
+      await portHost.promptSession('worker-1', 'message-2', 'second', undefined, ['input-2', 'input-1'])
+      await portHost.promptSession('worker-2', 'message-3', 'other', undefined, ['input-9'])
+
+      // One turn start reports every id waiting for it, without repeating one delivered twice.
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      expect(dataOf(events[0]!)).toEqual({ turn: 1, inputIds: ['input-1', 'input-2'] })
+      // Another Session's delivery waits for its own turn, not this one.
+      emit('worker-1', { type: 'turn/start', data: { turn: 2 } })
+      expect(dataOf(events[1]!)).toEqual({ turn: 2 })
+      emit('worker-2', { type: 'turn/start', data: { turn: 1 } })
+      expect(dataOf(events[2]!)).toEqual({ turn: 1, inputIds: ['input-9'] })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('forgets the ids of a delivery the backend refused', async () => {
+    const { host: portHost, emit } = host({ failPrompt: true })
+    const events: DshPortEvent[] = []
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await expect(portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1']))
+        .rejects.toThrow('the inbox is closed')
+
+      // The worker never received it, so no turn may claim these Inputs were read.
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      expect(dataOf(events[0]!)).toEqual({ turn: 1 })
+    } finally {
+      dispose()
+    }
+  })
+})
+
+describe('createDshPortHost cancel deadline', () => {
+  it('rejects a cancel whose Agent never becomes idle within the configured deadline', async () => {
+    const fake = fakeContext()
+    const agent = { status: 'running' as const, cancel: vi.fn(), whenIdle: () => new Promise<void>(() => {}) }
+    const context = { ...fake.context, agents: { get: () => agent } }
+    const stop = createDshPortHost({ context, nodeRuntime: { sessions: {
+      async ensure() { return {} },
+      async prompt() {},
+    } }, nodeId: NODE_ID, root, cancelTimeoutMs: 20 })
+
+    const started = Date.now()
+    const failure = await stop.cancelSession('worker-hang').then(() => undefined, (error: unknown) => error)
+    const elapsed = Date.now() - started
+
+    expect(elapsed).toBeLessThan(150)
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toContain('worker-hang')
+    expect((failure as Error).message).toContain('20 ms')
+    // The deadline bounds the wait; it does not replace the turn cancellation that may still settle.
+    expect(agent.cancel).toHaveBeenCalledOnce()
+  })
+})
+
+describe('createDshPortHost inspection of a persisted Session', () => {
+  /** A host whose Context reports `services`, plus the two members `inspectSession` always reads. */
+  function inspectionHost(options: { agent?: { status?: string }; archived?: readonly string[]
+    services?: Record<string, unknown> } = {}) {
+    const fake = fakeContext(options.services)
+    const context = { ...fake.context, agents: { get: () => options.agent },
+      workspaceRegistry: { archivedSessionIds: options.archived ?? [] } }
+    return {
+      host: createDshPortHost({ context, nodeRuntime: { sessions: {
+        async ensure() { return {} },
+        async prompt() {},
+      } }, nodeId: NODE_ID, root }),
+      emit: fake.emit,
+    }
+  }
+
+  /** An observation lease that records its release, as DSH's `sessionQuery` returns one. */
+  function lease(released: () => void): { [Symbol.dispose](): void } {
+    return { [Symbol.dispose]() { released() } }
+  }
+
+  it('reports a Session that exists only in persistence, with its backend id and no status', async () => {
+    const release = vi.fn()
+    const observeSession = vi.fn(async (_sessionId: string, _options?: unknown) => lease(release))
+    const { host } = inspectionHost({ services: { sessionQuery: { observeSession } } })
+
+    const inspection = await host.inspectSession('pm-1')
+    expect(inspection).toEqual({ sessionId: 'pm-1', found: true, backendSessionId: 'pm-1' })
+    // The missing status is the fact: the control plane must re-ensure a persisted Session that is not mounted.
+    expect(inspection).not.toHaveProperty('status')
+    expect(observeSession).toHaveBeenCalledWith('pm-1', { projectionMode: 'none' })
+    expect(release).toHaveBeenCalledOnce()
+  })
+
+  it('reports an absent Session as not found when the query says so', async () => {
+    const observeSession = vi.fn(async () => {
+      throw Object.assign(new Error('no such Session'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+    })
+    const { host } = inspectionHost({ services: { sessionQuery: { observeSession } } })
+
+    await expect(host.inspectSession('missing')).resolves.toEqual({ sessionId: 'missing', found: false })
+  })
+
+  it('propagates a read failure instead of claiming the Session is absent', async () => {
+    const observeSession = vi.fn(async () => { throw new Error('the Session store is unreadable') })
+    const { host } = inspectionHost({ services: { sessionQuery: { observeSession } } })
+
+    await expect(host.inspectSession('pm-1')).rejects.toThrow('the Session store is unreadable')
+  })
+
+  it('keeps the old answer when the host offers no sessionQuery', async () => {
+    const { host } = inspectionHost()
+    await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: false })
+  })
+
+  it('keeps reporting a live agent status without asking persistence', async () => {
+    const observeSession = vi.fn(async () => lease(() => {}))
+    const idle = inspectionHost({ agent: { status: 'idle' }, services: { sessionQuery: { observeSession } } })
+    await expect(idle.host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, status: 'idle',
+      backendSessionId: 'pm-1' })
+    const running = inspectionHost({ agent: { status: 'running' }, services: { sessionQuery: { observeSession } } })
+    await expect(running.host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, status: 'running',
+      backendSessionId: 'pm-1' })
+    expect(observeSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps a prepared Session ready without inventing a status', async () => {
+    const observeSession = vi.fn(async () => lease(() => {}))
+    const { host } = inspectionHost({ services: { sessionQuery: { observeSession } } })
+    await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'session-token' })
+
+    await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, ready: true })
+    expect(observeSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps reporting an archived Session', async () => {
+    const observeSession = vi.fn(async () => lease(() => {}))
+    const { host } = inspectionHost({ archived: ['pm-1'], services: { sessionQuery: { observeSession } } })
+
+    await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, status: 'archived',
+      backendSessionId: 'pm-1' })
+    expect(observeSession).not.toHaveBeenCalled()
   })
 })

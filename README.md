@@ -33,6 +33,14 @@ Read the numbered documents in order; each builds only on the ones before it.
 - [006 Deployment](docs/006-deployment.md): manual setup, configuration, upgrades and troubleshooting
 - [007 Architecture](docs/007-architecture.md)
 - [008 Cookbook](docs/008-cookbook.md): adding a Source
+- [009 Node protocol](docs/009-node-protocol.zh-CN.md): the control-plane/node command and event contract, SessionRecord/SessionInspection and session tokens (Chinese)
+- [010 Control-plane kernel](docs/010-control-plane-kernel.zh-CN.md): the standalone kernel, its API and run modes (Chinese)
+- [011 Phase 1B inventory](docs/011-phase1b-inventory.zh-CN.md): Phase 1B dependencies, writes and remaining boundaries (Chinese)
+- [012 Phase 2 plan](docs/012-phase2-plan.zh-CN.md): Phase 2 goals, order and acceptance criteria (Chinese)
+- [013 P2-D node spike](docs/013-p2d-node-spike.zh-CN.md): the independent DSH node spike, implementation status and E2E results (Chinese)
+- [014 P2-D2/D3 recovery](docs/014-p2d2-recovery.zh-CN.md): recovery, model and tool-boundary E2E evidence (Chinese)
+- [015 Node deployment](docs/015-node-deployment.zh-CN.md): control-plane plus independent DSH node deployment and operations (Chinese)
+- [016 Control-plane TLS](docs/016-control-plane-tls.zh-CN.md): viewer authentication, SSE and reverse-proxy TLS guidance (Chinese)
 
 ## Development
 

@@ -1,5 +1,4 @@
 /** Proactive candidate assessment for the main Session: relays candidate cards, serves bounded context reads, and records outcomes. */
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { reasonText, threadKey, type Assessor, type AssessmentOutcome, type Candidate, type EngineForMainSession,
   type Trigger } from '../core/index.ts'
@@ -9,7 +8,7 @@ import type { Commands } from '../infra/commands.ts'
 import type { Deployment } from '../deployment.ts'
 import { admissionContext } from '../sources/admission-context.ts'
 import { readRepositoryPath } from '../sources/github-read.ts'
-import type { TriggerContext } from '../sources/kind.ts'
+import type { ImageTarget, TriggerContext } from '../sources/kind.ts'
 import { relatedTickets } from './cards.ts'
 import { textPage } from './context.ts'
 import { AcknowledgementSchema } from './tools/tool.ts'
@@ -220,9 +219,9 @@ export class MasterAssessor implements Assessor {
   }
   /**
    * Serves bounded paginated text or image attachments from the evaluation's thread context or repository for
-   * `orchestrator_eval_read`; `agent` is the main Session, which receives images as attachments.
+   * `orchestrator_eval_read`; `target` is the main Session's image port, which receives images as attachments.
    */
-  async read(agent: Agent, read: EvalRead, signal: AbortSignal) {
+  async read(target: ImageTarget, read: EvalRead, signal: AbortSignal) {
       const { candidate, trigger } = this.evalFor(read.trigger_id)
       await this.seed(candidate.evalId, trigger, signal)
       const { cache } = this.reads(candidate.evalId, trigger)
@@ -235,7 +234,7 @@ export class MasterAssessor implements Assessor {
         const source = this.host.threadContext(trigger)
         if (!source) throw new Error(NO_CONTEXT)
         const key = read.image_id!.slice(read.image_id!.indexOf('/') + 1)
-        return source.image(agent, commands, image, key, this.host.deployment.stateDir, signal)
+        return source.image(target, commands, image, key, this.host.deployment.stateDir, signal)
       }
       const cacheKey = JSON.stringify([read.resource, read.path, read.cursor, read.message_id])
       if (read.offset > 0) {

@@ -6,6 +6,8 @@ import { UserError, HANDOFF, PROJECT_TICKETS, followupOwners, key, latestSession
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { allowedSender } from '../../policy.ts'
 import { MAIN_SESSION_SOURCE } from '../../sources/main-session.ts'
+import { imageTargetOf, type ImageAgent } from '../../sources/image-target.ts'
+import type { ImageTarget } from '../../sources/kind.ts'
 import { relaySession } from '../notices.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type EvalRead, type MasterAssessor } from '../assessment.ts'
 import { projectCard, projectTicketCard, ticketCard } from '../cards.ts'
@@ -37,15 +39,15 @@ const ProjectTaskSchema = z.object({
   }).strict()).max(PROJECT_TICKETS.threads).optional(),
 }).strict()
 export type ProjectTaskInput = z.infer<typeof ProjectTaskSchema>
-/** The host Session the main tools read: its id, and the events of its log for the current turn. */
-export interface MainSessionAgent {
+/** The host Session the main tools read: its id, the events of its log for the current turn, and its live image port. */
+export interface MainSessionAgent extends ImageAgent {
   readonly id: string
-  readonly session: { snapshotEvents(): readonly SessionEventView[] }
+  readonly session: ImageAgent['session'] & { snapshotEvents(): readonly SessionEventView[] }
 }
 /** The assessment operations the main tools use; the Session they read is narrowed to what those tools need. */
 export interface MainAssessorHost extends Omit<Pick<MasterAssessor, 'context' | 'read' | 'decide'>, 'read'> {
-  /** Reads one candidate's context for `agent`, the main Session that receives images. */
-  read(agent: MainSessionAgent, read: EvalRead, signal: AbortSignal): Promise<unknown>
+  /** Reads one candidate's context for `target`, the main Session's image port that receives images. */
+  read(target: ImageTarget, read: EvalRead, signal: AbortSignal): Promise<unknown>
 }
 export interface MainToolsHost {
   /** Logging surface the node platform supplies. */
@@ -552,7 +554,7 @@ export function mainTools(host: MainToolsHost, agent: MainSessionAgent): Tool[] 
       name: 'orchestrator_eval_read',
       description: 'Read more of a candidate\'s context, always with its trigger_id: a message or stub whole by message_id, an image by image_id, the root, the parent, a thread page by cursor, or a file or directory by path.',
       schema: EvalReadSchema,
-      execute: async (read, signal) => host.assessor.read(agent, read, signal),
+      execute: async (read, signal) => host.assessor.read(imageTargetOf(agent), read, signal),
     }),
     tool({
       name: 'orchestrator_eval_decide',

@@ -102,6 +102,52 @@ describe('operator execution controls', () => {
     expect(() => h.engine.stopAssignment(id, first.id)).toThrow(new UserError('assignmentEnded'))
     expect(runningAssignment(h.repo.tickets.get(id)!)?.id).not.toBe(first.id)
   })
+
+  it('records a failed Worker stop on the Ticket, keeps it stopped, and leaves no unhandled rejection', async () => {
+    const events: { type: string; data: Record<string, unknown> }[] = []
+    const h = harness({}, { emit: event => events.push(event) })
+    const id = accepted(h).ticketId!
+    const assignment = runningAssignment(h.repo.tickets.get(id)!)!
+    h.executor.stop = vi.fn(() => Promise.reject(new Error('node refused the cancel')))
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown) => { rejections.push(reason) }
+    process.on('unhandledRejection', onRejection)
+    try {
+      h.engine.stopAssignment(id, assignment.id)
+      await vi.waitFor(() => expect(h.repo.tickets.get(id)!.stopFailure).toBeDefined())
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+
+    const ticket = h.repo.tickets.get(id)!
+    expect(ticket.stopFailure).toMatchObject({ assignmentId: assignment.id, error: 'node refused the cancel' })
+    // The cleanup failure is a fact about the Worker, not a rollback: the Assignment ended and the Ticket stays stopped.
+    expect(ticket.assignments.at(-1)).toMatchObject({ state: 'ended', endedReason: 'stoppedByOperator' })
+    expect(ticket.ended).toBeUndefined()
+    expect(runningAssignment(ticket)).toBeUndefined()
+    expect(rejections).toEqual([])
+    expect(events.filter(event => event.type === 'ticket.stopFailed')).toEqual([
+      expect.objectContaining({ data: { ticketId: id, assignmentId: assignment.id, error: 'node refused the cancel' } }),
+    ])
+  })
+
+  it('clears a recorded stop failure once a later stop succeeds', async () => {
+    const h = harness()
+    const id = accepted(h).ticketId!
+    const first = runningAssignment(h.repo.tickets.get(id)!)!
+    h.executor.stop = vi.fn(() => Promise.reject(new Error('first stop refused')))
+    h.engine.stopAssignment(id, first.id)
+    await vi.waitFor(() => expect(h.repo.tickets.get(id)!.stopFailure).toBeDefined())
+
+    h.engine.allowResume(id)
+    h.engine.retryTicket(id)
+    h.settle()
+    const second = runningAssignment(h.repo.tickets.get(id)!)!
+    h.executor.stop = vi.fn(() => Promise.resolve())
+    h.engine.stopAssignment(id, second.id)
+    await vi.waitFor(() => expect(h.repo.tickets.get(id)!.stopFailure).toBeUndefined())
+    expect(h.repo.tickets.get(id)!.assignments.at(-1)).toMatchObject({ state: 'ended', endedReason: 'stoppedByOperator' })
+  })
 })
 
 describe('intake', () => {

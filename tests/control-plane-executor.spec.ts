@@ -131,6 +131,31 @@ describe('control-plane NodeExecutor', () => {
     expect(node.messages.get(`worker-${assignment.id}`)).toContain('more context for this Ticket')
   })
 
+  it('delivers a Trigger Input’s own message and task meta, not only its id', async () => {
+    directory = mkdtempSync(join(tmpdir(), 'superagent-executor-'))
+    const node = new FakeNode({ nodeId: 'local', root: join(directory, 'workspaces'), now: () => START })
+    const plane = openControl(node)
+    const project = createProject(plane)
+
+    const [ticket] = plane.engine.createProjectTickets(project.id, project.pmSessionId, [{ title: 'T', goal: 'G' }])
+    const assignment = ticket!.assignments[0]!
+    const sessionId = `worker-${assignment.id}`
+    await until(() => plane.store.tickets.get(ticket!.id)?.assignments.at(-1)?.state === 'running',
+      'the Assignment did not reach running before the Trigger delivery')
+
+    plane.store.triggers.save({ ...trigger(), id: 'trigger-2', text: 'Use the revised total 72 instead of 42.',
+      meta: { title: 'Revised total', goal: 'Deliver 72' } })
+    plane.engine.attach(ticket!.id, 'trigger-2')
+    await until(() => node.messages.get(sessionId)?.some(text => text.includes('72')) === true,
+      'the Trigger’s message text was not delivered')
+
+    // A Trigger Input names only its Trigger on the Ticket: the Executor must resolve the person's message, not send a notice.
+    const delivered = node.messages.get(sessionId)!.at(-1)!
+    expect(delivered).toContain('Use the revised total 72 instead of 42.')
+    expect(delivered).toContain('Title: Revised total')
+    expect(delivered).toContain('Goal: Deliver 72')
+  })
+
   it('reports a refused worker.create as a failed Assignment instead of leaving it pending silently', async () => {
     directory = mkdtempSync(join(tmpdir(), 'superagent-executor-'))
     const node = new RefusingWorkerCreate(new FakeNode({ nodeId: 'local', root: join(directory, 'workspaces'),

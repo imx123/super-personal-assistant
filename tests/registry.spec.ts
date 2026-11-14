@@ -2,8 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { SettingsSchema } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
-import type { SourceKind } from '../src/sources/kind.ts'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ImageTarget, SourceKind } from '../src/sources/kind.ts'
 import type { OutboundMessage } from '../src/core/index.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { HealthBoard } from '../src/infra/health.ts'
@@ -66,7 +65,7 @@ describe('Source registry', () => {
     expect(await context.read(commands, 'thread', '2')).toMatchObject({ body: { page: '2' } })
     expect(read).toEqual([['t1', 'thread', '2', 7]])
     expect(context.images('img_x')).toEqual([])
-    await expect(context.image({} as Agent, commands, { id: 'm1', text: '' }, 'img_x', '',
+    await expect(context.image({} as ImageTarget, commands, { id: 'm1', text: '' }, 'img_x', '',
       new AbortController().signal)).rejects.toThrow('no images')
     // A kind without a channel or a context has neither.
     sources.register({ ...probe, kind: 'quiet' })

@@ -7,6 +7,12 @@ const SECRET = 'test-secret'
 const now = 1_700_000_000
 const claims = { sid: 'pm-project-1', pid: 'project-1', role: 'pm' as const, backend: 'dsh' as const, nodeId: 'node-1' }
 
+/** Sign arbitrary claims with the test secret, so a shape test reaches its intended check rather than the signature. */
+function signed(value: unknown): string {
+  const encoded = Buffer.from(JSON.stringify(value), 'utf8').toString('base64url')
+  return `${encoded}.${createHmac('sha256', SECRET).update(encoded).digest('base64url')}`
+}
+
 describe('node protocol', () => {
   it('keeps the version and accepts the documented Session and command shapes', () => {
     expect(NODE_PROTOCOL_VERSION).toBe(1)
@@ -27,8 +33,26 @@ describe('session token', () => {
   it('round-trips the Session, Project, Assignment and backend claims', () => {
     const token = issueSessionToken({ ...claims, aid: 'assignment-1', backend: 'claude' }, SECRET, 60, now)
     const verified = verifySessionToken(token, SECRET, now + 30)
-    expect(verified).toMatchObject({ v: 1, sid: 'pm-project-1', pid: 'project-1', aid: 'assignment-1', role: 'pm',
+    expect(verified).toMatchObject({ v: 1, tv: 0, sid: 'pm-project-1', pid: 'project-1', aid: 'assignment-1', role: 'pm',
       backend: 'claude', nodeId: 'node-1', iat: now, exp: now + 60 })
+  })
+
+  it('signs an explicit token generation and keeps same-second tokens distinct', () => {
+    const first = issueSessionToken({ ...claims, tv: 0 }, SECRET, 60, now)
+    const second = issueSessionToken({ ...claims, tv: 1 }, SECRET, 60, now)
+
+    expect(first).not.toBe(second)
+    expect(verifySessionToken(first, SECRET, now).tv).toBe(0)
+    expect(verifySessionToken(second, SECRET, now).tv).toBe(1)
+    expect(verifySessionToken(first, SECRET, now).iat).toBe(verifySessionToken(second, SECRET, now).iat)
+  })
+
+  it('rejects a token without a token generation', () => {
+    const token = issueSessionToken(claims, SECRET, 60, now)
+    const payload = token.split('.')[0]!
+    const value = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>
+    delete value.tv
+    expect(() => verifySessionToken(signed(value), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
   })
 
   it('rejects an expired token', () => {
@@ -59,14 +83,13 @@ describe('session token', () => {
     const token = issueSessionToken(claims, SECRET, 60, now)
     const [payload] = token.split('.')
     const value = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as SessionTokenClaims
-    // Change the claims and re-sign them, so each case reaches its intended check rather than the signature.
-    const signed = (next: unknown) => {
-      const encoded = Buffer.from(JSON.stringify(next), 'utf8').toString('base64url')
-      return `${encoded}.${createHmac('sha256', SECRET).update(encoded).digest('base64url')}`
-    }
     expect(() => verifySessionToken(signed({ ...value, v: 2 }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'unsupported' }))
     expect(() => verifySessionToken(signed({ ...value, role: 'admin' }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
     expect(() => verifySessionToken(signed({ ...value, exp: value.iat }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
+    // The generation is a non-negative integer; every other shape is not a claim set.
+    expect(() => verifySessionToken(signed({ ...value, tv: -1 }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
+    expect(() => verifySessionToken(signed({ ...value, tv: 1.5 }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
+    expect(() => verifySessionToken(signed({ ...value, tv: '1' }), SECRET, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
   })
 
   it('refuses to issue with no secret or a non-positive lifetime', () => {
@@ -74,5 +97,7 @@ describe('session token', () => {
     expect(() => issueSessionToken(claims, SECRET, 0, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
     expect(() => issueSessionToken(claims, SECRET, 0.5, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
     expect(() => issueSessionToken(claims, SECRET, Number.NaN, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
+    expect(() => issueSessionToken({ ...claims, tv: -1 }, SECRET, 60, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
+    expect(() => issueSessionToken({ ...claims, tv: 1.5 }, SECRET, 60, now)).toThrowError(expect.objectContaining({ code: 'malformed' }))
   })
 })

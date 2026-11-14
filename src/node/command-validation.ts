@@ -98,6 +98,8 @@ export function validateNodeCommand(value: unknown): NodeCommand {
     case 'session.message':
       identifier(command, 'sessionId', type)
       stringField(command, 'text', type)
+      // Optional, but a present token must still name something: an empty bearer is never meaningful.
+      if (command.sessionToken !== undefined) identifier(command, 'sessionToken', type)
       break
 
     case 'session.cancel':

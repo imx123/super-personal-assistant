@@ -14,7 +14,27 @@ export interface HttpNodePortOptions {
   now?: () => string
   /** How long `inspect` waits for the node's `session.inspected` event. */
   inspectionTimeoutMs?: number
+  /**
+   * Total time one `POST /commands` may take, including reading a rejection body. A node that accepts the socket but never
+   * answers is half-reachable: without this bound a heartbeat (or any command) would wait forever, so the kernel could
+   * never record the node offline nor retry. Defaults to {@link DEFAULT_COMMAND_TIMEOUT_MS}.
+   */
+  commandTimeoutMs?: number
+  /** First delay before a dropped `subscribe` stream is reopened; every failed attempt doubles it. */
+  reconnectDelayMs?: number
+  /** Cap of the reconnect delay, so a node that stays away is retried at a steady pace instead of forever backing off. */
+  maxReconnectDelayMs?: number
+  /**
+   * Called once after a dropped `subscribe` stream was reopened, so the owner can refresh facts the missed events carried.
+   * `startControlPlane` rotates the control-plane generation here and then refreshes the node's liveness.
+   */
+  onReconnect?: () => void
 }
+
+const DEFAULT_RECONNECT_DELAY_MS = 250
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 5_000
+/** The default bound on one `send`; a heartbeat must settle well within its interval so the loop can retry. */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 10_000
 
 interface Subscription {
   listener: (event: NodeEvent) => void
@@ -22,6 +42,15 @@ interface Subscription {
   /** Resolves once the SSE response is open, so a command sent after it cannot race the connection. */
   ready: Promise<void>
   settleReady(error?: Error): void
+  /** Whether a dropped stream is reopened; `inspect` asks for one stream and never retries. */
+  reconnect: boolean
+  /** Consecutive failed attempts since the stream was last open; drives the reconnect backoff. */
+  attempts: number
+  /** Whether this subscription already opened once, so a later open is a reconnect worth refreshing state for. */
+  connected: boolean
+  /** The pending backoff timer, so `detach` can cancel it instead of leaving one behind. */
+  retryTimer?: ReturnType<typeof setTimeout>
+  cancelRetry?: () => void
 }
 
 function describe(error: unknown): string {
@@ -43,6 +72,11 @@ export class HttpNodePort implements NodePort {
   private readonly nodeId: string
   private readonly now: () => string
   private readonly inspectionTimeoutMs: number
+  private readonly commandTimeoutMs: number
+  private readonly reconnectDelayMs: number
+  private readonly maxReconnectDelayMs: number
+  /** Assignable so an owner that builds the control plane later can still refresh it when this transport reconnects. */
+  onReconnect?: () => void
   private readonly subscriptions = new Set<Subscription>()
 
   constructor(options: HttpNodePortOptions) {
@@ -53,15 +87,54 @@ export class HttpNodePort implements NodePort {
     this.nodeId = options.nodeId ?? 'local'
     this.now = options.now ?? (() => new Date().toISOString())
     this.inspectionTimeoutMs = options.inspectionTimeoutMs ?? 5000
+    const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
+    // An invalid bound must never silently mean "no timeout": a deployment typo would freeze every heartbeat again.
+    if (typeof commandTimeoutMs !== 'number' || !Number.isFinite(commandTimeoutMs) || commandTimeoutMs <= 0) {
+      throw new Error('HttpNodePort commandTimeoutMs must be a positive finite number of milliseconds')
+    }
+    this.commandTimeoutMs = commandTimeoutMs
+    this.reconnectDelayMs = options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS
+    this.maxReconnectDelayMs = options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS
+    this.onReconnect = options.onReconnect
   }
 
+  /**
+   * POST one command, bounded by `commandTimeoutMs` and by the caller's optional signal.
+   *
+   * The caller's signal is merged rather than replaced: `inspect` aborts the stream and the command with its own deadline,
+   * and this transport still needs its own total bound for every command no caller aborts. A timeout rejects with an error
+   * naming the command type and the limit (never the token), so `ControlPlane.heartbeat` records the node offline and its
+   * loop can retry instead of awaiting a fetch that will never settle. The timer and abort listener are always removed.
+   */
   async send(command: NodeCommand, signal?: AbortSignal): Promise<void> {
-    const response = await fetch(`${this.baseUrl}/commands`, { method: 'POST',
-      headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', accept: 'application/json' },
-      body: JSON.stringify(command), ...(signal ? { signal } : {}) })
-    if (response.ok) return
-    const detail = await response.text().catch(() => '')
-    throw new Error(`Node rejected ${command.type}: HTTP ${response.status}${detail ? `: ${detail.slice(0, 500)}` : ''}`)
+    const controller = new AbortController()
+    const timeoutError = new Error(`The node did not answer ${command.type} within ${this.commandTimeoutMs} ms`)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort(timeoutError)
+    }, this.commandTimeoutMs)
+    const forwardAbort = (): void => { controller.abort(signal?.reason) }
+    if (signal) {
+      if (signal.aborted) forwardAbort()
+      else signal.addEventListener('abort', forwardAbort, { once: true })
+    }
+    try {
+      const response = await fetch(`${this.baseUrl}/commands`, { method: 'POST',
+        headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(command), signal: controller.signal })
+      if (response.ok) return
+      const detail = await response.text().catch(() => '')
+      throw new Error(`Node rejected ${command.type}: HTTP ${response.status}${detail ? `: ${detail.slice(0, 500)}` : ''}`)
+    } catch (error) {
+      // Aborting a fetch does not consistently preserve the abort reason across implementations, so the timeout flag is the
+      // authority: a caller-owned abort still surfaces unchanged, a timeout always reports the node that never answered.
+      if (timedOut) throw timeoutError
+      throw error
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', forwardAbort)
+    }
   }
 
   /**
@@ -107,24 +180,26 @@ export class HttpNodePort implements NodePort {
   }
 
   subscribe(listener: (event: NodeEvent) => void): () => void {
-    const subscription = this.attach(listener)
+    const subscription = this.attach(listener, new AbortController(), true)
     return () => { this.detach(subscription) }
   }
 
   /**
    * Open one SSE stream; the caller owns its disposal and may await `ready` before sending a command. A caller that
-   * passes its own controller can abort the stream together with the work that depends on it.
+   * passes its own controller can abort the stream together with the work that depends on it. Only a subscription asks
+   * for reopening; `inspect` gets one stream so a failed question fails once instead of waiting on a retry loop.
    */
-  private attach(listener: (event: NodeEvent) => void, controller = new AbortController()): Subscription {
+  private attach(listener: (event: NodeEvent) => void, controller = new AbortController(),
+    reconnect = false): Subscription {
     let settleReady!: (error?: Error) => void
     const ready = new Promise<void>((resolve, reject) => {
       settleReady = error => error ? reject(error) : resolve()
     })
-    // A stream nobody awaits must not surface as an unhandled rejection; `consume` still reports the error.
+    // A stream nobody awaits must not surface as an unhandled rejection; `pump` still reports the error.
     ready.catch(() => {})
-    const subscription: Subscription = { listener, controller, ready, settleReady }
+    const subscription: Subscription = { listener, controller, ready, settleReady, reconnect, attempts: 0, connected: false }
     this.subscriptions.add(subscription)
-    void this.consume(subscription).catch(error => {
+    void this.pump(subscription).catch(error => {
       subscription.settleReady(error instanceof Error ? error : new Error(describe(error)))
       if (!subscription.controller.signal.aborted) {
         process.stderr.write(`superagent node event stream failed: ${describe(error)}\n`)
@@ -135,10 +210,87 @@ export class HttpNodePort implements NodePort {
 
   private detach(subscription: Subscription): void {
     if (!this.subscriptions.delete(subscription)) return
+    // A canceled backoff resolves its wait and clears its timer before the abort reaches the stream.
+    subscription.cancelRetry?.()
     subscription.controller.abort()
   }
 
-  private async consume(subscription: Subscription): Promise<void> {
+  /**
+   * Keep one subscription's stream open for as long as the subscription lives.
+   *
+   * A one-shot stream fails once and stops. A subscribed stream reopens after the stream ends or the node restarts,
+   * waiting `reconnectDelayMs` and doubling that per failed attempt up to `maxReconnectDelayMs`. A stream that opens
+   * again resets the backoff and calls `onReconnect` once, because events sent while it was down were missed. An
+   * unsubscribe aborts the controller and cancels a pending wait, so no timer or socket outlives the subscription.
+   */
+  private async pump(subscription: Subscription): Promise<void> {
+    while (!subscription.controller.signal.aborted && this.subscriptions.has(subscription)) {
+      try {
+        await this.consume(subscription, () => { this.noteOpen(subscription) })
+      } catch (error) {
+        if (subscription.controller.signal.aborted || !this.subscriptions.has(subscription)) return
+        if (!subscription.reconnect) {
+          subscription.settleReady(error instanceof Error ? error : new Error(describe(error)))
+          process.stderr.write(`superagent node event stream failed: ${describe(error)}\n`)
+          return
+        }
+        if (subscription.attempts === 0) {
+          // One line per outage: a stream that opened and then dropped, or a first connection that never opened.
+          process.stderr.write(`superagent node event stream lost, reconnecting: ${describe(error)}\n`)
+        }
+      }
+      if (subscription.controller.signal.aborted || !this.subscriptions.has(subscription)) return
+      if (!subscription.reconnect) return
+      // An ended or failed stream counts as one drop; consecutive failures double the wait from the base delay.
+      subscription.attempts += 1
+      const delay = Math.min(this.reconnectDelayMs * 2 ** (subscription.attempts - 1), this.maxReconnectDelayMs)
+      if (!(await this.waitBeforeRetry(subscription, delay))) return
+    }
+  }
+
+  /** Called as soon as a stream is open: a later open is a reconnect, so reset the backoff and refresh state once. */
+  private noteOpen(subscription: Subscription): void {
+    if (subscription.controller.signal.aborted || !this.subscriptions.has(subscription)) return
+    const wasConnected = subscription.connected
+    subscription.connected = true
+    subscription.attempts = 0
+    if (!wasConnected) return
+    try {
+      this.onReconnect?.()
+    } catch (error) {
+      process.stderr.write(`superagent node reconnect handler failed: ${describe(error)}\n`)
+    }
+  }
+
+  /** Wait out one reconnect backoff; resolves false when the subscription was disposed during the wait. */
+  private waitBeforeRetry(subscription: Subscription, delayMs: number): Promise<boolean> {
+    return new Promise<boolean>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (retry: boolean): void => {
+        if (timer !== undefined) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+        subscription.retryTimer = undefined
+        subscription.cancelRetry = undefined
+        subscription.controller.signal.removeEventListener('abort', onAbort)
+        resolve(retry)
+      }
+      const onAbort = (): void => { finish(false) }
+      timer = setTimeout(() => { finish(true) }, delayMs)
+      // A pending retry must not keep the process alive; `detach` still cancels it immediately.
+      timer.unref?.()
+      subscription.retryTimer = timer
+      subscription.cancelRetry = () => { finish(false) }
+      if (subscription.controller.signal.aborted) {
+        finish(false)
+        return
+      }
+      subscription.controller.signal.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
+  private async consume(subscription: Subscription, onOpen?: () => void): Promise<void> {
     const response = await fetch(`${this.baseUrl}/events`, {
       headers: { authorization: `Bearer ${this.token}`, accept: 'text/event-stream' },
       signal: subscription.controller.signal,
@@ -148,6 +300,7 @@ export class HttpNodePort implements NodePort {
 
     const reader = response.body.getReader()
     subscription.settleReady()
+    onOpen?.()
     const decoder = new TextDecoder()
     let buffer = ''
     try {

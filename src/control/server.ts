@@ -3,15 +3,26 @@ import { timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { UserError, type ProjectTicketTask, type WorkerReport } from '../core/index.ts'
-import { WORKER_REPORT_STATES } from '../shared/protocol.ts'
+import { WORKER_REPORT_STATES, type NodeEvent } from '../shared/protocol.ts'
 import { SessionTokenError } from '../shared/session-token.ts'
 import { ControlPlane, SessionEnsureError, ToolCallError, type ToolCallErrorCode } from './control-plane.ts'
 
 export interface ControlPlaneServerOptions {
   /** Bearer token required by every `/v1` route; `/health` stays public. */
   token: string
+  /**
+   * Optional read-only bearer token: it may `GET` the read routes and is refused with 403 on everything that writes.
+   * Unset, the server accepts exactly the one token it always did. It must differ from `token`: one secret cannot carry
+   * two roles without hiding a deployment mistake.
+   */
+  viewerToken?: string
   host?: string
+  /** How often an open event stream writes a keepalive comment; tests shorten it. */
+  keepaliveMs?: number
 }
+
+/** The interval an idle event stream is kept alive with, well under the usual 30–60 s proxy idle timeout. */
+const DEFAULT_KEEPALIVE_MS = 15_000
 
 /** A client-facing HTTP status and a message that is safe to return. */
 class HttpError extends Error {
@@ -53,6 +64,20 @@ function tokenMatches(given: string | undefined, expected: string): boolean {
   const actual = Buffer.from(given.slice('Bearer '.length), 'utf8')
   const wanted = Buffer.from(expected, 'utf8')
   return actual.length === wanted.length && timingSafeEqual(actual, wanted)
+}
+
+/**
+ * The last event a stream client already saw, from its `after` query or its `Last-Event-ID` header.
+ *
+ * A value may be omitted or empty (meaning "from the beginning"), and anything else must be a non-negative safe
+ * integer: an unparseable cursor would silently replay the wrong slice, so it is a client error instead.
+ */
+function cursor(value: string | string[] | null | undefined, name: string): number {
+  const raw = Array.isArray(value) ? value[0] : value
+  if (raw === null || raw === undefined || raw === '') return 0
+  const parsed = Number(raw)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new HttpError(400, `${name} must be a non-negative integer`)
+  return parsed
 }
 
 /** The Session token a tool request carries; a missing or malformed header is an authentication failure. */
@@ -138,12 +163,24 @@ const TOOL_STATUS: Record<ToolCallErrorCode, number> = { unauthenticated: 401, f
 export class ControlPlaneServer {
   private readonly server: Server
   private readonly token: string
+  private readonly viewerToken: string | undefined
   private readonly host: string
+  private readonly keepaliveMs: number
+  /** Event streams that are currently open, so `close` can end them instead of waiting on their sockets. */
+  private readonly streams = new Set<ServerResponse>()
+  private closed = false
 
   constructor(private readonly control: ControlPlane, options: ControlPlaneServerOptions) {
     if (!options.token) throw new Error('A control-plane API token is required')
+    // Refused before a socket exists: treating one secret as both roles would silently widen or narrow real access.
+    if (options.viewerToken !== undefined && options.viewerToken !== '' && options.viewerToken === options.token) {
+      throw new Error('The read-only viewer token must differ from the control-plane API token')
+    }
     this.token = options.token
+    // An empty variable means "not configured", the same convention the other optional settings follow.
+    this.viewerToken = options.viewerToken === '' ? undefined : options.viewerToken
     this.host = options.host ?? '127.0.0.1'
+    this.keepaliveMs = options.keepaliveMs ?? DEFAULT_KEEPALIVE_MS
     this.server = createServer((req, res) => { void this.handle(req, res) })
   }
 
@@ -158,8 +195,18 @@ export class ControlPlaneServer {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    // An open SSE response never finishes on its own, so the server would wait forever for it: end every stream first.
+    for (const stream of [...this.streams]) {
+      this.streams.delete(stream)
+      try { stream.end() } catch { /* an already-broken socket needs no ending */ }
+    }
     if (!this.server.listening) return
-    await new Promise<void>((resolve, reject) => this.server.close(error => error ? reject(error) : resolve()))
+    await new Promise<void>((resolve, reject) => {
+      this.server.close(error => error ? reject(error) : resolve())
+      this.server.closeAllConnections()
+    })
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -170,9 +217,12 @@ export class ControlPlaneServer {
       // Tool routes authenticate the acting Session, not the operator: a token issued for one PM or Worker is the only
       // authority there, so the control-plane API token must never open them (and vice versa).
       if (url.pathname.startsWith('/v1/tools/')) return await this.handleTool(req, res, url)
-      if (!tokenMatches(req.headers.authorization, this.token)) throw new HttpError(401, 'A control-plane bearer token is required')
 
       const method = req.method ?? 'GET'
+      // Authentication runs before routing, so a route added below can never forget the check. A viewer passes only for
+      // the reads further down — every one of them is a `GET` — and every write is refused right here.
+      this.authenticate(req.headers.authorization, method)
+
       if (method === 'GET' && url.pathname === '/v1/state') return json(res, 200, this.control.state())
       if (method === 'GET' && url.pathname === '/v1/projects') return json(res, 200, { projects: this.control.projects() })
       if (method === 'GET' && url.pathname === '/v1/tickets') return json(res, 200, { tickets: this.control.tickets() })
@@ -182,6 +232,7 @@ export class ControlPlaneServer {
         if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(400, 'after must be a non-negative integer')
         return json(res, 200, { events: this.control.events.filter(event => event.seq > after) })
       }
+      if (method === 'GET' && url.pathname === '/v1/events/stream') return this.eventStream(req, res, url)
 
       if (method === 'POST' && url.pathname === '/v1/nodes/register') {
         const body = await readJson(req)
@@ -255,6 +306,11 @@ export class ControlPlaneServer {
 
       throw new HttpError(404, 'Not found')
     } catch (error) {
+      // Once an event stream answered, an error can only end it; writing a JSON status would throw over its headers.
+      if (res.headersSent) {
+        res.end()
+        return
+      }
       if (error instanceof HttpError) return json(res, error.status, { error: error.message })
       // A bad, expired or mismatched Session token is an authentication failure, never a server bug.
       if (error instanceof SessionTokenError) return json(res, 401, { error: error.message })
@@ -268,6 +324,78 @@ export class ControlPlaneServer {
   }
 
   /**
+   * Accept one control-plane bearer token for one request, or throw the status the client should see.
+   *
+   * The operator token may do anything below. The optional viewer token may only `GET`, which is exactly the read half of
+   * the API; a write with it is an authenticated 403, never a 401, and the message says why without echoing any token. A
+   * missing, wrong or Session token stays a 401 before either role is considered.
+   */
+  private authenticate(header: string | undefined, method: string): void {
+    if (tokenMatches(header, this.token)) return
+    if (this.viewerToken !== undefined && tokenMatches(header, this.viewerToken)) {
+      if (method !== 'GET') throw new HttpError(403, 'A read-only viewer token may only GET /v1 read routes')
+      return
+    }
+    throw new HttpError(401, 'A control-plane bearer token is required')
+  }
+
+  /**
+   * The control plane's event stream: replay what the kernel already recorded, then follow it live.
+   *
+   * Authentication is a control-plane bearer token, checked before this method runs: the operator's, or the read-only
+   * viewer's because this is a GET, and never a Session token. `after` (query) or `Last-Event-ID` (header) names the last
+   * event the client saw; the query wins when both are present. Each frame carries its `seq` as the SSE id and the event
+   * as JSON, so a client that reconnects with the id it last read receives exactly the events it missed and none twice.
+   * No token is part of a frame: the kernel removes tokens before a Session record is stored, and no node event carries
+   * one.
+   */
+  private eventStream(req: IncomingMessage, res: ServerResponse, url: URL): void {
+    const after = url.searchParams.has('after')
+      ? cursor(url.searchParams.get('after'), 'after')
+      : cursor(req.headers['last-event-id'], 'Last-Event-ID')
+    res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform',
+      'x-accel-buffering': 'no', 'x-content-type-options': 'nosniff' })
+    res.flushHeaders()
+    res.write(': connected\n\n')
+
+    const write = (event: NodeEvent): void => {
+      if (this.closed || res.writableEnded || res.destroyed) return
+      try {
+        res.write(`id: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`)
+      } catch {
+        // A broken socket must not fail the kernel call that produced the event; the close listener cleans up.
+      }
+    }
+    // Subscribe before replaying, synchronously: no event can be delivered between the backlog and the subscription,
+    // and because both run in one turn of the event loop, a replayed event cannot be written twice either.
+    const unsubscribe = this.control.subscribe(write)
+    for (const event of this.control.events) {
+      if (event.seq > after) write(event)
+    }
+    const keepalive = setInterval(() => {
+      if (this.closed || res.writableEnded || res.destroyed) return
+      try {
+        res.write(': keepalive\n\n')
+      } catch {
+        // The close listener below cleans up.
+      }
+    }, this.keepaliveMs)
+    keepalive.unref()
+    this.streams.add(res)
+
+    let cleaned = false
+    const cleanup = (): void => {
+      if (cleaned) return
+      cleaned = true
+      clearInterval(keepalive)
+      this.streams.delete(res)
+      unsubscribe()
+    }
+    res.once('close', cleanup)
+    res.once('error', cleanup)
+  }
+
+  /**
    * The control-plane tools a PM or Worker calls through its Session token.
    *
    * These routes exist for the node's proxy tools: the token proves which Session acts, and the kernel derives the
@@ -276,6 +404,20 @@ export class ControlPlaneServer {
   private async handleTool(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const method = req.method ?? 'GET'
     const token = bearer(req.headers.authorization)
+
+    // Refreshing extends the caller's own Session and reads no body: the present token selects it, so no role check is
+    // needed. It is checked before the ordinary tool routes because this is the one place a token one generation behind the
+    // record is still accepted, and the one place an already expired token is: the kernel's bounded grace lets a long task
+    // that outlived its TTL rotate itself instead of being stranded. Every other route below verifies strictly and answers
+    // 401 for both.
+    if (method === 'POST' && url.pathname === '/v1/tools/token/refresh') {
+      const claims = this.control.verifyToolToken(token, { allowPrevious: true,
+        allowExpiredSeconds: this.control.tokenRefreshGraceSeconds })
+      const refreshed = this.control.refreshToolToken(claims.sid)
+      const expiresAt = new Date(this.control.verifyToolToken(refreshed).exp * 1000).toISOString()
+      return json(res, 200, { token: refreshed, expiresAt })
+    }
+
     const claims = this.control.verifyToolToken(token)
 
     // The PM's read path: its own Project and Tickets, derived from the token's Session and never from a body.

@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 
 declare module '@deepseek-ai/dsh-llm' {
@@ -25,6 +25,33 @@ function deliveryId(message: UserMessage): string | undefined {
 }
 
 /**
+ * The delivery ids one Session event records.
+ *
+ * DSH 0.2.2 logs a delivered inbox message as `agent/inbox/spliced` rather than `user/message`, and the same event type
+ * also records a removal (`inserted: []`). Both the live stream and the persisted history are read through here, so a
+ * message only present in a splice is still recognized after a restart.
+ */
+function eventDeliveryIds(event: SessionEvent): string[] {
+  if (event.type === 'user/message') {
+    const id = deliveryId(event.data)
+    return id === undefined ? [] : [id]
+  }
+  if (event.type !== 'agent/inbox/spliced') return []
+  // Persisted data is not trusted to keep the declared shape: an older or malformed splice contributes no ids.
+  const inserted: unknown = event.data.inserted
+  if (!Array.isArray(inserted)) return []
+  const ids: string[] = []
+  for (const candidate of inserted) {
+    if (typeof candidate !== 'object' || candidate === null) continue
+    const message = candidate as Partial<UserMessage>
+    if (typeof message.id !== 'string' || typeof message.source !== 'object' || message.source === null) continue
+    const id = deliveryId(message as UserMessage)
+    if (id !== undefined) ids.push(id)
+  }
+  return ids
+}
+
+/**
  * Delivers messages to DSH agents at most once per request ID across active and restored Sessions.
  * Tracks delivered message IDs from live Session events, persisted history, and pending inboxes so retries from `Sessions` do not duplicate messages,
  * and marks delivered messages with `dsh-superagent`'s own source (`dsh-superagent`) rather than user RPCs so they are never mistaken for messages written by a person.
@@ -33,9 +60,9 @@ export class AgentDelivery {
   private readonly seen = new WeakMap<Session, Seen>()
   constructor(private readonly ctx: Context) {
     ctx.on('session/event', (session, event) => {
-      if (event.type !== 'user/message') return
-      const id = deliveryId(event.data)
-      if (id) this.seen.get(session)?.ids.add(id)
+      const seen = this.seen.get(session)
+      if (!seen) return
+      for (const id of eventDeliveryIds(event)) seen.ids.add(id)
     })
   }
   private async history(agent: Agent): Promise<Seen> {
@@ -49,9 +76,7 @@ export class AgentDelivery {
         const { events } = await handle.read(offset, 512)
         if (!events.length) break
         for (const event of events) {
-          if (event.type !== 'user/message') continue
-          const id = deliveryId(event.data)
-          if (id) state.ids.add(id)
+          for (const id of eventDeliveryIds(event)) state.ids.add(id)
         }
         offset += events.length
       }

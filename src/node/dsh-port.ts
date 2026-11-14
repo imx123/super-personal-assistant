@@ -5,8 +5,8 @@
  */
 import { mkdirSync } from 'node:fs'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
-import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type SessionInspection,
-  type SessionRole } from '../shared/protocol.ts'
+import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type RoleProfile,
+  type SessionInspection, type SessionRole } from '../shared/protocol.ts'
 import { NodeCommandError, validateNodeCommand } from './command-validation.ts'
 
 /** Omits a field from each member of a union, so a discriminated command or event keeps its narrowing. */
@@ -38,16 +38,24 @@ export interface DshPortHost {
    * knows a control URL — register the control-plane proxy tools that call it with `sessionToken`.
    */
   ensureSession(input: { sessionId: string; workspace: string; title: string; role: 'pm' | 'worker'; prompt?: string
+    /** The control plane's role definition, complete: the node applies its preset, permission and model. */
+    profile: RoleProfile
     /** The control plane's short-lived token; the host hands it to the proxy tools, never to the prompt. */
     sessionToken: string
     /** The Ticket a Worker Session executes, when the command names one. */
     ticketId?: string
     /** The Assignment a Worker Session executes. */
     assignmentId?: string }): Promise<void>
-  /** Deliver `text` to the Session's next turn, once per idempotency key; rejects when the backend refused it. */
-  promptSession(sessionId: string, idempotencyKey: string, text: string): Promise<void>
-  /** Cancel the Session's current turn, keeping messages it has not claimed yet. */
-  cancelSession(sessionId: string): void
+  /**
+   * Deliver `text` to the Session's next turn, once per idempotency key; rejects when the backend refused it.
+   *
+   * A `sessionToken` is the control plane's latest token for the Session. The node has no signing secret, so this is a
+   * pass-through, not a local verification: the control plane's tool routes remain the verifier.
+   */
+  promptSession(sessionId: string, idempotencyKey: string, text: string, sessionToken?: string,
+    inputIds?: readonly string[]): Promise<void>
+  /** Cancel the Session's current turn and resolve once that turn has settled; keep unclaimed messages. */
+  cancelSession(sessionId: string, reason?: string): Promise<void>
   /** Archive the Session with the host; rejects when the archive did not happen. */
   archiveSession(sessionId: string): Promise<void>
   /** Report what the host knows about one Session, without changing it. */
@@ -189,7 +197,7 @@ export class DshNodePort implements NodePort {
         mkdirSync(workspace, { recursive: true, mode: 0o700 })
         this.sessions.set(command.sessionId, { projectId: command.project.id, role: 'pm' })
         await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: command.project.title,
-          role: 'pm', prompt: command.profile.prompt, sessionToken: command.sessionToken })
+          role: 'pm', prompt: command.profile.prompt, profile: command.profile, sessionToken: command.sessionToken })
         break
       }
 
@@ -201,18 +209,19 @@ export class DshNodePort implements NodePort {
         // The control plane sends the role prompt here by default and a Ticket's own prompt otherwise; either way it is
         // the Session's first message, so an empty one falls back to the profile's.
         await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: `Worker ${command.ticketId}`,
-          role: 'worker', prompt: command.prompt || command.profile.prompt, sessionToken: command.sessionToken,
-          ticketId: command.ticketId, assignmentId: command.assignmentId })
+          role: 'worker', prompt: command.prompt || command.profile.prompt, profile: command.profile,
+          sessionToken: command.sessionToken, ticketId: command.ticketId, assignmentId: command.assignmentId })
         break
       }
 
       case 'session.message':
         // The host's queue is idempotent per key, and awaiting it is what lets a refused delivery fail the command.
-        await this.host.promptSession(command.sessionId, command.idempotencyKey, command.text)
+        await this.host.promptSession(command.sessionId, command.idempotencyKey, command.text, command.sessionToken,
+          command.inputIds)
         break
 
       case 'session.cancel':
-        this.host.cancelSession(command.sessionId)
+        await this.host.cancelSession(command.sessionId, command.reason)
         break
 
       case 'session.archive':

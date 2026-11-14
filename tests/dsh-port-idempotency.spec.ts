@@ -59,7 +59,7 @@ class GatedHost implements DshPortHost {
   }
 
   async promptSession(): Promise<void> {}
-  cancelSession(): void {}
+  async cancelSession(): Promise<void> {}
   async archiveSession(): Promise<void> {}
   async inspectSession(sessionId: string): Promise<SessionInspection> {
     return { sessionId, found: false }

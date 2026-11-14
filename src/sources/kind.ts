@@ -1,5 +1,4 @@
 /** SourceKind plugin contract: configuration schema, UI form fields, policy integration, channel adapter, and thread context reader. */
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { z } from 'zod'
 import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
@@ -61,6 +60,42 @@ export interface ContextMessage {
 }
 export type ContextPartName = 'thread' | 'root' | 'parent'
 export interface ContextPart { messages: ContextMessage[]; next?: string | undefined; body: Record<string, unknown>; status?: string }
+/** Raster media types an image read accepts and commits. */
+export type ImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif'
+/** One image committed as a model-visible attachment; only the fields an assessment hands back to the model. */
+export interface ImageAttachment {
+  /** Opaque attachment identity; never a filesystem path or bearer URL. */
+  readonly attachmentId: string
+  readonly mediaType: ImageMediaType
+  readonly bytes: number
+  readonly width: number
+  readonly height: number
+  /** Optional display name stripped of local path information. */
+  readonly name?: string
+}
+/** The attachment service one image read commits through: only the image limits and `saveImage` it calls. */
+export interface ImageAttachments {
+  readonly imageLimits: { readonly maxImageBytes: number; readonly maxMessageImageBytes: number }
+  saveImage(input: { readonly data: Uint8Array; readonly mediaType: ImageMediaType; readonly name?: string }): Promise<ImageAttachment>
+}
+/** The model capability lookup one image read performs before downloading anything. */
+export interface ImageModels {
+  resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{ readonly inputModalities?: readonly string[] }>
+}
+/**
+ * Narrow port for reading one image of a Trigger into the main Session, in place of the DSH `Agent` a SourceKind used to
+ * receive: a Source only needs the attachment service, the model capability lookup, and the Session's resolved route.
+ */
+export interface ImageTarget {
+  /** Attachment service of the Session that receives the image, when mounted. */
+  readonly attachments?: ImageAttachments
+  /** Model service used to check that the resolved route accepts images, when mounted. */
+  readonly llm?: ImageModels
+  /** Provider of the Session's latest request, or its selected route before the first request. */
+  readonly provider?: string
+  /** Model of the Session's latest request, or its selected route before the first request. */
+  readonly model?: string
+}
 /** Bounded thread context reader used by assessments to inspect messages and images around a trigger. */
 export interface ThreadContext<C> {
   /** The ID of the Trigger's own message among the messages of its Thread. */
@@ -69,16 +104,16 @@ export interface ThreadContext<C> {
   read(commands: Commands, trigger: Trigger, part: ContextPartName, cursor: string | undefined, config: C): Promise<ContextPart>
   /** Extracts image keys from message text that `image` can read; omitted for kinds without image support. */
   images?(text: string): string[]
-  /** Reads one image of a message in the Trigger's Thread as an attachment for `agent`. */
-  image?(agent: Agent, commands: Commands, trigger: Trigger, message: { id: string; text: string }, key: string, stateDir: string,
+  /** Reads one image of a message in the Trigger's Thread as an attachment for `target`, the main Session's image port. */
+  image?(target: ImageTarget, commands: Commands, trigger: Trigger, message: { id: string; text: string }, key: string, stateDir: string,
     signal: AbortSignal): Promise<unknown>
 }
 export interface TriggerContext {
   readonly messageId: string
   read(commands: Commands, part: ContextPartName, cursor?: string): Promise<ContextPart>
   images(text: string): string[]
-  /** @throws for a kind without image support. */
-  image(agent: Agent, commands: Commands, message: { id: string; text: string }, key: string, stateDir: string,
+  /** Reads one image as an attachment for `target`, the main Session's image port; @throws for a kind without image support. */
+  image(target: ImageTarget, commands: Commands, message: { id: string; text: string }, key: string, stateDir: string,
     signal: AbortSignal): Promise<unknown>
 }
 /** Pluggable source kind descriptor registered with SourceRegistry. */

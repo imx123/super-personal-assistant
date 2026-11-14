@@ -93,4 +93,32 @@ describe('control-plane Session persistence', () => {
     expect(third.session(pm.sessionId)).toMatchObject({ status: 'archived', archivedAt: expect.any(String) })
     await expect(third.sendMessage(pm.sessionId, 'too late')).rejects.toThrow(/not running/)
   })
+
+  it('persists the token generation and rejects the retired token after a restart', async () => {
+    directory = mkdtempSync(join(tmpdir(), 'superagent-control-persist-'))
+    node = new FakeNode({ nodeId: 'local', root: join(directory, 'workspaces') })
+    const first = open()
+    await first.registerNode()
+    first.store.triggers.save(trigger())
+    const project = first.createProject('trigger-1', 'Project', 'Goal')
+    const pm = await first.openProject(project.id)
+    const retired = node.tokens.get(pm.sessionId)!
+    expect(verifySessionToken(retired, SECRET).tv).toBe(0)
+    expect(first.session(pm.sessionId)?.tokenVersion).toBeUndefined()
+
+    const refreshed = first.refreshToolToken(pm.sessionId)
+    expect(verifySessionToken(refreshed, SECRET).tv).toBe(1)
+    expect(first.session(pm.sessionId)?.tokenVersion).toBe(1)
+    expect(first.store.get(KV.control.session(pm.sessionId))).toMatchObject({ tokenVersion: 1 })
+    expect(() => first.verifyToolToken(retired)).toThrow(/superseded/)
+    expect(() => first.verifyToolToken(retired, { allowPrevious: true })).not.toThrow()
+    await first.close()
+
+    // The generation is part of the persisted record, so a restart neither re-issues the retired token nor accepts it.
+    const second = open()
+    expect(second.session(pm.sessionId)?.tokenVersion).toBe(1)
+    expect(() => second.verifyToolToken(retired)).toThrow(/superseded/)
+    expect(() => second.verifyToolToken(retired, { allowPrevious: true })).not.toThrow()
+    expect(() => second.verifyToolToken(refreshed)).not.toThrow()
+  })
 })

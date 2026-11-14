@@ -500,6 +500,18 @@ export interface Ticket {
   execution?: Execution
   /** The latest failed delivery of an Input to its worker, until a delivery succeeds. */
   delivery?: { error: string; at: string }
+  /**
+   * The last attempt to stop one of its Assignments failed, so no Worker was confirmed stopped even though the Assignment
+   * already ended. A successful stop clears it; an ended Ticket keeps it without becoming open again.
+   */
+  stopFailure?: StopFailure
+}
+/** A stop the Executor could not confirm: the Assignment ended, but its Worker's cancellation failed. */
+export interface StopFailure {
+  at: string
+  assignmentId: string
+  /** The redacted diagnostic of the failure, bounded like `delivery.error`. */
+  error: string
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it

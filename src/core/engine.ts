@@ -1152,11 +1152,13 @@ export class Engine {
   }
   /**
    * The Executor's fact that the worker's Session of an open ticket took the messages that carried Inputs into a step, from
-   * which its model reads them: a report or the end of a turn after that counts them as read at the ticket's end.
+   * which its model reads them: a report or the end of a turn after that counts them as read at the ticket's end. With
+   * `assignmentId`, only that Assignment's turn counts: a late turn of a replaced Worker names Inputs the current Worker
+   * never took, so it marks nothing read.
    * @throws UserError when the ticket is unknown.
    */
-  inputsRead(ticketId: string, inputIds: string[]): void {
-    this.repo.atomic(() => { this.assignments.read(ticketId, inputIds) })
+  inputsRead(ticketId: string, inputIds: string[], assignmentId?: string): void {
+    this.repo.atomic(() => { this.assignments.read(ticketId, inputIds, assignmentId) })
   }
   /** The Executor's fact that a turn of the worker of the Assignment that runs the ticket ended, after a report too. */
   turnEnded(ticketId: string, assignmentId: string, interruptedAt?: string): void {
