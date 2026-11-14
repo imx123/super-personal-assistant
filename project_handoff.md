@@ -2,7 +2,7 @@
 
 本文是 superagent 的交接入口，给接手的人一份整体地图。具体设计、字段和验收细节不在这里重复，按文末“文档地图”去对应文档看。
 
-最后更新：2026-11-14。当前 HEAD 为 `561f4b8`；工作区有 Phase 2 的未提交改动（审计修复后 69 条 `git status --porcelain`），未 push。
+最后更新：2026-11-14。当前 HEAD 为 `f863a21`；Phase 2 已提交，`main` 领先 `origin/main` 5 个提交（`1ca78fc`、`cc1c8c6`、`eb40165`、`63686d0`、`f863a21`），未 push；工作区仅剩既有未跟踪 `docs/P2_AUDIT.zh-CN.md`。
 
 ## 当前阶段
 
@@ -16,13 +16,14 @@
 - 跨层修复：`session.inspect` 显式确认、同一 Session 创建单飞、角色安装失败 502、消息/归档结果回传、未知命令 400/422/500、`startControlPlane` 注册失败 fail-fast；`NodeExecutor` 已让独立 Engine 的 Assignment 创建 Worker Session 并回写 `assignmentStarted`。
 - 工具桥：`control_project` / `control_create_tickets` / `control_report` 通过 session token 调用控制面 `/v1/tools/*`；PM 可读取自己的 Project 和已有 Ticket，建单进 `createProjectTickets`，Worker Report 回原 Ticket/Assignment；RoleProfile prompt/tools 已接入。NodeExecutor 的 Worker 首条消息含 Ticket/Goal/Scope/Note/Assignment，`deliver` 成功后 `inputsDelivered` 清 undelivered。
 - 真实 DSH + 真实模型全链路已通过：隔离 profile、独立控制面、真实 DSH 插件、`opencode-go/deepseek-v4.1-flash`；PM 读取 Project → `control_create_tickets` → NodeExecutor Worker → `control_report` 同一 Ticket/Assignment → completed。证据：`.artifacts/phase1-live-run-BzkxEa/acceptance.json`。
-- Phase 2 已完成（未提交，HEAD `561f4b8`；审计修复后 69 条未提交）：
+- Phase 2 验收通过（2026-11-14；真实 DSH 主链路 + inputsRead 复验通过）。
+- Phase 2 已完成并提交（HEAD `f863a21`；5 个本地提交未 push）：
   - P2-A1/P2-A2 token 刷新与版本化、P2-B1/P2-B2 执行事实与 stop cleanup、P2-C viewer/SSE、P2-D 独立 DSH 节点进程（D2 恢复 + D3 无 shim 模型/工具边界）、P2-E 图片窄端口、P2-F 部署文档与示例均已完成。
   - 2026-11-14 审计 5 条已修：过期 token refresh 宽限 300s、stopFailure/取消 10s deadline、半失联心跳 command timeout 10s、Trigger 正文投递、input 已读归属（`onDelivered` 后 ready + Assignment running 校验）。
   - 最终回归：37 files / 299 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 仍是已知 3 个 Windows 路径失败。
   - E2E 两条证据链：`p2d-e2e-fixed-3a6c`（恢复：慢/快节点重启、控制面重启、离线 502、inspect 无 status；`.artifacts/p2d-e2e-fixed-3a6c/evidence/`）与 `p2d-model-v2-f35fac`（真实模型、无 shim：PM 建 Ticket → NodeExecutor 自动建 Worker → `control_report` ready/42 → completed；`.artifacts/p2d-model-v2-f35fac/evidence/model-v2/`）。记录见 `docs/014`。
   - 部署/认证文档：`docs/015-node-deployment.zh-CN.md`、`docs/016-control-plane-tls.zh-CN.md`；示例 profile 在 `examples/profile.node/`。
-  - 下一步建议：本地 review、按目标拆分 commit（未做）；`RoleProfile.deny` 独立语义、PM role prompt 自动 turn 1、refresh 5min 宽限、cancel/command 10s deadline、强杀 lock stale、节点 `seq` 重启归零、`Assignment.sessionId` 与真实 `worker-<assignmentId>` 不一致、无控制面前端/TLS 文档保留为剩余风险/观察。
+  - 下一步：push 前 review；剩余风险如下：`RoleProfile.deny` 独立语义、PM role prompt 自动 turn 1、refresh 5min 宽限、cancel/command 10s deadline、强杀 lock stale、节点 `seq` 重启归零、`Assignment.sessionId` 与真实 `worker-<assignmentId>` 不一致、无控制面前端/TLS 文档保留为剩余风险/观察。
 
 ## 这是什么
 

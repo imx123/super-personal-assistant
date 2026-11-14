@@ -2,6 +2,8 @@
 
 本文定义 Phase 2 的目标、顺序和验收要求。Phase 1B 已通过真实 DSH + 真实模型链路验收；Phase 2 不再改业务入口语义，重点是把执行后端做成可长期运行、可恢复、可观测的生产设施。
 
+> 状态：Phase 2 验收通过（2026-11-14；真实 DSH 主链路 + inputsRead 复验通过）。`main` 领先 `origin/main` 5 个提交，未 push。
+
 ## 当前基线
 
 - 控制面 `Runtime` 已 DSH-free；Store/Engine 归 `ControlPlaneOwner`。
