@@ -88,9 +88,17 @@ export class AgentDelivery {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
   }
-  /** Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence before acknowledging the producer. */
+  /**
+   * Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence
+   * before acknowledging the producer.
+   *
+   * `onDelivered` reports that the message is now in the Session's inbox: it runs right after this call inserted it, or
+   * when a retry finds the same message still waiting there. A message the Session already took into its history is not a
+   * new delivery, and neither is a call that failed before insertion. The callback runs before the persistence flush,
+   * because the inserted message may start a turn before that flush returns.
+   */
   async send(agent: Agent, requestId: string, text: string, mode: DeliveryMode, signal: AbortSignal, authorize?: () => void,
-    accepted?: () => void): Promise<void> {
+    accepted?: () => void, onDelivered?: () => void): Promise<void> {
     signal.throwIfAborted()
     const seen = await this.history(agent)
     signal.throwIfAborted()
@@ -106,6 +114,11 @@ export class AgentDelivery {
       if (typeof mode === 'object' && 'inject' in mode) { agent.inject(message); seen.ids.add(id) }
       else if (mode === 'steer' || typeof mode === 'object') agent.steer(message)
       else agent.followup(message)
+      // The message is in the inbox from here on: its turn may start before the flush below resolves.
+      onDelivered?.()
+    } else if (pending) {
+      // A retry found the very message this request would insert still waiting in the inbox: the worker has it.
+      onDelivered?.()
     }
     accepted?.()
     await this.ctx.sessionPersistence.flush()

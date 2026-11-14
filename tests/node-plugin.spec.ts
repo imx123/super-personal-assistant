@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDshPortHost } from '../src/node/dsh-port-host.ts'
 import { createNodeSessions, NODE_ROLE_PRESETS } from '../src/node/node-sessions.ts'
 import { apply, readNodeEnvironment } from '../src/node/plugin.ts'
@@ -366,10 +366,28 @@ describe('NodeSessions.prompt', () => {
     expect(String(inbox[0]!.id)).toBe('dsh-superagent:message-1')
   })
 
+  it('reports a message once it reached the inbox, including a retry that finds it waiting', async () => {
+    const { context, live } = harness({ live: ['pm-1'] })
+    const sessions = createNodeSessions(context)
+    await sessions.ensure('pm-1', directory, 'Project One', 'pm', PM)
+    const delivered = vi.fn()
+
+    await sessions.prompt('pm-1', 'message-1', 'Hello', 'queue', delivered)
+    expect(delivered).toHaveBeenCalledOnce()
+    expect(live.get('pm-1')!.inbox.nextTurn).toHaveLength(1)
+
+    // The retry inserts nothing because the message still waits there, but the worker has it all the same.
+    await sessions.prompt('pm-1', 'message-1', 'Hello', 'queue', delivered)
+    expect(delivered).toHaveBeenCalledTimes(2)
+    expect(live.get('pm-1')!.inbox.nextTurn).toHaveLength(1)
+  })
+
   it('refuses a Session this node does not run', async () => {
     const { context } = harness()
-    await expect(createNodeSessions(context).prompt('pm-1', 'message-1', 'Hello', 'queue'))
+    const delivered = vi.fn()
+    await expect(createNodeSessions(context).prompt('pm-1', 'message-1', 'Hello', 'queue', delivered))
       .rejects.toThrow(/not loaded on this node/)
+    expect(delivered).not.toHaveBeenCalled()
   })
 })
 

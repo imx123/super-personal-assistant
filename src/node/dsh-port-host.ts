@@ -32,6 +32,15 @@ const STOP_REASON = 'The Session was stopped'
 const DEFAULT_CANCEL_TIMEOUT_MS = 10_000
 
 /**
+ * The Session message id `AgentDelivery` gives a delivery (see `messageId` in `src/app/delivery.ts`).
+ *
+ * The host keys a delivery's Input registration by it, so a retry of one message never registers twice. The format is
+ * written out rather than imported: the host must not pull `AgentDelivery`'s DSH runtime dependencies, and the id
+ * `dsh-superagent:<requestId>` is part of the delivery contract rather than an implementation detail.
+ */
+const deliveryMessageId = (idempotencyKey: string): string => `dsh-superagent:${idempotencyKey}`
+
+/**
  * The part of `Sessions` this host uses.
  *
  * Narrow on purpose: the host never needs the Executor or the runtime lifecycle, and a test can supply just these two
@@ -48,7 +57,14 @@ export interface DshPortSessions {
    */
   ensure(sessionId: string, directory: string, title: string, role: 'pm' | 'worker',
     profile?: RoleProfile): Promise<unknown>
-  prompt(sessionId: string, idempotencyKey: string, text: string, mode: 'queue'): Promise<void>
+  /**
+   * Deliver `text` under `idempotencyKey`, once, to the Session's next turn.
+   *
+   * `onDelivered` runs as soon as the backend inserted the message into the Session's inbox — before the persistence
+   * flush the returned promise also waits for. A retry that finds the same message still waiting there counts as
+   * inserted; one only present in the persisted history does not.
+   */
+  prompt(sessionId: string, idempotencyKey: string, text: string, mode: 'queue', onDelivered?: () => void): Promise<void>
 }
 
 /**
@@ -86,6 +102,12 @@ export interface DshPortHostInput {
    * Defaults to 10 seconds, which covers a shell job's own kill timeout.
    */
   cancelTimeoutMs?: number
+}
+
+/** One delivery's Input ids, registered before the backend call and ready once its message reached the inbox. */
+interface PendingDelivery {
+  inputIds: string[]
+  ready: boolean
 }
 
 /**
@@ -129,15 +151,55 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
    * Agent whose inherited layer is new, so the boundary is applied again for that Agent.
    */
   const boundarySessions = new Map<string, unknown>()
-  /** Input ids delivered to a Session whose next turn has not started yet; reported on that turn's start. */
-  const pendingInputs = new Map<string, string[]>()
+  /**
+   * One delivery's Input ids, by the deterministic id of the message carrying them, until a turn reports them.
+   *
+   * A delivery registers before the backend call, so an insertion can never precede its ids; the backend's insertion
+   * callback makes the entry ready. A turn reports only ready entries, in delivery order: a message still being inserted
+   * is not one the turn took, while the first turn after an insertion must carry its ids.
+   */
+  const deliveries = new Map<string, Map<string, PendingDelivery>>()
 
-  /** Merge a delivery's Inputs into the Session's pending set; returns the ids this delivery added. */
-  const rememberInputs = (sessionId: string, inputIds: readonly string[]): string[] => {
-    const prior = pendingInputs.get(sessionId) ?? []
-    const merged = [...new Set([...prior, ...inputIds])]
-    pendingInputs.set(sessionId, merged)
-    return merged.filter(id => !prior.includes(id))
+  /** The message-keyed deliveries of one Session, created on demand. */
+  const deliveriesOf = (sessionId: string): Map<string, PendingDelivery> => {
+    let byMessage = deliveries.get(sessionId)
+    if (!byMessage) { byMessage = new Map(); deliveries.set(sessionId, byMessage) }
+    return byMessage
+  }
+  /** Register a delivery's ids before it reaches the backend; a retry of the same message keeps one entry. */
+  const rememberDelivery = (sessionId: string, message: string, inputIds: readonly string[]): PendingDelivery => {
+    const byMessage = deliveriesOf(sessionId)
+    const existing = byMessage.get(message)
+    if (existing) { existing.inputIds = [...new Set([...existing.inputIds, ...inputIds])]; return existing }
+    const delivery: PendingDelivery = { inputIds: [...new Set(inputIds)], ready: false }
+    byMessage.set(message, delivery)
+    return delivery
+  }
+  /** Drop a delivery that never reached the inbox, so its ids can never ride a turn. */
+  const forgetDelivery = (sessionId: string, message: string, delivery: PendingDelivery): void => {
+    const byMessage = deliveries.get(sessionId)
+    if (!byMessage || byMessage.get(message) !== delivery) return
+    byMessage.delete(message)
+    if (byMessage.size === 0) deliveries.delete(sessionId)
+  }
+  /** The ids of every inserted delivery, in delivery order, removed so a later turn does not report them again. */
+  const takeReadyInputs = (sessionId: string): string[] => {
+    const byMessage = deliveries.get(sessionId)
+    if (!byMessage) return []
+    const inputIds: string[] = []
+    const reported = new Set<string>()
+    for (const [message, delivery] of byMessage) {
+      if (!delivery.ready) continue
+      for (const id of delivery.inputIds) {
+        // Two deliveries may name the same Input; a turn reports it once.
+        if (reported.has(id)) continue
+        reported.add(id)
+        inputIds.push(id)
+      }
+      byMessage.delete(message)
+    }
+    if (byMessage.size === 0) deliveries.delete(sessionId)
+    return inputIds
   }
 
   /** Register the role's proxy tools once per Agent and keep their bearer credential current. */
@@ -237,12 +299,33 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
         const session = toolSessions.get(sessionId)
         if (session) session.credential.current = sessionToken
       }
-      // Returned, not caught: a delivery the backend refused must fail the command that carried it.
-      const delivery = input.nodeRuntime.sessions.prompt(sessionId, idempotencyKey, text, 'queue')
-      if (inputIds === undefined || inputIds.length === 0) return delivery
-      // The ids become pending only after the backend accepted the message: a turn that starts while the delivery still
-      // waits must not claim them, and a refused delivery leaves none behind to be reported as read.
-      return delivery.then(() => { rememberInputs(sessionId, inputIds) })
+      if (inputIds === undefined || inputIds.length === 0) {
+        return input.nodeRuntime.sessions.prompt(sessionId, idempotencyKey, text, 'queue')
+      }
+      // Register before the backend call: it may insert the message and start its turn before `prompt` resolves, because
+      // the persistence flush it waits for comes after the insertion. Only the insertion callback makes the ids reportable.
+      const message = deliveryMessageId(idempotencyKey)
+      const delivery = rememberDelivery(sessionId, message, inputIds)
+      let inserted = false
+      const onDelivered = (): void => { inserted = true; delivery.ready = true }
+      let sending: Promise<void>
+      try {
+        // Returned, not caught: a delivery the backend refused must fail the command that carried it.
+        sending = input.nodeRuntime.sessions.prompt(sessionId, idempotencyKey, text, 'queue', onDelivered)
+      } catch (error) {
+        if (!inserted) forgetDelivery(sessionId, message, delivery)
+        throw error
+      }
+      return sending.then(
+        () => {
+          // Nothing was inserted (the message was already read), so this registration must never claim a later turn.
+          if (!inserted) forgetDelivery(sessionId, message, delivery)
+        },
+        (error: unknown) => {
+          // A message that never reached the inbox leaves no Inputs to report; one that did keeps them for its turn.
+          if (!inserted) forgetDelivery(sessionId, message, delivery)
+          throw error
+        })
     },
     async cancelSession(sessionId: string, reason?: string) {
       const agent = context.agents.get(sessionId as SessionId)
@@ -339,7 +422,7 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
         }),
         context.on('session/event', (session, event) => {
           const sessionId = String(session.id)
-          const mapped = portEvent(sessionId, event, pendingInputs)
+          const mapped = portEvent(sessionId, event, takeReadyInputs)
           if (mapped) listener(mapped)
         }),
       ]
@@ -742,20 +825,20 @@ function requiredState(value: unknown): WorkerReportState {
 /**
  * Maps one DSH Session event onto the protocol's conservative vocabulary; every other event is not reported.
  *
- * A turn reports the Inputs its step took, once: the Session's pending ids ride the `turn/start` that starts with them
- * and are then consumed, so a later turn of the same Session does not report them again. A turn without pending Inputs
- * stays exactly as it was, and the control plane reads no ids from it.
+ * A turn reports the Inputs of the messages inserted before it started, once: `takeReadyInputs` returns those ids and
+ * consumes them, so a later turn of the same Session does not repeat them. A message still being inserted is not ready
+ * and does not ride the turn. A turn without ready Inputs stays exactly as it was, and the control plane reads no ids.
  */
-function portEvent(sessionId: string, event: SessionEvent, pendingInputs: Map<string, string[]>): DshPortEvent | undefined {
+function portEvent(sessionId: string, event: SessionEvent,
+  takeReadyInputs: (sessionId: string) => string[]): DshPortEvent | undefined {
   switch (event.type) {
     case 'turn/start': {
-      const inputIds = pendingInputs.get(sessionId)
-      if (inputIds === undefined || inputIds.length === 0) {
+      const inputIds = takeReadyInputs(sessionId)
+      if (inputIds.length === 0) {
         return { type: 'session.event', sessionId, kind: 'turn-start', data: { turn: event.data.turn } }
       }
-      pendingInputs.delete(sessionId)
       return { type: 'session.event', sessionId, kind: 'turn-start',
-        data: { turn: event.data.turn, inputIds: [...inputIds] } }
+        data: { turn: event.data.turn, inputIds } }
     }
     case 'turn/end':
       return { type: 'session.event', sessionId, kind: 'turn-end', data: { turn: event.data.turn,

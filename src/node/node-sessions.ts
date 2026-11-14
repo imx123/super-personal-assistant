@@ -105,12 +105,19 @@ export class NodeSessions implements DshPortSessions {
     return agent
   }
 
-  /** Delivers `text` once per idempotency key to `sessionId`'s next turn. */
-  async prompt(sessionId: string, idempotencyKey: string, text: string, mode: 'queue'): Promise<void> {
+  /**
+   * Delivers `text` once per idempotency key to `sessionId`'s next turn.
+   *
+   * `onDelivered` runs once the message is in the Agent's inbox, which may happen before the persistence flush this
+   * promise also waits for; a retry that finds the message still waiting there reports it again.
+   */
+  async prompt(sessionId: string, idempotencyKey: string, text: string, mode: 'queue',
+    onDelivered?: () => void): Promise<void> {
     const agent = this.ctx.agents.get(sessionId as SessionId)
     // A node holds no Session registry of its own: an id this process does not run is the control plane's cue to ensure it.
     if (!agent) throw new Error(`Session ${sessionId} is not loaded on this node`)
-    await this.delivery.send(agent, idempotencyKey, text, mode, this.signal)
+    await this.delivery.send(agent, idempotencyKey, text, mode, this.signal,
+      /* authorize */ undefined, /* accepted */ undefined, onDelivered)
   }
 
   /** Whether `sessionId` exists outside this process, which decides between resume and create. */

@@ -329,9 +329,12 @@ describe('createDshPortHost turn start input ids', () => {
     return {
       host: createDshPortHost({ context: fake.context, nodeRuntime: { sessions: {
         async ensure() { return {} },
-        async prompt() {
+        async prompt(_sessionId: string, _idempotencyKey: string, _text: string, _mode: 'queue',
+          onDelivered?: () => void) {
           if (options.promptGate) await options.promptGate
           if (options.failPrompt) throw new Error('the inbox is closed')
+          // A real backend reports the insertion from inside `prompt`, before its persistence flush returns.
+          onDelivered?.()
         },
       } }, nodeId: NODE_ID, root }),
       emit: (sessionId, event) => fake.emit('session/event', { id: sessionId }, event),
@@ -413,6 +416,89 @@ describe('createDshPortHost turn start input ids', () => {
       // The worker never received it, so no turn may claim these Inputs were read.
       emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
       expect(dataOf(events[0]!)).toEqual({ turn: 1 })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reports the Inputs of a message inserted before its turn starts, not after the prompt resolves', async () => {
+    const fake = fakeContext()
+    const events: DshPortEvent[] = []
+    const sessions = {
+      async ensure() { return {} },
+      async prompt(sessionId: string, _key: string, _text: string, _mode: 'queue', onDelivered?: () => void) {
+        // The insertion callback and the turn it starts both happen while `prompt` is still running.
+        onDelivered?.()
+        fake.emit('session/event', { id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+      },
+    }
+    const portHost = createDshPortHost({ context: fake.context, nodeRuntime: { sessions }, nodeId: NODE_ID, root })
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1'])
+      expect(events).toHaveLength(1)
+      expect(dataOf(events[0]!)).toEqual({ turn: 1, inputIds: ['input-1'] })
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reports no Inputs for a turn that starts before a refused insertion, and none on a later turn', async () => {
+    const fake = fakeContext()
+    const events: DshPortEvent[] = []
+    const sessions = {
+      async ensure() { return {} },
+      async prompt(sessionId: string) {
+        // The turn starts while the message is still being delivered; the backend then refuses before inserting it.
+        fake.emit('session/event', { id: sessionId }, { type: 'turn/start', data: { turn: 1 } })
+        throw new Error('the inbox is closed')
+      },
+    }
+    const portHost = createDshPortHost({ context: fake.context, nodeRuntime: { sessions }, nodeId: NODE_ID, root })
+    const dispose = portHost.onEvent(event => events.push(event))
+    try {
+      await expect(portHost.promptSession('worker-1', 'message-1', 'Hello', undefined, ['input-1']))
+        .rejects.toThrow('the inbox is closed')
+      fake.emit('session/event', { id: 'worker-1' }, { type: 'turn/start', data: { turn: 2 } })
+      expect(events.map(dataOf)).toEqual([{ turn: 1 }, { turn: 2 }])
+    } finally {
+      dispose()
+    }
+  })
+
+  it('reports each delivery’s Inputs only from the message that was actually inserted', async () => {
+    const fake = fakeContext()
+    const events: DshPortEvent[] = []
+    const insertions = new Map<string, () => void>()
+    const sessions = {
+      async ensure() { return {} },
+      prompt(_sessionId: string, idempotencyKey: string, _text: string, _mode: 'queue', onDelivered?: () => void) {
+        return new Promise<void>(resolve => {
+          insertions.set(idempotencyKey, () => { onDelivered?.(); resolve() })
+        })
+      },
+    }
+    const portHost = createDshPortHost({ context: fake.context, nodeRuntime: { sessions }, nodeId: NODE_ID, root })
+    const dispose = portHost.onEvent(event => events.push(event))
+    const turn = (n: number) => fake.emit('session/event', { id: 'worker-1' }, { type: 'turn/start', data: { turn: n } })
+    try {
+      const first = portHost.promptSession('worker-1', 'message-1', 'first', undefined, ['input-1'])
+      const second = portHost.promptSession('worker-1', 'message-2', 'second', undefined, ['input-2'])
+
+      // Neither message is in the inbox yet, so an unrelated turn claims no Input.
+      turn(1)
+      expect(dataOf(events[0]!)).toEqual({ turn: 1 })
+
+      // Only the second message was inserted when its turn starts: it alone owns that turn's ids.
+      insertions.get('message-2')!()
+      await second
+      turn(2)
+      expect(dataOf(events[1]!)).toEqual({ turn: 2, inputIds: ['input-2'] })
+
+      insertions.get('message-1')!()
+      await first
+      turn(3)
+      expect(dataOf(events[2]!)).toEqual({ turn: 3, inputIds: ['input-1'] })
     } finally {
       dispose()
     }

@@ -33,7 +33,8 @@ function fixture(history: Recorded[] = []) {
   ctx.reflect.provide('sessionPersistence', { open, flush })
   const delivery = new AgentDelivery(ctx)
   const signal = new AbortController()
-  const send = (id = 'request', mode: 'queue' | 'steer' = 'steer') => delivery.send(agent, id, '{"event_id":"event"}', mode, signal.signal)
+  const send = (id = 'request', mode: 'queue' | 'steer' = 'steer', onDelivered?: () => void) =>
+    delivery.send(agent, id, '{"event_id":"event"}', mode, signal.signal, undefined, undefined, onDelivered)
   const inject = (id: string, summary: string) => delivery.send(agent, id, '{"settings_saved":"policy"}', { inject: summary }, signal.signal)
   const holds = (id: string) => delivery.holds(agent, id)
   const consume = (message: UserMessage) => {
@@ -202,4 +203,60 @@ it('ignores malformed spliced payloads instead of failing the read', async () =>
 
   await f.send('request')
   expect(f.steer).toHaveBeenCalledOnce()
+})
+
+it('reports a message as delivered once it is in the inbox, and again while a retry finds it waiting', async () => {
+  const f = fixture()
+  const delivered = vi.fn()
+
+  await f.send('request', 'queue', delivered)
+  expect(delivered).toHaveBeenCalledOnce()
+  expect(f.followup).toHaveBeenCalledOnce()
+
+  // The message still waits in the inbox, so the retry inserts nothing but still finds the message delivered.
+  await f.send('request', 'queue', delivered)
+  expect(delivered).toHaveBeenCalledTimes(2)
+  expect(f.followup).toHaveBeenCalledOnce()
+})
+
+it('reports an inserted message even when the persistence flush afterwards fails', async () => {
+  const f = fixture()
+  // The first flush belongs to loading the history; only the flush after the insertion fails.
+  f.flush.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('disk busy'))
+  const delivered = vi.fn()
+
+  await expect(f.send('request', 'queue', delivered)).rejects.toThrow('disk busy')
+  // The insertion preceded the flush, so the worker already has the message; only its durability acknowledgement failed.
+  expect(delivered).toHaveBeenCalledOnce()
+})
+
+it('does not report a message the Session already took into its history', async () => {
+  const f = fixture()
+  const delivered = vi.fn()
+  await f.send('request', 'steer', delivered)
+
+  f.consume(f.steer.mock.calls[0]![0])
+  await f.send('request', 'steer', delivered)
+  // A delivered message the Session has taken is history, not a new delivery.
+  expect(delivered).toHaveBeenCalledOnce()
+})
+
+it('does not report a message only present in the persisted history', async () => {
+  const sent = fixture()
+  await sent.send('request')
+  const restored = fixture([sent.steer.mock.calls[0]![0]])
+  const delivered = vi.fn()
+
+  await restored.send('request', 'steer', delivered)
+  expect(restored.steer).not.toHaveBeenCalled()
+  expect(delivered).not.toHaveBeenCalled()
+})
+
+it('does not report a delivery that failed before insertion', async () => {
+  const f = fixture()
+  f.read.mockRejectedValueOnce(new Error('read failed'))
+  const delivered = vi.fn()
+
+  await expect(f.send('request', 'steer', delivered)).rejects.toThrow('read failed')
+  expect(delivered).not.toHaveBeenCalled()
 })
