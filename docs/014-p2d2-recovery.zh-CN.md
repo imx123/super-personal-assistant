@@ -9,8 +9,8 @@
 - 已通过（D2）：独立 DSH 节点进程、控制面/节点双进程、存活与离线语义、慢/快节点重启、控制面重启、Session 代次 re-ensure、`session.inspect` 持久化探测、profile prompt 跨 resume 幂等。
 - 已通过（D3 v2，无 shim）：真实模型 PM→Ticket→NodeExecutor Worker→`control_report`；PM 工具表 2 个、Worker 20 个；PM/Worker 路由由产品代码在 turn 1 前写入 `opencode-go/deepseek-v4.1-flash/high`。
 - Phase 2 其余项已完成：P2-A2 token 版本化/refresh 宽限、P2-B2 stop cleanup、P2-C viewer/SSE、P2-E 图片窄端口、P2-F 部署文档与示例（`docs/015`、`examples/profile.node/`）；详见 `docs/012`。
-- 2026-11-14 审计 5 条已修：过期 token refresh 宽限 300s、stopFailure/取消 10s deadline、半失联 command timeout 10s、Trigger 正文投递、input 已读归属；最终回归 37 files / 295 tests。
-- 最终回归：37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过；D2 的 18 行验收表在 D3 v2 补齐模型项后为 18/18 pass，D3 v2 自身 11 项验收全 pass。
+- 2026-11-14 审计 5 条已修：过期 token refresh 宽限 300s、stopFailure/取消 10s deadline、半失联 command timeout 10s、Trigger 正文投递、input 已读归属；最终回归 37 files / 299 tests。
+- 最终回归：37 files / 299 tests 通过；`pnpm typecheck`、`pnpm build` 通过；D2 的 18 行验收表在 D3 v2 补齐模型项后为 18/18 pass，D3 v2 自身 11 项验收全 pass。
 
 ## 2. 修复内容（D2 + D3）
 

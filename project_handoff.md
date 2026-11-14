@@ -19,7 +19,7 @@
 - Phase 2 已完成（未提交，HEAD `561f4b8`；审计修复后 69 条未提交）：
   - P2-A1/P2-A2 token 刷新与版本化、P2-B1/P2-B2 执行事实与 stop cleanup、P2-C viewer/SSE、P2-D 独立 DSH 节点进程（D2 恢复 + D3 无 shim 模型/工具边界）、P2-E 图片窄端口、P2-F 部署文档与示例均已完成。
   - 2026-11-14 审计 5 条已修：过期 token refresh 宽限 300s、stopFailure/取消 10s deadline、半失联心跳 command timeout 10s、Trigger 正文投递、input 已读归属（`onDelivered` 后 ready + Assignment running 校验）。
-  - 最终回归：37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 仍是已知 3 个 Windows 路径失败。
+  - 最终回归：37 files / 299 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 仍是已知 3 个 Windows 路径失败。
   - E2E 两条证据链：`p2d-e2e-fixed-3a6c`（恢复：慢/快节点重启、控制面重启、离线 502、inspect 无 status；`.artifacts/p2d-e2e-fixed-3a6c/evidence/`）与 `p2d-model-v2-f35fac`（真实模型、无 shim：PM 建 Ticket → NodeExecutor 自动建 Worker → `control_report` ready/42 → completed；`.artifacts/p2d-model-v2-f35fac/evidence/model-v2/`）。记录见 `docs/014`。
   - 部署/认证文档：`docs/015-node-deployment.zh-CN.md`、`docs/016-control-plane-tls.zh-CN.md`；示例 profile 在 `examples/profile.node/`。
   - 下一步建议：本地 review、按目标拆分 commit（未做）；`RoleProfile.deny` 独立语义、PM role prompt 自动 turn 1、refresh 5min 宽限、cancel/command 10s deadline、强杀 lock stale、节点 `seq` 重启归零、`Assignment.sessionId` 与真实 `worker-<assignmentId>` 不一致、无控制面前端/TLS 文档保留为剩余风险/观察。
@@ -159,11 +159,11 @@ pnpm node        # lib/node.js 的 FakeNode；需要 SUPERAGENT_NODE_TOKEN
 - `SUPERAGENT_NODE_PORT` / `SUPERAGENT_NODE_HOST` / `SUPERAGENT_NODE_ROOT`：节点服务
 - `SUPERAGENT_CONTROL_DB` / `SUPERAGENT_WORKSPACE_ROOT` / `SUPERAGENT_NODE_ID`
 
-本轮 Phase 2 相关回归 37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过。E2E `p2d-e2e-fixed-3a6c`（恢复）与 `p2d-model-v2-f35fac`（无 shim 真实模型/工具边界）均通过，后者 11 项验收全 pass。
+本轮 Phase 2 相关回归 37 files / 299 tests 通过；`pnpm typecheck`、`pnpm build` 通过。E2E `p2d-e2e-fixed-3a6c`（恢复）与 `p2d-model-v2-f35fac`（无 shim 真实模型/工具边界）均通过，后者 11 项验收全 pass。
 
 本机 Windows 环境的已知问题：
 
-- 全量测试仍有本机 Windows/依赖环境失败（此前基线约 44 项失败、13 个加载错误：路径分隔符、权限位、`spawn EPERM/ENOENT`、`jsdom/undici` 缺模块等），不是新增逻辑失败；本轮定向 37 files / 295 tests 通过；
+- 全量测试仍有本机 Windows/依赖环境失败（此前基线约 44 项失败、13 个加载错误：路径分隔符、权限位、`spawn EPERM/ENOENT`、`jsdom/undici` 缺模块等），不是新增逻辑失败；本轮定向 37 files / 299 tests 通过；
 - `docs.spec` 的 3 个失败是测试自身用 `/` 切 Windows `\` 路径，归一化后模块/测试表无缺失；
 - 若 sandbox 在加载 Vitest 配置时仍 `spawn EPERM`，用 `node node_modules/vitest/vitest.mjs run --configLoader runner`；
 - `git diff --check` 通过。
@@ -178,8 +178,8 @@ pnpm node        # lib/node.js 的 FakeNode；需要 SUPERAGENT_NODE_TOKEN
 - `RoleProfile.deny` 未单独消费（现有 PM/Worker 的 deny 名字都在各自 tools 外，行为正确但“deny 独立语义”未实现）；控制面 `PM_PROFILE`/`WORKER_PROFILE.model` 仍为空，角色路由由节点 profile 默认决定。
 - PM 的 ensure role prompt 会自行开始 turn 1：v2 中 PM 在操作员消息前自建 3 个 Ticket 并起了 3 个 Worker（已取消）。这是“ensure 的 role prompt 是否应静默投递”的产品决策，不是已修复缺陷。
 - P2-D2 恢复语义已实现并 E2E 验证：每次注册唯一幂等键、10s 周期 heartbeat、失败本地 `online:false` + 离线命令 502、SSE 250ms→5s 退避重连、`onReconnect` 轮换 generation、`SessionRecord.nodeGeneration` 过期先 re-ensure、`inspectSession` 对“已持久化但未挂载”返回 `found:true` + `backendSessionId` 且无 `status`。
-- 2026-11-14 审计 5 条已修：token refresh 有过期宽限（默认 300s，`SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS`，`0` 关闭；普通路由仍严格）；stop 失败写 `Ticket.stopFailure` + `ticket.stopFailed`，取消有 10s deadline；`HttpNodePort` 命令总超时默认 10s，半失联心跳会 offline 并重试；Trigger 正文和 meta 一起投递；`AgentDelivery` 的 `onDelivered` 在消息真正插入 inbox 后回调，`promptSession` 收到回调才 ready，`turn/start` 只取 ready 的 Input IDs，并按 `assignmentId` 的 running 状态归属。
-- 已读投递的取舍：回调契约要求宿主在插入后触发 `onDelivered`；宿主违反时可能提前/延后标记 ready，导致 `turn/start` 带错/漏带 IDs。当前 DSH 路径已按回调实现，这是契约风险而非当前缺陷。
+- 2026-11-14 审计 5 条已修：token refresh 有过期宽限（默认 300s，`SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS`，`0` 关闭；普通路由仍严格）；stop 失败写 `Ticket.stopFailure` + `ticket.stopFailed`，取消有 10s deadline；`HttpNodePort` 命令总超时默认 10s，半失联心跳会 offline 并重试；Trigger 正文和 meta 一起投递；`AgentDelivery` 的 `onDelivered` 由 DSH 的 inbox splice 事件触发（消息真正插入时，覆盖 `followup` 内启动的回合），`followup` 返回后的回调只作无事件后端兜底，`promptSession` 收到回调才 ready，`turn/start` 只取 ready 的 Input IDs，并按 `assignmentId` 的 running 状态归属。
+- 已读投递的取舍：`onDelivered` 依赖 DSH 的 `agent/inbox/spliced` 事件；无事件后端只能靠 `followup` 返回后的兜底，若它在返回前启动 turn 可能延后。宿主违反回调契约时可能提前/延后，导致 `turn/start` 带错/漏带 IDs。
 - 其他审计取舍：refresh 超过 TTL+5min 仍失败；cancel/command 超时是上限，不是精确检测时间。
 - 强杀控制面后 `proper-lockfile` 的 30s stale 会让立即重启报 `Lock file is already being held`；正常 SIGTERM 不应触发，尚未修复（P2-F/运维）。节点重启后事件 `seq` 归零也未处理，`/v1/events?after=N` 的跨重启语义待明确。
 - P2-A1/P2-A2 token 已完成：可配置 TTL、`POST /v1/tools/token/refresh`、工具 401 自动刷新并重试一次；`SessionTokenClaims.tv` + `SessionRecord.tokenVersion` 做版本化，普通工具要求 current，refresh 只宽限 current/current-1 一次，同一秒刷新 token 也不同。节点仍不本地验签（节点没有 secret），验签在控制面 `/v1/tools/*`。

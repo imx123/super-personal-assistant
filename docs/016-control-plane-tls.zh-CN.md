@@ -1,6 +1,6 @@
 # 控制面 TLS、viewer 认证与反向代理部署
 
-> 状态：P2-C 收口文档（2026-11-14）。控制面的 viewer/operator 认证、写操作 403 和 14 客户端 SSE 压测已在代码与测试中完成；TLS 直接实现、反向代理代码、控制面前端**没有**在本仓库实现。最终回归 37 files / 295 tests 通过，`pnpm typecheck`、`pnpm build` 通过。
+> 状态：P2-C 收口文档（2026-11-14）。控制面的 viewer/operator 认证、写操作 403 和 14 客户端 SSE 压测已在代码与测试中完成；TLS 直接实现、反向代理代码、控制面前端**没有**在本仓库实现。最终回归 37 files / 299 tests 通过，`pnpm typecheck`、`pnpm build` 通过。
 > 关系：[009 节点协议](009-node-protocol.zh-CN.md) 定义 Session token 与节点命令；[010 控制面内核](010-control-plane-kernel.zh-CN.md) 定义控制面 API；[015 节点部署](015-node-deployment.zh-CN.md) 定义双进程、环境变量和节点运维。本文只写控制面的认证、TLS/反代边界和 SSE 部署约束。
 
 ## 1. 结论
@@ -168,4 +168,4 @@ viewer token 不能变成面板：它只解决“只读 HTTP 读路由”的授�
 - 控制面强杀后的 `proper-lockfile` 30s stale 仍会让立即重启失败（见节点部署文档的故障手册）。
 - `RoleProfile.deny` 独立消费、PM role prompt 自动 turn 1、`Assignment.sessionId` 与真实 `worker-<assignmentId>` 不一致，是 Phase 2 之外的剩余观察，不在本文的认证/TLS 范围内。
 
-最终验证口径：37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 的 3 个失败是已知 Windows 路径分隔符环境问题。
+最终验证口径：37 files / 299 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 的 3 个失败是已知 Windows 路径分隔符环境问题。
