@@ -9,7 +9,7 @@
 - HTTP NodePort/SSE、Session 持久化、控制面/节点双入口、PM/Worker 工具桥已存在。
 - 真实链路已通过：PM `control_project` 读取 → `control_create_tickets` → NodeExecutor Worker → `control_report` 回原 Ticket/Assignment。
 - `lib/node.js` 仍是 FakeNode；真实 DSH 节点由 `dsh --profile` + `dsh-superagent/node` 在独立进程中启动。
-- 最终回归：37 files / 286 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 仍是已知的 3 个 Windows 路径失败。
+- 最终回归：37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过；`docs.spec` 仍是已知的 3 个 Windows 路径失败。
 
 ## 目标
 
@@ -27,7 +27,7 @@
 ### P2-B 执行事实回写：P2-B1 / P2-B2 已完成
 
 - 已完成（P2-B1）：`turn-start`/`turn-end` 经 ControlPlane 回写 Assignment（`turnBegan`/`turnEnded`，turn-end 的 idle 事实沿用原路径）；`DshPortHost.cancelSession` await `agent.whenIdle()`，`session.cancel` 命令成功代表 turn 已结束。
-- 已完成（P2-B2 inputsRead）：`session.message` 携带本次投递的 `inputIds`，节点按 Session 合并 pending，`turn/start` 时一次性回传并清空；控制面只取非空字符串数组，调用 `engine.inputsRead` 给 trigger Input 写 `readAt`，未知/旧 Assignment 静默忽略且不影响 `turnBegan`。
+- 已完成（P2-B2 inputsRead）：`session.message` 携带本次投递的 `inputIds`；节点在投递前按 `dsh-superagent:<idempotencyKey>` 登记，收到 `AgentDelivery.send` 的 `onDelivered`（消息真正插入 inbox 后、flush 之前）才标记 ready，`turn/start` 只回传 ready 的 IDs 并清空；控制面只取非空字符串数组，调用 `engine.inputsRead` 给 trigger Input 写 `readAt`，未知/旧 Assignment 静默忽略且不影响 `turnBegan`。
 - 已完成（P2-B2 stop cleanup）：`DshPortHost.cancelSession(sessionId, reason?)` 先 `stopBackground`（kill 该 Session 的 running jobs、drain live subagents、`keepInbox=true`），再 cancel + `whenIdle`；清理失败不跳过 cancel，单个错误原样抛出、多个错误用 `AggregateError`，不假成功；无 jobs/subagents 服务时退化为只 cancel；无 live Agent 仍 kill jobs。
 - `DshPortHost.cancelSession` 接口与 `DshNodePort` 透传 `reason`。
 - 新增 `tests/node-stop-cleanup.spec.ts`（8 个）与 `dsh-port.spec.ts` 的 reason 透传；P2-B2 定向 82 tests 通过。`tests/control-plane-turn-facts.spec.ts`、`tests/control-plane-inputs-read.spec.ts` 覆盖 turn/input 事实。
@@ -54,7 +54,7 @@
   - 工具边界（D3）：`DshPortHost.ensureSession` 首轮前按 `RoleProfile.tools` 应用 `tools.restrict`（PM 继承工具全 deny；Worker 按 allow 保留工作工具）+ `tools.guard`（scope-local/越界兜底），`control_*` 在边界后注册仍在 own layer。v2 实际工具表：PM 2 个（`control_project`/`control_create_tickets`）、Worker 20 个（含 `control_report`，shell 是 `pwsh`）。`RoleProfile.deny` 未单独消费。
   - E2E D2 `p2d-e2e-fixed-3a6c`（隔离 `DSH_HOME`/`DSH_AGENTS_HOME`/profile，真实 `dsh` + 独立控制面）：恢复项覆盖双进程/无 Web、health/401、慢重启 offline 1.8s + 离线 502 + 恢复后同 id/`createdAt`、inspect found+backend id 无 status、prompt 1/1、快重启 SSE 轮换 generation、控制面重启自动 online。
   - E2E D3 v2 `p2d-model-v2-f35fac`（无 shim，凭据从上一轮 run 的 artifact 只读复制，系统 `~/.dsh` 未读写）：PM 建 Ticket `b5289e02…`，NodeExecutor 自动建 `worker-b7f520…`，Worker `control_report` 写回同一 Ticket/Assignment（`state=ready`、`17 + 25 = 42`），Ticket `completed`；v2 的 11 项验收全 pass。
-  - D3 收口时相关回归 28 files / 223 tests 通过（审计修复后最终回归 37 files / 286 tests，见“当前基线”）；`tests/node-plugin.spec.ts` 25、`tests/dsh-port.spec.ts` 22、`tests/node-tool-boundary.spec.ts` 6、`tests/control-plane-recovery.spec.ts` 14。
+  - D3 收口时相关回归 28 files / 223 tests 通过（审计/投递修复后最终回归 37 files / 295 tests，见“当前基线”）；当前 `tests/node-plugin.spec.ts` 26、`tests/dsh-port.spec.ts` 28、`tests/node-tool-boundary.spec.ts` 6、`tests/control-plane-recovery.spec.ts` 14。
   - 仍未完成/观察：`RoleProfile.deny` 的独立语义；PM role prompt 自动开始 turn 1 的产品决策；控制面 `PM_PROFILE`/`WORKER_PROFILE.model` 仍为空（路由由节点 profile 默认决定）；强杀控制面后的 proper-lockfile 30s stale、节点事件 `seq` 重启归零、`Assignment.sessionId` 与真实 `worker-<assignmentId>` 不一致，保留为剩余风险/观察（`docs/013` §6.9、§6.10）。
 
 ### P2-E app 层收尾：已完成
@@ -69,7 +69,7 @@
 - 新增 `docs/015-node-deployment.zh-CN.md`：双进程、环境变量、profile/模型、启动停止/health、lock stale、失联/generation/inspect/seq、`lib/node.js` FakeNode、升级回滚、日志脱敏、孤儿清理、Windows 服务化。
 - 新增示例目录 `examples/profile.node/`（`README.md`、`package.json`、`cordis.patch.yml`），已删除 evidence-only 行；不是单个 `examples/profile.node.cordis.patch.yml` 文件。
 - 新增 `docs/016-control-plane-tls.zh-CN.md`：viewer/operator 认证、401/403、viewer≠operator、SSE 语义与 14 客户端压测、TLS 反代示例、无控制面前端、日志/令牌脱敏。
-- 验收：最终回归 37 files / 286 tests 通过；`pnpm typecheck`、`pnpm build` 通过。TLS/反向代理是部署文档，不是本仓库已实现的代码。
+- 验收：最终回归 37 files / 295 tests 通过；`pnpm typecheck`、`pnpm build` 通过。TLS/反向代理是部署文档，不是本仓库已实现的代码。
 
 ### 2026-11-14 审计修复（5 条）
 
@@ -77,15 +77,15 @@
 - **P0-2 停止结果/取消无截止**：`Ticket.stopFailure?: { at; assignmentId; error }` 与 `ticket.stopFailed` 事件；`hardStopWorker`/`retry`/`end` 的 executor.stop 始终挂 rejection handler，失败写 `stopFailure`、成功清除；Ticket 仍保持 stopped/ended，不因 cleanup 失败回滚，也不再有 unhandled rejection。`DshPortHostInput.cancelTimeoutMs` 默认 **10_000ms**，`cancelSession` 把 `stopBackground + cancel + whenIdle` 包在 deadline race，超时抛 `Stopping the Session <id> did not settle within <ms> ms`。
 - **P1-3 半失联心跳冻结**：`HttpNodePortOptions.commandTimeoutMs` 默认 **10_000ms**；`send()` 用 AbortController+timer 做总超时并合并 caller signal，超时错误含 command type/ms、不含 token。heartbeat 超时 → `markNodeOffline`，循环继续重试；节点恢复应答后 online。注意：默认超时是 10s，审计脚本的 180ms 等待仍显示 `online:true` 是预期；50ms 注入测试证明会 offline/恢复，不要写成“默认 10s 内立刻 offline”。
 - **P1-4 Trigger 正文投递**：`NodeExecutorHost.inputText`；ControlPlane 用 `trigger.text` + meta 的 `title`/`goal`/`scope`/`note` 组装，`waitingText` 不再只认 text/note；审计消息现在包含 `Use the revised total 72 instead of 42.`。
-- **P1-5 已读归属**：`promptSession` 的 input ids 只在 `sessions.prompt` resolve 之后入 pending，投递失败不留 pending；`inputsRead(ticketId, inputIds, assignmentId?)` → `Assignments.read` 带 assignmentId 时必须 `running` 才写，控制面传 `record.assignmentId`，in-process executor 也传对应 Assignment。审计中 pending 期间 `turn/start` 不带 ids，旧 Worker 迟到的 turn 不再把新 Assignment 的 input 标 read。
-- 验证：审计脚本输出 `unhandled:[]`、`stopFailure.error:"synthetic node cancel failure"`、cancel-hang `failed`；相关回归 **37 files / 286 tests 全过**，`pnpm typecheck`、`pnpm build` 通过。
+- **P1-5 已读归属**：`AgentDelivery.send` 增加 `onDelivered` 回调——在 `followup/steer/inject` 真正插入 inbox 后立即调用（flush 之前）；重试命中 inbox pending 也调用；只在持久化历史已读（seen）不调用；插入前失败不调用。`DshPortHost.promptSession` 在调用前按 `dsh-superagent:<idempotencyKey>` 登记该次投递的 Input IDs，收到回调才 ready；`turn/start` 只取 ready 的 IDs。因此成功投递的第一轮 turn 就能带上 IDs，插入前失败不会带出，旧 Assignment 的迟到事件仍被 `record.assignmentId` 校验拒绝。`inputsRead(ticketId, inputIds, assignmentId?)` → `Assignments.read` 带 assignmentId 时必须 `running` 才写，控制面传 `record.assignmentId`，in-process executor 也传对应 Assignment。
+- 验证：审计脚本输出 `unhandled:[]`、`stopFailure.error:"synthetic node cancel failure"`、cancel-hang `failed`；相关回归 **37 files / 295 tests 全过**，`pnpm typecheck`、`pnpm build` 通过。
 
 ### Phase 2 剩余风险与观察
 
 - `RoleProfile.deny` 仍不单独消费，当前由 tools allowlist + `tools.guard` 覆盖（现有 PM/Worker 的 deny 名字都在各自 tools 外，行为正确）。
 - token refresh 的 5min 宽限只覆盖 refresh 路由；超过 TTL+grace 且期间无工具调用的长任务仍失败，普通工具路由始终严格。
 - cancel 的 10s deadline 与命令/心跳的 10s command timeout 是上限，不是精确检测时间；半失联节点可能在默认超时后才被标记 offline。
-- input ids 要等 `sessions.prompt` resolve 后才入 pending：投递失败不误标已读，代价是极短的 pending 窗口内 `turn/start` 可能不带这些 id；旧 Worker 的迟到 turn 也不会标 read 新 Assignment。
+- 已读投递依赖后端回调契约：`AgentDelivery` 要求宿主在消息真正插入 inbox 后触发 `onDelivered`；宿主实现违反时可能提前或延后标记 ready，进而让 `turn/start` 带错/漏带 IDs。当前 DSH 路径已按回调实现，这是契约风险而非当前缺陷。
 - PM 的 ensure role prompt 投递会自行开始 turn 1；这是“是否应静默投递”的产品决策，不是已修复缺陷。
 - 强杀控制面后 `proper-lockfile` 的 30s stale 会让立即重启失败；正常 SIGTERM 不触发，未修复（P2-F/运维）。
 - 节点重启后事件 `seq` 从 1 重新计数，`/v1/events?after=N` 的跨重启游标语义未定义。
