@@ -180,6 +180,18 @@
                   headChars: 4096
                   tailChars: 1024
 
+    # The standalone Router gets its control-plane tools from the node. The preset itself contains no execution tools.
+    - id: dsh-superagent-router-preset
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: dsh-superagent-router
+        name: dsh-superagent 控制台 Router
+        description: 独立控制面的 Router 会话，可以查进度、派独立工单、管理项目和提议转达给 PM。
+        order: 91
+        plugins:
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
     - id: dsh-superagent-node
       name: 'dsh-superagent/node'
       inject: [agents, sessionQuery, sessionPersistence, workspaceRegistry, permissionPresets,

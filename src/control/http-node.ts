@@ -120,7 +120,7 @@ export class HttpNodePort implements NodePort {
       else signal.addEventListener('abort', forwardAbort, { once: true })
     }
     try {
-      const response = await fetch(`${this.baseUrl}/commands`, { method: 'POST',
+      const response = await fetch(`${this.baseUrl}/commands`, { method: 'POST', redirect: 'error',
         headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(command), signal: controller.signal })
       if (response.ok) return
@@ -145,7 +145,7 @@ export class HttpNodePort implements NodePort {
    * timeout error; the deadline aborts the fetch and the stream reader, and the timer and listener are cleaned up. The
    * control plane then fails the request instead of returning a stale `starting` record or waiting forever.
    */
-  async inspect(sessionId: string): Promise<SessionInspection> {
+  async inspect(sessionId: string, routerDetails?: true): Promise<SessionInspection> {
     const requestId = `session-inspect:${sessionId}:${randomUUID()}`
     const controller = new AbortController()
     let resolveAnswer!: (inspection: SessionInspection) => void
@@ -165,7 +165,7 @@ export class HttpNodePort implements NodePort {
     const work = (async () => {
       await subscription.ready
       await this.send({ protocolVersion: NODE_PROTOCOL_VERSION, nodeId: this.nodeId, idempotencyKey: requestId,
-        at: this.now(), type: 'session.inspect', sessionId }, controller.signal)
+        at: this.now(), type: 'session.inspect', sessionId, ...(routerDetails ? { routerDetails } : {}) }, controller.signal)
       return await answered
     })()
     // The deadline can win while `work` is still pending; its later rejection is already observed by the race, and this
@@ -292,6 +292,7 @@ export class HttpNodePort implements NodePort {
 
   private async consume(subscription: Subscription, onOpen?: () => void): Promise<void> {
     const response = await fetch(`${this.baseUrl}/events`, {
+      redirect: 'error',
       headers: { authorization: `Bearer ${this.token}`, accept: 'text/event-stream' },
       signal: subscription.controller.signal,
     })

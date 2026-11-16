@@ -432,6 +432,8 @@ describe('control-plane cross-layer outcomes', () => {
     const address = await server.listen(0)
     const auth = { authorization: `Bearer ${API_TOKEN}` }
 
+    // The low-level archive of a PM Session keeps the semantics it always had: the Session is archived, whatever its
+    // Project is doing. The operator's own archive lives under the console's namespace and has its own rules.
     const archived = await fetch(`${address.url}/v1/sessions/${pm.sessionId}/archive`, { method: 'POST', headers: auth })
     expect(archived.status).toBe(200)
     expect(control.session(pm.sessionId)).toMatchObject({ status: 'archived', archivedAt: expect.any(String) })

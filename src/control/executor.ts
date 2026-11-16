@@ -7,7 +7,8 @@ import type { Assignment, Executor, Ticket, TicketInput } from '../core/index.ts
  */
 export interface NodeExecutorHost {
   /** Create the Worker Session for an Assignment; resolves with its control-plane Session id. */
-  createWorkerSession(projectId: string, assignmentId: string, ticketId: string, prompt: string): Promise<{ sessionId: string }>
+  createWorkerSession(projectId: string | undefined, assignmentId: string, ticketId: string, prompt: string):
+    Promise<{ sessionId: string }>
   /** Deliver one message to a Worker Session, naming the Inputs it carries. */
   sendMessage(sessionId: string, text: string, inputIds?: readonly string[]): Promise<void>
   /** Cancel a Worker Session's turn; a failure propagates to the caller that waits for the cleanup. */
@@ -66,23 +67,30 @@ const NO_TEXT = 'New input for this Assignment'
 export class NodeExecutor implements Executor {
   /** Input ids a send has already started for an Assignment, so a second delivery in flight never repeats them. */
   private readonly sending = new Map<string, Set<string>>()
+  /** The delivery in flight for an Assignment, so a caller can wait for the node's answer before it reports one. */
+  private readonly deliveries = new Map<string, { work: Promise<void>; inputIds: string[] }>()
 
   constructor(private readonly host: NodeExecutorHost) {}
 
   /**
-   * Create the Assignment's Worker Session without blocking the Engine transaction that queued it. A Ticket without a
-   * Project cannot be executed by a node, so it fails explicitly instead of remaining pending.
+   * The delivery in flight for one Assignment, if any: the promise and the Input ids it carries.
+   *
+   * It settles when the node answered or refused the message: a caller that must report whether a message really went out
+   * waits for it and reads the fact the failure left on the Ticket. The promise never rejects: a failed delivery is
+   * recorded on the Ticket, not thrown at the waiter.
+   */
+  deliveryInFlight(assignmentId: string): { work: Promise<void>; inputIds: string[] } | undefined {
+    return this.deliveries.get(assignmentId)
+  }
+
+  /**
+   * Create the Assignment's Worker Session without blocking the Engine transaction that queued it.
    */
   start(ticket: Ticket, assignment: Assignment): void {
-    const projectId = ticket.projectId
-    if (!projectId) {
-      this.fail(ticket.id, assignment.id, 'project required')
-      return
-    }
     try {
       // No await: the node round trip runs asynchronously, and its continuation, not this call, reports back.
       const prompt = this.host.taskPrompt(ticket)
-      void this.host.createWorkerSession(projectId, assignment.id, ticket.id, prompt)
+      void this.host.createWorkerSession(ticket.projectId, assignment.id, ticket.id, prompt)
         .then(() => { this.host.assignmentStarted(ticket.id, assignment.id) })
         .catch(error => { this.fail(ticket.id, assignment.id, errorText(error)) })
     } catch (error) {
@@ -109,7 +117,7 @@ export class NodeExecutor implements Executor {
       if (sending.size === 0 && this.sending.get(assignment.id) === sending) this.sending.delete(assignment.id)
     }
     try {
-      void this.host.sendMessage(sessionId, text, inputIds)
+      const work = this.host.sendMessage(sessionId, text, inputIds)
         .then(() => {
           settle()
           // The message went out: record its Inputs before a later delivery can include them again. A host that cannot
@@ -120,6 +128,7 @@ export class NodeExecutor implements Executor {
           settle()
           this.fail(ticket.id, assignment.id, errorText(error))
         })
+      this.deliveries.set(assignment.id, { work, inputIds })
     } catch (error) {
       settle()
       this.fail(ticket.id, assignment.id, errorText(error))

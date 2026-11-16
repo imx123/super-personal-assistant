@@ -14,6 +14,9 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-workspace'
+import { resolveRoleModel } from '../app/role-models.ts'
+import type { RoleModel } from '../policy.ts'
+import { loadDeployment } from '../shared/deployment.ts'
 import { DshNodePort } from './dsh-port.ts'
 import { createDshPortHost } from './dsh-port-host.ts'
 import { startNodeHttpServer } from './http-server.ts'
@@ -40,6 +43,7 @@ export interface NodeEnvironment {
   root: string
   /** Base URL of an independent control plane, when this node has one to register its proxy tools against. */
   controlUrl?: string
+  defaultModel?: RoleModel
 }
 
 /**
@@ -49,7 +53,9 @@ export interface NodeEnvironment {
  * forgot one must not start listening. A relative root is refused because it would make workspace containment depend on
  * whatever working directory DSH was started from.
  */
-export function readNodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeEnvironment {
+export function readNodeEnvironment(base: NodeJS.ProcessEnv = process.env): NodeEnvironment {
+  const file = base.SUPERAGENT_NODE_DEPLOYMENT_FILE
+  const env = file ? { ...base, ...loadDeployment('node', resolve(file)).values } : base
   const token = env.SUPERAGENT_NODE_TOKEN?.trim()
   if (!token) throw new Error('SUPERAGENT_NODE_TOKEN is required to start a dsh-superagent node')
   const requestedPort = env.SUPERAGENT_NODE_PORT?.trim()
@@ -68,6 +74,12 @@ export function readNodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeE
       throw new Error(`SUPERAGENT_CONTROL_URL must be an http(s) URL: ${controlUrl}`)
     }
   }
+  const provider = env.SUPERAGENT_NODE_MODEL_PROVIDER?.trim()
+  const model = env.SUPERAGENT_NODE_MODEL?.trim()
+  const reasoningEffort = env.SUPERAGENT_NODE_REASONING_EFFORT?.trim()
+  if (Boolean(provider) !== Boolean(model) || (!model && reasoningEffort)) {
+    throw new Error('A node default model requires both provider and model')
+  }
   return {
     token,
     port,
@@ -75,6 +87,7 @@ export function readNodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeE
     nodeId: env.SUPERAGENT_NODE_ID?.trim() || 'local',
     root: resolve(requestedRoot),
     ...(controlUrl === undefined ? {} : { controlUrl }),
+    ...(provider && model ? { defaultModel: { provider, model, ...(reasoningEffort ? { reasoningEffort } : {}) } } : {}),
   }
 }
 
@@ -86,12 +99,14 @@ export function readNodeEnvironment(env: NodeJS.ProcessEnv = process.env): NodeE
  */
 export async function apply(ctx: Context): Promise<void> {
   const environment = readNodeEnvironment()
+  if (environment.defaultModel) await resolveRoleModel(ctx, environment.defaultModel)
   mkdirSync(environment.root, { recursive: true, mode: 0o700 })
   // The node's own lifetime: a delivery already in flight is cancelled when DSH disposes this plugin.
   const lifetime = new AbortController()
   ctx.effect(() => () => { lifetime.abort() })
   const node = new DshNodePort({ nodeId: environment.nodeId, root: environment.root,
-    host: createDshPortHost({ context: ctx, nodeRuntime: { sessions: createNodeSessions(ctx, { signal: lifetime.signal }) },
+    host: createDshPortHost({ context: ctx, nodeRuntime: { sessions: createNodeSessions(ctx, { signal: lifetime.signal,
+      ...(environment.defaultModel ? { defaultModel: environment.defaultModel } : {}) }) },
       nodeId: environment.nodeId, root: environment.root,
       ...(environment.controlUrl === undefined ? {} : { controlUrl: environment.controlUrl }) }) })
   const server = await startNodeHttpServer({ node, token: environment.token, host: environment.host,

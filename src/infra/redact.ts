@@ -56,11 +56,13 @@ function pathReplacement(match: string): string {
 }
 
 /**
- * Redact one diagnostic for storage or a management response.
- * Query values, credential names, known token formats, URL userinfo and absolute paths are replaced; everything else,
- * including the error's category and status text, is preserved.
+ * Redact the credentials of one text, and nothing else.
+ *
+ * Authorization headers, credential-shaped names, known token formats and URL userinfo are replaced; absolute paths and
+ * query values are left alone. A conversation log or an audit line keeps its paths, because a path is a location a person
+ * needs to read, while a credential is never one.
  */
-export function redact(text: string): string {
+export function redactCredentials(text: string): string {
   let value = text
     .replace(AUTH_HEADER, (_match, name: string) => `${name}: ${REDACTED}`)
     .replace(CREDENTIAL, (match, name: string, separator: string, raw: string) => {
@@ -73,8 +75,16 @@ export function redact(text: string): string {
       /\d/.test(raw) ? `${name} ${connector ?? ''}${REDACTED}` : match)
     .replace(SCHEME_CREDENTIAL, (_match, scheme: string) => `${scheme} ${REDACTED}`)
   for (const pattern of KNOWN_TOKENS) value = value.replace(pattern, REDACTED)
-  return value
-    .replace(URL_USERINFO, (_match, scheme: string) => `${scheme}${REDACTED}@`)
+  return value.replace(URL_USERINFO, (_match, scheme: string) => `${scheme}${REDACTED}@`)
+}
+
+/**
+ * Redact one diagnostic for storage or a management response.
+ * Query values, credential names, known token formats, URL userinfo and absolute paths are replaced; everything else,
+ * including the error's category and status text, is preserved.
+ */
+export function redact(text: string): string {
+  return redactCredentials(text)
     .replace(QUERY_VALUE, (_match, name: string) => `${name}${REDACTED}`)
     .replace(FILE_URL, () => `file://${REDACTED_PATH}`)
     .replace(WINDOWS_PATH, pathReplacement)

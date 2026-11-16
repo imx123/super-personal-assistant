@@ -75,6 +75,12 @@ export function validateNodeCommand(value: unknown): NodeCommand {
       identifier(command, 'workspace', type)
       break
 
+    // The review names a Project and nothing else: the node reads the workspace it bound to that Project, so a command
+    // cannot carry a path or a Git argument of its own.
+    case 'review.diff':
+      identifier(command, 'projectId', type)
+      break
+
     case 'pm.ensure':
       identifier(command, 'sessionId', type)
       identifier(command, 'workspace', type)
@@ -95,11 +101,28 @@ export function validateNodeCommand(value: unknown): NodeCommand {
       profileField(command.profile, `${type}.profile`)
       break
 
+    // The Router belongs to no Project: it names its own Session and its own workspace, and nothing else.
+    case 'router.ensure':
+      identifier(command, 'sessionId', type)
+      identifier(command, 'workspace', type)
+      identifier(command, 'sessionToken', type)
+      stringField(command, 'prompt', type)
+      profileField(command.profile, `${type}.profile`)
+      break
+
     case 'session.message':
       identifier(command, 'sessionId', type)
       stringField(command, 'text', type)
       // Optional, but a present token must still name something: an empty bearer is never meaningful.
       if (command.sessionToken !== undefined) identifier(command, 'sessionToken', type)
+      if (command.routerModel !== undefined) {
+        if (typeof command.routerModel !== 'object' || command.routerModel === null || Array.isArray(command.routerModel)) {
+          throw new NodeCommandError('invalid-command', 'session.message.routerModel must be an object')
+        }
+        const model = command.routerModel as Record<string, unknown>
+        identifier(model, 'provider', `${type}.routerModel`)
+        identifier(model, 'model', `${type}.routerModel`)
+      }
       break
 
     case 'session.cancel':
@@ -113,6 +136,9 @@ export function validateNodeCommand(value: unknown): NodeCommand {
 
     case 'session.inspect':
       identifier(command, 'sessionId', type)
+      if (command.routerDetails !== undefined && command.routerDetails !== true) {
+        throw new NodeCommandError('invalid-command', 'session.inspect.routerDetails must be true when present')
+      }
       break
 
     case 'permission.set':

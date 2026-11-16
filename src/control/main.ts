@@ -9,6 +9,8 @@ async function main(): Promise<void> {
   process.once('SIGINT', () => { void stop().then(() => process.exit(0)) })
   process.once('SIGTERM', () => { void stop().then(() => process.exit(0)) })
   process.stdout.write(`superagent control plane listening on ${started.address.url}\n`)
+  // The console is the same process and the same origin: the browser asks for the control-plane key itself.
+  process.stdout.write(`superagent console at ${started.address.url}/console\n`)
   await new Promise<void>(() => {})
 }
 

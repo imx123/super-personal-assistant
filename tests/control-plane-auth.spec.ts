@@ -29,9 +29,16 @@ interface Fixture {
 /** One write route the API exposes, with the body a real client would send. */
 interface Write {
   name: string
-  method: 'POST' | 'PUT'
+  method: 'POST' | 'PUT' | 'DELETE'
   path(fixture: Fixture): string
-  body?: Record<string, unknown>
+  body?: Record<string, unknown> | ((fixture: Fixture) => Record<string, unknown>)
+  /**
+   * The status the operator's call answers with; a create route answers 201, the other writes 200.
+   *
+   * A route that needs something that does not exist answers 404, and the matrix says so rather than pretending the
+   * write happened.
+   */
+  status?: number
 }
 
 /** Every write the control plane can perform; a viewer must be refused all of them. */
@@ -39,16 +46,61 @@ const WRITES: Write[] = [
   { name: 'node registration', method: 'POST', path: () => '/v1/nodes/register',
     body: { version: '0.1.0', capabilities: ['dsh'] } },
   { name: 'node heartbeat', method: 'POST', path: () => '/v1/nodes/local/heartbeat', body: { online: true } },
+  // The low-level routes: the semantics they always had.
   { name: 'PM creation', method: 'POST', path: fixture => `/v1/projects/${fixture.project.id}/pm` },
   { name: 'Worker creation', method: 'POST', path: fixture => `/v1/projects/${fixture.project.id}/workers`,
     body: { assignmentId: 'assignment-auth', ticketId: 'ticket-auth', prompt: 'Do the work' } },
   { name: 'session message', method: 'POST', path: fixture => `/v1/sessions/${fixture.pm.sessionId}/message`,
     body: { text: 'hello' } },
+  { name: 'session permission', method: 'PUT', path: fixture => `/v1/sessions/${fixture.worker.sessionId}/permission`,
+    body: { permission: 'read-only' } },
+  // The console's own namespace: the human actions on a Project and a Session.
+  { name: 'console session message', method: 'POST',
+    path: fixture => `/v1/console/sessions/${fixture.pm.sessionId}/message`, body: { text: 'hello' } },
+  { name: 'console project creation', method: 'POST', path: () => '/v1/console/projects',
+    body: { title: 'A new project', goal: 'Do the work' }, status: 201 },
+  { name: 'console project pause', method: 'POST', path: fixture => `/v1/console/projects/${fixture.project.id}/pause`,
+    body: { paused: true, mode: 'hard' } },
+  { name: 'console project memory', method: 'POST', path: fixture => `/v1/console/projects/${fixture.project.id}/memory`,
+    body: { text: 'remember this' }, status: 201 },
+  { name: 'console project archive', method: 'POST', path: fixture => `/v1/console/projects/${fixture.project.id}/archive` },
+  { name: 'console project unarchive', method: 'POST',
+    path: fixture => `/v1/console/projects/${fixture.project.id}/unarchive` },
+  { name: 'console project stop', method: 'POST', path: fixture => `/v1/console/projects/${fixture.project.id}/stop`,
+    body: { reason: 'done' } },
+  { name: 'console session cancel', method: 'POST',
+    path: fixture => `/v1/console/sessions/${fixture.worker.sessionId}/cancel`, body: { reason: 'done' } },
+  { name: 'console session archive', method: 'POST',
+    path: fixture => `/v1/console/sessions/${fixture.worker.sessionId}/archive` },
+  { name: 'console session permission', method: 'PUT',
+    path: fixture => `/v1/console/sessions/${fixture.worker.sessionId}/permission`, body: { permission: 'read-only' } },
+  { name: 'console session revoke', method: 'POST',
+    path: fixture => `/v1/console/sessions/${fixture.worker.sessionId}/revoke`, body: { reason: 'done' } },
+  { name: 'router message', method: 'POST', path: () => '/v1/console/router/message', body: { text: 'hello' } },
+  // The Router's proposal is confirmed by a person, so it is a console write like any other: the proposal below does
+  // not exist, and the honest answer to that is 404.
+  { name: 'router proposal confirm', method: 'POST',
+    path: () => '/v1/console/router/proposal/router-prop-00000000-0000-4000-8000-000000000000/confirm', status: 404 },
+  { name: 'router proposal cancel', method: 'POST',
+    path: () => '/v1/console/router/proposal/router-prop-00000000-0000-4000-8000-000000000000/cancel', status: 404 },
+  { name: 'reconciliation', method: 'POST', path: () => '/v1/console/reconcile/run' },
+  // The scheduled plans are console writes like any other. The plan the routes below name does not exist, so the honest
+  // answer to them is 404 — a viewer is refused before the route is even reached.
+  { name: 'console schedule creation', method: 'POST', path: () => '/v1/console/schedules',
+    body: fixture => ({ projectId: fixture.project.id, name: 'A scheduled task', rule: 'every:1h', message: 'look at the backlog' }),
+    status: 201 },
+  { name: 'console schedule edit', method: 'PUT', path: () => '/v1/console/schedules/sched-missing-task',
+    body: { name: 'renamed' }, status: 404 },
+  { name: 'console schedule pause', method: 'POST', path: () => '/v1/console/schedules/sched-missing-task/pause',
+    status: 404 },
+  { name: 'console schedule resume', method: 'POST', path: () => '/v1/console/schedules/sched-missing-task/resume',
+    status: 404 },
+  { name: 'console schedule run', method: 'POST', path: () => '/v1/console/schedules/sched-missing-task/run', status: 404 },
+  { name: 'console schedule delete', method: 'DELETE', path: () => '/v1/console/schedules/sched-missing-task', status: 404 },
+  // The low-level stop and archive come last: they end the PM Session the other writes still need.
   { name: 'session cancel', method: 'POST', path: fixture => `/v1/sessions/${fixture.pm.sessionId}/cancel`,
     body: { reason: 'done' } },
   { name: 'session archive', method: 'POST', path: fixture => `/v1/sessions/${fixture.pm.sessionId}/archive` },
-  { name: 'session permission', method: 'PUT', path: fixture => `/v1/sessions/${fixture.worker.sessionId}/permission`,
-    body: { permission: 'read-only' } },
 ]
 
 let directory = ''
@@ -78,10 +130,11 @@ async function serve(options: { viewer?: boolean } = {}): Promise<{ url: string;
 /** Issue one write route with one bearer token, draining the answer so the connection is reusable. */
 async function send(url: string, write: Write, fixture: Fixture,
   auth: Record<string, string>): Promise<{ status: number; body: string }> {
+  const body = typeof write.body === 'function' ? write.body(fixture) : write.body
   const response = await fetch(`${url}${write.path(fixture)}`, {
     method: write.method,
-    headers: { ...auth, ...(write.body === undefined ? {} : { 'content-type': 'application/json' }) },
-    ...(write.body === undefined ? {} : { body: JSON.stringify(write.body) }),
+    headers: { ...auth, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   return { status: response.status, body: await response.text() }
 }
@@ -110,7 +163,7 @@ describe('control-plane read-only viewer', () => {
   it('keeps /health public and lets a viewer read state, projects, tickets, sessions, events and the stream', async () => {
     const { url, fixture } = await serve()
     const reads = ['/v1/state', '/v1/projects', '/v1/tickets', '/v1/sessions', '/v1/events',
-      `/v1/sessions/${fixture.pm.sessionId}`]
+      '/v1/console/schedules', `/v1/sessions/${fixture.pm.sessionId}`]
 
     for (const path of reads) {
       const viewer = await read(url, path, VIEWER)
@@ -157,7 +210,7 @@ describe('control-plane read-only viewer', () => {
 
     for (const write of WRITES) {
       const response = await send(url, write, fixture, OPERATOR)
-      expect(response.status, `${write.name} must be allowed for the operator`).toBe(200)
+      expect(response.status, `${write.name} must be allowed for the operator`).toBe(write.status ?? 200)
     }
     expect(node.messages.get(fixture.pm.sessionId)).toContain('hello')
     expect(node.permissions.get(fixture.worker.sessionId)).toBe('read-only')
@@ -231,6 +284,17 @@ describe('control-plane read-only viewer', () => {
       expect(await refused.text()).toMatch(/read-only viewer/)
       const beat = await fetch(`${running.address.url}/v1/nodes/local/heartbeat`, { method: 'POST', headers: OPERATOR })
       expect(beat.status).toBe(200)
+
+      // The standalone entry point creates a Project on its own empty database: no Trigger was seeded into it.
+      const created = await fetch(`${running.address.url}/v1/console/projects`, { method: 'POST',
+        headers: { ...OPERATOR, 'content-type': 'application/json' },
+        body: JSON.stringify({ title: 'From the entry point', goal: 'Do the work' }) })
+      expect(created.status).toBe(201)
+      const { project } = await created.json() as { project: { id: string; title: string } }
+      expect(project.title).toBe('From the entry point')
+      const projects = await read(running.address.url, '/v1/projects', VIEWER)
+      expect(projects.status).toBe(200)
+      expect(projects.body).toContain(project.id)
     } finally {
       await running.close()
     }

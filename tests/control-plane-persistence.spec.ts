@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -39,6 +39,24 @@ afterEach(async () => {
 })
 
 describe('control-plane Session persistence', () => {
+  it('remembers a selected workspace when the project has not started a Session yet', async () => {
+    directory = mkdtempSync(join(tmpdir(), 'superagent-control-persist-'))
+    const root = join(directory, 'workspaces')
+    const workspace = join(root, 'future project')
+    node = new FakeNode({ nodeId: 'local', root })
+    const first = open()
+    const project = first.createProjectFromOperator('Project', 'Goal', workspace)
+    expect(existsSync(workspace)).toBe(false)
+    expect(first.state().sessions).toHaveLength(0)
+    await first.close()
+
+    const second = open()
+    expect(second.consoleProjects()).toMatchObject([{ id: project.id, workspace }])
+    await second.registerNode()
+    expect((await second.startProjectPm(project.id)).workspace).toBe(workspace)
+    expect(existsSync(workspace)).toBe(true)
+  })
+
   it('writes Sessions to the Store KV area and reloads them after a restart', async () => {
     directory = mkdtempSync(join(tmpdir(), 'superagent-control-persist-'))
     node = new FakeNode({ nodeId: 'local', root: join(directory, 'workspaces') })

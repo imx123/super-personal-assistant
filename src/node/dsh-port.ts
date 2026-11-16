@@ -4,13 +4,23 @@
  * command and event mapping stays testable with a fake host; only `dsh-port-host.ts` names `@deepseek-ai/*`.
  */
 import { mkdirSync } from 'node:fs'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { resolve } from 'node:path'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type RoleProfile,
-  type SessionInspection, type SessionRole } from '../shared/protocol.ts'
+  type RouterModel, type SessionInspection, type SessionRole } from '../shared/protocol.ts'
+import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { NodeCommandError, validateNodeCommand } from './command-validation.ts'
+import { reviewWorkspace, type ReviewDiffLimits } from './review-diff.ts'
 
 /** Omits a field from each member of a union, so a discriminated command or event keeps its narrowing. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
+
+/**
+ * The roles a node runs a Session for.
+ *
+ * The protocol's `SessionRole` also names the `scout`, which the node never runs: a node ensures a PM, a Worker or the
+ * Router, and nothing else.
+ */
+export type NodeSessionRole = 'pm' | 'worker' | 'router'
 
 /**
  * One event the host reports, before the port stamps its envelope.
@@ -37,7 +47,7 @@ export interface DshPortHost {
    * Resolve or create a Session in `workspace`, install the role prompt once when there is one, and — when the host
    * knows a control URL — register the control-plane proxy tools that call it with `sessionToken`.
    */
-  ensureSession(input: { sessionId: string; workspace: string; title: string; role: 'pm' | 'worker'; prompt?: string
+  ensureSession(input: { sessionId: string; workspace: string; title: string; role: NodeSessionRole; prompt?: string
     /** The control plane's role definition, complete: the node applies its preset, permission and model. */
     profile: RoleProfile
     /** The control plane's short-lived token; the host hands it to the proxy tools, never to the prompt. */
@@ -53,13 +63,13 @@ export interface DshPortHost {
    * pass-through, not a local verification: the control plane's tool routes remain the verifier.
    */
   promptSession(sessionId: string, idempotencyKey: string, text: string, sessionToken?: string,
-    inputIds?: readonly string[]): Promise<void>
+    inputIds?: readonly string[], routerModel?: RouterModel): Promise<void>
   /** Cancel the Session's current turn and resolve once that turn has settled; keep unclaimed messages. */
   cancelSession(sessionId: string, reason?: string): Promise<void>
   /** Archive the Session with the host; rejects when the archive did not happen. */
   archiveSession(sessionId: string): Promise<void>
   /** Report what the host knows about one Session, without changing it. */
-  inspectSession(sessionId: string): Promise<SessionInspection>
+  inspectSession(sessionId: string, routerDetails?: true): Promise<SessionInspection>
   /** Set the Session's permission preset by name. */
   setPermission(sessionId: string, permission: string): void
   /** Report the Session events the host observes; returns the disposer that stops reporting. */
@@ -77,22 +87,22 @@ export interface DshNodePortOptions {
   root: string
   /** Clock for event and status timestamps; tests pin it. */
   now?: () => string
+  /**
+   * The bounds of the read-only Git review this node offers.
+   *
+   * They only ever narrow the defaults: a deployment may lower them, and the review stays a bounded read of the
+   * Project's own repository whatever they are.
+   */
+  reviewDiff?: ReviewDiffLimits
 }
 
 /**
  * Resolves `workspace` against the node root and refuses anything outside it.
  *
- * The check is lexical: a workspace escaping through `..` or an absolute path is rejected before any directory is
- * created, so a bad command cannot make the node write outside its root. A workspace equal to the root is allowed.
+ * Both the supplied path and its resolved directory must stay under the node root.
  */
 export function nodeWorkspace(root: string, workspace: string): string {
-  const base = resolve(root)
-  const target = resolve(base, workspace)
-  const escaped = relative(base, target)
-  if (escaped === '..' || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
-    throw new Error(`Workspace escapes the node root: ${workspace}`)
-  }
-  return target
+  return workspaceDirectory(root, workspace, `Workspace escapes the node root: ${workspace}`)
 }
 
 /**
@@ -107,6 +117,14 @@ export class DshNodePort implements NodePort {
   private readonly nodeId: string
   private readonly root: string
   private readonly now: () => string
+  private readonly reviewDiff: ReviewDiffLimits
+  /**
+   * The workspace this node bound to each Project, by Project id.
+   *
+   * The review command names a Project and nothing else, so this is where the directory it reads comes from: the node
+   * never takes a path from the command.
+   */
+  private readonly workspaces = new Map<string, string>()
   /** Keys of commands that already completed successfully; a repeated key is acknowledged without a second host call. */
   private readonly done = new Set<string>()
   /**
@@ -131,6 +149,7 @@ export class DshNodePort implements NodePort {
     this.nodeId = options.nodeId
     this.root = resolve(options.root)
     this.now = options.now ?? (() => new Date().toISOString())
+    this.reviewDiff = options.reviewDiff ?? {}
   }
 
   /**
@@ -188,13 +207,17 @@ export class DshNodePort implements NodePort {
 
       // Both commands name the directory a Project's Sessions work in; the node only creates it under its own root.
       case 'workspace.ensure':
-      case 'project.bind':
-        mkdirSync(this.workspaceOf(command.workspace), { recursive: true, mode: 0o700 })
+      case 'project.bind': {
+        const workspace = this.workspaceOf(command.workspace)
+        mkdirSync(workspace, { recursive: true, mode: 0o700 })
+        this.workspaces.set(command.projectId, workspace)
         break
+      }
 
       case 'pm.ensure': {
         const workspace = this.workspaceOf(command.workspace)
         mkdirSync(workspace, { recursive: true, mode: 0o700 })
+        this.workspaces.set(command.project.id, workspace)
         this.sessions.set(command.sessionId, { projectId: command.project.id, role: 'pm' })
         await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: command.project.title,
           role: 'pm', prompt: command.profile.prompt, profile: command.profile, sessionToken: command.sessionToken })
@@ -204,6 +227,7 @@ export class DshNodePort implements NodePort {
       case 'worker.create': {
         const workspace = this.workspaceOf(command.workspace)
         mkdirSync(workspace, { recursive: true, mode: 0o700 })
+        this.workspaces.set(command.projectId, workspace)
         this.sessions.set(command.sessionId, { projectId: command.projectId, role: 'worker',
           assignmentId: command.assignmentId })
         // The control plane sends the role prompt here by default and a Ticket's own prompt otherwise; either way it is
@@ -214,10 +238,20 @@ export class DshNodePort implements NodePort {
         break
       }
 
+      // The Router: one Session of its own, in a workspace of its own, bound to no Project.
+      case 'router.ensure': {
+        const workspace = this.workspaceOf(command.workspace)
+        mkdirSync(workspace, { recursive: true, mode: 0o700 })
+        this.sessions.set(command.sessionId, { projectId: '', role: 'router' })
+        await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: 'Router',
+          role: 'router', prompt: command.prompt, profile: command.profile, sessionToken: command.sessionToken })
+        break
+      }
+
       case 'session.message':
         // The host's queue is idempotent per key, and awaiting it is what lets a refused delivery fail the command.
         await this.host.promptSession(command.sessionId, command.idempotencyKey, command.text, command.sessionToken,
-          command.inputIds)
+          command.inputIds, command.routerModel)
         break
 
       case 'session.cancel':
@@ -231,7 +265,7 @@ export class DshNodePort implements NodePort {
         break
 
       case 'session.inspect': {
-        const inspection = await this.host.inspectSession(command.sessionId)
+        const inspection = await this.host.inspectSession(command.sessionId, command.routerDetails)
         // The request id echoes the key so the asking transport can match the answer to its request.
         this.publish({ type: 'session.inspected', sessionId: command.sessionId,
           requestId: command.idempotencyKey, inspection })
@@ -241,6 +275,18 @@ export class DshNodePort implements NodePort {
       case 'permission.set':
         this.host.setPermission(command.sessionId, command.permission)
         break
+
+      // The read-only review of a Project's workspace. The command names the Project, the node reads the workspace it
+      // bound to that Project, and the answer travels back as an event the control plane matches by the request id.
+      case 'review.diff': {
+        const workspace = this.workspaces.get(command.projectId)
+        const result = workspace === undefined
+          ? { status: 'refused' as const, reason: 'This node holds no workspace for the Project' }
+          : await reviewWorkspace({ workspace, root: this.root, ...this.reviewDiff })
+        this.publish({ type: 'review.diff', sessionId: '', projectId: command.projectId, role: 'pm',
+          requestId: command.idempotencyKey, result })
+        break
+      }
     }
   }
 

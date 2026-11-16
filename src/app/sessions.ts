@@ -338,12 +338,18 @@ export class Sessions {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     return !('error' in result) && await this.agentDelivery.holds(result.agent, key(requestId))
   }
-  /** Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent. */
+  /**
+   * Deliver a message once per request id: to the next turn, the current one, or `inject`ed with its label without waking the agent.
+   *
+   * `onDelivered` reports that the message reached the Agent's inbox. It is optional and the plugin's own callers do not
+   * pass it; the node port does, because a delivery that is in the inbox may start a turn before the persistence flush
+   * this call waits for, and the node reports the message's Input ids with that turn.
+   */
   async prompt(sessionId: string, requestId: string, text: string, mode: DeliveryMode, authorize?: () => void,
-    accepted?: () => void): Promise<void> {
+    accepted?: () => void, onDelivered?: () => void): Promise<void> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
     if ('error' in result) throw result.error
-    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted)
+    await this.agentDelivery.send(result.agent, key(requestId), text, mode, this.host.lifetime, authorize, accepted, onDelivered)
   }
   /** The id of the message `prompt` delivers under `requestId`, which DSH's inbox events name it by. */
   promptedId(requestId: string): MessageId { return messageId(key(requestId)) }

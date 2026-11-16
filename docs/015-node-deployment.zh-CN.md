@@ -47,6 +47,16 @@ node lib/control.js                      dsh --profile superagent-node
 | `SUPERAGENT_CONTROL_PORT` | 控制面 | 否 | 默认 `0`（临时端口）；部署时设固定值 |
 | `SUPERAGENT_CONTROL_HOST` | 控制面 | 否 | 默认 `127.0.0.1` |
 | `SUPERAGENT_CONTROL_DB` | 控制面 | 否 | SQLite 文件，默认 `<node root>/control.sqlite`；启动时锁住它的父目录 |
+| `SUPERAGENT_CONTROL_DEPLOYMENT_FILE` | 控制面 | 否 | 控制台写入的下次启动控制面设置。默认放在启动时业务库旁的 `.superagent-private/control.json`。若业务库在节点根目录内，移动到根目录同级的 `<节点目录名>.superagent-private` |
+| `SUPERAGENT_NODE_DEPLOYMENT_FILE` | 两端 | 节点使用控制台配置时必填 | 控制台写入的节点设置。控制面未指定时保存到 `.superagent-private/node.json`，DSH 节点启动器填写该文件的绝对路径。文件应位于节点和工作区之外 |
+| `SUPERAGENT_CONSOLE_DB` | 控制面 | 否 | 控制面自己的文件（持久事件日志 + 审计 + 项目备忘 + 对账记录），默认 `<node root>/console.sqlite`；与领域库分开，领域 schema 版本不动 |
+| `SUPERAGENT_CONSOLE_DIR` | 控制面 | 否 | 构建好的控制台前端目录，默认包自己的 `lib`（其中应有 `console.js`）；目录里只读这一个文件 |
+| `SUPERAGENT_CONSOLE_EVENT_ROWS` | 控制面 | 否 | 事件保留条数上限，默认 20000，至少 1 |
+| `SUPERAGENT_CONSOLE_EVENT_DAYS` | 控制面 | 否 | 事件保留天数，默认 7；0 关闭按天数清理 |
+| `SUPERAGENT_CONSOLE_AUDIT_DAYS` | 控制面 | 否 | 审计保留天数，默认 0，表示长期保留 |
+| `SUPERAGENT_RECONCILE_INTERVAL_MS` | 控制面 | 否 | 孤儿对账的周期（毫秒），默认 `0` = 不自动跑；控制台随时可以手动跑一次。只清理节点确认仍在跑、而其 Assignment 已经结束的残留会话 |
+| `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 控制面 | 否 | 定时任务的**固定**时基偏移（分钟，东为正），默认 `0` = UTC。取值范围 −720…840，非法值启动失败。用命名时区会带上夏令时规则，所以这里只给固定偏移；控制台会把这个偏移显示出来 |
+| `SUPERAGENT_SCHEDULER_TICK_MS` | 控制面 | 否 | 调度器查看「到点计划」的周期（毫秒），不设置时用模块自己的默认（5 秒）。`0` = 计划仍然存在，但**不自己**到点运行，只能手动跑 |
 | `SUPERAGENT_WORKSPACE_ROOT` | 控制面 | 否 | 默认 `<node root>/workspaces`；**必须**在 `SUPERAGENT_NODE_ROOT` 之内，否则节点报 `Workspace escapes the node root` |
 | `SUPERAGENT_NODE_URL` | 控制面 | 生产必填 | 节点 base URL。不设置时控制面使用内置 `FakeNode`（测试/兼容），不会连接真实节点 |
 | `SUPERAGENT_NODE_TOKEN` | 控制面 | `NODE_URL` 存在时必填 | 与节点侧相同 |
@@ -56,7 +66,7 @@ node lib/control.js                      dsh --profile superagent-node
 1. **两个 home 都是专用的。** `DSH_HOME`、`DSH_AGENTS_HOME`、`SUPERAGENT_NODE_ROOT`、`SUPERAGENT_CONTROL_DB` 的父目录、`SUPERAGENT_WORKSPACE_ROOT` 都应属于服务账号，不要复用个人目录。E2E 的隔离口径见 [014 §3](014-p2d2-recovery.zh-CN.md)。
 2. **令牌只存在于进程环境和机器的密钥存储里。** 不写进 `cordis.patch.yml`、`package.json`、示例、控制面数据库或日志；不要用命令行参数传（会出现在进程列表）。轮换时两侧同时改，再依次重启节点和控制面。
 3. 控制面进程也读 `SUPERAGENT_NODE_ROOT`/`SUPERAGENT_NODE_ID`，用于 `SUPERAGENT_WORKSPACE_ROOT` 的默认值和节点键；两个进程的 `NODE_ID` 不一致时，`/v1/state` 里的键与节点事件里的 id 会对不上，代次轮换也不会发生在控制面认为的那个节点上。
-4. `SUPERAGENT_WORKSPACE_ROOT` 在 `SUPERAGENT_NODE_ROOT` 之下是硬约束，不是建议：节点按词法路径检查越界。
+4. `SUPERAGENT_WORKSPACE_ROOT` 必须位于 `SUPERAGENT_NODE_ROOT` 内。节点也会检查子目录中的符号链接或 Windows 目录联接是否指向根目录之外。
 
 ## 3. Profile 与模型
 
@@ -106,7 +116,10 @@ export SUPERAGENT_NODE_TOKEN='<same node token>'
 export SUPERAGENT_NODE_ID=node-1
 node lib/control.js
 # superagent control plane listening on http://127.0.0.1:47100
+# superagent console at http://127.0.0.1:47100/console
 ```
+
+浏览器打开 `/console` 后输入 `SUPERAGENT_CONTROL_TOKEN`，当前标签页刷新时会自动恢复连接。只读密钥可以查看设置。调度检查间隔、自动对账间隔和令牌刷新宽限在设置页保存后立即生效，持久化于控制台 SQLite。选择「恢复启动值」可清除覆盖，重新采用启动参数。控制台详见 [017](017-console.zh-CN.md)。
 
 ### 4.1 健康检查
 
@@ -172,11 +185,15 @@ The node node-1 is offline; the command was not sent
 
 排障时可以直接 `curl` 节点的 `/commands` 发 `session.inspect`，但要注意 token 和命令 envelope；更简单的是看控制面 `/v1/sessions` 与节点日志。
 
-### 5.4 节点重启后事件 `seq` 从 1 重新计数
+### 5.4 事件 `seq` 是控制面自己的序号
 
-节点进程内的事件序号在重启后归零，`/v1/events?after=N` 的跨重启游标语义尚未定义。控制面当前的恢复逻辑不依赖跨节点重启的游标；如果你在外面接了消费者，不要持久化 `seq` 当全局游标，重启后从 `after=0` 重新拉全量或按事件内容去重。这是已知未处理项，不要把它当成已修复。
+节点进程内的事件序号在重启后归零，**对外的 `seq` 已经是控制面自己的序号**，跨控制面重启单调（见 [009](009-node-protocol.zh-CN.md)）。节点自己的计数以 `nodeSeq` 保留在事件里，`nodeSeq` 变小即节点重启过。日志有界，被裁掉的那一段会明确告知（`gap`），不会悄悄少一段。
 
-### 5.5 其他常见错误
+### 5.5 控制台页面显示“尚未构建”
+
+控制面进程正常、`/v1/*` 正常，但 `/console` 提示前端没构建：包里没有 `console.js`。处置：在源码目录执行 `pnpm build`（产物在 `lib/console.js`）后重启控制面，或用 `SUPERAGENT_CONSOLE_DIR` 指向已构建的目录。控制台与控制面同源，不加载任何第三方资源。
+
+### 5.6 其他常见错误
 
 | 现象 | 原因与处置 |
 | --- | --- |
@@ -189,7 +206,7 @@ The node node-1 is offline; the command was not sent
 | DSH 启动日志说某 bundle 被跳过/不兼容 | `engines.dsh` 与运行的 DSH 版本不匹配；安装匹配版本或放宽仓库的范围，不要改 `node_modules` |
 | PM 在操作员消息前自行开始 turn 1 | 这是 role prompt 投递的产品行为，不是部署故障；需要“干净的一问一答”要先做产品决策（[014 §6.4](014-p2d2-recovery.zh-CN.md)） |
 
-### 5.6 Session token 过期后 refresh：默认 5 分钟宽限
+### 5.7 Session token 过期后 refresh：默认 5 分钟宽限
 
 Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 `401`；只有 `POST /v1/tools/token/refresh` 在默认 **300 秒**宽限内仍允许自续一次，同时接受 `current` 或 `current - 1` 版本。
 
@@ -197,13 +214,13 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 - 刷新会自增 `tokenVersion`，同一秒刷新出的 token 也不同；旧 token 刷新后不能再打开普通工具，但可在宽限内再 refresh 一次。
 - 取舍：超过 `TTL + 5min` 且期间完全没有工具调用的长任务仍然失败；不要把宽限理解成“过期 token 仍可正常使用”。
 
-### 5.7 半失联节点：命令超时 10s
+### 5.8 半失联节点：命令超时 10s
 
 `HttpNodePortOptions.commandTimeoutMs` 默认 **10_000ms**（代码选项，不是 env）。它覆盖一次 `POST /commands` 的总时长，并合并调用方 signal；超时错误包含 command type 和毫秒数，不含 token。
 
 现象：节点进程还在、端口还能连，但请求迟迟不返回。心跳会在 command timeout 后失败，控制面本地记 `online:false`，下次心跳继续重试；节点恢复应答后自动 online。注意默认超时是 10s，不要在 180ms 的审计窗口里期待 offline；测试用 50ms 注入证明恢复语义。
 
-### 5.8 stop/cancel 的 10s deadline
+### 5.9 stop/cancel 的 10s deadline
 
 `DshPortHostInput.cancelTimeoutMs` 默认 **10_000ms**（代码选项，不是 env）。`cancelSession` 把 `stopBackground + cancel + whenIdle` 包在同一个 deadline race 里；超时抛 `Stopping the Session <id> did not settle within <ms> ms`，命令失败，不让调用方永远挂住。
 
@@ -281,7 +298,7 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 
 - viewer 认证、写操作 403 校验与 SSE 压测已在 P2-C 完成；TLS/反向代理仍不在本文实现，部署建议与威胁模型见 `docs/016-control-plane-tls.zh-CN.md`（纯文本提及）。本文不把 loopback 部署描述成“已经安全地暴露到网络”。
 - token refresh 默认 5 分钟宽限、cancel/command 默认 10 秒 deadline 都是上限，不是精确时间；超过 TTL+grace 且无工具调用的长任务仍失败，半失联节点可能到 10 秒才 offline。
-- 仓库没有控制面前端；`src/client` 是 DSH 面板（轮询 `/orchestrator/api`），不是控制面 UI，也不接控制面的 `/v1/events/stream`。
+- 控制面前端由控制面同源托管（`src/console`）：它读控制面的真实数据，也有写操作（项目、Session、对账、Router 对话）。`src/client` 仍然是 DSH 面板（轮询 `/orchestrator/api`），不是控制面 UI。控制台里 Router 的转发是**两段式**的：Router 只能提交一条待确认的提议，真正把话发给某个项目的 PM 要有人在控制台里点确认（确认端点只认控制面的 bearer，Router 的 Session token 开不了）；定时任务仍然没有。
 - 多节点调度/故障转移不在 Phase 2 范围内；本文只部署单个节点。
 - `RoleProfile.deny` 的独立语义、PM role prompt 是否应静默投递，仍是后续产品/实现项（[013 §6](013-p2d-node-spike.zh-CN.md)、[014 §6](014-p2d2-recovery.zh-CN.md)）。
-- 控制面锁 stale（§5.1）与节点事件 `seq` 跨重启语义（§5.4）是已知限制，不是已修复能力。
+- 控制面锁 stale（§5.1）是已知限制；事件 `seq` 的跨重启语义已经收口为控制面自己的序号（§5.4）。

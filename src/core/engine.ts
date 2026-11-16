@@ -1,9 +1,9 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
-import { assignmentSessionId, isoTime, latestAssignment, liveTicket, pmSessionId, runningAssignment, threadKey, waitsForPerson,
-  workerSessionId, WORK_TOOLS } from './model.ts'
-import type { ChannelRef, Decision, Handoff, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask, ProjectTicketThread, ThreadRef,
-  Ticket, Trigger } from './model.ts'
+import { assignmentSessionId, currentReview, isoTime, latestAssignment, liveTicket, pmSessionId, reviewById, runningAssignment,
+  threadKey, waitsForPerson, workerSessionId, WORK_TOOLS } from './model.ts'
+import type { Assignment, ChannelRef, Decision, Handoff, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask,
+  ProjectTicketThread, ThreadRef, Ticket, TicketReview, Trigger } from './model.ts'
 import { key } from './ids.ts'
 import type { Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
@@ -52,6 +52,8 @@ export const HANDOFF = { summary: 4000, unfinished: 20, item: 500 } as const
 
 /** The bounds a PM's `orchestrator_project_ticket_create` request must keep; the tool schema states the same limits. */
 export const PROJECT_TICKETS = { max: 5, title: 200, goal: 4000, scope: 1500, note: 500, threads: 10, threadKey: 300, tools: 32 } as const
+/** How long the reason of a rejected result may be: it is read by the Worker that has to act on it. */
+export const REVIEW_REASON_MAX = 2000
 const WORKTREE_NAME = /^[a-z]+(?:-[a-z0-9]+){0,3}$/
 /** A short lowercase ASCII worktree name from an English title, or `task-<n>` when the title has none. */
 function worktreeName(title: string, index: number): string {
@@ -70,6 +72,19 @@ function projectThread(value: string): ThreadRef {
   return { source, id }
 }
 const invalidTask = (reason: string): never => { throw new UserError('invalidProjectTask', { reason }) }
+/**
+ * The message a rejected result sends back to the Worker that produced it.
+ *
+ * It states the decision, the reason the PM gave and what the Worker is expected to do next: the Ticket stays open, and
+ * the Worker reports its new result for a new review.
+ */
+function revisionRequest(review: TicketReview): string {
+  return [
+    `The Project PM reviewed the result of Assignment ${review.assignmentId} (review ${review.id}) and rejected it.`,
+    `Reason: ${review.reason}`,
+    'The Ticket stays open. Make the revision, then report the new result with control_report; the PM reviews it again.',
+  ].join('\n')
+}
 /**
  * The tools a PM task allows: its explicit list, or the PM Mandate's when it names none; undefined means every work tool.
  * A list may only narrow the PM Mandate's, must name known work tools once each, and holds at most PROJECT_TICKETS.tools.
@@ -315,7 +330,7 @@ export class Engine {
    * The Decision comes from a gate-only Eval with a real Eval id, not from an assessor.
    * @throws UserError when the Trigger is unknown or not admissible.
    */
-  createProject(triggerId: string, title: string, goal: string): ProjectProfile {
+  createProject(triggerId: string, title: string, goal: string, workspace?: string): ProjectProfile {
     return this.repo.atomic(() => {
       const projectId = key('project', triggerId)
       const existing = this.repo.projects.get(projectId)
@@ -323,6 +338,7 @@ export class Engine {
       if (!this.repo.triggers.get(triggerId)) throw new UserError('unknownTrigger')
       const { decision, mandate } = this.evals.project(triggerId, projectId, goal)
       const project: ProjectProfile = { id: projectId, title, goal, status: 'active', decisionId: decision.id,
+        ...(workspace === undefined ? {} : { workspace }),
         pmSessionId: pmSessionId(projectId), mandate, createdAt: decision.at, updatedAt: decision.at }
       this.repo.projects.save(project)
       this.options.emit?.({ type: 'project.created', at: decision.at, data: { projectId, decisionId: decision.id, pmSessionId: project.pmSessionId } })
@@ -527,6 +543,196 @@ export class Engine {
       if (project.status !== 'active') throw new UserError('projectEnded')
       return this.tickets.revive(ticketId, projectId, pmSessionId)
     })
+  }
+  /**
+   * A Project PM stops the Worker of one of its own Tickets: the current Assignment ends as an operator stop, the Ticket
+   * records the stop under its Project, and the Executor stops the Worker's Session.
+   *
+   * It reuses the one primitive that stops a Worker (`Tickets.hardStopWorker`), so the domain state and the node stay in
+   * step: the Assignment ends in the Store, the Ticket keeps the stop, and the Worker's Session is asked to stop. Nothing
+   * here changes only the remote Session, and nothing starts a second Worker over the stopped one.
+   *
+   * The stop is recorded with the `project` scope, like a Project hard pause: the Project's PM may revive the Worker
+   * (`reviveProjectTicket`), while a stop a person made (`worker` scope) is left in place and still needs a person to
+   * approve the resume. The Assignment must still be the Ticket's current one, so a stale Assignment can never stop the
+   * Worker a newer Assignment owns.
+   *
+   * The stop is open until the node confirms it: the fact that it is open is written in the same transaction as the end of
+   * the Assignment, so a control plane that stops before the node answers still knows that the Worker may run and starts
+   * no replacement over it. A confirmed stop clears that fact again.
+   *
+   * The Executor's cleanup is collected in `options.cleanups` instead of being awaited here, so the caller can wait for
+   * the node's own stop and report a failure that left the Worker Session running.
+   * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, the Ticket is not
+   * its own or is ended, or the Assignment is not its current one or has already ended.
+   */
+  stopProjectWorker(projectId: string, pmSessionId: string, ticketId: string, assignmentId: string,
+    options: { reason?: string; cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): Ticket {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      if (project.status === 'archived') throw new UserError('projectArchived')
+      if (project.status === 'paused') throw new UserError('projectPaused')
+      if (project.status !== 'active') throw new UserError('projectEnded')
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      const latest = latestAssignment(ticket)
+      if (!latest || latest.id !== assignmentId || latest.state === 'ended') throw new UserError('assignmentEnded')
+      // The `project` scope stops the Ticket's current Assignment; the check above is what makes the named Assignment
+      // that one, so a stale Assignment cannot stop the Worker a newer Assignment owns. The stop waits for the node's
+      // answer, so the Ticket records that it is open until the node confirms it.
+      return this.tickets.hardStopWorker(ticketId, { scope: 'project', by: 'pm', projectId, confirmStop: true,
+        ...(options.reason ? { reason: options.reason } : {}), ...(options.cleanups ? { cleanups: options.cleanups } : {}) })
+    })
+  }
+  /**
+   * A Project PM asks the node to stop a Worker whose Assignment already ended, because that stop was never confirmed.
+   *
+   * The Assignment stays ended and the Ticket keeps its stop and its failure; only the node is asked again, and the caller
+   * waits for the answer through `options.cleanups`. This is what makes a failed stop recoverable: the PM may ask for a
+   * new Assignment only after a later stop is confirmed, and this is the call that confirms it.
+   * @throws UserError when the Project is unknown, the caller is not its PM, the Ticket is not its own, or the Assignment
+   * is not one of its own.
+   */
+  reconfirmStoppedWorker(projectId: string, pmSessionId: string, ticketId: string, assignmentId: string,
+    options: { reason?: string; cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): Ticket {
+    return this.repo.atomic(() => {
+      const project = this.repo.projects.get(projectId)
+      if (!project) throw new UserError('unknownProject')
+      if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+      this.tickets.restopWorker(ticketId, assignmentId,
+        options.reason ?? 'The stop of this Worker is confirmed again', options.cleanups)
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
+  /**
+   * Record that stopping one Worker could not be confirmed, so the Ticket keeps that failure until a later stop confirms it.
+   *
+   * The failure is what keeps a new Assignment from starting over a Worker that may still run, so a caller that gave up
+   * waiting for the node records it here instead of leaving the Ticket as if the Worker were gone.
+   */
+  noteStopFailure(ticketId: string, assignmentId: string, error: string): void {
+    this.repo.atomic(() => { this.tickets.noteStopFailure(ticketId, assignmentId, error) })
+  }
+  /**
+   * A Project PM accepts the result a Worker reported: the Ticket ends as `completed` and its Worker stops.
+   *
+   * The decision names the review it is about: the review's own id, and the Assignment that produced the result. The
+   * Ticket's own review says which Assignment it was about, and that Assignment must still be the Ticket's current one.
+   * A review that was already accepted is answered with the same result, so a repeated request decides nothing new and
+   * contradicts nothing; a rejected review, one that names another Assignment, or one that a newer round replaced, is
+   * refused.
+   * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, the Ticket is not
+   * its own, the Ticket has no review with that id, no result waits for review, or the Assignment is not the one under
+   * review.
+   */
+  acceptProjectReview(projectId: string, pmSessionId: string, ticketId: string, assignmentId: string, reviewId: string): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.reviewTicket(projectId, pmSessionId, ticketId)
+      const { review } = this.reviewTarget(ticket, assignmentId, reviewId)
+      // A repeated acceptance answers with the same result: it decides nothing new.
+      if (review.state === 'accepted') return ticket
+      // A rejected result is not accepted afterwards: the decision that was made stands.
+      if (review.state === 'rejected') throw new UserError('reviewAlreadyRejected')
+      this.tickets.acceptReview(ticket, review, this.options.now?.() ?? new Date().toISOString())
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
+  /**
+   * A Project PM rejects the result a Worker reported: the Ticket stays open, the review keeps the reason, and the reason
+   * goes back to the same Assignment as a revision request.
+   *
+   * The decision names the review it is about: the review's own id, and the Assignment that produced the result. The
+   * revision request is the safe minimal path: the Worker that produced the result keeps working on it and no second
+   * Worker is created beside it. A repeated rejection of the same review keeps the reason it recorded — another reason
+   * would contradict that decision — and sends the request again when it never reached the Worker. A decision about a
+   * round a newer one replaced is answered as it was made and sends nothing: a late decision never decides the round that
+   * waits now.
+   * @throws UserError when the Project is unknown, paused, archived or ended, the caller is not its PM, the Ticket is not
+   * its own, the Ticket has no review with that id, no result waits for review, the Assignment is not the one under
+   * review, or the reason is missing or too long.
+   */
+  rejectProjectReview(projectId: string, pmSessionId: string, ticketId: string, assignmentId: string, reviewId: string, reason: string):
+    { ticket: Ticket; delivered?: TicketMessageDelivery; revisionInputId: string } {
+    const why = typeof reason === 'string' ? reason.trim() : ''
+    if (!why || why.length > REVIEW_REASON_MAX) throw new UserError('reviewReasonRequired')
+    return this.repo.atomic(() => {
+      const ticket = this.reviewTicket(projectId, pmSessionId, ticketId)
+      const { review, assignment, current } = this.reviewTarget(ticket, assignmentId, reviewId)
+      // A result the PM already rejected keeps its reason: another reason would contradict that decision.
+      if (review.state === 'accepted') throw new UserError('reviewAlreadyAccepted')
+      if (review.state === 'rejected' && review.reason !== why) throw new UserError('reviewAlreadyRejected')
+      // A decision about a round a newer one replaced was already made: it is answered as it was, and the round that
+      // waits now is left alone. No request goes out, so a late decision never disturbs the work under the newer review.
+      if (review.state === 'rejected' && !current) {
+        return { ticket, revisionInputId: key('input', ticket.id, 'note', 'review', review.id) }
+      }
+      const decided = review.state === 'rejected' ? review
+        : this.tickets.rejectReview(ticket, review, why, this.options.now?.() ?? new Date().toISOString())
+      const revisionInputId = key('input', ticket.id, 'note', 'review', decided.id)
+      this.tickets.noteWithId(ticket.id, revisionRequest(decided), revisionInputId, true)
+      // The Ticket is read again: the revision request is an Input of it, and a request that never reached the Worker is
+      // sent again from here.
+      const updated = this.repo.tickets.get(ticket.id)!
+      this.tickets.redeliver(updated, assignment)
+      return { ticket: updated, delivered: this.messageDelivery(updated), revisionInputId }
+    })
+  }
+  /**
+   * The Ticket of the caller's own Project that a review decision is about.
+   *
+   * The Project, its PM and the Ticket are the domain's own checks: a PM of another Project never learns that a Ticket
+   * exists, and a Ticket of another Project is unknown to the caller.
+   */
+  private reviewTicket(projectId: string, pmSessionId: string, ticketId: string): Ticket {
+    const project = this.repo.projects.get(projectId)
+    if (!project) throw new UserError('unknownProject')
+    if (project.pmSessionId !== pmSessionId) throw new UserError('notProjectPm')
+    if (project.status === 'archived') throw new UserError('projectArchived')
+    if (project.status === 'paused') throw new UserError('projectPaused')
+    if (project.status !== 'active') throw new UserError('projectEnded')
+    const ticket = this.repo.tickets.get(ticketId)
+    if (!ticket || ticket.projectId !== projectId) throw new UserError('notProjectTicket')
+    return ticket
+  }
+  /**
+   * The review one Assignment's result is under, or the refusal that applies.
+   *
+   * The decision names the review by its own id, and the review names the Assignment that produced the result: a decision
+   * about another Assignment's work is refused, and a result that is no longer there cannot be decided at all. The round
+   * the Ticket waits for is the one the decision may reach: an earlier round's decision never decides a later result,
+   * and a withdrawn round has nothing left to decide.
+   */
+  private reviewTarget(ticket: Ticket, assignmentId: string, reviewId: string):
+    { review: TicketReview; assignment: Assignment; current: boolean } {
+    const review = reviewById(ticket, reviewId)
+    if (!review) throw new UserError('reviewUnknown')
+    if (review.assignmentId !== assignmentId) throw new UserError('reviewStale')
+    const assignment = ticket.assignments.find(item => item.id === assignmentId)
+    if (!assignment || latestAssignment(ticket)?.id !== assignmentId) throw new UserError('assignmentEnded')
+    // The round the Ticket waits for: the one that is pending, or the last one that was decided.
+    const current = currentReview(ticket)
+    const isCurrent = current?.id === review.id
+    // A withdrawn round has nothing left to decide: the Worker reported something else since.
+    if (review.state === 'withdrawn') throw new UserError('reviewSuperseded')
+    if (review.state === 'pending') {
+      // A round a newer one replaced is not the round that waits: its id decides nothing.
+      if (!isCurrent) throw new UserError('reviewSuperseded')
+      if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      if (assignment.state === 'ended') throw new UserError('assignmentEnded')
+      if (assignment.report?.state !== 'ready') throw new UserError('noReviewPending')
+    }
+    return { review, assignment, current: isCurrent }
+  }
+  /** How a message to a Ticket's Worker reached it: the states `messageTicket` reports. */
+  private messageDelivery(ticket: Ticket): TicketMessageDelivery {
+    if (runningAssignment(ticket)) return 'running'
+    if (latestAssignment(ticket)?.state === 'pending' && !waitsForPerson(ticket)) return 'started'
+    return 'queued'
   }
   /**
    * A Project PM moves one of its Tickets to a new Worker: the same Ticket, Mandate and worktree, a new Session named
@@ -924,9 +1130,13 @@ export class Engine {
   /**
    * End a Project and cascade-stop every still-open Ticket it owns, using the ordinary Ticket stop semantics so history,
    * Sessions and directories stay. It is idempotent: an ended or archived Project returns unchanged.
+   *
+   * The cleanup each stopped Worker started is collected into `options.cleanups`, so a caller that must know whether the
+   * Workers are really gone can wait for them and report a failure instead of a silent success.
    * @throws UserError when the Project is unknown.
    */
-  stopProject(projectId: string, reason?: string): ProjectProfile {
+  stopProject(projectId: string, reason?: string,
+    options: { cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): ProjectProfile {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
@@ -935,7 +1145,10 @@ export class Engine {
       this.repo.projects.save(updated)
       this.options.emit?.({ type: 'project.ended', at: updated.updatedAt, data: { projectId, ...(reason !== undefined ? { reason } : {}) } })
       // The Project is ended first, so child lifecycle notices and relays fall back instead of pretending it is active.
-      for (const ticket of this.repo.tickets.open()) if (ticket.projectId === projectId) this.tickets.stop(ticket.id, reason)
+      for (const ticket of this.repo.tickets.open()) {
+        if (ticket.projectId !== projectId) continue
+        this.tickets.stop(ticket.id, reason, options.cleanups)
+      }
       return updated
     })
   }
@@ -943,9 +1156,15 @@ export class Engine {
    * Archive a Project: save its active/paused status in `archivedFrom`, mark every child Ticket archived, and end any
    * Assignment that still ran with `projectArchived`. Session archiving happens after this transaction, in the application
    * service. Idempotent; an ended Project cannot be archived.
+   *
+   * The state is written first and the Workers are stopped through the one path that stops them: the assignment ends in
+   * the domain and the Executor is asked to cancel its Session, so a Worker is never stopped twice and no new Assignment
+   * can start over one that is on its way out. The cleanup each stop started is collected into `options.cleanups`, so a
+   * caller can wait for the node's answer and report a Worker that could not be stopped.
    * @throws UserError when the Project is unknown or ended.
    */
-  archiveProject(projectId: string): ProjectProfile {
+  archiveProject(projectId: string,
+    options: { cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): ProjectProfile {
     return this.repo.atomic(() => {
       const project = this.repo.projects.get(projectId)
       if (!project) throw new UserError('unknownProject')
@@ -960,7 +1179,13 @@ export class Engine {
         for (const assignment of ticket.assignments) {
           if (assignment.state === 'ended') continue
           assignment.state = 'ended'; assignment.endedAt = at; assignment.endedReason = 'projectArchived'
-          this.options.executor.stop(ticket, assignment, 'projectArchived')
+          // The Executor stops the Session through the one path that stops a Worker; its cleanup is recorded, not awaited
+          // here, so the transaction is not held open by a node round trip.
+          const work: Promise<void> = Promise.resolve(this.options.executor.stop(ticket, assignment, 'projectArchived'))
+          // The rejection is observed here, so a stop nobody waits for never becomes an unhandled rejection; a caller that
+          // does wait still sees the failure.
+          work.catch(() => {})
+          options.cleanups?.push({ ticketId: ticket.id, work })
         }
         ticket.archived = { at, by: 'project', projectId }
         ticket.updatedAt = at
@@ -1122,7 +1347,9 @@ export class Engine {
    * A person stops a ticket, which withdraws its Mandate: it ends and receives nothing more.
    * @throws UserError when the ticket is unknown.
    */
-  stopTicket(ticketId: string, reason?: string): Ticket { return this.repo.atomic(() => this.tickets.stop(ticketId, reason)) }
+  stopTicket(ticketId: string, reason?: string, cleanups?: { ticketId: string; work: Promise<void> }[]): Ticket {
+    return this.repo.atomic(() => this.tickets.stop(ticketId, reason, cleanups))
+  }
 
   stopAssignment(ticketId: string, assignmentId: string): Ticket {
     return this.repo.atomic(() => this.tickets.stopAssignment(ticketId, assignmentId))
@@ -1132,7 +1359,9 @@ export class Engine {
    * Assignment ends and a new one starts under the same Mandate.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
-  retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
+  retryTicket(ticketId: string, confirmedStoppedAssignmentId?: string): Ticket {
+    return this.repo.atomic(() => this.tickets.retry(ticketId, confirmedStoppedAssignmentId))
+  }
 
   // The Executor
 
@@ -1279,7 +1508,8 @@ export type EngineForMainSession = Pick<Engine, 'recordTriggerForRouting' | 'cre
   | 'requestStatus' | 'note'>
 /** What a Project's PM Session asks of the Engine. */
 export type EngineForPM = Pick<Engine, 'projectReport' | 'createProjectTickets' | 'messageTicket' | 'reviveProjectTicket'
-  | 'transferTicket' | 'splitTicket' | 'requestProjectHandoff' | 'decideProjectHandoff'>
+  | 'transferTicket' | 'splitTicket' | 'requestProjectHandoff' | 'decideProjectHandoff' | 'acceptProjectReview'
+  | 'rejectProjectReview'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'stopAssignment' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'
   | 'pauseProject' | 'pauseProjectReport' | 'allowResume' | 'stopProject' | 'archiveProject' | 'unarchiveProject'>

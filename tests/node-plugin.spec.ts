@@ -35,6 +35,10 @@ class FakeSession {
 class FakeScopedContext {
   readonly handlers = new Map<string, FakeHandler[]>()
   readonly disposers: (() => void)[] = []
+  readonly promptSections: { text: () => string }[] = []
+  readonly systemPrompt = {
+    section: (section: { text: () => string }) => { this.promptSections.push(section) },
+  }
   effect(factory: () => () => void): void { this.disposers.push(factory()) }
   on(name: string, handler: FakeHandler, _options?: unknown): () => void {
     const handlers = this.handlers.get(name) ?? []
@@ -419,16 +423,17 @@ describe('createDshPortHost over the node Sessions', () => {
       .rejects.toThrow(/no permission preset for "root"/)
   })
 
-  it('installs the role prompt once under the Session profile key', async () => {
+  it('installs the PM role once as instructions without starting a turn', async () => {
     const { host, live } = hostOf({ live: ['pm-1'] })
     const input = { sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm' as const, profile: PM,
       prompt: PM.prompt, sessionToken: 'session-token' }
     await host.ensureSession(input)
     await host.ensureSession(input)
 
-    const inbox = live.get('pm-1')!.inbox.nextTurn
-    expect(inbox).toHaveLength(1)
-    expect(String(inbox[0]!.id)).toBe('dsh-superagent:profile:pm-1')
+    const agent = live.get('pm-1')!
+    expect(agent.ctx.promptSections).toHaveLength(1)
+    expect(agent.ctx.promptSections[0]!.text()).toBe(PM.prompt)
+    expect(agent.inbox.nextTurn).toEqual([])
   })
 })
 

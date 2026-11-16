@@ -4,6 +4,7 @@
  */
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
+import type { ReportCallRecord } from './control/report-call.ts'
 import type { SettingsSave } from './policy.ts'
 import type { SessionRecord } from './shared/protocol.ts'
 import type { Retry } from './sources/github.ts'
@@ -37,7 +38,14 @@ export const KV = {
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Standalone control-plane kernel: persisted Session records, keyed by Session id. Session tokens stay in memory only. */
-  control: { session: family<SessionRecord, [sessionId: string]>('control/session:') },
+  control: { session: family<SessionRecord, [sessionId: string]>('control/session:'),
+    /**
+     * The call-level ledger of Worker reports, keyed by the Session and the call's own id.
+     *
+     * It lives in the domain's own KV area, so a report and its ledger entry are written in one transaction: a report can
+     * never be written without being recorded, and a recorded call is never forgotten by a restart.
+     */
+    reportCall: family<ReportCallRecord, [scope: string, callId: string]>('control/report-call:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

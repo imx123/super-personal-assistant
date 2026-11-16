@@ -3,8 +3,9 @@ import { join, resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-settings'
 import { Runtime } from './app/runtime.ts'
+import type { Sessions } from './app/sessions.ts'
 import { DshNodePort } from './node/dsh-port.ts'
-import { createDshPortHost } from './node/dsh-port-host.ts'
+import { createDshPortHost, type DshPortSessions } from './node/dsh-port-host.ts'
 import { startNodeHttpServer } from './node/http-server.ts'
 import { OrchestratorService } from './node/orchestrator-service.ts'
 import { runtimePlatform } from './node/platform.ts'
@@ -59,7 +60,8 @@ async function startNodeServer(ctx: Context, runtime: Runtime, stateDir: string)
   // the plugin's own Store. Without the URL the node registers no proxy tool and behaves exactly as before.
   const controlUrl = process.env.SUPERAGENT_CONTROL_URL
   const node = new DshNodePort({ nodeId, root,
-    host: createDshPortHost({ context: ctx, nodeRuntime: runtime.nodeRuntime, nodeId, root,
+    host: createDshPortHost({ context: ctx, nodeRuntime: { sessions: pluginSessions(runtime.nodeRuntime.sessions) },
+      nodeId, root,
       ...(controlUrl ? { controlUrl } : {}) }) })
   try {
     const server = await startNodeHttpServer({ node, token, host, port })
@@ -74,3 +76,26 @@ async function startNodeServer(ctx: Context, runtime: Runtime, stateDir: string)
 }
 export type { Deployment, DeploymentConfig } from './deployment.ts'
 export * from './core/index.ts'
+
+/**
+ * The plugin's own Sessions seen through the node port's narrow seam.
+ *
+ * The plugin's Sessions have their own roles — `orchestrator`, `pm` and `worker` — and no Router role of their own, so a
+ * Router Session is refused here instead of being hosted as a PM: a PM would answer the control plane's Router requests
+ * with a PM's own tools and authority, which is not a Router at all. A node that does host a Router brings its own
+ * adapter (`src/node/node-sessions.ts`), which has the role. Everything else keeps the plugin's own behaviour: the profile
+ * is the plugin's own decoration of a Session, and the old plugin's semantics do not change here.
+ */
+function pluginSessions(sessions: Sessions): DshPortSessions {
+  return {
+    async ensure(sessionId, directory, title, role) {
+      if (role === 'router') {
+        throw new Error('This node does not host a Router Session: its Sessions have no Router role')
+      }
+      return sessions.ensure(sessionId, directory, title, role)
+    },
+    prompt(sessionId, idempotencyKey, text, mode, onDelivered) {
+      return sessions.prompt(sessionId, idempotencyKey, text, mode, undefined, undefined, onDelivered)
+    },
+  }
+}

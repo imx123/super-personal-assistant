@@ -2,12 +2,12 @@
 
 This directory is a starting point for the execution node of a two-process deployment: a control plane started with
 `node lib/control.js`, and a separate DSH process started with `dsh --profile superagent-node`. The DSH process hosts
-real Sessions for PMs and Workers and serves the node protocol on one loopback port. It is not a Web app.
+real Sessions for the Router, PMs, and Workers and serves the node protocol on one loopback port. It is not a Web app.
 
 It differs from [`../profile.cordis.patch.yml`](../profile.cordis.patch.yml), which is an overlay for a normal Web
 profile: that file configures the `dsh-superagent` bundle (panel port and `stateDir`) and still loads the control
 plane's Runtime, Store, Sources and panel in the same process. The node profile here is a complete profile: it loads
-only `@deepseek-ai/dsh-base`, the workspace and agent-preset services, the PM and Worker presets, and the repository's
+only `@deepseek-ai/dsh-base`, the workspace and agent-preset services, the Router, PM and Worker presets, and the repository's
 node plugin (`dsh-superagent/node`). It mounts no `dsh-web-app`, no `dsh-headless`, no session controller, no file
 upload, and no `dsh-superagent` top-level bundle. The control plane is a different process with its own database.
 
@@ -19,7 +19,7 @@ credentials, and must never load in one process.
 | File | Purpose |
 | --- | --- |
 | `package.json` | Profile manifest: the base bundle and this repository as a dependency |
-| `cordis.patch.yml` | The profile's patch: workspace, preset registry, PM/Worker presets, the node plugin, and optional model rows |
+| `cordis.patch.yml` | The profile's patch: workspace, preset registry, Router/PM/Worker presets, the node plugin, and optional model rows |
 
 Do not copy a `.credentials.yaml` or any token into this directory. Credentials belong to the DSH home the node runs
 with, and tokens belong to the process environment.
@@ -62,8 +62,8 @@ dsh --profile superagent-node --dump-config | grep -E 'dsh-superagent/node|dsh-w
 pinned copy of the package instead. If the profile name does not exist, `dsh plugin ... add` creates it; it also
 writes the profile's `node_modules`.
 
-`--dump-config` must exit 0, name `dsh-superagent/node`, `@deepseek-ai/dsh-workspace`, the preset registry and both
-presets, and report no unknown plugin. A bundle that DSH skips for incompatibility is listed in the launcher output;
+`--dump-config` must exit 0, name `dsh-superagent/node`, `@deepseek-ai/dsh-workspace`, the preset registry and the
+Router, PM and Worker presets, and report no unknown plugin. A bundle that DSH skips for incompatibility is listed in the launcher output;
 fix the version range in the repository's `package.json` rather than editing the profile.
 
 ## Model configuration

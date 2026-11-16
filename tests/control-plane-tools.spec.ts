@@ -17,7 +17,7 @@ import { ControlPlaneServer } from '../src/control/server.ts'
 import { createDshPortHost, type DshPortFetch } from '../src/node/dsh-port-host.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { issueSessionToken } from '../src/shared/session-token.ts'
-import type { SessionRecord } from '../src/shared/protocol.ts'
+import type { NodeCommand, SessionRecord } from '../src/shared/protocol.ts'
 
 const SECRET = 'tools-secret'
 const API_TOKEN = 'tools-api-token'
@@ -27,7 +27,7 @@ const NODE_ID = 'local'
 let directory = ''
 let control: ControlPlane | undefined
 let server: ControlPlaneServer | undefined
-let node: FakeNode
+let node: ControllableNode
 
 function trigger(id: string): Trigger {
   return { id, source: 'main-session', threads: [{ source: 'main-session', id: `thread-${id}` }],
@@ -43,6 +43,45 @@ async function until(predicate: () => boolean, message: string, timeoutMs = 3000
   }
 }
 
+/** A promise a test resolves by hand, so a command can be held where a race needs one. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, resolve: release }
+}
+
+/**
+ * A FakeNode whose `worker.create` and `session.cancel` a test can hold or fail.
+ *
+ * The PM's cancel and the node's own work race in ways an in-process node answers too quickly to show: a creation that
+ * outlives the cancel, a cancel the node refuses, and a stop the PM waits for before it may replace a Worker.
+ */
+class ControllableNode extends FakeNode {
+  /** The commands that reached the node, in the order they were sent, before any gate held them. */
+  readonly arriving: NodeCommand[] = []
+  /** Held until it resolves, so `worker.create` waits for the test. */
+  createGate: Promise<void> | undefined
+  /** Held until it resolves, so `session.cancel` waits for the test. */
+  cancelGate: Promise<void> | undefined
+  /** When set, `session.cancel` fails with it. */
+  cancelFailure: Error | undefined
+  /** What one Session's cancel does, so one stop can be held while another is refused. */
+  readonly cancels = new Map<string, { gate?: Promise<void>; failure?: Error }>()
+
+  override async send(command: NodeCommand): Promise<void> {
+    this.arriving.push(command)
+    if (command.type === 'worker.create' && this.createGate) await this.createGate
+    if (command.type === 'session.cancel') {
+      const own = this.cancels.get(command.sessionId)
+      if (own?.failure) throw own.failure
+      if (own?.gate) await own.gate
+      if (this.cancelFailure) throw this.cancelFailure
+      if (this.cancelGate) await this.cancelGate
+    }
+    return super.send(command)
+  }
+}
+
 interface Opened {
   project: ProjectProfile
   pm: SessionRecord
@@ -52,12 +91,14 @@ interface Opened {
 }
 
 /** A Project whose PM and first Worker Session exist on the FakeNode, plus the tool API listening on a random port. */
-async function open(): Promise<Opened> {
+async function open(options: { stopCleanupTimeoutMs?: number; ensureSettleTimeoutMs?: number } = {}): Promise<Opened> {
   directory = mkdtempSync(join(tmpdir(), 'superagent-tools-'))
   const root = join(directory, 'workspaces')
-  node = new FakeNode({ nodeId: NODE_ID, root, now: () => START })
+  node = new ControllableNode({ nodeId: NODE_ID, root, now: () => START })
   control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: NODE_ID, node, secret: SECRET,
-    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50 })
+    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50,
+    ...(options.stopCleanupTimeoutMs === undefined ? {} : { stopCleanupTimeoutMs: options.stopCleanupTimeoutMs }),
+    ...(options.ensureSettleTimeoutMs === undefined ? {} : { ensureSettleTimeoutMs: options.ensureSettleTimeoutMs }) })
   await control.registerNode()
   control.store.triggers.save(trigger('trigger-1'))
   const project = control.createProject('trigger-1', 'Project', 'Goal')
@@ -226,7 +267,8 @@ describe('control-plane tool API', () => {
     expect(body.tickets).toHaveLength(1)
     expect(body.tickets[0]).toMatchObject({ id: ticket.id, title: 'Ticket', status: 'running' })
     expect(Object.keys(body.tickets[0]!).sort()).toEqual(['assignment', 'id', 'status', 'title'])
-    expect(body.tickets[0]!.assignment).toEqual({ id: assignment.id, state: 'running' })
+    expect(body.tickets[0]!.assignment).toEqual({ id: assignment.id, state: 'running',
+      sessionId: `worker-${assignment.id}` })
 
     // Another PM reads its own Project only: this Project's Ticket never appears in it.
     control!.store.triggers.save(trigger('trigger-2'))
@@ -265,7 +307,8 @@ describe('control-plane tool API', () => {
 
     expect((await post(address, '/v1/tools/worker/report', workerToken, { ticketId: ticket.id,
       report: { state: 'ready', summary: 'done' } })).status).toBe(200)
-    expect(await status()).toBe('completed')
+    // A result waits for the PM's review: the Ticket stays open until the PM accepts it.
+    expect(await status()).toBe('waiting')
 
     // An archived Project Ticket reads as archived, ahead of the end state it still records.
     control!.store.tickets.save({ ...control!.store.tickets.get(ticket.id)!,
@@ -278,8 +321,455 @@ describe('control-plane tool API', () => {
     expect(PM_PROFILE.prompt).toContain('control_project')
     expect(PM_PROFILE.tools).toContain('control_create_tickets')
     expect(PM_PROFILE.prompt).toContain('control_create_tickets')
+    expect(PM_PROFILE.tools).toContain('control_message_worker')
+    expect(PM_PROFILE.prompt).toContain('control_message_worker')
+    expect(PM_PROFILE.tools).toContain('control_cancel_worker')
+    expect(PM_PROFILE.prompt).toContain('control_cancel_worker')
+    expect(PM_PROFILE.tools).toContain('control_request_assignment')
+    expect(PM_PROFILE.prompt).toContain('control_request_assignment')
+    expect(PM_PROFILE.tools).toContain('control_review_result')
+    expect(PM_PROFILE.prompt).toContain('control_review_result')
+    expect(PM_PROFILE.tools).toContain('control_review_diff')
+    expect(PM_PROFILE.prompt).toContain('control_review_diff')
     expect(WORKER_PROFILE.tools).toContain('control_report')
     expect(WORKER_PROFILE.prompt).toContain('control_report')
+  })
+
+  it('names no tool the standalone PM does not run', () => {
+    // The profile is the role's whole capability set: every name in it must be a tool the node registers, and every
+    // tool the node registers must be in it. The old plugin's nine `orchestrator_*` tools belong to that plugin's own
+    // PM Session, which is registered and unchanged.
+    expect([...PM_PROFILE.tools]).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
+      'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
+      'control_project_report'])
+    expect(PM_PROFILE.tools.some(name => name.startsWith('orchestrator_'))).toBe(false)
+  })
+})
+
+/**
+ * The PM's orchestration path: listing the work, messaging a Worker, stopping a Worker and asking for a new Assignment.
+ *
+ * Every rule is the domain's: the Ticket must belong to the caller's own Project, an Assignment the caller names must
+ * still be current, a stop ends the Assignment in the Store and asks the node to stop the Session, and a new Assignment
+ * starts only where the domain allows one.
+ */
+describe('PM orchestration tools', () => {
+  it('lists the Assignments and the reports of the Project\'s own Tickets', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+    expect((await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'progress', summary: 'halfway there' } })).status).toBe(200)
+
+    const response = await get(address, '/v1/tools/pm/context', tokenOf(pm.sessionId))
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { tickets: { id: string; status: string
+      assignment?: { id: string; state: string; sessionId: string; report?: { state: string; summary: string } } }[] }
+    expect(body.tickets[0]).toMatchObject({ id: ticket.id, status: 'running' })
+    expect(body.tickets[0]!.assignment).toMatchObject({ id: assignment.id, state: 'running',
+      sessionId: `worker-${assignment.id}`, report: { state: 'progress', summary: 'halfway there' } })
+  })
+
+  it('delivers a PM message to the Worker of the current Assignment', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+
+    const response = await post(address, '/v1/tools/pm/message', tokenOf(pm.sessionId),
+      { ticketId: ticket.id, text: 'Use the new schema' })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { delivered: string }
+    expect(body.delivered).toBe('running')
+
+    await until(() => (node.messages.get(worker)?.length ?? 0) > 0, 'the Worker did not receive the message')
+    expect(node.messages.get(worker)![0]).toContain('Use the new schema')
+    // The message is a Ticket Input, not new authority.
+    expect(control!.store.tickets.get(ticket.id)?.inputs.some(input => input.kind === 'note')).toBe(true)
+  })
+
+  it('ends the Assignment in the domain and stops the Worker Session on the node', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+
+    const response = await post(address, '/v1/tools/pm/cancel', tokenOf(pm.sessionId),
+      { ticketId: ticket.id, reason: 'the plan changed' })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { stopped: boolean; assignment: { id: string; state: string; endedReason?: string } }
+    expect(body.stopped).toBe(true)
+    expect(body.assignment).toMatchObject({ id: assignment.id, state: 'ended', endedReason: 'stoppedByOperator' })
+    // The stop is recorded under the Project, so the PM may ask for a new Assignment and a person's stop still stands.
+    expect(control!.store.tickets.get(ticket.id)?.manualStop).toMatchObject({ scope: 'project', by: 'pm' })
+    // The node really stopped the Worker Session.
+    expect(node.commands.some(command => command.type === 'session.cancel' && command.sessionId === worker)).toBe(true)
+    expect(node.sessions.get(worker)?.status).toBe('stopped')
+  })
+
+  it('reports a node that could not stop the Worker', async () => {
+    const { pm, ticket, address } = await open()
+    control!.markNodeOffline()
+
+    const response = await post(address, '/v1/tools/pm/cancel', tokenOf(pm.sessionId), { ticketId: ticket.id })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { stopped: boolean; error?: string }
+    expect(body.stopped).toBe(false)
+    expect(body.error).toContain('offline')
+    // The Assignment ended in the domain all the same, and the failure stays on the Ticket.
+    expect(control!.store.tickets.get(ticket.id)?.assignments.at(-1)?.state).toBe('ended')
+    expect(control!.store.tickets.get(ticket.id)?.stopFailure?.error).toBeTruthy()
+    // The failure is visible to the PM that reads the Project.
+    const context = (await (await get(address, '/v1/tools/pm/context', tokenOf(pm.sessionId))).json()) as {
+      tickets: { id: string; stopFailure?: { error: string } }[] }
+    expect(context.tickets[0]!.stopFailure?.error).toBeTruthy()
+  })
+
+  it('starts exactly one new Assignment after the PM stopped the Worker', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })).status).toBe(200)
+
+    const response = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { rule: string; assignment: { id: string } }
+    expect(body.rule).toBe('revived')
+
+    const current = control!.store.tickets.get(ticket.id)!
+    expect(current.assignments).toHaveLength(2)
+    expect(current.assignments[0]!.state).toBe('ended')
+    expect(current.assignments[1]!.id).toBe(body.assignment.id)
+    expect(current.manualStop).toBeUndefined()
+    await until(() => control!.store.tickets.get(ticket.id)?.assignments.at(-1)?.state === 'running',
+      'the new Assignment did not start')
+    // The new Worker runs in its own Session; the stopped one keeps its own.
+    expect(node.sessions.get(`worker-${body.assignment.id}`)).toBeDefined()
+    expect(body.assignment.id).not.toBe(assignment.id)
+  })
+
+  it('retries a stalled Worker with one new Assignment', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+    expect((await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'failed', summary: 'the build is broken' } })).status).toBe(200)
+
+    const response = await post(address, '/v1/tools/pm/assignment', tokenOf(pm.sessionId), { ticketId: ticket.id })
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { rule: string; assignment: { id: string } }
+    expect(body.rule).toBe('retried')
+    const current = control!.store.tickets.get(ticket.id)!
+    expect(current.assignments).toHaveLength(2)
+    expect(current.assignments[0]!.state).toBe('ended')
+    expect(current.assignments[1]!.id).toBe(body.assignment.id)
+  })
+
+  it('answers a cancel with the Assignment it stopped, not the one a concurrent request started', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    // The node's stop is held, so the request below arrives while the cancel is still running.
+    const gate = deferred()
+    node.cancelGate = gate.promise
+
+    const cancel = post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })
+    await until(() => node.arriving.some(command => command.type === 'session.cancel'), 'the cancel was never sent')
+    const request = post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    gate.resolve()
+
+    const cancelled = (await (await cancel).json()) as { stopped: boolean; assignment: { id: string } }
+    const revived = (await (await request).json()) as { rule: string; assignment: { id: string } }
+    // The cancel names the Assignment it stopped; it never reports the one the request started.
+    expect(cancelled.stopped).toBe(true)
+    expect(cancelled.assignment.id).toBe(assignment.id)
+    expect(revived.rule).toBe('revived')
+    expect(revived.assignment.id).not.toBe(assignment.id)
+    const current = control!.store.tickets.get(ticket.id)!
+    expect(current.assignments).toHaveLength(2)
+    // The old Worker was stopped before its replacement was created.
+    const order = node.arriving.map(command => command.type)
+    expect(order.indexOf('session.cancel')).toBeLessThan(order.lastIndexOf('worker.create'))
+  })
+
+  it('waits for the confirmed stop of a stalled Worker before it starts its replacement', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    const worker = `worker-${assignment.id}`
+    expect((await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'failed', summary: 'the build is broken' } })).status).toBe(200)
+    // The node's stop is held: the replacement must not start while the old Worker may still run.
+    const gate = deferred()
+    node.cancelGate = gate.promise
+
+    const request = post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    await until(() => node.arriving.some(command => command.type === 'session.cancel'), 'the Worker was never stopped')
+    // Only the first Worker's creation happened: the replacement waits for the stop.
+    expect(node.arriving.filter(command => command.type === 'worker.create')).toHaveLength(1)
+    gate.resolve()
+
+    const response = await request
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { rule: string; assignment: { id: string } }
+    expect(body.rule).toBe('retried')
+    const current = control!.store.tickets.get(ticket.id)!
+    expect(current.assignments).toHaveLength(2)
+    expect(current.assignments[0]!.state).toBe('ended')
+    expect(current.assignments[1]!.id).toBe(body.assignment.id)
+    const order = node.arriving.map(command => command.type)
+    expect(order.indexOf('session.cancel')).toBeLessThan(order.lastIndexOf('worker.create'))
+  })
+
+  it('refuses a new Assignment while the previous Worker was never confirmed stopped', async () => {
+    const { pm, ticket, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    node.cancelFailure = new Error('The node could not reach the Worker')
+
+    const cancel = await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })
+    expect(cancel.status).toBe(200)
+    const body = (await cancel.json()) as { stopped: boolean; error?: string }
+    expect(body.stopped).toBe(false)
+    expect(body.error).toBeTruthy()
+
+    // The Assignment ended, but its Worker may still run: no new Assignment starts over it.
+    const request = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(request.status).toBe(400)
+    const refused = (await request.json()) as { error: string }
+    expect(refused.error).toContain('not confirmed stopped')
+    expect(control!.store.tickets.get(ticket.id)?.assignments).toHaveLength(1)
+    // The failure stays on the Ticket, where the PM reads it.
+    expect(control!.store.tickets.get(ticket.id)?.stopFailure?.error).toBeTruthy()
+  })
+
+  it('confirms a failed stop when the PM stops that Worker again', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    node.cancelFailure = new Error('The node could not reach the Worker')
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })).status).toBe(200)
+
+    // The node answers now, so the second stop confirms the first one.
+    node.cancelFailure = undefined
+    const again = await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id, assignmentId: assignment.id })
+    expect(again.status).toBe(200)
+    const body = (await again.json()) as { stopped: boolean; assignment: { id: string; state: string } }
+    expect(body.stopped).toBe(true)
+    expect(body.assignment.id).toBe(assignment.id)
+    // The failure a confirmed stop supersedes is gone.
+    expect(control!.store.tickets.get(ticket.id)?.stopFailure).toBeUndefined()
+
+    // And now a new Assignment may start.
+    const request = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(request.status).toBe(200)
+    expect(((await request.json()) as { rule: string }).rule).toBe('revived')
+  })
+
+  it('reports the redacted diagnostic of a stop the node refused', async () => {
+    const { pm, ticket, address } = await open()
+    node.cancelFailure = new Error('cannot stop /home/me/.config/gh token=abc123def456')
+
+    const response = await post(address, '/v1/tools/pm/cancel', tokenOf(pm.sessionId), { ticketId: ticket.id })
+    const body = (await response.json()) as { stopped: boolean; error?: string }
+    expect(body.stopped).toBe(false)
+    expect(body.error).not.toContain('/home/me')
+    expect(body.error).not.toContain('abc123def456')
+    // The answer is the Ticket's own redacted diagnostic, never the raw error.
+    expect(body.error).toBe(control!.store.tickets.get(ticket.id)?.stopFailure?.error)
+  })
+
+  it('stops a Worker whose creation is still in flight, and never leaves it running', async () => {
+    const { project, pm, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    // The creation is held, so the cancel reaches the node before the Worker exists.
+    const gate = deferred()
+    node.createGate = gate.promise
+    // A second Ticket whose Worker Session is still being created.
+    const [second] = control!.engine.createProjectTickets(project.id, pm.sessionId, [{ title: 'Second', goal: 'G' }])
+    const assignmentId = second!.assignments[0]!.id
+
+    const cancel = post(address, '/v1/tools/pm/cancel', token, { ticketId: second!.id })
+    await until(() => node.arriving.some(command => command.type === 'worker.create'
+      && command.assignmentId === assignmentId), 'the Worker was never created')
+    // The stop waits for the creation, so no cancel reaches the node before the Worker exists.
+    expect(node.arriving.some(command => command.type === 'session.cancel')).toBe(false)
+    gate.resolve()
+
+    const response = await cancel
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { stopped: boolean }
+    expect(body.stopped).toBe(true)
+    // The node created the Worker and stopped it again, in that order: no Worker is left running.
+    const workerSession = `worker-${assignmentId}`
+    expect(node.sessions.get(workerSession)?.status).toBe('stopped')
+    const created = node.commands.findIndex(command => command.type === 'worker.create'
+      && command.sessionId === workerSession)
+    const stopped = node.commands.findIndex(command => command.type === 'session.cancel'
+      && command.sessionId === workerSession)
+    expect(created).toBeGreaterThanOrEqual(0)
+    expect(stopped).toBeGreaterThan(created)
+  })
+
+  it('refuses a new Assignment while a creation is in flight and the stop is unconfirmed', async () => {
+    const { project, pm, address } = await open({ ensureSettleTimeoutMs: 50 })
+    const token = tokenOf(pm.sessionId)
+    // The creation is held, so the stop cannot be confirmed.
+    const gate = deferred()
+    node.createGate = gate.promise
+    const [second] = control!.engine.createProjectTickets(project.id, pm.sessionId, [{ title: 'Second', goal: 'G' }])
+
+    const cancel = await post(address, '/v1/tools/pm/cancel', token, { ticketId: second!.id })
+    const body = (await cancel.json()) as { stopped: boolean; error?: string }
+    expect(body.stopped).toBe(false)
+    expect(body.error).toContain('not confirmed')
+
+    // No new Assignment may start over a Worker that may still be created.
+    const request = await post(address, '/v1/tools/pm/assignment', token, { ticketId: second!.id })
+    expect(request.status).toBe(400)
+    expect(control!.store.tickets.get(second!.id)?.assignments).toHaveLength(1)
+    gate.resolve()
+  })
+
+  it('refuses a request that names a stale Assignment', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })).status).toBe(200)
+    expect((await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })).status).toBe(200)
+    const current = control!.store.tickets.get(ticket.id)!.assignments.at(-1)!
+    expect(current.id).not.toBe(assignment.id)
+
+    // A stale request starts no new attempt.
+    const stale = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id, assignmentId: assignment.id })
+    expect(stale.status).toBe(400)
+    expect(control!.store.tickets.get(ticket.id)?.assignments).toHaveLength(2)
+  })
+
+  it('refuses a new Assignment for a Worker that still works and for one a person stopped', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    // The Worker still works: it needs no new Assignment.
+    expect((await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })).status).toBe(400)
+    // A person stopped the Worker: only a person may approve its resume.
+    control!.engine.stopAssignment(ticket.id, assignment.id)
+    expect((await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })).status).toBe(403)
+  })
+
+  it('refuses a third Assignment when the second stop failed', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    const worker = `worker-${assignment.id}`
+    // The first Worker stalls and is replaced by a second one.
+    expect((await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'failed', summary: 'the build is broken' } })).status).toBe(200)
+    const first = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(first.status).toBe(200)
+    expect(((await first.json()) as { rule: string }).rule).toBe('retried')
+    const second = control!.store.tickets.get(ticket.id)!.assignments.at(-1)!
+    expect(second.id).not.toBe(assignment.id)
+
+    // The node refuses to stop that second Worker.
+    node.cancelFailure = new Error('The node could not reach the Worker')
+    const stop = await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id, assignmentId: second.id })
+    expect(stop.status).toBe(200)
+    const stopped = (await stop.json()) as { stopped: boolean; error?: string }
+    expect(stopped.stopped).toBe(false)
+
+    // No third Assignment starts over a Worker that may still run: the second stop was never confirmed.
+    const third = await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(third.status).toBe(400)
+    expect(((await third.json()) as { error: string }).error).toContain('not confirmed stopped')
+    expect(control!.store.tickets.get(ticket.id)?.assignments).toHaveLength(2)
+  })
+
+  it('keeps an unconfirmed stop across a control-plane restart', async () => {
+    const { pm, ticket, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    node.cancelFailure = new Error('The node could not reach the Worker')
+    const cancel = await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })
+    expect(cancel.status).toBe(200)
+    expect(((await cancel.json()) as { stopped: boolean }).stopped).toBe(false)
+
+    // The control plane restarts: its own memory of the stop is gone, but the Ticket keeps the open stop.
+    await server!.close()
+    server = undefined
+    await control!.close()
+    control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: NODE_ID, node, secret: SECRET,
+      workspaceRoot: join(directory, 'workspaces'), now: () => START, confirmationTimeoutMs: 50 })
+    await control.registerNode()
+    server = new ControlPlaneServer(control, { token: API_TOKEN })
+    const restarted = await server.listen(0)
+
+    // The Worker may still run, so no new Assignment starts over it.
+    const request = await post(restarted, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })
+    expect(request.status).toBe(400)
+    expect(((await request.json()) as { error: string }).error).toContain('not confirmed stopped')
+    expect(control!.store.tickets.get(ticket.id)?.assignments).toHaveLength(1)
+  })
+
+  it('keeps the newer Assignment\'s stop diagnostics when an older stop answers late', async () => {
+    const { project, pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    const worker = `worker-${assignment.id}`
+    // The first stop waits for the node, so its answer arrives after the second Worker was started.
+    const gate = deferred()
+    node.cancels.set(worker, { gate: gate.promise })
+    const cleanups: { ticketId: string; work: Promise<void> }[] = []
+    control!.engine.stopProjectWorker(project.id, pm.sessionId, ticket.id, assignment.id, { cleanups })
+    await until(() => node.arriving.some(command => command.type === 'session.cancel' && command.sessionId === worker),
+      'the first cancel never reached the node')
+
+    // A second Assignment starts over the ended one while that stop is still unanswered.
+    const revived = control!.engine.reviveProjectTicket(project.id, pm.sessionId, ticket.id)
+    const second = revived.assignments.at(-1)!
+    // The node refuses to stop that second Worker.
+    node.cancels.set(`worker-${second.id}`, { failure: new Error('The node could not reach the Worker') })
+    const stop = await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id, assignmentId: second.id })
+    expect(stop.status).toBe(200)
+    expect(((await stop.json()) as { stopped: boolean }).stopped).toBe(false)
+    expect(control!.store.tickets.get(ticket.id)?.stopFailure?.assignmentId).toBe(second.id)
+
+    // The older stop answers now: it confirms its own Assignment and nothing else.
+    gate.resolve()
+    await cleanups[0]!.work
+    const current = control!.store.tickets.get(ticket.id)!
+    expect(current.stopFailure?.assignmentId).toBe(second.id)
+    expect(current.stopPending?.assignmentId).toBe(second.id)
+  })
+
+  it('refuses a stale Assignment on the message and on the cancel', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const token = tokenOf(pm.sessionId)
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id })).status).toBe(200)
+    expect((await post(address, '/v1/tools/pm/assignment', token, { ticketId: ticket.id })).status).toBe(200)
+    const current = control!.store.tickets.get(ticket.id)!.assignments.at(-1)!
+    expect(current.id).not.toBe(assignment.id)
+
+    // The Assignment that was replaced may neither carry a message into the new Worker nor stop it.
+    expect((await post(address, '/v1/tools/pm/message', token, { ticketId: ticket.id, text: 'stale',
+      assignmentId: assignment.id })).status).toBe(400)
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: ticket.id,
+      assignmentId: assignment.id })).status).toBe(400)
+    // The new Assignment is untouched by the refused calls.
+    expect(control!.store.tickets.get(ticket.id)?.assignments.at(-1)?.state).not.toBe('ended')
+  })
+
+  it('refuses a Ticket of another Project on every PM route', async () => {
+    const { pm, address } = await open()
+    control!.store.triggers.save(trigger('trigger-2'))
+    const other = control!.createProject('trigger-2', 'Other', 'Other goal')
+    const [foreign] = control!.engine.createProjectTickets(other.id, other.pmSessionId, [{ title: 'Foreign', goal: 'G' }])
+    const token = tokenOf(pm.sessionId)
+
+    expect((await post(address, '/v1/tools/pm/message', token, { ticketId: foreign!.id, text: 'hi' })).status).toBe(400)
+    expect((await post(address, '/v1/tools/pm/cancel', token, { ticketId: foreign!.id })).status).toBe(400)
+    expect((await post(address, '/v1/tools/pm/assignment', token, { ticketId: foreign!.id })).status).toBe(400)
+    // The foreign Ticket keeps its own Worker.
+    expect(control!.store.tickets.get(foreign!.id)?.assignments.at(-1)?.state).not.toBe('ended')
+  })
+
+  it('refuses a Worker token, the operator token and an invalid body on the PM routes', async () => {
+    const { pm, ticket, assignment, address } = await open()
+    const workerToken = tokenOf(`worker-${assignment.id}`)
+    for (const path of ['/v1/tools/pm/message', '/v1/tools/pm/cancel', '/v1/tools/pm/assignment']) {
+      expect((await post(address, path, workerToken, { ticketId: ticket.id, text: 'x' })).status).toBe(403)
+      expect((await post(address, path, API_TOKEN, { ticketId: ticket.id, text: 'x' })).status).toBe(401)
+    }
+    expect((await get(address, '/v1/tools/pm/context', workerToken)).status).toBe(403)
+    expect((await get(address, '/v1/tools/pm/context', API_TOKEN)).status).toBe(401)
+    // A body without the Ticket is a client error, not a silent success.
+    expect((await post(address, '/v1/tools/pm/message', tokenOf(pm.sessionId), { text: 'x' })).status).toBe(400)
+    expect((await post(address, '/v1/tools/pm/cancel', tokenOf(pm.sessionId), {})).status).toBe(400)
+    expect((await post(address, '/v1/tools/pm/assignment', tokenOf(pm.sessionId), {})).status).toBe(400)
   })
 })
 
@@ -416,10 +906,17 @@ describe('node control tools', () => {
       profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
 
     const agent = agents.get('pm-1')!
-    expect([...agent.tools.keys()]).toEqual(['control_project', 'control_create_tickets'])
-    // The usage note names both tools, so the PM's first turn knows how to read and how to create.
+    expect([...agent.tools.keys()]).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
+      'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
+      'control_project_report'])
+    // The usage note names the tools, so the PM's first turn knows how to read, create and orchestrate.
     expect(prompts[0]!.text).toContain('Use control_project')
     expect(prompts[0]!.text).toContain('control_create_tickets')
+    expect(prompts[0]!.text).toContain('control_message_worker')
+    expect(prompts[0]!.text).toContain('control_cancel_worker')
+    expect(prompts[0]!.text).toContain('control_request_assignment')
+    expect(prompts[0]!.text).toContain('control_review_result')
+    expect(prompts[0]!.text).toContain('control_review_diff')
 
     const tool = agent.tools.get('control_project')!
     expect(tool.parameters).toEqual({ type: 'object', additionalProperties: false, properties: {} })
@@ -431,6 +928,64 @@ describe('node control tools', () => {
     expect(calls[0]!.init.headers).toEqual({ authorization: 'Bearer pm-token' })
     // A GET must not carry a body at all, not even an empty one.
     expect(calls[0]!.init.body).toBeUndefined()
+  })
+
+  it('registers the PM orchestration tools and posts them to the control plane', async () => {
+    const root = nodeRoot()
+    const { calls, fetch } = recorder(() => jsonAnswer({ delivered: 'running' }))
+    const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
+
+    await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+
+    const agent = agents.get('pm-1')!
+    await agent.tools.get('control_message_worker')!.execute({ ticketId: 'ticket-1', text: 'use the new schema' }, EXEC)
+    expect(calls[0]!.url).toBe('http://control.test/v1/tools/pm/message')
+    expect(calls[0]!.init).toMatchObject({ method: 'POST',
+      headers: { authorization: 'Bearer pm-token', 'content-type': 'application/json' } })
+    expect(JSON.parse(calls[0]!.init.body!)).toEqual({ ticketId: 'ticket-1', text: 'use the new schema' })
+
+    await agent.tools.get('control_cancel_worker')!.execute({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reason: 'the plan changed' }, EXEC)
+    expect(calls[1]!.url).toBe('http://control.test/v1/tools/pm/cancel')
+    expect(JSON.parse(calls[1]!.init.body!)).toEqual({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reason: 'the plan changed' })
+
+    await agent.tools.get('control_request_assignment')!.execute({ ticketId: 'ticket-1' }, EXEC)
+    expect(calls[2]!.url).toBe('http://control.test/v1/tools/pm/assignment')
+    expect(JSON.parse(calls[2]!.init.body!)).toEqual({ ticketId: 'ticket-1' })
+
+    await agent.tools.get('control_review_result')!.execute({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reviewId: 'review-1', action: 'reject', reason: 'the tests are missing' }, EXEC)
+    expect(calls[3]!.url).toBe('http://control.test/v1/tools/pm/review')
+    expect(JSON.parse(calls[3]!.init.body!)).toEqual({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reviewId: 'review-1', action: 'reject', reason: 'the tests are missing' })
+  })
+
+  it('refuses a PM orchestration call without the Ticket or the Assignment it names', async () => {
+    const root = nodeRoot()
+    const { calls, fetch } = recorder(() => jsonAnswer({ delivered: 'running' }))
+    const { host, agents } = toolHost({ root, controlUrl: 'http://control.test', fetch })
+
+    await host.ensureSession({ sessionId: 'pm-1', workspace: 'project-1', title: 'Project', role: 'pm',
+      profile: PM_PROFILE, prompt: PM_PROFILE.prompt, sessionToken: 'pm-token' })
+
+    const agent = agents.get('pm-1')!
+    await expect(agent.tools.get('control_message_worker')!.execute({ text: 'no ticket' }, EXEC))
+      .rejects.toThrow('ticketId must be a non-empty string')
+    await expect(agent.tools.get('control_cancel_worker')!.execute({ ticketId: 'ticket-1', assignmentId: '  ' }, EXEC))
+      .rejects.toThrow('assignmentId must be a non-empty string')
+    // A review needs the Assignment whose result it is about, the review it decides, and a rejection needs a reason.
+    await expect(agent.tools.get('control_review_result')!.execute({ ticketId: 'ticket-1', action: 'accept' }, EXEC))
+      .rejects.toThrow('assignmentId must be a non-empty string')
+    await expect(agent.tools.get('control_review_result')!.execute({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      action: 'accept' }, EXEC)).rejects.toThrow('reviewId must be a non-empty string')
+    await expect(agent.tools.get('control_review_result')!.execute({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reviewId: 'review-1', action: 'reject' }, EXEC)).rejects.toThrow('a rejection needs a reason')
+    await expect(agent.tools.get('control_review_result')!.execute({ ticketId: 'ticket-1', assignmentId: 'assignment-1',
+      reviewId: 'review-1', action: 'maybe' }, EXEC)).rejects.toThrow('action must be "accept" or "reject"')
+    // Nothing reached the control plane.
+    expect(calls).toHaveLength(0)
   })
 
   it('propagates a refused context read', async () => {

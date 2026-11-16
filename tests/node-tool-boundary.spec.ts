@@ -141,10 +141,19 @@ describe('node role tool boundary', () => {
     expect(registry.denial('subagent')).toMatch(/A Project PM may use only/)
     expect(registry.denial('control_project')).toBeUndefined()
     expect(registry.denial('control_create_tickets')).toBeUndefined()
+    expect(registry.denial('control_message_worker')).toBeUndefined()
+    expect(registry.denial('control_cancel_worker')).toBeUndefined()
+    expect(registry.denial('control_request_assignment')).toBeUndefined()
+    expect(registry.denial('control_review_result')).toBeUndefined()
+    expect(registry.denial('control_review_diff')).toBeUndefined()
     // The proxy tools land in the Agent's own layer after the mask, so the mask cannot hide them.
-    expect(registry.registered).toEqual(['control_project', 'control_create_tickets'])
+    expect(registry.registered).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
+      'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
+      'control_project_report'])
     expect(registry.log).toEqual(['schemas', 'restrict', 'guard', 'register:control_project',
-      'register:control_create_tickets'])
+      'register:control_create_tickets', 'register:control_message_worker', 'register:control_cancel_worker',
+      'register:control_request_assignment', 'register:control_review_result', 'register:control_review_diff',
+      'register:control_project_report'])
   })
 
   it('keeps only the worker profile\'s inherited tools and guards the rest', async () => {
@@ -173,7 +182,9 @@ describe('node role tool boundary', () => {
     expect(registry.restrictions).toHaveLength(1)
     expect(registry.guards).toHaveLength(1)
     expect(registry.log.filter(entry => entry === 'restrict' || entry === 'guard')).toEqual(['restrict', 'guard'])
-    expect(registry.registered).toEqual(['control_project', 'control_create_tickets'])
+    expect(registry.registered).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
+      'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
+      'control_project_report'])
   })
 
   it('applies the boundary again to a resumed Agent', async () => {

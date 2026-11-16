@@ -105,8 +105,17 @@ describe('simulated DSH chain', () => {
     expect(reported.status).toBe(200)
     const after = control!.store.tickets.get(ticketId)!
     expect(after.assignments.at(-1)?.report).toMatchObject({ state: 'ready', summary: 'done' })
-    expect(after.ended?.outcome).toBe('completed')
     expect(after.assignments.at(-1)?.id).toBe(assignment.id)
+    // The result waits for the PM's review: the Ticket is still open.
+    expect(after.ended).toBeUndefined()
+    expect(after.reviews?.at(-1)).toMatchObject({ state: 'pending', assignmentId: assignment.id })
+    const reviewId = after.reviews!.at(-1)!.id
+
+    // The PM accepts the result, and the Ticket ends as completed.
+    const accepted = await post(url, '/v1/tools/pm/review', tokenOf(pmSessionId),
+      { ticketId, assignmentId: assignment.id, reviewId, action: 'accept' })
+    expect(accepted.status).toBe(200)
+    expect(control!.store.tickets.get(ticketId)?.ended?.outcome).toBe('completed')
   })
 
   it('refuses a report from another Assignment and leaves the Ticket unchanged', async () => {

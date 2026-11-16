@@ -22,8 +22,65 @@ export const NODE_PROTOCOL_VERSION = 1
 export const WORKER_REPORT_STATES = ['progress', 'ready', 'blocked', 'failed', 'dropped'] as const
 export type WorkerReportState = (typeof WORKER_REPORT_STATES)[number]
 
-/** What a Session is for: a Project's PM, an Assignment's Worker, or read-only reconnaissance. */
-export type SessionRole = 'pm' | 'worker' | 'scout'
+/**
+ * What a Session is for: a Project's PM, an Assignment's Worker, read-only reconnaissance, or the Router.
+ *
+ * The Router is the one Session that belongs to no Project: it is the console's own conversation, and it names no
+ * Assignment. It still gets a Session id, a token and a lifecycle of its own, so the same boundaries as every other
+ * role apply to it.
+ */
+export type SessionRole = 'pm' | 'worker' | 'scout' | 'router'
+
+/**
+ * How one read-only Git review of a Project's workspace ended.
+ *
+ * `ok` is a complete read and `truncated` a read whose diff was cut at the byte bound. `no-repository` is a workspace
+ * that is not a Git repository at all, and `no-baseline` a repository without a commit, so there is nothing to compare
+ * against. `refused` is a read the boundary refused: the workspace is not the root of its own repository, its real path
+ * leaves the node root, or the repository's own configuration and layout are not the workspace's own. `timeout` is a Git
+ * command that ran out of time, and `failed` one that failed otherwise.
+ */
+export type ReviewDiffStatus = 'ok' | 'truncated' | 'no-repository' | 'no-baseline' | 'refused' | 'timeout' | 'failed'
+
+/**
+ * What one read-only Git review of a Project's workspace found.
+ *
+ * The node produces it and the control plane relays it to the Project's PM. Every field is a fact about the workspace at
+ * the moment it was read: the diff is a snapshot of a directory several Workers share, so it can never show which Worker
+ * or Assignment changed a file.
+ */
+export interface ReviewDiffResult {
+  /** How the read ended. */
+  status: ReviewDiffStatus
+  /** The workspace the read describes, as the node resolved it. */
+  workspace?: string
+  /** The commit the changes are compared against; absent when the repository has no commit yet. */
+  baseline?: string
+  /** The bounded diff text; empty when there is nothing to show. */
+  diff?: string
+  /** The files the diff touches, bounded. */
+  files?: string[]
+  /** How many files the diff touches, before the bound. */
+  fileCount?: number
+  /** The untracked files of the workspace: their names only, never their content. */
+  untracked?: string[]
+  /** How many untracked files the workspace has, before the bound. */
+  untrackedCount?: number
+  /** The whitespace problems the check found, one line each. */
+  whitespace?: string[]
+  /** Whether the whitespace check found nothing at all. */
+  whitespaceClean?: boolean
+  /**
+   * Whether every part of the read finished.
+   *
+   * A Git command that failed or ran out of time leaves the answer incomplete: the file list may be short and the
+   * whitespace check may have found nothing because it never ran. The answer says so instead of looking like a clean
+   * workspace.
+   */
+  complete?: boolean
+  /** Why the read ended the way it did; safe to show to a PM. */
+  reason?: string
+}
 
 /** The backend that actually runs a Session. */
 export type BackendKind = 'dsh' | 'claude' | 'codex'
@@ -71,6 +128,16 @@ export interface SessionRecord {
   createdAt: string
   updatedAt: string
   archivedAt?: string
+  /**
+   * When this Session's authority was revoked.
+   *
+   * A revoked Session keeps its record and its history, but no token may be issued for it again: the ordinary tool routes,
+   * the refresh route, every re-ensure and every message refuse it. The field is optional, so a record persisted before
+   * revocation existed loads as not revoked.
+   */
+  revokedAt?: string
+  /** Why the authority was revoked, as the operator wrote it. */
+  revokedReason?: string
 }
 
 /**
@@ -110,6 +177,31 @@ export interface NodeRegistration {
  * says whether the role profile and its tools finished installing; a Session can be `idle` while `ensure` is
  * still failing, so a status alone is not proof that the command succeeded.
  */
+export interface RouterModel {
+  provider: string
+  model: string
+}
+
+export interface ConsoleRuntimeSettings {
+  schedulerTickMs: number
+  reconcileIntervalMs: number
+  tokenRefreshGraceSeconds: number
+}
+
+export interface RouterOptions {
+  models: (RouterModel & { name: string })[]
+  selected?: RouterModel
+  usage?: RouterModel & { tokens: number; contextWindow?: number }
+}
+
+export const ROUTER_ATTACHMENT_BYTES = 48 * 1024
+export const ROUTER_ATTACHMENT_COUNT = 4
+
+export interface RouterTextAttachment {
+  name: string
+  text: string
+}
+
 export interface SessionInspection {
   sessionId: string
   /** False when the node has no Session with this id. */
@@ -122,6 +214,7 @@ export interface SessionInspection {
   ready?: boolean
   /** The installation or node error that left `ready` false. */
   error?: string
+  routerOptions?: RouterOptions
 }
 
 /** Liveness of a node from the control plane's point of view. */
@@ -152,6 +245,10 @@ interface CommandEnvelope {
  * Commands that create a Session carry that Session's short-lived `sessionToken`; the node hands it to
  * the Session's tools and never parses or logs it. `session.message` may carry the latest token too, so a
  * node can keep its proxy tools current; it is opaque there as well because a node has no signing secret.
+ *
+ * `review.diff` names a Project and nothing else: the node reads that Project's own workspace with a fixed, read-only
+ * Git command set. It carries no path and no Git argument, so a caller can never point it at another directory or at a
+ * command of its own.
  */
 export type NodeCommand =
   | (CommandEnvelope & { type: 'node.register'; registration: NodeRegistration })
@@ -177,13 +274,29 @@ export type NodeCommand =
     sessionToken: string
     prompt: string
   })
+  | (CommandEnvelope & {
+    /**
+     * Ensure the Router Session.
+     *
+     * The Router belongs to no Project: the command names its own Session id and its own workspace, and the node keeps it
+     * apart from every Project's Sessions. The command is additive — a node that does not know it refuses it, and an older
+     * control plane never sends it — so the protocol version does not move.
+     */
+    type: 'router.ensure'
+    sessionId: string
+    workspace: string
+    profile: RoleProfile
+    sessionToken: string
+    prompt: string
+  })
   | (CommandEnvelope & { type: 'session.message'; sessionId: string; text: string; sessionToken?: string
-    inputIds?: readonly string[] })
+    inputIds?: readonly string[]; routerModel?: RouterModel })
   | (CommandEnvelope & { type: 'session.cancel'; sessionId: string; reason?: string })
   | (CommandEnvelope & { type: 'session.archive'; sessionId: string })
-  | (CommandEnvelope & { type: 'session.inspect'; sessionId: string })
+  | (CommandEnvelope & { type: 'session.inspect'; sessionId: string; routerDetails?: true })
   | (CommandEnvelope & { type: 'permission.set'; sessionId: string; permission: string })
   | (CommandEnvelope & { type: 'workspace.ensure'; projectId: string; workspace: string })
+  | (CommandEnvelope & { type: 'review.diff'; projectId: string })
 
 /**
  * The envelope every event carries.
@@ -201,6 +314,14 @@ interface EventEnvelope {
   role: SessionRole
   /** Monotonic per node from 1; lets the control plane detect gaps and order events. */
   seq: number
+  /**
+   * The node's own `seq` of the event the control plane recorded, when the event came from a node.
+   *
+   * The control plane gives every recorded event a sequence of its own, because a node restarts and counts from 1 again.
+   * That own sequence is the `seq` a client sees; the node's counter is kept here, so a node restart stays visible instead
+   * of silently reusing a number. The control plane itself sets this field, and the node never sends it.
+   */
+  nodeSeq?: number
   /** ISO 8601 timestamp with an explicit offset. */
   at: string
 }
@@ -215,7 +336,21 @@ export type NodeEvent =
     data?: unknown
   })
   | (EventEnvelope & { type: 'session.inspected'; requestId: string; inspection: SessionInspection })
+  | (EventEnvelope & { type: 'review.diff'; requestId: string; result: ReviewDiffResult })
   | (EventEnvelope & { type: 'tool.call'; tool: string; args: unknown; toolCallId: string })
+  | (EventEnvelope & {
+    type: 'schedule.run'
+    /** The plan the run belongs to. */
+    scheduleId: string
+    /** The run's own id; the same slot of the same plan always has the same id. */
+    runId: string
+    /** How the run ended: `delivered`, `failed` or `interrupted`. */
+    state: string
+    /** Whether the node acknowledged the message. A lost confirmation is never a success. */
+    acknowledged: boolean
+    /** Why the run failed, when it did. */
+    reason?: string
+  })
 
 /**
  * Authority for one tool call.
@@ -265,5 +400,5 @@ export interface NodePort {
    * Optional so an in-process or older transport still satisfies the port; a transport that implements it
    * gives the control plane the only loss-proof confirmation of a `starting` record.
    */
-  inspect?(sessionId: string): Promise<SessionInspection>
+  inspect?(sessionId: string, routerDetails?: true): Promise<SessionInspection>
 }

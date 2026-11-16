@@ -12,4 +12,10 @@ export default defineConfig([
   { entry: { client: 'src/client/index.tsx' }, outDir: 'lib', format: 'cjs', platform: 'browser', dts: false, clean: false, plugins: [raw],
     deps: { neverBundle: ['react', 'react/jsx-runtime', 'react-dom'] },
     outputOptions: { entryFileNames: 'client.js', banner: 'window.__ModuleLoader__.load({ id: "dsh-superagent", factory: (require) => {', footer: 'return module.exports; } });', intro: 'var module = { exports: {} }; var exports = module.exports;' } },
+  // The console: one browser bundle of its own, with React inside it, so the page loads exactly one file from its own
+  // origin and asks no CDN, no font host and no other origin for anything. React's own entry reads
+  // `process.env.NODE_ENV`, which a browser has no `process` for, so the bundle carries a small shim for it.
+  { entry: { console: 'src/console/index.tsx' }, outDir: 'lib', format: 'esm', platform: 'browser', dts: false, clean: false, plugins: [raw],
+    outputOptions: { entryFileNames: 'console.js',
+      banner: 'var process = globalThis.process || { env: { NODE_ENV: "production" } };' } },
 ])

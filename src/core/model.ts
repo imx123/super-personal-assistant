@@ -177,6 +177,8 @@ export interface ProjectProfile {
   id: string
   title: string
   goal: string
+  /** Directory selected at creation for an independent control-plane Project. */
+  workspace?: string
   /** Active Projects create Tickets; paused ones keep their existing Tickets but create no new one; ended ones are read-only history. */
   status: 'active' | 'paused' | 'ended' | 'archived'
   /** How a paused Project stops work: soft lets running Assignments finish, hard stops them now. */
@@ -357,6 +359,36 @@ export interface Assignment {
   interruptedAt?: string
 }
 
+/**
+ * The Project PM's review of one Worker's result.
+ *
+ * A Ticket whose Worker reported `ready` waits for its PM: the review is `pending` until the PM accepts or rejects it.
+ * It names the Assignment whose result is under review, so a decision never applies to another Assignment's work, and it
+ * keeps the Worker's own summary of that result.
+ *
+ * Its `id` is the round's own identity: a decision names it, so a decision about an earlier round never decides a later
+ * one. The id is durable, and a new round of the same Assignment gets a new one.
+ */
+export interface TicketReview {
+  /** The review's own id, unique among the Ticket's reviews; it names the revision request a rejection sends. */
+  id: string
+  /**
+   * `pending` until the PM decides; `accepted` or `rejected` after it did; `withdrawn` when the Worker reported
+   * something else since, so the result under review is no longer the Ticket's latest one.
+   */
+  state: 'pending' | 'accepted' | 'rejected' | 'withdrawn'
+  /** The Assignment whose `ready` report this review is about. */
+  assignmentId: string
+  /** When the review was opened. */
+  at: string
+  /** The Worker's own summary of the result under review. */
+  summary?: string
+  /** Why the PM rejected the result. */
+  reason?: string
+  /** When the PM decided. */
+  decidedAt?: string
+}
+
 export type TicketInput =
   /** A Trigger on one of its Threads, or attached to it; `human` when a person wrote it. */
   | { id: string; kind: 'trigger'; triggerId: string; at: string; note?: string; human?: true
@@ -403,14 +435,15 @@ export interface Attention { id: string; question: string; triggerId?: string }
 /** Set when its Project's archive made a Ticket non-executable; unarchiving the Project clears it. */
 export interface TicketArchive { at: string; by: 'project'; projectId: string }
 /**
- * A person's stop of a Ticket's Worker, kept until the stop is cleared: `worker` for a stop of this Worker alone, which only
- * a person may clear, and `project` for a Project hard pause, which the Project's resume clears so its PM may revive the
- * Worker. A later `project` label leaves an earlier `worker` label in place (see `docs/002`).
+ * A stop of a Ticket's Worker, kept until the stop is cleared: `worker` for a stop of this Worker alone, which only
+ * a person may clear, and `project` for a stop the Project itself made — a hard pause, or the Project's PM cancelling
+ * its own Worker — which the Project's resume clears so its PM may revive the Worker. A later `project` label leaves an
+ * earlier `worker` label in place (see `docs/002`).
  */
 export interface ManualStop {
   at: string
   scope: 'worker' | 'project'
-  /** Who stopped it, such as `user` for the panel's operator. */
+  /** Who stopped it, such as `user` for the panel's operator or `pm` for the Project's own PM. */
   by: string
   /** The Worker Session that was stopped, when it had one. */
   sessionId?: string
@@ -505,6 +538,22 @@ export interface Ticket {
    * already ended. A successful stop clears it; an ended Ticket keeps it without becoming open again.
    */
   stopFailure?: StopFailure
+  /**
+   * A stop of one Assignment the node has not confirmed yet.
+   *
+   * The Assignment already ended in the domain, but its Worker Session may still run. The fact is written in the same
+   * transaction as that end, so a control plane that stops before the node answers still knows the stop is open, and no
+   * replacement Worker starts over one that may still run. A confirmed stop clears it, for that Assignment alone.
+   */
+  stopPending?: StopPending
+  /**
+   * The PM's reviews of this Ticket's results, oldest first.
+   *
+   * A Worker's `ready` result waits for the PM's decision instead of ending the Ticket. Each round is one review, so a
+   * rejection and the result that follows it stay apart, and every review names the Assignment it was about. A decision
+   * names the review's own id, so a decision about an earlier round never decides a later one.
+   */
+  reviews?: TicketReview[]
 }
 /** A stop the Executor could not confirm: the Assignment ended, but its Worker's cancellation failed. */
 export interface StopFailure {
@@ -512,6 +561,12 @@ export interface StopFailure {
   assignmentId: string
   /** The redacted diagnostic of the failure, bounded like `delivery.error`. */
   error: string
+}
+/** A stop that is still open: the Assignment ended, but nobody confirmed that its Worker Session stopped. */
+export interface StopPending {
+  at: string
+  /** The Assignment whose stop is open. */
+  assignmentId: string
 }
 /**
  * A Thread a ticket follows, by its key: `own` when the ticket opened it, such as its own pull request, and when and how it
@@ -540,6 +595,15 @@ export function reached(ticket: Ticket, trigger: Trigger, thread: (key: string) 
   }) || (input && (context || !trigger.threads.every(ref => thread(threadKey(ref))?.context?.includes(ticket.id))))
 }
 export const latestAssignment = (ticket: Pick<Ticket, 'assignments'>): Assignment | undefined => ticket.assignments.at(-1)
+/** The review that waits for the PM's decision, if the Ticket has one. */
+export const pendingReview = (ticket: Pick<Ticket, 'reviews'>): TicketReview | undefined =>
+  ticket.reviews?.findLast(review => review.state === 'pending')
+/** The Ticket's current review: the one waiting for the PM, or the last one it decided. */
+export const currentReview = (ticket: Pick<Ticket, 'reviews'>): TicketReview | undefined =>
+  ticket.reviews?.findLast(review => review.state === 'pending') ?? ticket.reviews?.at(-1)
+/** The review of the Ticket that carries that id, or undefined when the Ticket has no such round. */
+export const reviewById = (ticket: Pick<Ticket, 'reviews'>, id: string): TicketReview | undefined =>
+  ticket.reviews?.find(review => review.id === id)
 export const OPERATOR_STOP = 'stoppedByOperator'
 export const assignmentStopped = (assignment: Assignment | undefined): boolean =>
   assignment?.state === 'ended' && assignment.endedReason === OPERATOR_STOP

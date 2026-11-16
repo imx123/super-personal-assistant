@@ -1,6 +1,4 @@
 import { mkdirSync } from 'node:fs'
-import { isAbsolute, relative, resolve, sep } from 'node:path'
-
 import {
   NODE_PROTOCOL_VERSION,
   type NodeCommand,
@@ -13,6 +11,8 @@ import {
   type SessionRole,
   type SessionStatus,
 } from '../shared/protocol.ts'
+import { workspaceDirectory } from '../shared/workspace-path.ts'
+import { reviewWorkspace, type ReviewDiffLimits } from './review-diff.ts'
 
 /** The fields every Session event carries; the protocol's envelope is not exported directly. */
 export interface NodeEventBase {
@@ -30,6 +30,8 @@ export interface FakeNodeOptions {
   nodeId: string
   root: string
   now?: () => string
+  /** The bounds of the read-only Git review this node offers; the defaults bound it tightly. */
+  reviewDiff?: ReviewDiffLimits
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
@@ -146,6 +148,29 @@ export class FakeNode implements NodePort {
         break
       }
 
+      // The Router: one Session of its own, bound to no Project. The fake keeps it apart from every Project's Sessions,
+      // exactly as the real node does.
+      case 'router.ensure': {
+        const workspace = this.resolveWorkspace(command.workspace)
+        const at = this.now()
+        const session: SessionRecord = {
+          sessionId: command.sessionId,
+          backendSessionId: command.sessionId,
+          projectId: '',
+          role: 'router',
+          nodeId: this.options.nodeId,
+          workspace,
+          status: 'idle',
+          toolProfile: command.profile.name,
+          createdAt: at,
+          updatedAt: at,
+        }
+        this.sessions.set(session.sessionId, session)
+        this.tokens.set(session.sessionId, command.sessionToken)
+        this.emitSessionStatus(session, 'idle')
+        break
+      }
+
       case 'session.message': {
         const session = this.requireSession(command.sessionId)
         if (session.status === 'archived' || session.status === 'stopped') {
@@ -222,6 +247,26 @@ export class FakeNode implements NodePort {
         })
         break
       }
+
+      // The read-only review of a Project's workspace. The fake reads the workspace it bound to that Project with the
+      // same reader the real node uses, so a test exercises the real Git boundary without a DSH node.
+      case 'review.diff': {
+        const workspace = this.workspaces.get(command.projectId)
+        const result = workspace === undefined
+          ? { status: 'refused' as const, reason: 'This node holds no workspace for the Project' }
+          : await reviewWorkspace({ workspace, root: this.options.root, ...(this.options.reviewDiff ?? {}) })
+        this.emit({
+          protocolVersion: NODE_PROTOCOL_VERSION,
+          nodeId: this.options.nodeId,
+          sessionId: '',
+          projectId: command.projectId,
+          role: 'pm',
+          type: 'review.diff',
+          requestId: command.idempotencyKey,
+          result,
+        })
+        break
+      }
     }
 
     this.idempotencyKeys.set(command.idempotencyKey, true)
@@ -259,6 +304,23 @@ export class FakeNode implements NodePort {
       tool,
       args,
       toolCallId: `fake-tool-${this.seq + 1}`,
+    })
+  }
+
+  /**
+   * Report one message of a Session, as a backend would.
+   *
+   * The fake has no model, so a test that needs the other side of a conversation reports it here: `role: 'assistant'` is
+   * what a model's own answer looks like, and `role: 'user'` what a person's message looks like. The control plane reads
+   * both from the event log, so a console shows the same conversation it would show against a real node.
+   */
+  simulateMessage(sessionId: string, role: 'user' | 'assistant', text: string): void {
+    const session = this.requireSession(sessionId)
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'session.event',
+      kind: 'message',
+      data: { role, text },
     })
   }
 
@@ -321,13 +383,7 @@ export class FakeNode implements NodePort {
   }
 
   private resolveWorkspace(workspace: string): string {
-    const root = resolve(this.options.root)
-    const target = resolve(root, workspace)
-    const escaped = relative(root, target)
-    if (escaped === '..' || escaped.startsWith(`..${sep}`) || isAbsolute(escaped)) {
-      throw new Error(`workspace escapes node root: ${workspace}`)
-    }
-    return target
+    return workspaceDirectory(this.options.root, workspace, `workspace escapes node root: ${workspace}`)
   }
 
   private now(): string {

@@ -1,10 +1,10 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { assignmentSessionId, assignmentStopped, latestAssignment, latestReport, liveTicket, OPERATOR_STOP, readUntil, runningAssignment,
-  settled, threadKey, waitsForPerson, workerSessionId } from './model.ts'
+import { assignmentSessionId, assignmentStopped, latestAssignment, latestReport, liveTicket, OPERATOR_STOP, pendingReview, readUntil,
+  runningAssignment, settled, threadKey, waitsForPerson, workerSessionId } from './model.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Handoff, Mandate, ManualStop, PolicyEffect, ThreadRef, Ticket, TicketEndBy,
-  TicketInput, TicketOutcome, Trigger, TriggerDisposition } from './model.ts'
+  TicketInput, TicketOutcome, TicketReview, Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
@@ -40,6 +40,15 @@ export interface HardStopWorkerOptions {
   assignmentId?: string
   /** The Project whose hard pause stops the Worker. */
   projectId?: string
+  /**
+   * The caller waits for the node to confirm the stop and clears the open-stop fact itself.
+   *
+   * A PM's own stop is confirmed by the node's answer, which may come after this transaction is committed: the fact that
+   * the stop is still open is therefore written next to the Assignment's end, so a control plane that restarts before the
+   * answer arrives still knows that the Worker may run. A person's stop and a Project hard pause do not wait for such an
+   * answer and leave the domain as it was.
+   */
+  confirmStop?: boolean
   /** Receives the Executor's background cleanup, which a Project hard pause waits for before reporting the Worker stopped. */
   cleanups?: { ticketId: string; work: Promise<void> }[]
 }
@@ -156,6 +165,9 @@ export class Tickets extends EnginePart {
       this.repo.tickets.save(ticket)
       const done = this.followsDone(ticket)
       if (!done || this.unfinished(ticket, at)) continue
+      // A result that waits for the PM's decision is not ended by a close: the PM decides that result, and the close
+      // stays recorded either way. A Ticket that never had a review ends as it always did.
+      if (pendingReview(ticket)) continue
       // Work resumed after the close and finished ends now.
       const resumed = Date.parse(latestAssignment(ticket)?.createdAt ?? '') > Date.parse(at)
       this.end(ticket.id, 'executor', done.outcome, resumed ? this.now() : done.at)
@@ -231,10 +243,13 @@ export class Tickets extends EnginePart {
   }
   /**
    * Stops a ticket on behalf of a human, ending any active assignments.
+   *
+   * The cleanup each stopped Assignment started is collected into `cleanups`, so a caller that must know whether the
+   * Worker is really gone — a Project that ends — can wait for it and report a failure instead of a silent success.
    * @throws UserError when the ticket is unknown.
    */
-  stop(ticketId: string, reason?: string): Ticket {
-    this.end(ticketId, 'human', 'stopped', this.now(), reason)
+  stop(ticketId: string, reason?: string, cleanups?: { ticketId: string; work: Promise<void> }[]): Ticket {
+    this.end(ticketId, 'human', 'stopped', this.now(), reason, cleanups)
     return this.require(ticketId)
   }
   /**
@@ -273,6 +288,9 @@ export class Tickets extends EnginePart {
       if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
       delete ticket.attention
       delete ticket.delivery
+      // The stop is not confirmed until the node answers, so the fact that it is open is written with the end of the
+      // Assignment: a restart before the answer must still know that this Worker may run.
+      if (options.confirmStop === true) this.noteStopPending(ticket, assignment.id)
     }
     if (!labelled && options.scope === 'worker') return this.require(ticketId)
     ticket.updatedAt = this.now()
@@ -287,31 +305,100 @@ export class Tickets extends EnginePart {
     return this.require(ticketId)
   }
   /**
+   * Ask the Executor to stop an Assignment that already ended, without changing what the Ticket records.
+   *
+   * A stop the node never confirmed leaves the Assignment ended while its Worker Session may still run, and
+   * `hardStopWorker` refuses an Assignment that already ended: there would be no second way to ask the node to stop it.
+   * This is that second way. The Assignment stays ended and the Ticket keeps its stop; only the node is asked again, and
+   * the outcome is recorded as the first stop recorded it — a confirmed stop clears the failure, a refused one replaces it.
+   *
+   * The stop is open again until the node answers, so the fact that it is open is written with this call: a restart
+   * before the answer must still know that this Worker may run.
+   * @throws UserError when the ticket is unknown or the Assignment is not one of its own.
+   */
+  restopWorker(ticketId: string, assignmentId: string, reason: string,
+    cleanups?: { ticketId: string; work: Promise<void> }[]): void {
+    const ticket = this.require(ticketId)
+    const assignment = ticket.assignments.find(item => item.id === assignmentId)
+    if (!assignment) throw new UserError('unknownAssignment')
+    this.noteStopPending(ticket, assignmentId)
+    const work = this.stopWorker(ticket, assignment, reason)
+    // The open stop is written here, so it survives a restart; a stop that reported no cleanup work succeeded at once
+    // and cleared the facts it superseded in the same write.
+    this.repo.tickets.save(ticket)
+    if (work && cleanups) cleanups.push({ ticketId, work })
+  }
+  /**
+   * Record that stopping one Worker could not be confirmed, so the Ticket keeps that failure until a later stop confirms it.
+   *
+   * The failure is the redacted diagnostic of the stop, bounded like `delivery.error`. It is the fact that keeps a new
+   * Assignment from starting over a Worker that may still run.
+   */
+  noteStopFailure(ticketId: string, assignmentId: string, error: string): void {
+    this.recordStopFailure(ticketId, assignmentId, error)
+  }
+  /**
    * Ask the Executor to stop one Assignment, and record on the Ticket whether that stop really happened.
    *
    * The returned promise still rejects for a caller that waits for the cleanup, such as a Project hard pause, but it always
    * carries a rejection handler here: a stop nobody awaits can never become an unhandled rejection. A successful stop clears
-   * an earlier `stopFailure`; a failed one records it and emits `ticket.stopFailed`. Ending the Assignment is not undone:
-   * the Ticket keeps its `ended`/`stopped` state and never returns to running because a Worker's cleanup failed.
+   * the open-stop fact and an earlier `stopFailure` of that same Assignment; a failed one records the failure and emits
+   * `ticket.stopFailed`. Ending the Assignment is not undone: the Ticket keeps its `ended`/`stopped` state and never returns
+   * to running because a Worker's cleanup failed.
    */
-  private stopWorker(ticket: Ticket, assignment: Assignment, reason: string): Promise<void> | undefined {
+  private stopWorker(ticket: Ticket, assignment: Assignment, reason: string,
+    cleanups?: { ticketId: string; work: Promise<void> }[]): Promise<void> | undefined {
     // A synchronous throw is the Executor refusing the stop request itself, which the caller still handles: the
     // Assignment is not confirmed ended and the ticket must keep it, exactly as before.
     const cleanup = this.options.executor.stop(ticket, assignment, reason)
     if (!cleanup) {
-      // A synchronous stop reported no cleanup work: it succeeded, so a failure it superseded no longer stands.
-      delete ticket.stopFailure
+      // A synchronous stop reported no cleanup work: it succeeded, so the facts it superseded no longer stand.
+      this.forgetStopFacts(ticket, assignment.id)
       return undefined
     }
     const work: Promise<void> = Promise.resolve(cleanup).then(
-      () => { this.clearStopFailure(ticket.id) },
+      () => { this.clearStopFacts(ticket.id, assignment.id) },
       (error: unknown) => {
         this.recordStopFailure(ticket.id, assignment.id, error)
         // Keep the failure visible to a caller that waits for the cleanup, while the handler above already observed it.
         throw error
       })
     work.catch(() => {})
+    // The cleanup is recorded for the caller that must know whether the Worker is really gone.
+    if (cleanups) cleanups.push({ ticketId: ticket.id, work })
     return work
+  }
+  /**
+   * Record that the stop of one Assignment is still open: the Assignment ended, but nobody confirmed that its Worker
+   * Session stopped.
+   *
+   * The fact belongs to that Assignment alone. A late report of an older stop never replaces the open stop of a newer
+   * Assignment, whose Worker is the one a new Assignment would start over.
+   */
+  private noteStopPending(ticket: Ticket, assignmentId: string): void {
+    const at = this.now()
+    const open = ticket.stopPending
+    if (open && this.assignmentOrder(ticket, open.assignmentId) > this.assignmentOrder(ticket, assignmentId)) return
+    ticket.stopPending = { at, assignmentId }
+  }
+  /** The position of an Assignment in the Ticket's own order: a later Assignment is a newer one. */
+  private assignmentOrder(ticket: Ticket, assignmentId: string): number {
+    return ticket.assignments.findIndex(item => item.id === assignmentId)
+  }
+  /**
+   * Forget the facts a successful stop of this Assignment supersedes.
+   *
+   * The failure of this Assignment and of every older one is superseded: a later confirmed stop means the Worker that
+   * could not be stopped is gone. The open stop of this Assignment is superseded as well, but only for this Assignment: a
+   * late success of an older stop never clears the open stop of a newer one, whose Worker may still run.
+   */
+  private forgetStopFacts(ticket: Ticket, assignmentId: string): boolean {
+    let changed = false
+    const order = this.assignmentOrder(ticket, assignmentId)
+    const failure = ticket.stopFailure
+    if (failure && this.assignmentOrder(ticket, failure.assignmentId) <= order) { delete ticket.stopFailure; changed = true }
+    if (ticket.stopPending?.assignmentId === assignmentId) { delete ticket.stopPending; changed = true }
+    return changed
   }
   /** Record that stopping `assignmentId` failed, for the panel and the next reader of the Ticket. */
   private recordStopFailure(ticketId: string, assignmentId: string, error: unknown): void {
@@ -323,6 +410,10 @@ export class Tickets extends EnginePart {
       this.repo.atomic(() => {
         const ticket = this.repo.tickets.get(ticketId)
         if (!ticket) return
+        // A late failure of an older Assignment never replaces the diagnostic of a newer one: the newer Worker is the one
+        // a new Assignment would start over.
+        const known = ticket.stopFailure
+        if (known && this.assignmentOrder(ticket, known.assignmentId) > this.assignmentOrder(ticket, assignmentId)) return
         ticket.stopFailure = { at, assignmentId, error: diagnostic }
         ticket.updatedAt = at
         this.repo.tickets.save(ticket)
@@ -334,18 +425,23 @@ export class Tickets extends EnginePart {
     }
     if (recorded) this.emit('ticket.stopFailed', { ticketId, assignmentId, error: diagnostic })
   }
-  /** Clear the `stopFailure` a later, successful stop superseded: the Worker's stop is no longer outstanding. */
-  private clearStopFailure(ticketId: string): void {
+  /**
+   * Clear the facts a later, successful stop superseded: that Worker's stop is no longer outstanding.
+   *
+   * A late success of an older Assignment never clears the diagnostic or the open stop of a newer one, whose Worker may
+   * still run: only a success of that Assignment itself does.
+   */
+  private clearStopFacts(ticketId: string, assignmentId: string): void {
     try {
       this.repo.atomic(() => {
         const ticket = this.repo.tickets.get(ticketId)
-        if (!ticket?.stopFailure) return
-        delete ticket.stopFailure
+        if (!ticket) return
+        if (!this.forgetStopFacts(ticket, assignmentId)) return
         ticket.updatedAt = this.now()
         this.repo.tickets.save(ticket)
       })
     } catch {
-      // A closed Store only keeps a stale failure; the next successful stop records the newest fact.
+      // A closed Store only keeps a stale fact; the next successful stop records the newest one.
     }
   }
   /**
@@ -404,6 +500,87 @@ export class Tickets extends EnginePart {
     this.options.executor.start(ticket, assignment)
     this.emit('ticket.revived', { ticketId, assignmentId: assignment.id, pmSessionId })
     return this.require(ticketId)
+  }
+  /**
+   * Open the Project PM's review of one Assignment's result.
+   *
+   * The Ticket stays open and records the review, bound to the Assignment that reported the result, so the PM sees a
+   * pending decision it can act on and a later decision never applies to another Assignment's work. A result that waits
+   * for the PM already is replaced: only one review of an Assignment waits for a decision.
+   *
+   * The same result reported again keeps its round: one round is one result, and a decision about it stays valid. A
+   * result whose content changed is a new round: the round that waits is withdrawn and the new one gets its own id, so
+   * the old id never decides the new content.
+   */
+  openReview(ticket: Ticket, assignment: Assignment, summary: string, at: string): TicketReview {
+    const waiting = (ticket.reviews ?? []).findLast(review => review.state === 'pending'
+      && review.assignmentId === assignment.id)
+    if (waiting && (waiting.summary ?? '').trim() === summary.trim()) return waiting
+    this.withdrawReview(ticket, assignment.id)
+    const review: TicketReview = { id: key('review', ticket.id, String(ticket.reviews?.length ?? 0)), state: 'pending',
+      assignmentId: assignment.id, at, summary }
+    ticket.reviews = [...ticket.reviews ?? [], review]
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.emit('ticket.reviewOpened', { ticketId: ticket.id, assignmentId: assignment.id, reviewId: review.id })
+    return review
+  }
+  /**
+   * Withdraw the review of one Assignment's result: the Worker reported something else since, so the result under review
+   * is no longer the Ticket's latest one and there is nothing left to accept or reject.
+   *
+   * The record stays on the Ticket as a withdrawn round: the PM sees that the result it was about is gone, and the next
+   * review of the same Assignment is a round of its own. A withdrawn round's id decides nothing any more.
+   */
+  withdrawReview(ticket: Ticket, assignmentId: string): void {
+    const waiting = (ticket.reviews ?? []).filter(review => review.state === 'pending' && review.assignmentId === assignmentId)
+    if (!waiting.length) return
+    const at = this.now()
+    ticket.reviews = (ticket.reviews ?? []).map(review => review.state === 'pending' && review.assignmentId === assignmentId
+      ? { ...review, state: 'withdrawn' as const, decidedAt: at } : review)
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.emit('ticket.reviewWithdrawn', { ticketId: ticket.id, assignmentId, reviewId: waiting[0]!.id })
+  }
+  /**
+   * The PM accepts the result under review: the Ticket ends as `completed` and the review says so.
+   *
+   * The end is the domain's own: the Ticket's Assignment ends with it and its Worker is stopped, so an accepted result
+   * never leaves a Worker running.
+   */
+  acceptReview(ticket: Ticket, review: TicketReview, at: string): Ticket {
+    this.decideReview(ticket, review, 'accepted', undefined, at)
+    this.end(ticket.id, 'executor', 'completed', at, 'The Project PM accepted the result')
+    return this.require(ticket.id)
+  }
+  /**
+   * The PM rejects the result under review: the Ticket stays open and the review keeps the reason.
+   *
+   * The rejection itself changes no work: the reason reaches the Worker as a revision request, which the caller sends.
+   */
+  rejectReview(ticket: Ticket, review: TicketReview, reason: string, at: string): TicketReview {
+    return this.decideReview(ticket, review, 'rejected', reason, at)
+  }
+  /** Record the PM's decision on one review, in place; the Ticket keeps every earlier round apart. */
+  private decideReview(ticket: Ticket, review: TicketReview, decision: 'accepted' | 'rejected', reason: string | undefined,
+    at: string): TicketReview {
+    const decided: TicketReview = { ...review, state: decision, ...(reason === undefined ? {} : { reason }), decidedAt: at }
+    ticket.reviews = (ticket.reviews ?? []).map(item => item.id === review.id ? decided : item)
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.emit('ticket.reviewDecided', { ticketId: ticket.id, assignmentId: review.assignmentId, reviewId: review.id,
+      decision })
+    return decided
+  }
+  /**
+   * Send the Inputs that still wait to the Assignment that runs the Ticket.
+   *
+   * A message that never reached the Worker stays in the Ticket's waiting list, so a repeated request sends it again
+   * instead of leaving the Worker without the reason it needs.
+   */
+  redeliver(ticket: Ticket, assignment: Assignment): void {
+    if (assignment.state !== 'running' || !ticket.undelivered.length) return
+    this.options.executor.deliver(ticket, assignment)
   }
   /**
    * Move a Ticket to a new Worker inside its Project: end the current Assignment with `handedOff` and ask the Executor to
@@ -653,12 +830,15 @@ export class Tickets extends EnginePart {
    * Replaces the stalled or explicitly stopped assignment of a retryable open ticket.
    * @throws UserError when the ticket is unknown, its Project is paused, it carries a manual stop, or it is not retryable.
    */
-  retry(ticketId: string): Ticket {
+  retry(ticketId: string, confirmedStoppedAssignmentId?: string): Ticket {
     const ticket = this.require(ticketId)
     if (this.projectPaused(ticket)) throw new UserError('projectPaused')
     this.refuseManualStop(ticket)
     const latest = latestAssignment(ticket)
     if (!canRetry(ticket) || !latest) throw new UserError('notRetryable')
+    if (confirmedStoppedAssignmentId !== undefined && latest.id !== confirmedStoppedAssignmentId) {
+      throw new UserError('assignmentEnded')
+    }
     const stopped = assignmentStopped(latest)
     if (!stopped) {
       this.endAssignment(ticket, latest, 'retried')
@@ -667,7 +847,7 @@ export class Tickets extends EnginePart {
     const assignment = this.newAssignment(ticket)
     ticket.updatedAt = this.now()
     this.repo.tickets.save(ticket)
-    if (!stopped) this.stopWorker(ticket, latest, 'retried')
+    if (!stopped && confirmedStoppedAssignmentId === undefined) this.stopWorker(ticket, latest, 'retried')
     this.options.executor.start(ticket, assignment)
     return ticket
   }
@@ -859,7 +1039,8 @@ export class Tickets extends EnginePart {
    * ends the ticket included (see `readBefore`), and neither acknowledged, answered nor handed back: one may have come while
    * the worker wrote the report that ends the ticket, or after its turn ended, and either way it can no longer hand it back.
    */
-  end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string): void {
+  end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string,
+    cleanups?: { ticketId: string; work: Promise<void> }[]): void {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) return
     const stopping = ticket.assignments.filter(assignment => assignment.state !== 'ended')
@@ -876,7 +1057,7 @@ export class Tickets extends EnginePart {
     this.repo.tickets.save(ticket)
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
-    for (const assignment of stopping) this.stopWorker(ticket, assignment, reason ?? outcome)
+    for (const assignment of stopping) this.stopWorker(ticket, assignment, reason ?? outcome, cleanups)
   }
   /**
    * Whether a ticket's work has not finished at a close at `at`: its worker took up a person's message the ticket decides and
@@ -924,6 +1105,8 @@ export class Tickets extends EnginePart {
   }
   private endAssignment(ticket: Ticket, assignment: Assignment, reason: string): void {
     assignment.state = 'ended'; assignment.endedAt = this.now(); assignment.endedReason = reason
+    // A review of this Assignment's result is moot once the Assignment ends: the PM can no longer accept or reject it.
+    this.withdrawReview(ticket, assignment.id)
     this.emit('assignment.ended', { ticketId: ticket.id, assignmentId: assignment.id, reason })
   }
   /**

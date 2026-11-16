@@ -60,7 +60,7 @@ export class SessionTokenError extends Error {
 }
 
 const BASE64URL = /^[A-Za-z0-9_-]+$/
-const ROLES: ReadonlySet<string> = new Set<SessionRole>(['pm', 'worker', 'scout'])
+const ROLES: ReadonlySet<string> = new Set<SessionRole>(['pm', 'worker', 'scout', 'router'])
 const BACKENDS: ReadonlySet<string> = new Set<BackendKind>(['dsh', 'claude', 'codex'])
 
 /** The current time in whole seconds; an explicit `nowSeconds` makes issuance and verification testable. */

@@ -14,8 +14,8 @@ interface Manifest {
   scripts: Record<string, string>
 }
 const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as Manifest
-const built = ['lib/index.js', 'lib/index.d.ts', 'lib/client.js', 'lib/github-watch.js', 'lib/github-watch.d.ts',
-  'lib/feishu-watch.js', 'lib/feishu-watch.d.ts']
+const built = ['lib/index.js', 'lib/index.d.ts', 'lib/client.js', 'lib/console.js', 'lib/github-watch.js',
+  'lib/github-watch.d.ts', 'lib/feishu-watch.js', 'lib/feishu-watch.d.ts']
 const shipped = ['cordis.patch.yml', 'locale/en.json', 'locale/zh.json', 'LICENSE', 'LICENSE-MIT', 'NOTICE',
   'README.md', 'scripts/dsh-superagent', 'examples/profile.cordis.patch.yml']
 

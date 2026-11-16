@@ -109,6 +109,8 @@ export class Assignments extends EnginePart {
   /**
    * Records a worker status report on an open ticket's current assignment, updating `attention`, `answers`, held automated
    * inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads (`followsDone`).
+   * A `ready` report of a Ticket whose Project PM reviews results opens that review instead of ending the Ticket: the
+   * Ticket stays open until the PM accepts or rejects the result.
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,
    * or a question/answer referencing a non-human or unreached trigger.
    */
@@ -136,6 +138,9 @@ export class Assignments extends EnginePart {
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
     assignment.report = { state: report.state, summary: report.summary, at }
+    // A result the Worker has moved on from is no longer under review: a newer report replaces the one that waits for
+    // the PM, so the PM never reviews a result the Worker has already superseded.
+    if (report.state !== 'ready') this.tickets.withdrawReview(ticket, assignment.id)
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
@@ -145,6 +150,12 @@ export class Assignments extends EnginePart {
     const ready = !ticket.follows?.length ? 'completed' : this.tickets.followsDone(ticket)?.outcome
     // A dropped report after a close the ticket deferred ends it as the close did, which its final notice tells.
     const outcome = report.state === 'dropped' ? this.tickets.followsDone(ticket)?.outcome ?? 'dropped' : report.state === 'ready' ? ready : undefined
+    // A result the Project PM reviews does not end its Ticket: the review waits for the PM's decision instead. The
+    // decision is the PM's whatever the Ticket follows: a closed Thread does not end a Ticket that waits for its review.
+    if (report.state === 'ready' && this.options.reviewReady?.(ticket, assignment) === true) {
+      this.tickets.openReview(ticket, assignment, report.summary, at)
+      return this.require(ticketId)
+    }
     if (outcome) this.tickets.end(ticketId, 'executor', outcome, at)
     return this.require(ticketId)
   }

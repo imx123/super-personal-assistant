@@ -10,6 +10,7 @@ import { verifySessionToken } from '../src/shared/session-token.ts'
 
 const SECRET = 'control-test-secret'
 const API_TOKEN = 'api-test-token'
+const VIEWER_TOKEN = 'viewer-test-token'
 let directory: string
 let control: ControlPlane
 let node: FakeNode
@@ -117,8 +118,125 @@ describe('control-plane kernel', () => {
     expect(sent.status).toBe(200)
     expect(node.messages.get(pm.sessionId)).toContain('over HTTP')
 
+    // The low-level archive of a PM Session keeps the semantics it always had: the Session is archived, whatever its
+    // Project is doing. The operator's own archive lives under the console's namespace and has its own rules.
     const archived = await fetch(`${address.url}/v1/sessions/${pm.sessionId}/archive`, { method: 'POST', headers: auth })
     expect(archived.status).toBe(200)
     expect(node.sessions.get(pm.sessionId)?.status).toBe('archived')
+  })
+})
+
+describe('project creation over HTTP', () => {
+  /** The operator headers the API expects, with the JSON content type a create request carries. */
+  function operator(): Record<string, string> {
+    return { authorization: `Bearer ${API_TOKEN}`, 'content-type': 'application/json' }
+  }
+
+  /** Serve the control plane over HTTP; the Project list starts empty, so the route is the only way in. */
+  async function serve(viewer = false): Promise<string> {
+    server = new ControlPlaneServer(control, viewer ? { token: API_TOKEN, viewerToken: VIEWER_TOKEN } : { token: API_TOKEN })
+    const address = await server.listen(0)
+    return address.url
+  }
+
+  it('creates a Project from an empty database and returns it', async () => {
+    setup()
+    await control.registerNode()
+    const url = await serve()
+
+    const response = await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: operator(),
+      body: JSON.stringify({ title: 'Ship the thing', goal: 'A working thing' }) })
+    expect(response.status).toBe(201)
+    const body = await response.json() as { project: { id: string; title: string; goal: string; status: string; pmSessionId: string } }
+    expect(body.project).toMatchObject({ title: 'Ship the thing', goal: 'A working thing', status: 'active' })
+    expect(body.project.pmSessionId).toBe(`pm-${body.project.id}`)
+
+    // The Project is in the domain store, and the read route lists it.
+    expect(control.store.projects.get(body.project.id)).toMatchObject({ title: 'Ship the thing', goal: 'A working thing' })
+    const listed = await fetch(`${url}/v1/projects`, { headers: { authorization: `Bearer ${API_TOKEN}` } })
+    expect(((await listed.json()) as { projects: unknown[] }).projects).toHaveLength(1)
+
+    // The Project came through the domain: its own Thread holds the request's `project` Decision.
+    const threads = control.store.threads.list()
+    expect(threads).toHaveLength(1)
+    expect(threads[0]!.pending).toEqual([])
+    expect(threads[0]!.evaluating).toBeUndefined()
+    const decisions = control.store.decisions.byThread(threads[0]!.key)
+    expect(decisions).toHaveLength(1)
+    expect(decisions[0]!).toMatchObject({ kind: 'project', projectId: body.project.id })
+
+    // A request is not work: it started no Ticket, no Assignment and no Session.
+    expect(control.tickets()).toHaveLength(0)
+    expect(control.sessions.size).toBe(0)
+    expect(node.sessions.size).toBe(0)
+  })
+
+  it('refuses a missing, wrong or read-only token and creates nothing', async () => {
+    setup()
+    await control.registerNode()
+    const url = await serve(true)
+    const payload = JSON.stringify({ title: 'Title', goal: 'Goal' })
+
+    expect((await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: payload })).status).toBe(401)
+    expect((await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: { authorization: 'Bearer not-the-token', 'content-type': 'application/json' }, body: payload })).status).toBe(401)
+    const viewer = await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: { authorization: `Bearer ${VIEWER_TOKEN}`, 'content-type': 'application/json' }, body: payload })
+    expect(viewer.status).toBe(403)
+    expect(await viewer.text()).toMatch(/read-only viewer/)
+    expect(control.projects()).toHaveLength(0)
+  })
+
+  it('refuses a body without a non-empty title and goal', async () => {
+    setup()
+    await control.registerNode()
+    const url = await serve()
+    const send = async (body: unknown): Promise<Response> => fetch(`${url}/v1/console/projects`, { method: 'POST', headers: operator(), body: JSON.stringify(body) })
+
+    expect((await send({})).status).toBe(400)
+    expect((await send({ title: 'Title' })).status).toBe(400)
+    expect((await send({ goal: 'Goal' })).status).toBe(400)
+    expect((await send({ title: '   ', goal: 'Goal' })).status).toBe(400)
+    expect((await send({ title: 'Title', goal: '   ' })).status).toBe(400)
+    expect((await send({ title: 7, goal: 'Goal' })).status).toBe(400)
+    expect((await send({ title: 'Title', goal: ['Goal'] })).status).toBe(400)
+    const notAnObject = await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: operator(), body: JSON.stringify([1, 2]) })
+    expect(notAnObject.status).toBe(400)
+    expect(control.projects()).toHaveLength(0)
+  })
+
+  it('keeps the created Project in the database across a restart', async () => {
+    setup()
+    await control.registerNode()
+    const url = await serve()
+    const created = await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: operator(),
+      body: JSON.stringify({ title: 'Persisted', goal: 'Stay' }) })
+    const { project } = await created.json() as { project: { id: string } }
+
+    await server!.close()
+    server = undefined
+    await control.close()
+    // A new kernel on the same database finds the Project: it was written, not held in memory.
+    control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: 'local', node, secret: SECRET,
+      workspaceRoot: join(directory, 'workspaces') })
+    expect(control.projects().map(item => item.id)).toContain(project.id)
+  })
+
+  it('ensures the PM of a new Project only when asked', async () => {
+    setup()
+    await control.registerNode()
+    const url = await serve()
+    const created = await fetch(`${url}/v1/console/projects`, { method: 'POST', headers: operator(),
+      body: JSON.stringify({ title: 'Managed', goal: 'Work' }) })
+    const { project } = await created.json() as { project: { id: string; pmSessionId: string } }
+
+    // Creating the Project started no Session; the PM comes up on its own route.
+    expect(control.sessions.size).toBe(0)
+    expect(node.sessions.size).toBe(0)
+
+    const opened = await fetch(`${url}/v1/projects/${project.id}/pm`, { method: 'POST', headers: { authorization: `Bearer ${API_TOKEN}` } })
+    expect(opened.status).toBe(200)
+    const { session } = await opened.json() as { session: { sessionId: string; status: string } }
+    expect(session.sessionId).toBe(project.pmSessionId)
+    expect(session.status).toBe('idle')
+    expect(node.sessions.get(project.pmSessionId)?.status).toBe('idle')
   })
 })

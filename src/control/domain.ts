@@ -1,6 +1,6 @@
 /** Minimal domain composition for the standalone control-plane kernel. No DSH or Runtime dependency. */
 import { Engine } from '../core/index.ts'
-import type { Assessor, DomainEvent, Executor, OutboundMessage, Outbox, Policy, Repositories, ReplyStatus, SourceScope }
+import type { Assessor, DomainEvent, EngineOptions, Executor, OutboundMessage, Outbox, Policy, Repositories, ReplyStatus, SourceScope }
   from '../core/index.ts'
 
 /** A deliberately simple Policy for the kernel: human triggers are explicit, inferred work is refused. */
@@ -23,6 +23,14 @@ export const kernelAssessor: Assessor = { request: () => {} }
 
 /** The kernel runs no Worker; execution is the node's responsibility. */
 export const kernelExecutor: Executor = { start: () => {}, deliver: () => {}, stop: () => {} }
+
+/**
+ * The kernel's review policy: a Worker's result waits for the review of its Project's PM.
+ *
+ * Only the standalone control plane's PM Projects review their results: the old plugin keeps ending a Ticket on a `ready`
+ * report, because it never had this policy. The Engine owns both transitions; this only says which of them applies.
+ */
+export const kernelReview: EngineOptions['reviewReady'] = ticket => ticket.projectId !== undefined
 
 /** An in-memory Outbox so Engine replies are recorded without a Source or channel. */
 export class KernelOutbox implements Outbox {
@@ -65,6 +73,7 @@ export function createKernelDomain(store: Repositories, now?: () => string, exec
     assessor: kernelAssessor,
     executor,
     outbox,
+    reviewReady: kernelReview,
     ...(now ? { now } : {}),
     emit: event => { events.push(event) },
   })

@@ -11,23 +11,27 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle, CreateAgentOptions, ModelSelection, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 // These augment DSH's `Context` with `agents`, `sessionPersistence` and `permissionPresets`; imports are type-only.
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import { AgentDelivery } from '../app/delivery.ts'
-import { initializeRoleModel } from '../app/role-models.ts'
-import type { RoleProfile } from '../shared/protocol.ts'
+import { initializeRoleModel, resolveRoleModel } from '../app/role-models.ts'
+import type { RoleModel } from '../policy.ts'
+import type { RoleProfile, RouterModel, RouterOptions } from '../shared/protocol.ts'
 import type { DshPortSessions } from './dsh-port-host.ts'
 
 /**
  * The agent presets a node profile defines for its Sessions.
  *
- * These mirror `PM_PRESET` and `WORKER_PRESET` in `src/app/sessions.ts`; that module is the control plane's own Session
- * decoration (it imports the Store, the Engine's domain types and zod), so a node keeps its own copy of the two ids and
- * never loads it. The profile's `cordis.patch.yml` must define both rows with these ids (docs/013 §1.2).
+ * These mirror `PM_PRESET`, `WORKER_PRESET` and `ROUTER_PRESET` in `src/app/sessions.ts`; that module is the control
+ * plane's own Session decoration (it imports the Store, the Engine's domain types and zod), so a node keeps its own copy of
+ * the three ids and never loads it. The profile's `cordis.patch.yml` must define all three rows with these ids
+ * (docs/013 §1.2).
  */
-export const NODE_ROLE_PRESETS = { pm: 'dsh-superagent-pm', worker: 'dsh-superagent-worker' } as const
+export const NODE_ROLE_PRESETS = { pm: 'dsh-superagent-pm', worker: 'dsh-superagent-worker',
+  router: 'dsh-superagent-router' } as const
 
 /**
  * The part of DSH's preset registry (`@deepseek-ai/dsh-agent-preset-registry`) an Agent is created with.
@@ -69,6 +73,7 @@ interface AgentDefaultModel {
 export interface NodeSessionsOptions {
   /** Cancels a delivery in flight; the plugin aborts it when DSH disposes the node plugin. */
   signal?: AbortSignal
+  defaultModel?: RoleModel
 }
 
 /**
@@ -83,14 +88,17 @@ export interface NodeSessionsOptions {
 export class NodeSessions implements DshPortSessions {
   private readonly delivery: AgentDelivery
   private readonly signal: AbortSignal
+  private readonly rolePrompts = new WeakMap<Agent, { text: string }>()
+  private readonly routerModels = new WeakMap<Agent, { selected?: ModelSelection }>()
+  private catalog?: { expires: number; models: Promise<RouterOptions['models']> }
 
-  constructor(private readonly ctx: Context, options: NodeSessionsOptions = {}) {
+  constructor(private readonly ctx: Context, private readonly options: NodeSessionsOptions = {}) {
     this.delivery = new AgentDelivery(ctx)
     this.signal = options.signal ?? new AbortController().signal
   }
 
   /** Resolves, resumes or creates `sessionId`, then names it; returns the live Agent for the host's proxy tools. */
-  async ensure(sessionId: string, directory: string, title: string, role: 'pm' | 'worker',
+  async ensure(sessionId: string, directory: string, title: string, role: 'pm' | 'worker' | 'router',
     profile?: RoleProfile): Promise<Agent> {
     const id = sessionId as SessionId
     let agent = this.ctx.agents.get(id)
@@ -101,6 +109,7 @@ export class NodeSessions implements DshPortSessions {
     // could apply the route must still become runnable. `initializeRoleModel` itself skips an Agent that already has a
     // request header or a recorded selection, so a healthy repeated ensure re-reads the default but never re-seeds it.
     await this.applyDefaultModel(agent, profile)
+    if (role === 'router') this.bindRouterModel(agent)
     this.applyTitle(agent, title)
     return agent
   }
@@ -118,6 +127,93 @@ export class NodeSessions implements DshPortSessions {
     if (!agent) throw new Error(`Session ${sessionId} is not loaded on this node`)
     await this.delivery.send(agent, idempotencyKey, text, mode, this.signal,
       /* authorize */ undefined, /* accepted */ undefined, onDelivered)
+  }
+
+  setRolePrompt(sessionId: string, text: string): void {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (!agent) throw new Error(`Session ${sessionId} is not loaded on this node`)
+    const existing = this.rolePrompts.get(agent)
+    if (existing) {
+      existing.text = text
+      return
+    }
+    const prompt = { text }
+    agent.ctx.systemPrompt.section({ name: 'dsh-superagent-node-role', order: 9999,
+      interpolate: false, text: () => prompt.text })
+    this.rolePrompts.set(agent, prompt)
+  }
+
+  private bindRouterModel(agent: Agent): void {
+    if (this.routerModels.has(agent)) return
+    const selected = agent.session.snapshotEvents().findLast(event => event.type === 'model/selection')?.data
+    const route: { selected?: ModelSelection } = selected ? { selected: {
+      provider: selected.provider, model: selected.model,
+      ...(selected.reasoningEffort ? { reasoningEffort: ReasoningEffortId(selected.reasoningEffort) } : {}),
+    } } : {}
+    this.routerModels.set(agent, route)
+    agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      const result = await next()
+      const model = route.selected
+      return model ? { ...result, variables: { ...result.variables, provider: model.provider, model: model.model } } : result
+    }, { prepend: true })
+    agent.ctx.on('agent/request', async (_payload, next) => {
+      const result = await next()
+      if (!route.selected) return result
+      const { reasoningEffort: _previous, ...rest } = result
+      return { ...rest, ...route.selected }
+    }, { prepend: true })
+  }
+
+  private modelCatalog(): Promise<RouterOptions['models']> {
+    if (this.catalog && this.catalog.expires > Date.now()) return this.catalog.models
+    const models = Promise.allSettled(this.ctx.llm.listProviders().map(async provider =>
+      (await this.ctx.llm.listModels(provider.id)).map(model => ({
+        provider: provider.id, model: model.id, name: model.name,
+      }))
+    )).then(results => results.flatMap(result => result.status === 'fulfilled' ? result.value : []))
+    this.catalog = { expires: Date.now() + 60_000, models }
+    return models
+  }
+
+  async selectRouterModel(sessionId: string, model: RouterModel): Promise<void> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    const route = agent && this.routerModels.get(agent)
+    if (!agent || !route) throw new Error('The Router Session is not loaded')
+    if (route.selected?.model === model.model && route.selected.provider === model.provider) return
+    if (!(await this.modelCatalog()).some(item => item.provider === model.provider && item.model === model.model)) {
+      throw new Error('This model is not available on the Router node')
+    }
+    const selection = await resolveRoleModel(this.ctx, model)
+    if (agent.status === 'running') throw new Error('Wait until the Router finishes before changing models')
+    route.selected = selection
+    agent.session.append('model/selection', selection)
+  }
+
+  async routerOptions(sessionId: string): Promise<RouterOptions> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    const options: RouterOptions = { models: await this.modelCatalog() }
+    const fallback = this.options.defaultModel ?? serviceOf<AgentDefaultModel>(this.ctx, 'agentDefaultModel')?.currentSelection()
+    const selected = agent ? this.routerModels.get(agent)?.selected ?? agent.session.requestHeader()?.config ?? fallback : fallback
+    if (selected?.provider && selected.model) options.selected = { provider: selected.provider, model: selected.model }
+    if (!agent) return options
+    const log = agent.session.snapshotEvents()
+    const index = log.findLastIndex(event => event.type === 'assistant/message' && event.data.usage !== undefined)
+    if (index < 0) return options
+    const reply = log[index]!
+    if (reply.type !== 'assistant/message' || reply.data.usage === undefined) return options
+    const preceding = log.slice(0, index)
+    const context = preceding.findLast(event => event.type === 'request/context')?.data
+    const config = preceding.findLast(event => event.type === 'request/header')?.data.header.config
+    if (config) {
+      const usage = reply.data.usage
+      const tokens = usage.totalTokens ?? (usage.inputTokens + usage.outputTokens
+        + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0))
+      const contextWindow = context?.provider === config.provider && context.model === config.model
+        ? context.contextWindow : undefined
+      options.usage = { provider: config.provider, model: config.model, tokens,
+        ...(contextWindow === undefined ? {} : { contextWindow }) }
+    }
+    return options
   }
 
   /** Whether `sessionId` exists outside this process, which decides between resume and create. */
@@ -139,7 +235,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Creates a new Agent on `id` in `directory`, recording the role preset in the Session's metadata. */
-  private async create(id: SessionId, directory: string, role: 'pm' | 'worker', profile?: RoleProfile): Promise<Agent> {
+  private async create(id: SessionId, directory: string, role: 'pm' | 'worker' | 'router', profile?: RoleProfile): Promise<Agent> {
     const preset = await this.rolePreset(role)
     const options: CreateAgentOptions = { sessionId: id, meta: { cwd: directory, agentPreset: preset },
       setup: agentCtx => this.mount(agentCtx, preset), ...modelOptions(profile) }
@@ -147,7 +243,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Resumes the persisted Session on `id`, recomposing the role preset in its fresh scope. */
-  private async resume(id: SessionId, role: 'pm' | 'worker', profile?: RoleProfile): Promise<Agent> {
+  private async resume(id: SessionId, role: 'pm' | 'worker' | 'router', profile?: RoleProfile): Promise<Agent> {
     const preset = await this.rolePreset(role)
     const options: ResumeAgentOptions = { resumeSessionId: id, setup: agentCtx => this.mount(agentCtx, preset),
       ...modelOptions(profile) }
@@ -155,7 +251,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Resolves one of the node profile's presets, failing before creation when the profile does not define it. */
-  private async rolePreset(role: 'pm' | 'worker'): Promise<string> {
+  private async rolePreset(role: 'pm' | 'worker' | 'router'): Promise<string> {
     const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
     if (typeof presets?.resolve !== 'function' || typeof presets.mount !== 'function') {
       throw new Error('The node requires @deepseek-ai/dsh-agent-preset-registry: the agentPresets service is not available')
@@ -181,6 +277,7 @@ export class NodeSessions implements DshPortSessions {
    */
   private async applyDefaultModel(agent: Agent, profile: RoleProfile | undefined): Promise<void> {
     if (profile?.model) return
+    if (this.options.defaultModel) return initializeRoleModel(this.ctx, agent, this.options.defaultModel)
     const defaults = serviceOf<AgentDefaultModel>(this.ctx, 'agentDefaultModel')
     if (typeof defaults?.currentSelection !== 'function') return
     const selection = defaults.currentSelection()

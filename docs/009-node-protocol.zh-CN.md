@@ -17,14 +17,31 @@
 
 ## 命令与事件
 
-- `NodeCommand` 是控制面发给节点的判别联合：注册、心跳、项目绑定、PM/Worker 创建、消息、取消、归档、状态查询、权限、工作区。
+- `NodeCommand` 是控制面发给节点的判别联合：注册、心跳、项目绑定、PM/Worker 创建、Router 创建、消息、取消、归档、状态查询、权限、工作区、只读代码审阅（`review.diff`）。
 - 每条命令带 `protocolVersion`、`nodeId`、`idempotencyKey`、`at`；节点必须对重复的幂等键最多执行一次。
 - 创建 Session 的命令必须带 `sessionToken`；`session.message` 可选携带控制面当前 token。节点把它当作不透明字符串，不解析、不记录、不本地验签（节点没有 secret），只透传给工具层。
-- `NodeEvent` 是节点回传的事件：节点状态、Session 状态、Session 事件、状态应答、工具调用。
+- `NodeEvent` 是节点回传的事件：节点状态、Session 状态、Session 事件、状态应答、只读代码审阅结果、工具调用。
 - 事件带 `seq`，控制面用它检测丢事件和排序。
+- **`router.ensure` 是加进去的一条命令**：它给控制面那个**不属于任何 Project** 的 Router 起一个 Session——命令只带 `sessionId`、它自己的工作区、角色 profile、`sessionToken` 与提示词，没有 `projectId`。它是**加法**：不认识它的旧节点会拒绝这条命令（控制面据此说「这个节点还没有 Router」），协议版本不因此往上抬。节点侧给它注册的是 `control_router_summary` 与 `control_router_pm_proposal` 两个工具，继承来的工具全部被边界挡掉；它用的 agent preset 是既有的 `dsh-superagent-router`。
+- **`control_router_pm_proposal` 只提交提议，不投递**：`control_router_pm_instruction` 这个名字已经不用了——旧的那个名字是「直接转达」，会让人以为 Router 自己就能把话送到某个项目的 PM。现在这个工具只在控制面里记下一条**待确认的转发提议**（目标 Project、真正会发出去的原文、提议 id），真正发送要等人在控制台里确认，Router 的 token 开不了那条确认端点。节点侧的工具名、profile 的提示词与控制面的端点是一起改的，旧节点不认识新工具名就等于没有这条写路径。
+- **对外的 `seq` 是控制面自己的序号**，不是节点的：节点重启会从 1 重新计数，而控制面把每条事件写进自己的持久日志，序号跨控制面重启单调递增。客户端看到的 `seq` 一律是控制面的序号，`after=` / `Last-Event-ID` 用它续接；节点自己的计数以 `nodeSeq` 保留在同一条事件里，所以节点重启仍然看得见（`nodeSeq` 变小即节点重启过）。
+- 日志有界（默认 20000 条 / 7 天）。被裁掉的那一段用 `gap` 明确告知（`GET /v1/events` 返回 `gap: true`，SSE 写一条 `: gap` 注释），不会悄悄少一段。
+- `tool.call` 事件在**记录与广播时都不带 `args`**：工具入参是模型自己的输入，可能含人粘贴进去的密钥。审计里另有该次工具调用的记录（只有工具名）。
 - `session.inspect` 要求节点回一条 `session.inspected`，`requestId` 回显命令的 `idempotencyKey`；应答带 `found`、可选 `status`、`backendSessionId` 和 `ready`。`ready=false` 表示 Session 已存在但角色提示词/工具安装失败，控制面必须按失败处理，不能因为收到过 `idle` 就当成功。
 - 显式状态查询是控制面确认 `starting`/`failed` 记录的唯一无损手段：命令回执和第一次状态事件都可能丢失，重发命令不足以证明 Session 的真实状态。
 - `session.message` 和 `session.archive` 只在后端真正接受/完成后回执；投递或归档失败必须让命令失败，控制面不会把 HTTP 200 当作成功。
+- **`schedule.run` 是控制面自己发的一条事件，不是节点回传的**：一次定时运行结束时控制面把它写进自己的事件日志并推给 SSE，客户端因此能在**现有的事件流**上看到后台触发的定时任务。节点永远不报这种事件，协议版本也不因此往上抬。事件里只有这次运行的 id、计划 id、结果与失败原因，没有消息正文，也没有任何凭据。
+
+## 只读代码审阅（`review.diff`）
+
+- 命令只带 `projectId`，**不带路径、不带 Git 参数**：节点读它自己为该项目绑定的工作区（`workspace.ensure`/`project.bind`/`pm.ensure` 时记录），命令里任何别的字段都被忽略。调用方无法指定目录，也无法指定要跑的 Git 命令。
+- 节点用固定 argv、无 shell 的方式执行只读 Git 命令：仓库根核对、基线核对（`rev-parse --verify HEAD`）、工作区对基线的 diff（`--no-ext-diff --no-textconv`）、空白检查（`diff --check`）和未跟踪文件的**文件名**（`ls-files --others`）。每条命令有超时与输出上限，整次审阅有总预算（默认 8s），环境变量从零构造（不带 `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_*`，系统与全局配置关闭），因此宿主的环境、操作员的全局配置、外部 diff 程序与 textconv 过滤都进不来。
+- **Git 程序固定**：在 `PATH` 的绝对目录里找一次 `git`（Windows 只认 `git.exe`），之后每条命令都用这个绝对路径执行；`PATH` 里的相对项不搜，工作区放自己的 `git` 抢不到前面。每条命令还带 `-c core.fsmonitor=false`（明确关掉文件系统监视器）与 `-c core.pager=cat`，这两项与 `--no-ext-diff`/`--no-textconv` 一样压过仓库本地配置。
+- **仓库自己的配置由节点读**：节点自己解析 `<workspace>/.git/config`（以及 `config.worktree`），凡是**会被审阅的命令读到或跑到的**外部程序与项目外路径（`alias.*`、`credential.*`、`filter.*`、`include.path`/`includeIf.*`、`diff.external`、`diff.*.command`、`diff.*.textconv`、`core.attributesFile`/`core.excludesFile`/`core.hooksPath`/`core.worktree`、`core.sshCommand`/`core.gitProxy`/`core.askPass`/`core.editor`/`core.sequenceEditor`、`gpg.program`/`gpg.ssh.program`、`diff.orderFile`）一律**拒绝**这次审阅；审阅命令走不到的配置（remote、branch、submodule、user 身份）留着不动。仓库布局也要核对：`.git` 必须是工作区自己的目录（指向别的仓库的 `.git` 文件或链接拒绝）、`commondir` 不存在、`objects` 在仓库之内、`objects/info/alternates` 为空。
+- 节点回一条 `review.diff` 事件，`requestId` 回显命令的 `idempotencyKey`，内容是 `ReviewDiffResult`：`status`（`ok`/`truncated`/`no-repository`/`no-baseline`/`refused`/`timeout`/`failed`）、基线提交、diff 文本、涉及的文件、未跟踪文件名、空白问题、`complete`（辅助命令没跑完时为 `false`）、`reason`。
+- **这条事件不进事件历史**：控制面收到它就只交给那次被授权的请求，不记进 `GET /v1/events`、不推给 SSE、不进通知与日志；回传要核对请求 id、节点 id 与 Project id。
+- 边界：工作区必须是**自己那个仓库的根**（只落在某个父仓库里的目录被拒绝，审阅不向上爬），真实路径必须落在节点根之内，外部 diff/textconv/可配置外部执行路径全部关闭。
+- 语义边界：结果只是**共享工作区的一个快照**，无法证明哪个 Worker 改了哪个文件，也无法显示“改了又改回去”的变更。
 
 ## SessionRecord 与状态查询
 

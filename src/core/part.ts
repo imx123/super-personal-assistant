@@ -1,7 +1,7 @@
 /** Shared base class and configuration for Engine domain parts. */
 import { UserError } from './errors.ts'
 import { followupOwners, reached, threadKey } from './model.ts'
-import type { Thread, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { Assignment, Thread, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { Assessor, AssessmentOutcome, DomainEvent, DomainEvents, Executor, Outbox, Policy, Repositories, SourceScope } from './ports.ts'
 
 export interface EngineOptions {
@@ -13,6 +13,14 @@ export interface EngineOptions {
   executor: Executor
   outbox: Outbox
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
+  /**
+   * Whether a `ready` report waits for the Project PM's review instead of ending its Ticket.
+   *
+   * The old plugin ends a Ticket on `ready`, and the standalone control plane's PM Projects review the result first: the
+   * Ticket stays open with a pending review until the PM accepts or rejects it. The Engine owns both transitions — this
+   * option only says which of them applies to a Ticket, never how a review is decided.
+   */
+  reviewReady?: (ticket: Ticket, assignment: Assignment) => boolean
   /** How long a pause or handoff waits for a Worker's background cleanup before treating it as failed. */
   cleanupTimeoutMs?: number
   now?: () => string
