@@ -2,6 +2,8 @@
 
 Instructions for an agent that sets up dsh-superagent with its operator. If you are a person, ask your coding agent to read this file and follow it.
 
+This setup installs the original DSH bundle with GitHub and optional Feishu sources. For the independent browser console, use the [node deployment guide](docs/015-node-deployment.zh-CN.md).
+
 ## How to run the setup
 
 The setup follows [docs/000-philosophy.md](docs/000-philosophy.md): it takes as little of the operator's attention as possible.

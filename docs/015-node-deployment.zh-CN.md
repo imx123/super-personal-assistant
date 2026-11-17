@@ -1,6 +1,6 @@
 # 节点部署：控制面进程与独立 DSH 节点
 
-> 状态：P2-F 部署面说明（2026-11-14）。控制面/节点双进程形态已在 DSH `0.2.2-rc.1` 的隔离 E2E 中验证（见 [013](013-p2d-node-spike.zh-CN.md)、[014](014-p2d2-recovery.zh-CN.md)）；本文只写部署与运维，不重复协议字段和验收过程。
+> 本文说明独立控制面与单个 DSH 节点的部署。早期双进程恢复与工具边界验收见 [013](013-p2d-node-spike.zh-CN.md) 和 [014](014-p2d2-recovery.zh-CN.md)。当前控制台验收记录见仓库根目录的 `project_handoff.md`。
 > 关系：[009 节点协议](009-node-protocol.zh-CN.md) 定义命令/事件；[010 控制面内核](010-control-plane-kernel.zh-CN.md) 定义控制面；[006 部署](006-deployment.md) 是单进程 Web profile 的部署指南；本文对应其中的“节点分进程”形态。
 > 边界：控制面 viewer/operator 认证与 SSE 压测已在 P2-C 完成（本文只列部署相关变量）；TLS/反向代理仍是部署建议，见 `docs/016-control-plane-tls.zh-CN.md`（按编号规则用纯文本提及，不建立 Markdown 链接）。本文的示例 profile（`examples/profile.node/`）由 E2E 实际启动过的 profile 整理而来，仓库内副本只做了 YAML/字段静态校验，没有在写文档时重新启动服务。
 
@@ -49,12 +49,12 @@ node lib/control.js                      dsh --profile superagent-node
 | `SUPERAGENT_CONTROL_DB` | 控制面 | 否 | SQLite 文件，默认 `<node root>/control.sqlite`；启动时锁住它的父目录 |
 | `SUPERAGENT_CONTROL_DEPLOYMENT_FILE` | 控制面 | 否 | 控制台写入的下次启动控制面设置。默认放在启动时业务库旁的 `.superagent-private/control.json`。若业务库在节点根目录内，移动到根目录同级的 `<节点目录名>.superagent-private` |
 | `SUPERAGENT_NODE_DEPLOYMENT_FILE` | 两端 | 节点使用控制台配置时必填 | 控制台写入的节点设置。控制面未指定时保存到 `.superagent-private/node.json`，DSH 节点启动器填写该文件的绝对路径。文件应位于节点和工作区之外 |
-| `SUPERAGENT_CONSOLE_DB` | 控制面 | 否 | 控制面自己的文件（持久事件日志 + 审计 + 项目备忘 + 对账记录），默认 `<node root>/console.sqlite`；与领域库分开，领域 schema 版本不动 |
+| `SUPERAGENT_CONSOLE_DB` | 控制面 | 否 | 保存事件、操作日志、项目备忘、会话检查和定时任务等控制台数据。默认在业务数据库旁创建 `console.sqlite` |
 | `SUPERAGENT_CONSOLE_DIR` | 控制面 | 否 | 构建好的控制台前端目录，默认包自己的 `lib`（其中应有 `console.js`）；目录里只读这一个文件 |
 | `SUPERAGENT_CONSOLE_EVENT_ROWS` | 控制面 | 否 | 事件保留条数上限，默认 20000，至少 1 |
 | `SUPERAGENT_CONSOLE_EVENT_DAYS` | 控制面 | 否 | 事件保留天数，默认 7；0 关闭按天数清理 |
 | `SUPERAGENT_CONSOLE_AUDIT_DAYS` | 控制面 | 否 | 审计保留天数，默认 0，表示长期保留 |
-| `SUPERAGENT_RECONCILE_INTERVAL_MS` | 控制面 | 否 | 孤儿对账的周期（毫秒），默认 `0` = 不自动跑；控制台随时可以手动跑一次。只清理节点确认仍在跑、而其 Assignment 已经结束的残留会话 |
+| `SUPERAGENT_RECONCILE_INTERVAL_MS` | 控制面 | 否 | 自动清理残留会话的间隔（毫秒）。默认 `0`，可在节点部署页手动检查。 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 控制面 | 否 | 定时任务的**固定**时基偏移（分钟，东为正），默认 `0` = UTC。取值范围 −720…840，非法值启动失败。用命名时区会带上夏令时规则，所以这里只给固定偏移；控制台会把这个偏移显示出来 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 控制面 | 否 | 调度器查看「到点计划」的周期（毫秒），不设置时用模块自己的默认（5 秒）。`0` = 计划仍然存在，但**不自己**到点运行，只能手动跑 |
 | `SUPERAGENT_WORKSPACE_ROOT` | 控制面 | 否 | 默认 `<node root>/workspaces`；**必须**在 `SUPERAGENT_NODE_ROOT` 之内，否则节点报 `Workspace escapes the node root` |
@@ -119,7 +119,7 @@ node lib/control.js
 # superagent console at http://127.0.0.1:47100/console
 ```
 
-浏览器打开 `/console` 后输入 `SUPERAGENT_CONTROL_TOKEN`，当前标签页刷新时会自动恢复连接。只读密钥可以查看设置。调度检查间隔、自动对账间隔和令牌刷新宽限在设置页保存后立即生效，持久化于控制台 SQLite。选择「恢复启动值」可清除覆盖，重新采用启动参数。控制台详见 [017](017-console.zh-CN.md)。
+浏览器打开 `/console` 后输入 `SUPERAGENT_CONTROL_TOKEN`，当前标签页刷新时会自动恢复连接。定时任务检查间隔、自动清理残留会话的间隔和会话令牌过期宽限保存后立即生效。「恢复启动设置」会重新采用本次启动的参数。部署与凭据页保存的设置在相应进程重启后应用，查看和修改这组设置都需要控制台连接密钥。
 
 ### 4.1 健康检查
 
@@ -263,9 +263,9 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 - 控制面错误、Session 日志会包含 sessionId、workspace 路径、Ticket id；对外粘贴前替换绝对路径和 id。控制面没有面板层的统一脱敏，别假设它会自动清掉所有敏感串。
 - 报告问题时建议附：两侧 `/health`、`/v1/state`（可脱敏 id）、节点启动行、控制面启动行、错误发生时间；不要附 token 和 `.credentials.yaml`。
 
-## 9. 孤儿 Session 清理建议
+## 9. 清理残留会话
 
-当前没有自动 GC。一次运行会留下四类持久化数据：
+在节点部署页点击「检查并清理」，或在运行设置里设置自动检查间隔。控制面只检查自己记录的会话。任务或项目已结束时，系统会请节点确认相应会话是否还在运行，再停止并归档确认的会话。磁盘上的会话日志、工作区与数据库仍按各自的生命周期保留。
 
 | 位置 | 内容 |
 | --- | --- |
@@ -274,7 +274,7 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 | `SUPERAGENT_WORKSPACE_ROOT` 下的目录 | PM/Worker 的工作目录 |
 | 控制面 SQLite | Project/Ticket/Assignment/SessionRecord |
 
-“孤儿”通常指：DSH 侧存在、控制面已没有对应记录（或反之）的 Session，以及没有 Session/Ticket 引用的工作目录。建议流程：
+来源不明的会话或目录需要单独核对。需要回收磁盘空间时，可按以下步骤排查：
 
 1. 停之前先导出 `GET /v1/sessions`、`GET /v1/tickets` 作为对照清单。
 2. 停控制面、停节点，确保没有进程在写。
@@ -298,7 +298,6 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 
 - viewer 认证、写操作 403 校验与 SSE 压测已在 P2-C 完成；TLS/反向代理仍不在本文实现，部署建议与威胁模型见 `docs/016-control-plane-tls.zh-CN.md`（纯文本提及）。本文不把 loopback 部署描述成“已经安全地暴露到网络”。
 - token refresh 默认 5 分钟宽限、cancel/command 默认 10 秒 deadline 都是上限，不是精确时间；超过 TTL+grace 且无工具调用的长任务仍失败，半失联节点可能到 10 秒才 offline。
-- 控制面前端由控制面同源托管（`src/console`）：它读控制面的真实数据，也有写操作（项目、Session、对账、Router 对话）。`src/client` 仍然是 DSH 面板（轮询 `/orchestrator/api`），不是控制面 UI。控制台里 Router 的转发是**两段式**的：Router 只能提交一条待确认的提议，真正把话发给某个项目的 PM 要有人在控制台里点确认（确认端点只认控制面的 bearer，Router 的 Session token 开不了）；定时任务仍然没有。
-- 多节点调度/故障转移不在 Phase 2 范围内；本文只部署单个节点。
-- `RoleProfile.deny` 的独立语义、PM role prompt 是否应静默投递，仍是后续产品/实现项（[013 §6](013-p2d-node-spike.zh-CN.md)、[014 §6](014-p2d2-recovery.zh-CN.md)）。
+- 控制台的定时任务会向已启动且可用的项目 PM 发消息。独立控制面只连接一个 DSH 节点，跨节点调度和故障接替尚未实现。
+- 独立 DSH 节点安装 PM 和 Router 的角色提示词时会等待实际消息。角色工具边界以工具许可列表为准，`RoleProfile.deny` 尚未作为单独规则消费。
 - 控制面锁 stale（§5.1）是已知限制；事件 `seq` 的跨重启语义已经收口为控制面自己的序号（§5.4）。

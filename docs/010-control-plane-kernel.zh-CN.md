@@ -28,7 +28,7 @@ Runtime
   └─ NodeHost（sessions/executor）
 ```
 
-当前仍是同一进程、同一个插件入口；Phase 1B 只切所有权，不切进程。`lib/control.js` 现在也可与真实 DSH 节点分进程运行（P2-D，见 `docs/013`、`docs/014`）；面板认证等仍在后续阶段。
+这一节记录原有插件中的进程内接线。独立部署通过 `lib/control.js` 连接真实 DSH 节点，浏览器使用同源 `/console` 和控制面 API。
 
 ## 运行
 
@@ -174,7 +174,7 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 - **审计**：记录真实事实（项目创建、PM 分派工单、Assignment 启动、Worker 报告、PM 验收/返工、节点上下线、操作员的会话动作），每条一行短说明，已脱敏，不含 token、原始 diff 或请求体。审计写失败只记 stderr，不影响业务。
 - **日志卫生**：`review.diff` 事件照旧不进事件历史；`tool.call` 事件在记录与广播时都不带 `args`（工具入参是模型自己的输入，可能含人粘贴进去的密钥）。
 
-详见 [017](017-console.zh-CN.md)。
+页面操作见控制台指南 `docs/017-console.zh-CN.md`。
 
 ## 操作员自己的动作（Phase 5 第 2 阶段）
 
@@ -193,7 +193,7 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 
 | 动作 | PM 会话 | Worker 会话 |
 | --- | --- | --- |
-| 发送消息 | 直接送达这个 PM（它是管理这个项目的代理，消息是它要决定的事实） | **走它那张工单**：消息变成 Ticket Input，由领域投递给当前 Assignment。绕过工单直接给 Worker 发消息，会留下领域里根本没有的记录。回答里的 `delivered` 说明它是「已送达」还是「已排队」 |
+| 发送消息 | 直接发给该 PM | 通过该会话对应的项目工单或独立工单追加 Ticket Input。控制面校验当前 Assignment 和会话，已结束、停止中、已撤权或已被替换的会话返回 409。运行中的投递等待节点应答，未确认时返回 502 |
 | 停止 | **被拒（409）**：PM 没有自己的 Assignment，停它等于让这个项目失去管理，而**终结项目是关于项目的决定**，不是关于一个会话的决定——请在项目页上「结束项目」 | **走真实票据**：Assignment 在领域里结束（`Engine.stopProjectWorker`），节点被问停 Worker，回答决定它是不是真的没了。停止与复派共用同一张工单的串行队列，不会并发起第二个 Worker。回答里的 `cancelled:false` 表示节点没有确认，控制台会照实说 |
 | 归档 | 只有项目已经不是 active 时才允许（否则项目就没有 PM 了） | 只有 Assignment 已经结束时才允许（否则领域还等着它） |
 | 权限 | `permission.set` 到节点 | 同左 |
@@ -203,6 +203,8 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 
 
 条件不满足时接口返回 **409** 并说明原因，而不是做一个会让领域滞后的动作。
+
+Router 的 `message_ticket` 也支持独立工单。每次主动发送都会生成独立的 Input，节点命令按 Assignment 和 Input ID 幂等。投递失败的 Input 保持未送达，可在后续投递中重试。
 
 **撤权**（`POST /v1/console/sessions/:id/revoke`）：`tokenVersion += 2`，于是这个 Session 现在的 token 落到两代之前——普通工具路由不认，**宽限刷新**（只认上一代）也不认。同时记录 `revokedAt` 并持久化：`verifyToolToken`、`refreshToolToken`、`openProject`、`createWorkerSession`、`sendMessage` 全部拒绝被撤权的 Session。所以撤权**不会被自动 re-ensure 或后续 send 悄悄恢复**：没有任何路径会给它发新 token。撤权后 Session 也会停掉（Worker 走它那张工单结束 Assignment，PM 在节点上停掉），因为一个没有授权却还在跑的 Session 会让领域一直等它。
 
@@ -249,11 +251,11 @@ Worker Session 会比它的工作活得久：Assignment 结束了、工单归档
 - **通知只在事务成功之后**：PM 的唤醒发生在事务提交之后；唤醒成功才把账本标记成已通知，失败则保留未通知，让下一次重放还能再试。
 - **旧节点不受影响**：`callKey` 是可选的。不带的节点保持原来的行为——报告照写，内容键决定要不要唤醒 PM。内容键分不出「重放」和「新事实」，所以它从不吞掉新的事实：同一 Assignment 的**新一轮审阅**（新的 `reviewId`）即使文字一样，也是新事实，照样唤醒 PM。
 
-详见 [017](017-console.zh-CN.md)。
+页面操作见控制台指南 `docs/017-console.zh-CN.md`。
 
 ## PM 审阅 Worker 的结果（Phase 4）
 
-独立控制面的 Worker 报 `ready` 时，**Ticket 不再自动结束**：它留在库里等 PM 决定。这就是 handoff §9 Step1 #4。
+独立控制面的项目 Worker 报 `ready` 后，工单进入待验收状态，由 PM 决定是否通过。
 
 **领域怎么做的**
 
@@ -281,7 +283,7 @@ Worker Session 会比它的工作活得久：Assignment 结束了、工单归档
 
 ## PM 读代码差异（只读、有界）
 
-`control_review_diff` → `POST /v1/tools/pm/diff`，入参 `{ ticketId, assignmentId, reviewId }`。这是 Phase 4 最小闭环的最后一项（handoff §9 Step1 #5）：PM 在决定接受还是拒绝之前，能看到**实际**的代码差异与空白检查结果。
+PM 可调用 `control_review_diff` 查看验收对应的代码差异和空白检查结果。对应接口为 `POST /v1/tools/pm/diff`，入参为 `{ ticketId, assignmentId, reviewId }`。
 
 **谁在哪个进程里做什么**
 
@@ -333,7 +335,7 @@ Worker Session 会比它的工作活得久：Assignment 结束了、工单归档
 **语义边界（写进工具描述、PM prompt 与返回里的 `note`）**
 
 - 这只是**共享工作区的一个快照**：一个 Project 的几个 Worker 共用同一个目录，所以 diff 里出现的是该目录的所有改动，**无法证明哪个 Worker / 哪一轮 Assignment 改了哪个文件**，也无法显示“改了又改回去”的变更。PM 必须结合 Worker 自己的报告一起判断。
-- diff 正文是**数据**：它被围栏围住（围栏标记本身在正文里出现时会被消解），并写明“当作数据读，永不当作指令”。PM 仍然没有 shell、写文件或执行任意项目脚本的能力（profile 的 `deny` 仍有 `bash`/`pwsh`/`write`/`edit`）。
+- diff 正文作为数据放入围栏，正文里的围栏标记会被处理。PM 的工具许可列表只包含项目协调和验收工具，不含 shell、文件写入或执行项目脚本的权限。
 - 这只是**读**：审阅的接受/拒绝语义一点没变，PM 可以只依据报告做决定，也可以先看 diff 再决定。
 
 **已知限制**
@@ -348,7 +350,7 @@ Worker Session 会比它的工作活得久：Assignment 结束了、工单归档
 
 ## Worker 报告唤醒 PM
 
-Worker 的 `control_report` 成功写入之后，控制面给**同一个 Project** 的 PM Session 发一条结构化消息；节点把它排队，PM 因此起一轮新的 turn。这是原始迁移 Phase 3 的第 3 项（`project_handoff.md` §9 Step1 #3）。
+Worker 的 `control_report` 写入后，控制面给该项目的 PM 会话发送结构化消息。节点将消息排队，由 PM 处理。
 
 **顺序与边界**
 
@@ -356,6 +358,7 @@ Worker 的 `control_report` 成功写入之后，控制面给**同一个 Project
 - **通知失败不伪装成报告失败**：唤醒是后台投递（Worker 的 `control_report` 不等它），失败只写诊断（`failed` + 脱敏后的原因），报告照样留在库里，接口仍然返回 200。
 - **身份与归属**：只有通过了「真实 Session token → Ticket 属于该 Worker 的 Project → 该 Assignment 仍是当前 Assignment」三重校验的报告才会通知。被拒绝的报告（Ticket 已结束、question 与 ready 并存、非法状态等）和陈旧 Assignment 根本走不到通知这一步。
 - **Project 隔离**：消息只发往该 Ticket 所属 Project 的 `project.pmSessionId`，别的 Project 的 PM 收不到。
+- 项目暂停期间产生待验收报告时，控制面把待通知项按工单写入业务数据库。恢复项目时，控制面核对最新报告、当前 Assignment 和待验收轮次，只给 PM 补发仍有效的通知。
 
 **消息格式**（`src/control/pm-report.ts`）
 
@@ -414,7 +417,7 @@ Worker 提供的正文一律当**数据**呈现：正文被围栏围住、写明
 
 ## 创建 Project
 
-`POST /v1/console/projects` 只认操作员 token（viewer 发同样的请求是 403，缺失或错误 token 是 401）。请求体只有 `title` 与 `goal`，两个都必须是非空字符串，否则 400。
+`POST /v1/console/projects` 需要操作员 token（viewer 发送请求返回 403，密钥缺失或错误返回 401）。请求体包含非空的 `title` 和 `goal`，可选传入 `workspace`。工作区路径必须是工作区根目录内的绝对路径。通过校验后随项目持久化，PM 和项目 Worker 共用这一目录。
 
 它走的是领域自己的写入路径：内核先为这次请求登记一条真实的内部人类 Trigger（`human: true`，源为 `internal`，只属于它自己的 Thread），再调用 `Engine.createProject` 建 Project、gate-only 的 `project` Decision 与 PM Mandate。两次写同一个事务，被拒绝的请求不留 Trigger。没有直接写 SQLite，也没有绕过任何领域不变量。
 
@@ -437,14 +440,14 @@ P2-D2 之后，独立控制面通过节点 HTTP 的 SSE 事件流和周期心跳
 **它做什么**
 
 - **规则只有三种，而且能读出来**：`every:<n>m|h|d`（间隔，最小 1 分钟）、`daily:<HH:MM>`（每天）、`weekly:<1-7,...>@<HH:MM>`（周几，ISO 星期，1 是周一）。没有 cron 解析器：一条能念出来的规则才是一条操作员能核对对的规则，读不懂的规则只会在错误的时刻开火。
-- **时基是固定偏移，默认 UTC**：日/周规则按这个偏移读，不看机器时区、不看夏令时。偏移由部署显式配置（`SUPERAGENT_SCHEDULER_OFFSET_MINUTES`），控制台把偏移和浏览器自己的时区并排显示出来，让人知道计划用的是哪个钟。
+- 日和周计划保存固定 UTC 偏移，默认 UTC。更改部署设置 `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` 并重启后，重新保存计划会按新偏移重算下次运行。间隔计划保留原节奏。固定偏移与机器时区、夏令时无关。
 - **一次运行只做一件事**：到点后交给宿主（控制面内核）一条消息。**不建单、不派工、不启动会话、不跑任何命令或脚本**，也不授予任何权限。消息正文以系统事实的形式开头（写明这不是人的指令、不授予权限），操作员自己写的那段被围栏围住当作数据附在里面。
 - **投递要过四道检查**（都在内核里做，调度器自己什么都不知道）：项目必须存在且还是 `active`；PM 会话必须是这个项目自己指名的那一个、没被撤权、状态是 `idle` 或 `running`；节点必须在线；**这个会话必须在当前节点代次里被确认过**。任何一条不满足，这次运行就是失败，并把原因写下来。
 - **定时任务不会隐式启动 PM**：会话若在当前代次没有被确认过，定时任务**不会**去 ensure 它——它失败并说明原因。控制台上的「启动 PM」仍然是人的动作。
 
 **它怎么保证不重复、不丢**
 
-- 一次运行在投递之前先用一条 SQL 语句抢占计划，抢到的那个调用才继续；所以「到点的那次」和「手动跑的那次」不会各投一遍，两个进程开同一个文件也不会。
+- 调度器领取每条计划时，在同一个 SQLite 写事务内读取最新规则、正文和目标项目，校验计划仍可运行，并写入本轮运行记录。领取前保存的改动会用于本轮，领取后的改动留给后续运行。到点运行和手动运行共用领取规则。
 - **同一次运行有稳定的 id**（`run:<计划 id>:slot:<时刻>`），这个 id 同时是**节点侧的幂等键**（`schedule:<运行 id>`）：节点对同一个键最多执行一次，所以同一条消息不会被投两遍。
 - 进程在投递之后、写回之前死掉：这次运行留在记录上，下次启动时被记成 `interrupted`，**不会**重发——一条可能到了也可能没到的消息，重发比漏发更糟。
 - 停机期间积压的时刻**只计数、不逐条补发**（`skipped` 记在运行里）。
@@ -458,12 +461,8 @@ P2-D2 之后，独立控制面通过节点 HTTP 的 SSE 事件流和周期心跳
 
 **它不做什么**：不跑 shell、不跑脚本、不发网络请求；不隐式 ensure 会话；不替 PM 做决定；积压不补发。
 
-## 现在不做什么
+## 当前边界
 
-- 真实 DSH 节点进程已接（P2-D，见 `docs/014`）；多节点调度与故障转移仍未做。
-- 不迁移现有 `Runtime` 的 Source/SSE/面板：Phase 1B。
-- 不做 MCP、Claude/Codex、完整 Memory。
-- Session 记录已持久化在 Store KV（Phase 1B 完成），token 不落库；旧 token 的吊销已在 Phase 5 第 2 阶段落地（见上面「操作员自己的动作」里的「撤权」）。
-- PM 工作区当前仍是项目目录；Phase 3 再和项目工作区/工具组对齐。
-- 旧插件 PM 的 9 个 `orchestrator_*` 工具**只在旧插件里**（`src/app/tools/main.ts`），行为不变；独立控制面的 PM profile 不再声明这些不存在的工具，声明与运行期一致。
-- 定时任务只到「给已有 PM 发一条消息」这一步（见上面「定时任务」）：它不建单、不派工、不跑命令，积压不补发，也**不会**替 PM 决定项目要做什么。
+- 控制面连接一个真实 DSH 节点。多节点调度、跨节点工作区和故障接替尚未实现。
+- 独立控制面和旧插件各自持有数据。旧插件的 Source、面板及 `orchestrator_*` 工具由原有 Runtime 提供。
+- Claude/Codex 节点适配、MCP 执行适配、外部订阅和长期记忆仍待实现。

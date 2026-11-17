@@ -1,6 +1,6 @@
 # 控制台
 
-独立控制面自己的前端。它由控制面同源托管，只读控制面的真实数据；没有账号体系，没有角色下拉，也不加载任何第三方资源。
+控制台由独立控制面同源提供，接入真实的运行状态和管理接口。浏览器通过连接密钥访问。
 
 设计沿用已批准的原型（浅色淡紫、左侧六项菜单、首页 Router → 运行概览 → 近期动向），实现是 React 18 + TypeScript，由 `tsdown` 打成**一个**浏览器包 `lib/console.js`。首页的 Router 读起来像一段对话：人自己的话在右边一个泡里，Router 的回答在左边按 Markdown 排版，输入框一直留在面板里够得着。
 
@@ -8,6 +8,7 @@
 
 ```bash
 export SUPERAGENT_CONTROL_TOKEN='<operator token>'
+export SUPERAGENT_CONTROL_PORT=47100
 node lib/control.js
 # superagent control plane listening on http://127.0.0.1:47100
 # superagent console at http://127.0.0.1:47100/console
@@ -20,7 +21,7 @@ node lib/control.js
 | 变量 | 说明 |
 | --- | --- |
 | `SUPERAGENT_CONSOLE_DIR` | 构建产物所在目录，默认包自己的 `lib`（其中应有 `console.js`） |
-| `SUPERAGENT_CONSOLE_DB` | 控制面自己的持久文件（事件日志、审计、项目备忘和会话检查记录），默认 `<node root>/console.sqlite` |
+| `SUPERAGENT_CONSOLE_DB` | 保存事件日志、操作日志、项目备忘、会话检查和定时任务。默认在业务数据库旁创建 `console.sqlite` |
 | `SUPERAGENT_RECONCILE_INTERVAL_MS` | 自动清理残留会话的间隔（毫秒）。默认 `0`，可在「节点部署」页手动检查 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 定时任务使用的 UTC 偏移（分钟，向东为正）。默认 `0`（UTC）。 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 调度器查看「到点计划」的周期（毫秒）。默认 5 秒；`0` = 只存计划，不自己到点跑 |
@@ -29,7 +30,7 @@ node lib/control.js
 
 - **页面公开，页面里没有凭据**：`GET /console` 返回的 HTML 只有挂载点和一个脚本引用，不含 token、不含 key、不含任何秘密。被复制、被缓存、被截图的页面都不构成泄露。
 - **同一标签页刷新后自动连接**：密钥经 `GET /v1/overview` 验证后保存在该标签页的 `sessionStorage`。用户主动断开或控制面拒绝密钥时，页面清除已保存的密钥。
-- **每次请求用 `Authorization: Bearer` 头送出**，和命令行完全一样。控制台不用 cookie，因此没有 CSRF 面，也没有「别的页面自动带上权限」的可能。
+- 浏览器用 `Authorization: Bearer` 发送密钥。控制台的认证使用请求头，页面没有认证 cookie。
 - **同源、无外链**：页面带 CSP（`default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'`），只加载 `/console/console.js` 这一个文件，不连 CDN、不连字体服务、不发统计。
 - **工具 token 隔离**：`/v1/tools/*` 永远只认控制面签发的 Session token；控制台用的是操作员 token，两者互不通用。viewer token 换不出任何 Session 权限。
 
@@ -88,7 +89,7 @@ node lib/control.js
 | --- | --- | --- |
 | 新建项目 | `POST /v1/console/projects` | 可选填 `workspace`。项目和工作区路径一起保存，创建时暂不启动 PM |
 | 启动 PM | `POST /v1/console/projects/:id/pm` | 节点真的 ensure 一个 PM Session；项目已结束或归档时拒绝（409） |
-| 暂停 / 恢复 | `POST /v1/console/projects/:id/pause` | 硬暂停逐个停掉 Worker 并等节点确认；停不掉的会显示出来 |
+| 暂停 / 恢复 | `POST /v1/console/projects/:id/pause` | 硬暂停后列出节点未确认停止的工单。软暂停期间新增的待验收结果会在恢复后通知 PM，前提是结果仍待验收 |
 | 结束项目 | `POST /v1/console/projects/:id/stop` | 项目与其工单一起结束；回答里区分「已停」与「未确认停止」 |
 | 归档 / 取消归档 | `POST /v1/console/projects/:id/archive`、`/unarchive` | 归档先落领域（项目与工单归档、Assignment 结束、Worker 由领域那一条路径去停），再等已记录的清理；PM Session 保留，项目还能回来 |
 | 记一笔 | `POST /v1/console/projects/:id/memory` | 写进这个项目的备忘；只有这个项目的 PM 读得到（`control_project` 的 `memory` 段） |
@@ -104,13 +105,15 @@ node lib/control.js
 
 | 操作 | PM 会话 | Worker 会话 |
 | --- | --- | --- |
-| 发送消息 | 直接送达 PM | 走它那张工单（Ticket Input），领域有记录；页面区分「已送达」与「已排队」 |
+| 发送消息 | 直接送达 PM | 给当前执行会话对应的工单追加指令，支持项目工单和独立工单。页面分别显示「已送达」「已排队」和发送失败 |
 | 停止 | **不提供**：结束它管理的项目才是合适的动作，在项目页上 | Assignment 在领域里结束，节点确认后才算停；没确认时页面照实说没确认 |
 | 归档 | 项目不再 active 时才允许 | Assignment 已结束时才允许 |
 | 权限 | `PUT /v1/console/sessions/:id/permission` | 同左 |
 | 撤销权限 | **二次确认**后才执行 | 同左 |
 
 点「撤销权限」后，页面会先说明影响，再请你确认。确认后，这个会话的令牌立即失效，系统也会尝试停止会话。该会话的工具权限无法恢复。
+
+Worker 被替换后，请打开新会话再发消息。向旧会话发送会返回 409。向运行中的 Worker 发送时，页面等节点确认后才显示「已送达」。节点拒收或投递未确认时会显示错误，并保留输入框中的草稿。连续两次主动发送相同的文字会生成两条指令。
 
 条件不满足的动作（例如给还在跑活的 Worker 归档）会显示控制面返回的 409 原因，不是一个没有解释的失败。
 
@@ -134,14 +137,14 @@ node lib/control.js
 | 操作 | 走哪条路 | 说明 |
 | --- | --- | --- |
 | 新建 | `POST /v1/console/schedules` | 要选一个**真实存在**的项目；项目不存在时接口 400 并说明「Unknown Project」 |
-| 编辑 | `PUT /v1/console/schedules/:id` | 改名称、规则、正文（也可以换项目）。改规则只影响**下一个**时刻，不会把已经到点的时刻补跑 |
+| 编辑 | `PUT /v1/console/schedules/:id` | 可改名称、规则、正文或目标项目。尚未开始执行的计划读取保存后的版本，已开始执行的这一轮使用开始时的版本 |
 | 暂停 / 恢复 | `POST /v1/console/schedules/:id/pause`、`/resume` | 暂停期间错过的时刻**不补发**；恢复后从下一个时刻开始 |
 | 立即运行 | `POST /v1/console/schedules/:id/run` | 手动跑一次，**不改变**时刻表。没有送达时接口答 502 并带上原因，页面照实显示失败，不说成功 |
 | 删除 | `DELETE /v1/console/schedules/:id` | 页面先要一次确认；删掉后不再到点运行，历史仍留在控制面里 |
 | 运行历史 | `GET /v1/console/schedules/:id/runs` | 每一次运行：到点/手动、是否被节点确认、跳过了几次、失败原因 |
 
 - **规则只有三种**：`every:<n>m|h|d`、`daily:<HH:MM>`、`weekly:<1-7,...>@<HH:MM>`（ISO 星期，1 是周一）。读不懂的规则在创建时就被拒（400），不会等到该开火的时候才出错。
-- 任务时区使用固定 UTC 偏移，默认 UTC。页面用浏览器本地时间和任务时区分别显示下次运行的时间。
+- 任务时区使用固定 UTC 偏移，默认 UTC。更改偏移并重启控制面后，重新保存已有的日或周计划，即使规则文本相同，也会按新时区计算下次运行。按间隔运行的计划保留原节奏。页面用浏览器本地时间和任务时区分别显示下次运行的时间。
 - 发送失败时，页面显示具体原因，例如项目已结束、PM 会话的权限已撤销、节点离线，或节点尚未确认 PM 会话可用。
 - **空态**是真的空态：还没有任务时页面说明到点会发生什么（只发一条消息，不建单不派工不跑命令），不展示任何示例任务，也不展示假的运行结果。
 - **审计里没有正文**：定时任务的审计只写事实（规则、时刻、结果、失败原因），任务正文和任何凭据都不进审计。

@@ -1,5 +1,7 @@
 # P2 验收说明
 
+> 历史文档。旧插件 Project/PM 阶段的验收。这里的 P2 指 Project Profile 与 PM，与独立执行后端的 Phase 2 分开编号。
+
 本文记录 P2（Project Profile + PM 小号 Router）的验收范围、场景和已知边界；P2.1–P2.9 的代码细节见 [BASELINE](BASELINE.zh-CN.md)。
 
 ## 范围

@@ -1,5 +1,7 @@
 # 基线说明
 
+> 历史文档。旧插件阶段的开发日志。当前能力、启动入口和验收记录见 [项目交接](../project_handoff.md)。
+
 ## 这是什么
 
 本仓库是 superagent 的独立开发基线，派生自 MIT 许可的 [dsh-superagent research prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)。上游官方原型作为独立参考保留，不在本仓库内修改；本仓库的起点是 2026-11-09 的 19:38 工具版。
