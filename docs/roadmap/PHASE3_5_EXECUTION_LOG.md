@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | P3-0 | — | 基线、权限和停止矩阵 | DONE |
 | P3-1 | P3-0 | 全角色会话干预，真实 DSH | DONE |
-| P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | NOT_STARTED |
+| P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | DONE |
 | P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | NOT_STARTED |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | NOT_STARTED |
 | P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | NOT_STARTED |
@@ -28,11 +28,15 @@
 
 ## P3-0
 
+基线文档提交为 2419bb6。
+
 Claude Code（MiniMax-M3.1-Flash）完成基线调查。Codex 对照源码、任务书和本机测试复核，补充随机端口失败记录，并区分纯回合中断和节点全会话停止。[基线](PHASE3_BASELINE.md)包含当前能力、状态变化、权限和停止作用域、自动交接迁移及 P3-1 计划。
 
 本轮 12 个文件 198 项通过、1 项跳过。类型检查和直接运行 tsdown 通过。全量与真实模型未重跑。旧审计仍为本地未跟踪文件。本次提交只包含这两份文档。
 
 ## P3-1A
+
+实现提交为 9f62bd5。
 
 Claude Code（MiniMax-M3.1-Flash）实施，Codex 独立验收。操作员可分开停止 PM 或 Router 会话、停止单个 Worker 派工以及取消工单。停止 PM 保留项目、工单、Mandate 和其他 Worker。恢复须由操作员明确发起，节点未确认停下时拒绝恢复。持久停止标记和领域事实同时保护重启后的消息、ensure 与恢复入口。操作范围及 API 见 [P3-1A 规范](../018-phase3-session-stop.zh-CN.md)。
 
@@ -44,6 +48,8 @@ P3-1A 已验收。P3-1B 接回合中断、Router 顺序插话和前端，完成�
 
 ## P3-1B
 
+实现提交为 9f1265d。
+
 Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。Router 忙时仍可提交，普通插话先持久排队，当前回合结束后按顺序进入后续回合。刷新可查看排队状态，节点入箱与回合读取分别显示。重复请求按 ID 去重，明确拒收保留原因，缺回执标记未确认。重启后只对尚未投递的排队消息恢复原有请求窗口。
 
 打断请求绑定当前回合编号，由节点确认该回合以 `aborted` 结束。控制台会话页可查看 Router、PM、Worker，操作员可单独停止和恢复 PM 或 Router，停止未确认时可重试，取消整个工单须确认。
@@ -53,3 +59,13 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验�
 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node` 和本机 Gemma 4 12B 复验通过。两条插话在第一轮生成时提交，刷新后仍列在队列中，随后分别进入第二、第三轮。点击中断并插话后，第四轮以 `aborted` 结束，第五轮收到新消息，项目状态不变。会话页点击停止 PM 后，项目仍 active，两个 Worker 派工保持原身份，显式恢复后原 PM 收到了新消息。证据位于本地忽略目录 `.artifacts/phase3-5-20261117/` 的 `live-09FYhL/evidence.json`、`live-N7c91D/evidence.json`。
 
 P3-1 已验收，下一项为 P3-2。快路由首版用确定性规则，OpenSquilla 与小模型接入可选。
+
+## P3-2
+
+Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。规则可派明确的独立工单、续接开放工单、向唯一的现有项目 PM 交接，以及按完整 ID 查状态。控制面在 Router 的消息队列内按顺序执行快动作。项目和工单匹配要求完整标识，引用、歧义及权限边界留给高层处理。投递拒绝或缺回执时保留回执，原请求不进入模型再次执行。[快路由操作](../019-phase3-fast-router.zh-CN.md)
+
+定向测试覆盖同 ID 重试、Router 忙或停止、拒收、回执丢失、跨重启、精确目标与相似名称。复核补齐了 PM 会话 ID 的回执，以及队列与路由记录的事务更新。类型检查与构建通过，52 文件定向回归通过，681 项通过、1 项跳过（Windows 目录联接）。一次重跑遇到旧有的临时端口 `bad port`，完整定向重跑后通过。全量测试未重跑。
+
+真实 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node` 和 Gemma 4 12B 本机模型通过。使用同一条示例文件指令和相同 16K 模型上下文，P3-1 基线走了一轮 Router 模型；P3-2 在 Worker 开始之前的 Router 模型回合为 0。真实 Worker 写入 `hello.txt` 并向原独立 Ticket 报告，首页显示工单和会话 ID。明确交给已存在项目的另一条指令，无需点击确认，真实 PM 收到一次，首页显示正确项目、PM 会话和已确认状态。证据位于本机忽略目录 `.artifacts/phase3-5-20261117/` 的 `live-HxyojW/evidence.json` 与 `live-32OY0o/evidence.json`。
+
+P3-3 处理复杂项目任务的高层分派、四条件门禁和高层 PM 自动交接。确定性快路由已经可用，小模型接入保持可选。

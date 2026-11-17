@@ -11,9 +11,10 @@
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
-  messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type NodeView, type Overview,
-  type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterQueueEntry, type RouterState, type ScheduleCounts,
-  type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView, type StopNotice,
+  messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type FastRouteReceipt,
+  type NodeView, type Overview, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterQueueEntry,
+  type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView,
+  type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -193,11 +194,13 @@ function interruptedWording(result: unknown): string {
  *
  * A message that waits says so, and a message the node refused says why: the queue shows the same facts, and the line
  * under the composer must not claim more than the control plane knows. An interruption and a message are two facts, and
- * the wording names both.
+ * the wording names both. A message the Fast Router claimed never reached the Router at all, and the wording says what
+ * became of it instead of claiming a delivery to a model that never read it.
  */
 function routerSendWording(result: unknown): string {
   const value = result as { queue?: { state?: string; error?: string }; delivered?: string
-    interrupt?: { interrupted?: boolean } }
+    interrupt?: { interrupted?: boolean }; routing?: FastRouteReceipt }
+  if (value.routing !== undefined) return routingWording(value.routing)
   const state = value.queue?.state ?? value.delivered
   if (state === 'failed') {
     return `消息发送失败${value.queue?.error === undefined ? '' : `：${value.queue.error}`}`
@@ -205,6 +208,7 @@ function routerSendWording(result: unknown): string {
   if (state === 'unconfirmed') {
     return `节点未确认消息是否送达${value.queue?.error === undefined ? '' : `：${value.queue.error}`}`
   }
+  if (state === 'routed') return '消息已由快路由直接处理，没有进入 Router 对话'
   if (value.interrupt?.interrupted === true) {
     return state === 'sent' || state === 'read'
       ? '已打断当前回合，消息已交给下一轮'
@@ -212,6 +216,46 @@ function routerSendWording(result: unknown): string {
   }
   if (state === 'queued' || state === 'sending') return '消息已排队，当前回合结束后自动交给下一轮'
   return '消息已送达 Router'
+}
+
+/** What a routing did, as the console's own words. */
+const ROUTE_OUTCOME: Record<string, string> = {
+  existing_ticket: '续接独立工单',
+  existing_project_pm: '交给项目 PM',
+  standalone_ticket: '派了独立工单',
+  read_only: '按权威记录回答',
+  escalate: '规则未动手',
+  ordinary_reply: '普通对话',
+}
+
+/** How far a routing got, as the console's own words. */
+const ROUTE_STAGE: Record<string, string> = {
+  accepted: '已认领，待处理',
+  routing: '正在路由',
+  queued: '待送达',
+  assigned: '目标已确认接收',
+  escalated: '已交给高层 Router',
+  failed: '失败',
+  unconfirmed: '未确认',
+}
+
+/**
+ * The wording of a message the Fast Router claimed.
+ *
+ * The line names the target and how far it got, and it never says that a Worker is running before the node says so: a
+ * Worker that was asked to start is "待送达" until the node confirms it. A question the record answered says the answer.
+ */
+function routingWording(receipt: FastRouteReceipt): string {
+  if (receipt.stage === 'failed' || receipt.stage === 'unconfirmed') {
+    return `快路由没有投递${receipt.error === undefined ? '' : `：${receipt.error}`}`
+  }
+  if (receipt.outcome === 'read_only') {
+    return receipt.answer ?? '快路由按权威记录回答了这条消息'
+  }
+  const outcome = ROUTE_OUTCOME[receipt.outcome] ?? receipt.outcome
+  const stage = ROUTE_STAGE[receipt.stage] ?? receipt.stage
+  const target = receipt.target === undefined ? '' : `（${receipt.target.title || receipt.target.id}）`
+  return `快路由：${outcome}${target} · ${stage}`
 }
 
 /**
@@ -282,6 +326,10 @@ function activityOf(entry: AuditEntry): { title: string; meta: string; icon: str
     case 'session.permission': return { title: '修改了会话权限', meta: detail, icon: 'settings', tone: '' }
     case 'session.proposal': return { title: 'Router 提交了转发提议', meta: detail, icon: 'chat', tone: '' }
     case 'session.relayed': return { title: '已把 Router 的提议发给项目 PM', meta: detail, icon: 'ok', tone: 'success' }
+    case 'session.routed': return {
+      title: entry.outcome === 'failed' ? '快路由没有投递' : entry.outcome === 'skipped' ? '快路由交给了高层 Router' : '快路由已处理一条消息',
+      meta: detail, icon: entry.outcome === 'failed' ? 'fail' : 'assign', tone: entry.outcome === 'failed' ? 'failure' : '',
+    }
     case 'session.proposal-cancelled': return { title: '取消了 Router 的转发提议', meta: detail, icon: 'fail', tone: '' }
     case 'schedule.created': return { title: '新建了定时任务', meta: detail, icon: 'clock', tone: '' }
     case 'schedule.updated': return { title: '修改了定时任务', meta: detail, icon: 'clock', tone: '' }
@@ -397,6 +445,7 @@ const QUEUE_STATE: Record<string, string> = {
   read: '已被回合读取',
   failed: '发送失败',
   unconfirmed: '节点未确认是否送达',
+  routed: '快路由已自行处理',
 }
 
 /**
@@ -417,6 +466,37 @@ function RouterQueue(props: { entries: RouterQueueEntry[]; id: string }): ReactE
               {QUEUE_STATE[entry.state] ?? entry.state}
             </span>
             {entry.error ? <span className="quiet"> · {entry.error}</span> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+/**
+ * The routings the Fast Router made, as the console shows them.
+ *
+ * Each line names what the rule decided, the target it found and how far the work really got: the Ticket's own id, the
+ * Project's title and the Worker Session's live status. A Worker that was asked to start but is not up yet reads as
+ * "待送达" — the console never shows a Worker as running before the node says so.
+ */
+function RouterRoutes(props: { receipts: FastRouteReceipt[]; id: string }): ReactElement {
+  return (
+    <div className="router-queue" id={props.id} aria-label="快路由的处理结果">
+      <p className="quiet">快路由直接处理的消息（没有进入 Router 对话）</p>
+      <ul className="router-queue-list">
+        {props.receipts.map(receipt => (
+          <li key={receipt.requestId} className={receipt.stage === 'failed' ? 'failure' : ''}>
+            <span className="router-queue-text">{receipt.text}</span>
+            <span className={`chip ${receipt.stage === 'failed' ? 'failure' : receipt.stage === 'assigned' ? 'success' : 'muted'}`}>
+              {ROUTE_OUTCOME[receipt.outcome] ?? receipt.outcome}
+            </span>
+            <span className="quiet"> · {ROUTE_STAGE[receipt.stage] ?? receipt.stage}</span>
+            {receipt.target ? <span className="quiet"> · {receipt.target.kind === 'ticket' ? '工单' : '项目'} {receipt.target.title || receipt.target.id}</span> : null}
+            {receipt.ticketId ? <span className="quiet"> · 工单 {receipt.ticketId}</span> : null}
+            {receipt.sessionId ? <span className="quiet"> · 会话 {receipt.sessionId}{receipt.sessionStatus ? `（${SESSION_STATUS[receipt.sessionStatus] ?? receipt.sessionStatus}）` : ''}</span> : null}
+            {receipt.answer ? <span className="quiet"> · {receipt.answer}</span> : null}
+            {receipt.error ? <span className="quiet"> · {receipt.error}</span> : null}
           </li>
         ))}
       </ul>
@@ -481,6 +561,7 @@ export function HomePage(props: PageProps): ReactElement {
   const session = router.data?.session
   const proposal = router.data?.proposal
   const queue: RouterQueueEntry[] = router.data?.queue ?? []
+  const routes: FastRouteReceipt[] = router.data?.routes ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -638,6 +719,7 @@ export function HomePage(props: PageProps): ReactElement {
               </div>
             </div>
           ) : null}
+          {routes.length ? <RouterRoutes receipts={routes} id="router-routes" /> : null}
           {queue.length ? <RouterQueue entries={queue} id="router-queue" /> : null}
           <form className="composer" onSubmit={event => { event.preventDefault(); send(false) }}>
             {attachments.length ? <ul className="router-files">

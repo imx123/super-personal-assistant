@@ -17,16 +17,18 @@ import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegi
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
-import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow, type RouterQueueRow,
-  type StopNoticeRow } from './console-store.ts'
+import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectMemoryRow,
+  type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
+import { FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
+  type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
 import { Reconciler, type ReconcileFinding, type ReconcileResult } from './reconcile.ts'
 import { reportCallKey, reportCallPrefix, reportPayloadHash, type ReportCallRecord } from './report-call.ts'
 import { fenceDiff, PM_REVIEW_DIFF_NOTE, type PmReviewDiff } from './review-diff.ts'
-import { RouterRequests, routerInstructionMessage, routerRequestMessage, routerRequestOf, type RouterManagement,
-  routerProjectReportMessage, type RouterProposal } from './router.ts'
+import { RouterRequests, routerAutoInstructionMessage, routerInstructionMessage, routerRequestMessage, routerRequestOf,
+  type RouterManagement, routerProjectReportMessage, type RouterProposal, type RouterRequest } from './router.ts'
 import { DEFAULT_TICK_MS, Scheduler, type ScheduleAuditEntry, type ScheduleDelivery, type ScheduleDeliveryResult, type ScheduleOverview,
   type SchedulePlan, type ScheduleRun } from './scheduler.ts'
 import { PM_PROFILE, ROUTER_PROFILE, WORKER_PROFILE } from './roles.ts'
@@ -203,6 +205,14 @@ const ROUTER_QUEUE_PENDING = ['queued', 'sending', 'sent', 'unconfirmed'] as con
 const ROUTER_QUEUE_RETRY_MS = 5_000
 
 /**
+ * How many routings the console shows.
+ *
+ * The routings are a task list like the queue: the ones a person still waits for are what has to be readable, and the
+ * ones that came to rest long ago are only noise.
+ */
+const FAST_ROUTE_SHOWN = 50
+
+/**
  * How many report calls one Session keeps in the ledger.
  *
  * The ledger is what makes a replayed call a replay, so it has to outlive a restart — but it is not a log of everything
@@ -248,6 +258,17 @@ function routerProposalRefusal(proposal: RouterProposal): string {
   if (proposal.state === 'sending') return 'This proposal is already being sent'
   if (proposal.state === 'cancelled') return 'This proposal was cancelled; nothing was sent'
   return 'This proposal is no longer valid; nothing was sent'
+}
+
+/**
+ * Whether a routing is a claim the control plane carries out itself, or only a decision to leave the message to the Router.
+ *
+ * Only the first kind is the control plane's own work: it is idempotent by its request id, and a message that was
+ * dispatched is never dispatched twice, while a message that was merely escalated is queued for the Router as it always was.
+ */
+function isClaimedOutcome(outcome: string): boolean {
+  return outcome === 'existing_ticket' || outcome === 'existing_project_pm' || outcome === 'standalone_ticket'
+    || outcome === 'read_only'
 }
 
 /**
@@ -528,6 +549,14 @@ export interface RouterState {
    * was really taken by a turn; a `failed` one the node refused, with the reason it gave.
    */
   queue?: RouterQueueEntry[]
+  /**
+   * The routings the Fast Router made, oldest first.
+   *
+   * A receipt is the control plane's own account of one message: which rule read it, which target it found, and how far
+   * it got. The stage never claims more than happened — a Worker that was asked to start is not running until the node
+   * says so, and the Session status beside it is the node's own word.
+   */
+  routes?: FastRouteReceipt[]
 }
 
 /**
@@ -537,10 +566,11 @@ export interface RouterState {
  * HTTP answer of 200 is neither.
  *
  * `queued` is a message that was never attempted, `sending` one that is on its way, `sent` one the node took into the
- * Session's inbox, `read` one a turn of that Session really took, `failed` one the node refused, and `unconfirmed` one
- * whose receipt is missing — the control plane cannot say whether it arrived, and says exactly that.
+ * Session's inbox, `read` one a turn of that Session really took, `failed` one the node refused, `unconfirmed` one
+ * whose receipt is missing — the control plane cannot say whether it arrived, and says exactly that. `routed` is one the
+ * Fast Router claimed: the control plane carried it out itself, so it never reaches the Router's model at all.
  */
-export type RouterQueueState = 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed'
+export type RouterQueueState = 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed' | 'routed'
 
 /** One message a person sent to the Router, as the console reads it. */
 export interface RouterQueueEntry {
@@ -559,6 +589,59 @@ export interface RouterQueueEntry {
   /** The Router request the message is. */
   requestId: string
 }
+
+/**
+ * One routing the Fast Router made, as the console reads it.
+ *
+ * The receipt is the control plane's own account of what became of a person's message: which rule read it, which target it
+ * found, and how far it really got. The stage never claims more than happened — a Worker that was asked to start is not
+ * running until the node says so, and the live Session status beside it is the node's own word.
+ */
+export interface FastRouteReceipt {
+  /** The Router request this routing is; the message's own id. */
+  requestId: string
+  /** When the message was accepted. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** What the rule decided. */
+  outcome: FastRouteOutcome
+  /** How far the message got. */
+  stage: FastRouteStage
+  /** How sure the rule was, between 0 and 1. */
+  confidence: number
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The target the rule found, when it found one. */
+  target?: { kind: string; id: string; title: string }
+  /** The Ticket the work landed in, when one was created or addressed. */
+  ticketId?: string
+  /** The Worker Session of that Ticket, when it is known. */
+  sessionId?: string
+  /** The live status of that Session, as the control plane knows it. */
+  sessionStatus?: string
+  /** Why it failed, when it failed. */
+  error?: string
+  /**
+   * The answer to a question about the state of a thing, when the record itself answered it.
+   *
+   * A message that only asked for the state of a Ticket or a Project is answered from the authoritative record: no model
+   * turn runs and nothing is dispatched, and the answer is the record's own word.
+   */
+  answer?: string
+}
+
+/**
+ * What one message to the Router became.
+ *
+ * A message the fast router claimed never reaches the Router's model: the control plane carried it out itself and
+ * answers with the receipt of what it did. A message it did not claim is queued for the Router as it always was.
+ */
+export type RouterSendResult =
+  | { routed: true; requestId: string; route: FastRouteReceipt }
+  | { routed: false; requestId: string; session: SessionRecord; entry: RouterQueueEntry }
 
 /**
  * What one interrupt of a running turn did.
@@ -965,6 +1048,17 @@ export function pmTicketStatus(ticket: Ticket): PmTicketStatus {
 }
 
 /**
+ * The state of a Ticket, in words a person can read.
+ *
+ * The Fast Router answers a question about a Ticket with this: the answer is the record's own word, and it never claims
+ * more than the domain holds.
+ */
+const TICKET_STATE: Record<string, string> = {
+  open: '待开始', running: '进行中', completed: '已完成', stopped: '已停止', waiting: '等待审阅',
+  blocked: '已阻塞', failed: '失败', archived: '已归档',
+}
+
+/**
  * The Input ids a `turn-start` reported, as this kernel may act on them.
  *
  * A node reports them as opaque strings in `data`, which is untrusted protocol payload: only a non-empty array of
@@ -1239,6 +1333,9 @@ export class ControlPlane {
       // The Router's queue is the control plane's own durable record, and a message that was on its way when this
       // process ended has an unknown outcome: it is marked as such instead of being sent again.
       this.reconcileRouterQueue()
+      // The routings the Fast Router made are the same kind of record: one that was on its way when the process ended
+      // is marked as unconfirmed, and it is never carried out again.
+      this.reconcileFastRoutes()
       this.audit = new AuditRecorder(consoleDb, () => this.now(), error => {
         // An audit trail that cannot be written is a diagnostic, never a failed report: the work itself stays written.
         process.stderr.write(`superagent control-plane audit write failed: ${
@@ -1255,11 +1352,13 @@ export class ControlPlane {
         assignmentStarted: (ticketId, assignmentId) => {
           this.engine.assignmentStarted(ticketId, assignmentId)
           this.auditAssignmentStarted(ticketId, assignmentId)
+          this.markFastRouteAssigned(ticketId)
         },
         assignmentFailed: (ticketId, assignmentId, error) => { this.assignmentFailed(ticketId, assignmentId, error) },
         taskPrompt: ticket => this.taskPrompt(ticket),
         inputsDelivered: (ticketId, assignmentId, inputIds) => {
           this.engine.inputsDelivered(ticketId, assignmentId, inputIds)
+          this.markFastRouteDelivered(ticketId, inputIds)
         },
         inputText: input => this.inputText(input),
         workerSessionId: (_ticketId, assignmentId) => this.workerSessionFor(assignmentId),
@@ -2045,13 +2144,24 @@ export class ControlPlane {
    * The message is recorded as a request before it goes out, so the Router may act for it — and only for it. The Router
    * Session is ensured here, so the first message a person sends starts it without a detour through another page.
    *
+   * The Fast Router reads the message before any of that, but it may only act on it **in the queue's own order**: a
+   * message that plainly names its target — a Ticket of this Router, a Project of this control plane, an independent task
+   * of its own, or a question about the state of a thing — is carried out by the control plane itself, in the place the
+   * queue gives it. No model turn starts for it, nothing waits for one, and the answer is the receipt of what really
+   * happened. A message that waits behind an earlier one waits with it, and a Router an operator stopped takes no
+   * message at all — the fast route never acts behind the operator's back.
+   *
+   * Every other message — a question, a conversation, anything the rules are not sure about — is queued for the Router
+   * exactly as it was, and the rules say why they left it alone.
+   *
    * `options.id` is the message's own id, and it is what makes a repeated send the same message: a message that is
-   * already queued is not queued twice, so a browser that repeats its request cannot make the Router read it twice. The
-   * same id with other words is a conflict and is refused: the queue holds one message under one id, and the person
-   * would not know which of the two the Router reads.
+   * already queued is not queued twice, and a message the fast router already carried out is not carried out twice, so a
+   * browser that repeats its request cannot make the Router read it twice or create a second Ticket. The same id with
+   * other words, other files or another model is a conflict and is refused: the queue holds one message under one id, and
+   * the person would not know which of the two the Router reads.
    */
   async sendToRouter(text: string, attachments: readonly RouterTextAttachment[] = [], routerModel?: RouterModel,
-    options: { id?: string } = {}): Promise<{ requestId: string; session: SessionRecord; entry: RouterQueueEntry }> {
+    options: { id?: string } = {}): Promise<RouterSendResult> {
     const value = text.trim()
     if (value === '') throw new OperatorError(400, 'A message to the Router needs a text')
     const id = options.id !== undefined && UUID.test(options.id) ? options.id : randomUUID()
@@ -2060,19 +2170,66 @@ export class ControlPlane {
     // The same id is the same message: a message that is already in the queue is not queued twice.
     const known = this.consoleStore.routerMessage(messageId)
     if (known) return this.knownRouterMessage(known, value, attachments, routerModel)
-    const session = await this.ensureRouter()
-    // The ensure awaited: two copies of one message may arrive at the same moment, and the second one finds the row the
-    // first one wrote instead of writing a second row.
-    const knownNow = this.consoleStore.routerMessage(messageId)
-    if (knownNow) return this.knownRouterMessage(knownNow, value, attachments, routerModel)
-    // The queue is bounded: a message that does not fit is refused before it is accepted, and the messages that are
-    // already there keep their place. The person still holds the words in the browser.
+    // A message with files belongs to the conversation: the files are read by the Router's own turn, so it is not
+    // fast-routed and the model sees it as it always did.
+    const decision = attachments.length === 0 ? fastRoute(value, this.fastRouteFacts()) : undefined
+    const claimed = decision !== undefined && decision.outcome !== 'ordinary_reply' && decision.outcome !== 'escalate'
+      && decision.confidence >= FAST_ROUTE_MIN_CONFIDENCE
+    if (!claimed) {
+      // The Router Session is ensured here, so the first message a person sends starts it without a detour.
+      const session = await this.ensureRouter()
+      // The ensure awaited: two copies of one message may arrive at the same moment, and the second one finds the row the
+      // first one wrote instead of writing a second row.
+      const knownNow = this.consoleStore.routerMessage(messageId)
+      if (knownNow) return this.knownRouterMessage(knownNow, value, attachments, routerModel)
+      const request = this.acceptRouterMessage(messageId, requestId, value, attachments, routerModel)
+      // The delivery is awaited when it can happen right away, so the answer says whether the message really went out. A
+      // Router that is answering keeps the message: the answer then says it is queued, not that it was read.
+      await this.scheduleRouterQueue()
+      // A message the rules left to the high-level Router keeps the reason why, so the console can say what it did with it.
+      if (decision !== undefined && decision.outcome === 'escalate') {
+        this.recordEscalation(requestId, value, request.at, decision)
+      }
+      return { routed: false, requestId, session, entry: this.routerQueueEntry(this.consoleStore.routerMessage(messageId)!) }
+    }
+    // The message is one the rules may carry out by themselves. It is queued like any other message, so it keeps its
+    // place, and the claim travels with it: the queue's own pump decides when the action happens.
+    // A Router an operator stopped — or one whose authority was withdrawn — takes no message at all, and the fast route
+    // is not a way around it: the same refusal the conversation path gives.
+    const refusal = this.routerTakesNoMessage()
+    if (refusal !== undefined) {
+      throw new OperatorError(409, `The Router Session is not running: ${refusal}`)
+    }
+    try {
+      this.consoleStore.writeTransaction(() => {
+        const request = this.acceptRouterMessage(messageId, requestId, value, attachments, routerModel)
+        this.recordClaim(requestId, value, request.at, decision!)
+      })
+    } catch (error) {
+      this.routerRequests.discard(requestId)
+      throw error
+    }
+    await this.scheduleRouterQueue()
+    return { routed: true, requestId, route: this.fastRouteReceipt(requestId) }
+  }
+
+  /**
+   * Accept one message into the Router's queue.
+   *
+   * The queue is bounded: a message that does not fit is refused before it is accepted, and the messages that are already
+   * there keep their place. The person still holds the words in the browser.
+   *
+   * The request is recorded before the message goes out, so the Router may act for this message — and only for it. The
+   * request keeps the time it was written: the window in which the Router may act on it is the one the person was given,
+   * and a message that waits for ever does not get a new one.
+   */
+  private acceptRouterMessage(messageId: string, requestId: string, value: string,
+    attachments: readonly RouterTextAttachment[], routerModel?: RouterModel): RouterRequest {
     const pending = this.consoleStore.routerMessageCount(ROUTER_QUEUE_PENDING)
     if (pending >= ROUTER_QUEUE_LIMIT) {
       throw new OperatorError(409, `The Router queue holds ${pending} messages and cannot take more `
         + `(the limit is ${ROUTER_QUEUE_LIMIT}); this message was not queued`)
     }
-    // The request is recorded before the message goes out, so the Router may act for this message — and only for it.
     const request = this.routerRequests.record(value, requestId)
     this.consoleStore.addRouterMessage({
       id: messageId,
@@ -2084,10 +2241,300 @@ export class ControlPlane {
       state: 'queued',
       error: '',
     })
-    // The delivery is awaited when it can happen right away, so the answer says whether the message really went out. A
-    // Router that is answering keeps the message: the answer then says it is queued, not that it was read.
-    await this.scheduleRouterQueue()
-    return { requestId, session, entry: this.routerQueueEntry(this.consoleStore.routerMessage(messageId)!) }
+    return request
+  }
+
+  /**
+   * The authoritative facts the Fast Router reads.
+   *
+   * The rules never guess a Ticket or a Project: they read the ones this control plane really holds, with the state that
+   * decides whether they may be acted upon. A Ticket of a Project is in the list as well, because its PM — not the
+   * Router — is the one that owns it.
+   */
+  private fastRouteFacts(): FastRouteFacts {
+    return {
+      tickets: this.tickets().map(ticket => ({ id: ticket.id, title: ticket.title,
+        ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
+        ended: ticket.ended !== undefined, archived: ticket.archived !== undefined })),
+      projects: this.projects().map(project => ({ id: project.id, title: project.title, status: project.status })),
+    }
+  }
+
+  /**
+   * Write down that the rules claimed one message, before anything acts on it.
+   *
+   * The row is the claim itself: it names the rule that read the message, the target it found and the words that would
+   * really be delivered. It is written before the action begins, so a control plane that died in the middle leaves the
+   * fact behind — and the queue's own order decides *when* the action happens.
+   */
+  private recordClaim(requestId: string, text: string, at: string, decision: FastRouteDecision): void {
+    this.consoleStore.addFastRoute({
+      requestId, at, text, outcome: decision.outcome, stage: 'accepted',
+      confidence: Math.round(decision.confidence * 100), reason: decision.reason, detail: decision.detail,
+      targetKind: decision.target?.kind ?? '', targetId: decision.target?.id ?? '', targetTitle: decision.target?.title ?? '',
+      ticketId: '', sessionId: '', ticketTitle: decision.title ?? '', ticketGoal: decision.goal ?? '', error: '',
+    })
+  }
+
+  /**
+   * The action one rule asked for.
+   *
+   * The record was written before the action began, so a control plane that died in the middle leaves the fact behind
+   * instead of repeating the action when it comes back.
+   *
+   * A failure here is the end of this message, not the beginning of another one: the receipt says what happened, and the
+   * message does **not** go to the high-level Router afterwards. A delivery that was already tried — and refused, or
+   * never confirmed — must not be tried again by a model that would read the same words and act on them a second time.
+   */
+  private async executeFastRoute(requestId: string, text: string, decision: FastRouteDecision, at: string):
+    Promise<FastRouteStage> {
+    try {
+      if (decision.outcome === 'standalone_ticket') return await this.dispatchStandaloneTicket(requestId, text, decision, at)
+      if (decision.outcome === 'existing_ticket') return await this.continueStandaloneTicket(requestId, text, decision)
+      if (decision.outcome === 'read_only') return this.answerReadOnly(requestId, decision)
+      return await this.handInstructionToProjectPm(requestId, text, decision)
+    } catch (error) {
+      // The action was attempted and could not be carried out. The receipt says so, and the message stays where it is:
+      // nothing here is reported as a delivery that did not happen, and nothing is handed to the Router to try again.
+      const reason = redact(messageOf(error)).slice(0, 300)
+      // A missing receipt is not a refusal: the action may have arrived, so it is neither "failed" nor to be repeated.
+      const stage: FastRouteStage = error instanceof NodeUnconfirmedError ? 'unconfirmed' : 'failed'
+      this.consoleStore.updateFastRoute(requestId, { stage, error: reason })
+      this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: decision.target?.kind ?? 'session',
+        targetId: decision.target?.id ?? requestId, outcome: 'failed', detail: reason })
+      return stage
+    }
+  }
+
+  /**
+   * The answer to a question about the state of a thing the message named by its id.
+   *
+   * The record is the answer: the control plane reads the authoritative state and writes it down. No model turn runs, no
+   * Worker is started and no PM is interrupted — the person asked what is true, and what is true is on record.
+   */
+  private answerReadOnly(requestId: string, decision: FastRouteDecision): FastRouteStage {
+    const target = decision.target
+    if (target === undefined) throw new OperatorError(400, 'The read-only request named no target')
+    const answer = this.fastRouteAnswer(target)
+    this.consoleStore.updateFastRoute(requestId, { stage: 'assigned', detail: answer, error: '' })
+    this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: target.kind, targetId: target.id,
+      detail: answer })
+    return 'assigned'
+  }
+
+  /**
+   * The state of the thing a message named, as the authoritative record holds it.
+   *
+   * The answer is the record's own word: the Ticket's title and where it stands, the Project's status and the work under
+   * it. Nothing here is a summary of a conversation — it is what the control plane really knows.
+   */
+  private fastRouteAnswer(target: FastRouteTarget): string {
+    if (target.kind === 'ticket') {
+      const ticket = this.store.tickets.get(target.id)
+      if (!ticket) return `工单 ${target.id} 不在这个控制面里。`
+      const assignment = latestAssignment(ticket)
+      const worker = assignment === undefined ? '' : `；Worker 派工 ${assignment.state}`
+      const state = pmTicketStatus(ticket)
+      return `工单 ${target.id}「${ticket.title}」现在是 ${TICKET_STATE[state] ?? state}${worker}。`
+    }
+    const project = this.store.projects.get(target.id)
+    if (!project) return `项目 ${target.id} 不在这个控制面里。`
+    const tickets = this.tickets().filter(ticket => ticket.projectId === project.id)
+    const running = tickets.filter(ticket => pmTicketStatus(ticket) === 'running').length
+    return `项目「${project.title}」现在是 ${project.status}；共 ${tickets.length} 张工单，其中 ${running} 张在跑。`
+  }
+
+  /**
+   * The independent task a rule found: a Ticket of the Router's own, with its own Worker.
+   *
+   * The Ticket is created through the Engine, exactly as the Router's own dispatch tool creates it, so the domain's
+   * idempotency holds: the same request never becomes a second Ticket, even when the control plane is restarted between
+   * the two attempts.
+   */
+  private async dispatchStandaloneTicket(requestId: string, text: string, decision: FastRouteDecision, at: string):
+    Promise<FastRouteStage> {
+    const title = decision.title ?? ''
+    const goal = decision.goal ?? ''
+    if (title === '' || goal === '') throw new OperatorError(400, 'The request did not say what the task is')
+    this.requireNodeOnline()
+    // The Router owns the Ticket it creates, and that Ticket's Worker reports back to the Router: the Session is ensured
+    // here, so the report finds the Router it belongs to. This is a Session, not a model turn — the model only runs when
+    // a message is delivered, and this path delivers none.
+    await this.ensureRouter()
+    // The request is recorded before the Ticket is created, so the Router may act for this message — and only for it.
+    // The request keeps the time it was written: the window it may act in is the one it was given, never a new one.
+    const request = this.routerRequests.record(text, requestId, at)
+    const ticketId = this.dispatchStandaloneForRequest(request, title, goal)
+    const ticket = this.requireStandaloneTicket(ticketId)
+    const assignment = latestAssignment(ticket)
+    const sessionId = assignment === undefined ? undefined : this.workerSessionFor(assignment.id)
+    // The Worker was asked to start; it is not running until the node says so, so the receipt says "waiting" until then.
+    this.consoleStore.updateFastRoute(requestId, { stage: 'queued', ticketId: ticket.id, error: '',
+      ...(sessionId === undefined ? {} : { sessionId }) })
+    this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'ticket', targetId: ticket.id,
+      detail: `${title} · ${decision.detail}` })
+    return 'queued'
+  }
+
+  /**
+   * The Ticket a rule found: the message continues the work of a Ticket the Router owns.
+   *
+   * The message becomes an Input of that Ticket and is delivered by the same path every other message to a Worker takes,
+   * so the node's own answer says whether it arrived. A Ticket that has ended is never continued: the domain refuses it,
+   * and the refusal is reported as the failure it is.
+   */
+  private async continueStandaloneTicket(requestId: string, text: string, decision: FastRouteDecision):
+    Promise<FastRouteStage> {
+    const ticketId = decision.target?.id ?? ''
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket || ticket.projectId !== undefined) {
+      throw new OperatorError(400, `Unknown standalone Ticket ${ticketId}`)
+    }
+    const inputId = key('input', ticketId, 'note', 'router', requestId)
+    const result = this.engine.messageTicketTo(ticketId, text, { standalone: true, inputId })
+    const assignment = latestAssignment(result.ticket)
+    const delivery: { delivered: TicketMessageDelivery; error?: string } = assignment === undefined
+      ? { delivered: result.delivered }
+      : await this.confirmTicketDelivery(assignment.id, result.inputId, result.delivered)
+    const stage: FastRouteStage = delivery.delivered === 'failed' ? 'failed'
+      : delivery.delivered === 'running' ? 'assigned' : 'queued'
+    const sessionId = assignment === undefined ? undefined : this.workerSessionFor(assignment.id)
+    this.consoleStore.updateFastRoute(requestId, { stage, ticketId, error: delivery.error ?? '',
+      ...(sessionId === undefined ? {} : { sessionId }) })
+    this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'ticket', targetId: ticketId,
+      outcome: delivery.delivered === 'failed' ? 'failed' : 'ok', detail: decision.detail })
+    return stage
+  }
+
+  /**
+   * The Project a rule found: the message is an instruction for the PM of that Project.
+   *
+   * Only the body the Project needs travels with it: the person's own words, fenced as data, and nothing else — no
+   * history of the conversation, no files, no other Project's data. The Project must be active and its PM must be there
+   * and may be used: a paused, ended or archived Project, a revoked PM and a PM an operator stopped all refuse the
+   * instruction, so a routine handoff never walks around a pause, a stop or a withdrawal of authority.
+   */
+  private async handInstructionToProjectPm(requestId: string, text: string, decision: FastRouteDecision):
+    Promise<FastRouteStage> {
+    const projectId = decision.target?.id ?? ''
+    const project = this.store.projects.get(projectId)
+    if (!project) throw new OperatorError(400, `Unknown Project ${projectId}`)
+    if (project.status !== 'active') {
+      throw new OperatorError(409, `This Project is ${project.status}; it has no PM to instruct`)
+    }
+    this.consoleStore.updateFastRoute(requestId, { sessionId: project.pmSessionId })
+    const pm = this.sessions.get(project.pmSessionId)
+    if (!pm) throw new OperatorError(409, 'This Project has no PM Session')
+    if (pm.revokedAt) throw new OperatorError(409, 'The PM Session of this Project was revoked')
+    const stopped = this.operatorStopRefusal(pm)
+    if (stopped !== undefined) {
+      throw new OperatorError(409, `The PM Session of this Project is not running: ${stopped}`)
+    }
+    const instruction = decision.instruction ?? text
+    // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once.
+    await this.sendMessage(project.pmSessionId, routerAutoInstructionMessage(requestId, instruction, project.title),
+      undefined, 'system', { idempotencyKey: `fast-relay:${requestId}` })
+    this.consoleStore.updateFastRoute(requestId, { stage: 'assigned', error: '' })
+    this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'project', targetId: project.id,
+      detail: `${project.title} · ${decision.detail}` })
+    return 'assigned'
+  }
+
+  /**
+   * Write down that the rules left a message to the high-level Router, and why.
+   *
+   * The reason is the whole point of the record: a person may ask why their message was not carried out at once, and the
+   * answer is a stable code beside the words they wrote.
+   */
+  private recordEscalation(requestId: string, text: string, at: string, decision: FastRouteDecision): void {
+    this.consoleStore.addFastRoute({
+      requestId, at, text, outcome: 'escalate', stage: 'escalated', confidence: Math.round(decision.confidence * 100),
+      reason: decision.reason, detail: decision.detail, targetKind: '', targetId: '', targetTitle: '',
+      ticketId: '', sessionId: '', ticketTitle: '', ticketGoal: '', error: '',
+    })
+    this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'session', targetId: requestId,
+      outcome: 'skipped', detail: decision.detail })
+  }
+
+  /**
+   * The decision a row on record carries.
+   *
+   * The row is what the claim was: the target and the task it named are the ones the row holds, so a fact that moved in
+   * the meantime cannot send the work somewhere else, and a restart cannot turn the claim into another one.
+   */
+  private fastRouteDecisionOf(row: FastRouteRow): FastRouteDecision {
+    const target = row.targetId === ''
+      ? undefined
+      : { kind: row.targetKind as 'ticket' | 'project', id: row.targetId, title: row.targetTitle }
+    return { outcome: row.outcome as FastRouteOutcome, stage: 'accepted', confidence: row.confidence / 100,
+      reason: row.reason, detail: row.detail,
+      ...(target === undefined ? {} : { target }),
+      ...(row.ticketTitle === '' ? {} : { title: row.ticketTitle }),
+      ...(row.ticketGoal === '' ? {} : { goal: row.ticketGoal }),
+      ...(row.outcome === 'existing_project_pm' ? { instruction: row.text } : {}) }
+  }
+
+  /**
+   * One routing, as the console reads it.
+   *
+   * The Session status beside it is the node's own word, so a Worker that was asked to start but is not up yet is never
+   * shown as running.
+   */
+  private fastRouteReceipt(requestId: string): FastRouteReceipt {
+    const row = this.consoleStore.fastRoute(requestId)
+    if (!row) throw new OperatorError(500, 'The routing of this message is not on record')
+    const session = row.sessionId === '' ? undefined : this.sessions.get(row.sessionId)
+    return { requestId: row.requestId, at: row.at, text: row.text, outcome: row.outcome as FastRouteOutcome,
+      stage: row.stage as FastRouteStage, confidence: row.confidence / 100, reason: row.reason, detail: row.detail,
+      ...(row.targetId === '' ? {} : { target: { kind: row.targetKind, id: row.targetId, title: row.targetTitle } }),
+      ...(row.ticketId === '' ? {} : { ticketId: row.ticketId }),
+      ...(row.sessionId === '' ? {} : { sessionId: row.sessionId }),
+      ...(session === undefined ? {} : { sessionStatus: session.status }),
+      ...(row.error === '' ? {} : { error: row.error }),
+      ...(row.outcome === 'read_only' && row.stage === 'assigned' ? { answer: row.detail } : {}) }
+  }
+
+  /**
+   * The routings the console shows: what became of the messages the rules read.
+   *
+   * They are the newest first, so the console may show them in the order they were made.
+   */
+  fastRouteReceipts(limit = FAST_ROUTE_SHOWN): FastRouteReceipt[] {
+    return this.consoleStore.fastRoutes({ limit, newest: true })
+      .reverse()
+      .map(row => this.fastRouteReceipt(row.requestId))
+  }
+
+  /**
+   * A Worker's Assignment started: the routing that started this Worker now has its target.
+   *
+   * The receipt moves from "waiting" to "the target took it" here, where the node's own confirmation of the Worker
+   * Session is the fact that the work began. A routing that continued a Ticket waits for its own message instead: it
+   * moves when the node says that message reached the Worker.
+   */
+  private markFastRouteAssigned(ticketId: string): void {
+    for (const row of this.consoleStore.fastRoutesOfTicket(ticketId)) {
+      if (row.stage !== 'queued' && row.stage !== 'routing') continue
+      if (row.outcome !== 'standalone_ticket') continue
+      this.consoleStore.updateFastRoute(row.requestId, { stage: 'assigned' })
+    }
+  }
+
+  /**
+   * The Worker took the message a routing was waiting for.
+   *
+   * The receipt moves from "waiting" to "the target took it" here, where the node's own answer says the Input reached
+   * the Worker's Session. The Input carries the id the routing derived, so a message that belongs to another routing is
+   * never mistaken for this one.
+   */
+  private markFastRouteDelivered(ticketId: string, inputIds: readonly string[]): void {
+    for (const row of this.consoleStore.fastRoutesOfTicket(ticketId)) {
+      if (row.stage !== 'queued') continue
+      if (row.outcome !== 'existing_ticket') continue
+      const inputId = key('input', ticketId, 'note', 'router', row.requestId)
+      if (!inputIds.includes(inputId)) continue
+      this.consoleStore.updateFastRoute(row.requestId, { stage: 'assigned' })
+    }
   }
 
   /**
@@ -2097,9 +2544,12 @@ export class ControlPlane {
    * request neither queues a second message nor gets a second answer. The same id with other words, other files or
    * another model is a conflict and is refused — the queue cannot hold both, and a person would not know which one the
    * Router is going to read.
+   *
+   * A message the rules claimed is answered with its own receipt: the control plane carried it out, and a repeated
+   * request neither carries it out again nor hands it to the Router now.
    */
   private async knownRouterMessage(row: RouterQueueRow, text: string, attachments: readonly RouterTextAttachment[],
-    routerModel?: RouterModel): Promise<{ requestId: string; session: SessionRecord; entry: RouterQueueEntry }> {
+    routerModel?: RouterModel): Promise<RouterSendResult> {
     const same = row.text === text
       && sameAttachments(parseRouterAttachments(row.attachments), attachments)
       && sameModel(parseRouterModel(row.model), routerModel)
@@ -2107,8 +2557,12 @@ export class ControlPlane {
       throw new OperatorError(409, `The message id ${row.id} was already used for another message; `
         + 'send this one with a new id')
     }
+    const claim = this.consoleStore.fastRoute(row.requestId)
+    if (claim !== undefined && isClaimedOutcome(claim.outcome)) {
+      return { routed: true, requestId: row.requestId, route: this.fastRouteReceipt(row.requestId) }
+    }
     const session = this.sessions.get(ROUTER_SESSION_ID) ?? await this.ensureRouter()
-    return { requestId: row.requestId, session, entry: this.routerQueueEntry(row) }
+    return { routed: false, requestId: row.requestId, session, entry: this.routerQueueEntry(row) }
   }
 
   /**
@@ -2136,6 +2590,36 @@ export class ControlPlane {
     while (!this.closed) {
       const next = this.consoleStore.routerMessages({ limit: 1, states: ['queued'] })[0]
       if (!next) return
+      // A message the rules claimed is the control plane's own work: it is carried out here, in the place the queue
+      // gives it, and it never reaches the Router's model. A later task never overtakes an earlier one, because the
+      // queue's order is the only order there is.
+      const claim = this.consoleStore.fastRoute(next.requestId)
+      if (claim !== undefined && isClaimedOutcome(claim.outcome)) {
+        if (claim.stage !== 'accepted') {
+          // The action already began: the message is the control plane's own work now, and a second attempt would be a
+          // second Ticket, a second handoff or a second message to a Worker that already has this one.
+          this.consoleStore.updateRouterMessage(next.id, { state: 'routed', error: '' })
+          continue
+        }
+        const record = this.sessions.get(ROUTER_SESSION_ID)
+        if (record !== undefined && this.routerTakesNoMessage() === undefined && !await this.routerIsFree(record)) {
+          this.scheduleRouterQueueRetry()
+          return
+        }
+        if (this.closed) return
+        const refusal = this.routerTakesNoMessage()
+        if (refusal !== undefined) {
+          // A Router an operator stopped — or one whose authority was withdrawn — takes no message at all: the claim
+          // waits with the rest of the queue for the explicit resume, and nothing is carried out behind the operator's
+          // back. The Projects and the Workers that are still running stay as they are.
+          this.consoleStore.updateRouterMessage(next.id, { state: 'queued', error: refusal })
+          this.consoleStore.updateFastRoute(claim.requestId, { stage: 'accepted', error: refusal })
+          return
+        }
+        await this.runClaimedFastRoute(next, claim)
+        // The next message may follow: a carried-out claim costs no model turn, so the queue does not wait for one.
+        continue
+      }
       const record = this.sessions.get(ROUTER_SESSION_ID)
       if (!record) {
         // The Router Session is not there yet: the message waits for it rather than failing.
@@ -2172,6 +2656,35 @@ export class ControlPlane {
       // The node refused this message: it is over, and the next one still has to move. The queue does not stop at the
       // first refusal, and it does not push the waiting messages out either.
     }
+  }
+
+  /**
+   * Why the Router takes no message right now, or undefined when it may.
+   *
+   * A Router an operator stopped — or one whose authority was withdrawn — is not a Router that may be used: its own
+   * messages wait for the explicit resume, and the fast route waits with them. The Projects and the Workers that are
+   * still running are not touched by this: only the Router's own messages wait.
+   */
+  private routerTakesNoMessage(): string | undefined {
+    const record = this.sessions.get(ROUTER_SESSION_ID)
+    if (record === undefined) return undefined
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) return stopped
+    return record.revokedAt === undefined ? undefined : 'the Router Session was revoked'
+  }
+
+  /**
+   * Carry one claimed message out, in the queue's own order.
+   *
+   * The message leaves the queue before the action begins: it is the control plane's own work from now on, so a control
+   * plane that died in the middle must not carry it out a second time when it comes back.
+   */
+  private async runClaimedFastRoute(entry: RouterQueueRow, row: FastRouteRow): Promise<void> {
+    this.consoleStore.writeTransaction(() => {
+      this.consoleStore.updateRouterMessage(entry.id, { state: 'routed', error: '' })
+      this.consoleStore.updateFastRoute(row.requestId, { stage: 'routing', error: '' })
+    })
+    await this.executeFastRoute(row.requestId, entry.text, this.fastRouteDecisionOf(row), row.at)
   }
 
   /**
@@ -2294,6 +2807,24 @@ export class ControlPlane {
     }
   }
 
+  /**
+   * Say honestly what a restart left behind the Fast Router's routings.
+   *
+   * A routing that was on its way when the process ended may or may not have reached its target: the receipt is missing,
+   * not negative. It says exactly that, and it is never carried out again: a Ticket that may or may not exist, an
+   * instruction that may or may not have arrived and a Worker that may or may not have the message are all facts the
+   * control plane cannot confirm, so the person's message is not repeated to find out.
+   */
+  private reconcileFastRoutes(): void {
+    for (const row of this.consoleStore.fastRoutes({ limit: 200, newest: true })) {
+      if (row.stage !== 'routing') continue
+      this.consoleStore.updateFastRoute(row.requestId, {
+        stage: 'unconfirmed',
+        error: 'The control plane stopped while this routing was on its way; it is not carried out again',
+      })
+    }
+  }
+
   /** One row of the Router's queue, as the console reads it. */
   private routerQueueEntry(row: RouterQueueRow): RouterQueueEntry {
     return { id: row.id, at: row.at, text: row.text, attachments: parseRouterAttachments(row.attachments).map(file => file.name),
@@ -2340,11 +2871,17 @@ export class ControlPlane {
     if (stops.length > 0) base.stops = stops
     // The messages a person sent to the Router, and what became of them: the console shows the queue, so a reloaded
     // page explains it instead of hiding it. The newest are kept and shown in the order they were written, because
-    // that is the order they will be delivered in.
+    // that is the order they will be delivered in. A message the Fast Router carried out is not in this list: it never
+    // went to the Router, and the routings below show it once.
     const queue = this.consoleStore.routerMessages({ limit: ROUTER_QUEUE_SHOWN, newest: true })
+      .filter(row => row.state !== 'routed')
       .reverse()
       .map(row => this.routerQueueEntry(row))
     if (queue.length > 0) base.queue = queue
+    // The routings the Fast Router made, and what became of them: the console shows the target of each one and how far
+    // it really got, so a person never has to guess where their message went.
+    const routes = this.fastRouteReceipts()
+    if (routes.length > 0) base.routes = routes
     if (record === undefined) return base
     // The turn the Router runs right now and the node's own offer to end one: the console shows the interrupt only when
     // the backend confirms both.
@@ -2471,28 +3008,40 @@ export class ControlPlane {
     if (request.createdProject || request.proposal || request.management) {
       throw new ToolCallError('invalid', 'This request already routed to another action')
     }
-    if (!request.dispatchedTicket) {
-      this.requireNodeOnline()
-      const id = request.id
-      const trigger: Trigger = { id, source: PROJECT_REQUEST_SOURCE, threads: [{ source: PROJECT_REQUEST_SOURCE, id }],
-        actor: { source: PROJECT_REQUEST_SOURCE, id: PROJECT_REQUEST_ACTOR }, human: true, at: request.at,
-        text: request.text, meta: { title, goal } }
-      const ticketId = this.store.atomic(() => {
-        this.engine.recordTriggerForRouting(trigger)
-        const decision = this.engine.decide(id, { kind: 'accept', title, scope: goal, acknowledgement: goal,
-          reason: { code: 'explicitRouted' } })
-        if (!decision.ticketId) throw new ToolCallError('invalid', 'The request did not create a Ticket')
-        return decision.ticketId
-      })
-      request.dispatchedTicket = { id: ticketId, title, goal }
-      this.audit.record({ actor: 'router', kind: 'ticket', action: 'created', targetKind: 'ticket',
-        targetId: ticketId, detail: title })
-    }
     const dispatched = request.dispatchedTicket
-    if (dispatched.title !== title || dispatched.goal !== goal) {
+    if (dispatched !== undefined && (dispatched.title !== title || dispatched.goal !== goal)) {
       throw new ToolCallError('invalid', 'This request already dispatched a different Ticket')
     }
-    return this.routerTicketResult(this.requireStandaloneTicket(dispatched.id))
+    const ticketId = this.dispatchStandaloneForRequest(request, title, goal)
+    return this.routerTicketResult(this.requireStandaloneTicket(ticketId))
+  }
+
+  /**
+   * The standalone Ticket one request names, created once.
+   *
+   * The Router's own dispatch tool and the Fast Router both come through here, so one request is one Ticket: a second
+   * attempt finds the Ticket the first one made instead of making another. The domain's own idempotency holds it too —
+   * the Trigger carries the request id, so a control plane that was restarted between the two attempts ends up with the
+   * same Ticket and not a second one.
+   */
+  private dispatchStandaloneForRequest(request: RouterRequest, title: string, goal: string): string {
+    if (request.dispatchedTicket !== undefined) return request.dispatchedTicket.id
+    this.requireNodeOnline()
+    const id = request.id
+    const trigger: Trigger = { id, source: PROJECT_REQUEST_SOURCE, threads: [{ source: PROJECT_REQUEST_SOURCE, id }],
+      actor: { source: PROJECT_REQUEST_SOURCE, id: PROJECT_REQUEST_ACTOR }, human: true, at: request.at,
+      text: request.text, meta: { title, goal } }
+    const ticketId = this.store.atomic(() => {
+      this.engine.recordTriggerForRouting(trigger)
+      const decided = this.engine.decide(id, { kind: 'accept', title, scope: goal, acknowledgement: goal,
+        reason: { code: 'explicitRouted' } })
+      if (!decided.ticketId) throw new ToolCallError('invalid', 'The request did not create a Ticket')
+      return decided.ticketId
+    })
+    request.dispatchedTicket = { id: ticketId, title, goal }
+    this.audit.record({ actor: 'router', kind: 'ticket', action: 'created', targetKind: 'ticket',
+      targetId: ticketId, detail: title })
+    return ticketId
   }
 
   private requireStandaloneTicket(ticketId: string): Ticket {
@@ -4503,6 +5052,8 @@ export class ControlPlane {
     if (record.role === 'router') {
       const queued = await this.sendToRouter(value, options.attachments ?? [], options.model,
         options.id === undefined ? {} : { id: options.id })
+      // A message the fast router claimed did not join the queue: it was carried out by the control plane itself.
+      if (queued.routed) return { interrupt: outcome, delivered: 'routed' }
       // The answer says what became of the message, in the queue's own words: a message that waits is queued, one the
       // node took is sent, one the node refused is failed, and one whose receipt is missing is unconfirmed.
       return { interrupt: outcome, delivered: queued.entry.state }

@@ -519,6 +519,13 @@ export class ControlPlaneServer {
       const id = typeof body.id === 'string' && body.id !== '' ? body.id : undefined
       const result = await this.control.sendToRouter(message, attachments, routerModel(body.model),
         id === undefined ? {} : { id })
+      // A message the Fast Router claimed never reached the Router's model: the control plane carried it out itself and
+      // answers with the receipt of what really happened. A claim that still waits for its place in the queue says so:
+      // it is queued, not carried out.
+      if (result.routed) {
+        return json(res, 200, { sent: false, queued: result.route.stage === 'accepted',
+          requestId: result.requestId, routing: result.route })
+      }
       // The fields say what the queue says: a message that waits is not sent, a message the node took is sent, and a
       // message the node refused is neither — it is answered with the reason instead of a success that never happened.
       const state = result.entry.state

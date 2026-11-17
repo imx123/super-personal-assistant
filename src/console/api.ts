@@ -206,11 +206,54 @@ export interface RouterQueueEntry {
   /** The names of the files the message carried. */
   attachments?: string[]
   /** What became of it. */
-  state: 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed'
+  state: 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed' | 'routed'
   /** Why it failed, or why it still waits. */
   error?: string
   /** The Router request the message is. */
   requestId: string
+}
+
+/**
+ * One routing the Fast Router made, as the console reads it.
+ *
+ * The receipt is the control plane's own account of one message: which rule read it, which target it found, and how far
+ * it really got. The stage never claims more than happened — a Worker that was asked to start is not running until the
+ * node says so, and the Session status beside it is the node's own word.
+ */
+export interface FastRouteReceipt {
+  /** The Router request this routing is; the message's own id. */
+  requestId: string
+  /** When the message was accepted. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** What the rule decided. */
+  outcome: 'existing_ticket' | 'existing_project_pm' | 'standalone_ticket' | 'read_only' | 'escalate' | 'ordinary_reply'
+  /** How far the message got. */
+  stage: 'accepted' | 'routing' | 'queued' | 'assigned' | 'escalated' | 'failed' | 'unconfirmed'
+  /** How sure the rule was, between 0 and 1. */
+  confidence: number
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The target the rule found, when it found one. */
+  target?: { kind: string; id: string; title: string }
+  /** The Ticket the work landed in, when one was created or addressed. */
+  ticketId?: string
+  /** The Worker Session of that Ticket, when it is known. */
+  sessionId?: string
+  /** The live status of that Session, as the control plane knows it. */
+  sessionStatus?: string
+  /** Why it failed, when it failed. */
+  error?: string
+  /**
+   * The answer to a question about the state of a thing.
+   *
+   * The record itself answered it: no model turn ran and nothing was dispatched, so the answer is the control plane's
+   * own word about what is true right now.
+   */
+  answer?: string
 }
 
 /**
@@ -236,6 +279,13 @@ export interface RouterState {
   proposal?: RouterProposal
   /** The messages that wait for the Router, oldest first. */
   queue?: RouterQueueEntry[]
+  /**
+   * The routings the Fast Router made, oldest first.
+   *
+   * A message that plainly named its target never reached the Router's model: the control plane carried it out itself,
+   * and these receipts say which target it found and how far the work got.
+   */
+  routes?: FastRouteReceipt[]
   /**
    * The notices about stops the Router is the logical superior of.
    *

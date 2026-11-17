@@ -131,6 +131,51 @@ export interface StopNoticeRow {
 }
 
 /**
+ * One message the Fast Router claimed, and what became of it.
+ *
+ * The row is the durable half of the fast route: it names the request the message was, the rule that read it, the target
+ * the rule found and how far the message actually got. It is written before the action begins, so a control plane that
+ * died in the middle leaves the fact behind instead of repeating the action, and it is keyed by the request id, so the
+ * same message never becomes two.
+ */
+export interface FastRouteRow {
+  /** The row's own order; the oldest row was routed first. */
+  seq: number
+  /** The Router request this routing is; the message's own id, so the same message is routed once. */
+  requestId: string
+  /** When the message was accepted. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** What the rule decided: `existing_ticket`, `existing_project_pm`, `standalone_ticket`, `read_only`, `escalate` or `ordinary_reply`. */
+  outcome: string
+  /** How far the message got: `accepted`, `routing`, `queued`, `assigned`, `escalated`, `failed` or `unconfirmed`. */
+  stage: string
+  /** How sure the rule was, in hundredths. */
+  confidence: number
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** Whether the target was a `ticket` or a `project`; empty when there was none. */
+  targetKind: string
+  /** The id of the target. */
+  targetId: string
+  /** The title of the target. */
+  targetTitle: string
+  /** The Ticket the work landed in, when one was created or addressed. */
+  ticketId: string
+  /** The Worker Session of that Ticket, when it is known. */
+  sessionId: string
+  /** The title of the Ticket a standalone task was to become. */
+  ticketTitle: string
+  /** The goal of the Ticket a standalone task was to become. */
+  ticketGoal: string
+  /** Why it failed, when it failed. */
+  error: string
+}
+
+/**
  * One message a person sent to the Router, and what became of it.
  *
  * The row is the control plane's own durable fact about a message that is on its way to the Router. It exists because
@@ -162,8 +207,9 @@ export interface RouterQueueRow {
    *
    * The states are facts about different moments, and the queue keeps them apart: `queued` while the message waits for
    * its turn, `sending` while it is on its way to the node, `sent` once the node took it into the Session's inbox,
-   * `read` once a turn of that Session took it, `failed` when the node refused it, and `unconfirmed` when the control
-   * plane cannot say whether it arrived — a restart in the middle of a delivery leaves exactly that fact behind.
+   * `read` once a turn of that Session took it, `failed` when the node refused it, `unconfirmed` when the control
+   * plane cannot say whether it arrived — a restart in the middle of a delivery leaves exactly that fact behind — and
+   * `routed` when the Fast Router carried the message out itself, so it never goes to the Router at all.
    */
   state: string
   /** Why the delivery failed, or why it still waits; empty when there is nothing to say. */
@@ -231,6 +277,14 @@ CREATE TABLE IF NOT EXISTS router_queue (
   id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, text TEXT NOT NULL, attachments TEXT NOT NULL,
   model TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, error TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS router_queue_state ON router_queue(state, seq);
+CREATE TABLE IF NOT EXISTS fast_route (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, text TEXT NOT NULL,
+  outcome TEXT NOT NULL, stage TEXT NOT NULL, confidence INTEGER NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
+  target_kind TEXT NOT NULL, target_id TEXT NOT NULL, target_title TEXT NOT NULL,
+  ticket_id TEXT NOT NULL, session_id TEXT NOT NULL, ticket_title TEXT NOT NULL, ticket_goal TEXT NOT NULL,
+  error TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS fast_route_stage ON fast_route(stage, seq);
 `
 
 /** The value of one column of a row, as a number. */
@@ -276,6 +330,18 @@ export class ConsoleStore {
 
   /** Close the file; a closed store throws on every later call, which is how a closed control plane behaves. */
   close(): void { this.db.close() }
+
+  writeTransaction<T>(work: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = work()
+      this.db.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
 
   /**
    * Take the sequence the next event gets.
@@ -552,7 +618,7 @@ export class ConsoleStore {
    */
   pruneRouterMessages(keep = 200): void {
     const rows = this.db.prepare(
-      "SELECT seq FROM router_queue WHERE state IN ('read','failed') ORDER BY seq DESC").all()
+      "SELECT seq FROM router_queue WHERE state IN ('read','failed','routed') ORDER BY seq DESC").all()
     const doomed = rows.slice(keep).map(row => numberOf(row.seq))
     if (doomed.length === 0) return
     const remove = this.db.prepare('DELETE FROM router_queue WHERE seq = ?')
@@ -573,6 +639,93 @@ export class ConsoleStore {
   }
 
   /**
+   * Write one routing the Fast Router claimed.
+   *
+   * The request id is the message's own id, and it is unique: a message that arrives twice writes one row, and the second
+   * write leaves the first one alone. The row is written before the action begins, so a control plane that died in the
+   * middle of the action finds the fact when it comes back.
+   */
+  addFastRoute(row: Omit<FastRouteRow, 'seq'>): FastRouteRow {
+    this.db.prepare('INSERT OR IGNORE INTO fast_route'
+      + ' (request_id, at, text, outcome, stage, confidence, reason, detail,'
+      + ' target_kind, target_id, target_title, ticket_id, session_id, ticket_title, ticket_goal, error)'
+      + ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.requestId, row.at, row.text, row.outcome, row.stage, row.confidence, row.reason, row.detail,
+        row.targetKind, row.targetId, row.targetTitle, row.ticketId, row.sessionId, row.ticketTitle, row.ticketGoal,
+        row.error)
+    return this.fastRoute(row.requestId)!
+  }
+
+  /** The row of one routing, when the file still holds it. */
+  fastRoute(requestId: string): FastRouteRow | undefined {
+    const row = this.db.prepare('SELECT seq, request_id, at, text, outcome, stage, confidence, reason, detail,'
+      + ' target_kind, target_id, target_title, ticket_id, session_id, ticket_title, ticket_goal, error'
+      + ' FROM fast_route WHERE request_id = ?')
+      .get(requestId)
+    return row === undefined ? undefined : this.fastRouteRow(row)
+  }
+
+  /**
+   * The routings the file holds, newest first.
+   *
+   * The console shows them in the order they were made, so a person reads what happened to their messages in the order
+   * they wrote them.
+   */
+  fastRoutes(options: { limit?: number; newest?: boolean } = {}): FastRouteRow[] {
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 50), 200))
+    const order = options.newest === true ? 'DESC' : 'ASC'
+    const rows = this.db.prepare('SELECT seq, request_id, at, text, outcome, stage, confidence, reason, detail,'
+      + ' target_kind, target_id, target_title, ticket_id, session_id, ticket_title, ticket_goal, error FROM fast_route'
+      + ` ORDER BY seq ${order} LIMIT ?`).all(limit)
+    return rows.map(row => this.fastRouteRow(row))
+  }
+
+  /**
+   * Write what became of one routing.
+   *
+   * Only the facts that move change: the words the person wrote and the id of the request stay, so a row that is read
+   * again still says the same thing. The `detail` is the wording of the rule, and it becomes the answer itself when the
+   * rule answered a question from the record.
+   */
+  updateFastRoute(requestId: string, patch: { stage?: string; error?: string; ticketId?: string; sessionId?: string;
+    detail?: string }): void {
+    const current = this.fastRoute(requestId)
+    if (!current) return
+    this.db.prepare('UPDATE fast_route SET stage = ?, error = ?, ticket_id = ?, session_id = ?, detail = ?'
+      + ' WHERE request_id = ?')
+      .run(patch.stage ?? current.stage, patch.error ?? current.error, patch.ticketId ?? current.ticketId,
+        patch.sessionId ?? current.sessionId, patch.detail ?? current.detail, requestId)
+  }
+
+  /**
+   * The routings that named one Ticket.
+   *
+   * They are the ones that wait for that Ticket's Worker: the routing that started it and the routing that continues it.
+   */
+  fastRoutesOfTicket(ticketId: string): FastRouteRow[] {
+    const rows = this.db.prepare('SELECT seq, request_id, at, text, outcome, stage, confidence, reason, detail,'
+      + ' target_kind, target_id, target_title, ticket_id, session_id, ticket_title, ticket_goal, error'
+      + ' FROM fast_route WHERE ticket_id = ? ORDER BY seq ASC').all(ticketId)
+    return rows.map(row => this.fastRouteRow(row))
+  }
+
+  /**
+   * Drop the routings the file may no longer keep.
+   *
+   * Only a routing that came to rest may go: one that is still on its way, or whose outcome the control plane does not
+   * know, is a task and not history.
+   */
+  pruneFastRoutes(keep = 200): void {
+    const rows = this.db.prepare(
+      "SELECT seq FROM fast_route WHERE stage IN ('queued','assigned','escalated','failed','unconfirmed')"
+      + ' ORDER BY seq DESC').all()
+    const doomed = rows.slice(keep).map(row => numberOf(row.seq))
+    if (doomed.length === 0) return
+    const remove = this.db.prepare('DELETE FROM fast_route WHERE seq = ?')
+    for (const seq of doomed) remove.run(seq)
+  }
+
+  /**
    * Drop what the log may no longer keep.
    *
    * The events are bounded twice: by their number and by their age. The audit is bounded by its age alone, and an age of
@@ -590,6 +743,8 @@ export class ConsoleStore {
     this.db.prepare('DELETE FROM stop_notice WHERE id <= (SELECT MAX(id) FROM stop_notice) - ?').run(DEFAULT_STOP_NOTICES)
     // The Router's queue is bounded the same way: a message that was read or failed long ago is history, not a task.
     this.pruneRouterMessages()
+    // The routings the Fast Router made are bounded the same way: one that came to rest long ago is history, not a task.
+    this.pruneFastRoutes()
   }
 
   /** One value of the console's own settings. */
@@ -631,5 +786,15 @@ export class ConsoleStore {
     return { seq: numberOf(row.seq), id: stringOf(row.id), at: stringOf(row.at), text: stringOf(row.text),
       attachments: stringOf(row.attachments), model: stringOf(row.model), requestId: stringOf(row.request_id),
       state: stringOf(row.state), error: stringOf(row.error) }
+  }
+
+  /** One routing row, as this store hands it out. */
+  private fastRouteRow(row: Record<string, unknown>): FastRouteRow {
+    return { seq: numberOf(row.seq), requestId: stringOf(row.request_id), at: stringOf(row.at), text: stringOf(row.text),
+      outcome: stringOf(row.outcome), stage: stringOf(row.stage), confidence: numberOf(row.confidence),
+      reason: stringOf(row.reason), detail: stringOf(row.detail), targetKind: stringOf(row.target_kind),
+      targetId: stringOf(row.target_id), targetTitle: stringOf(row.target_title), ticketId: stringOf(row.ticket_id),
+      sessionId: stringOf(row.session_id), ticketTitle: stringOf(row.ticket_title), ticketGoal: stringOf(row.ticket_goal),
+      error: stringOf(row.error) }
   }
 }
