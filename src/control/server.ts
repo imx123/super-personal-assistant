@@ -340,7 +340,11 @@ export class ControlPlaneServer {
       }
       if (method === 'GET' && url.pathname === '/v1/projects') return json(res, 200, { projects: this.control.projects() })
       if (method === 'GET' && url.pathname === '/v1/tickets') return json(res, 200, { tickets: this.control.tickets() })
-      if (method === 'GET' && url.pathname === '/v1/sessions') return json(res, 200, { sessions: [...this.control.sessions.values()] })
+      if (method === 'GET' && url.pathname === '/v1/sessions') {
+        // The Sessions with what may still be done with them: a Worker Session that a newer Assignment replaced cannot
+        // receive a message, and the console is told so instead of offering an action the server would refuse.
+        return json(res, 200, { sessions: this.control.consoleSessions() })
+      }
       if (method === 'GET' && url.pathname === '/v1/events') {
         const after = Number(url.searchParams.get('after') ?? 0)
         if (!Number.isSafeInteger(after) || after < 0) throw new HttpError(400, 'after must be a non-negative integer')
@@ -596,8 +600,8 @@ export class ControlPlaneServer {
           }
           patch.projectId = projectId
         }
-        // Whether a plan comes due is not an edit: it has its own routes, so the moment it comes due is never moved by a
-        // change of its text.
+        // Whether a plan comes due is not an edit: it has its own routes. The moment a plan comes due moves when its rule
+        // changes and when its time base changed — a change of its text alone never moves it.
         const plan = schedule(() => this.control.scheduler.updatePlan(planId, patch))
         return json(res, 200, { plan: scheduleView(this.control, plan) })
       }
@@ -679,8 +683,12 @@ export class ControlPlaneServer {
       if (method === 'POST' && action === 'message') {
         const body = await readJson(req)
         // The message goes where the Session's role says it belongs: straight to a PM, and through its Ticket to a
-        // Worker, so the domain keeps the record of it.
-        const result = await this.control.sendToSession(sessionId, text(body.text))
+        // Worker, so the domain keeps the record of it. A message may name the Assignment it is meant for: it must be
+        // the Session's own, and the Session's own must still be the Ticket's current one.
+        const assignmentId = typeof body.assignmentId === 'string' && body.assignmentId !== ''
+          ? body.assignmentId : undefined
+        const result = await this.control.sendToSession(sessionId, text(body.text),
+          assignmentId === undefined ? {} : { assignmentId })
         return json(res, 200, { sent: true, ...result })
       }
       if (method === 'POST' && action === 'cancel') {

@@ -247,19 +247,98 @@ describe('a Worker report wakes the PM of its Project', () => {
     expect(node.messages.get(pm.sessionId)).toBeUndefined()
   })
 
-  it('records the skip and stays quiet when the Project is paused', async () => {
+  it('defers the wake-up while the Project is paused, and stays quiet', async () => {
     const { project, pm, ticket, assignment, address } = await open()
     const worker = `worker-${assignment.id}`
     control!.engine.pauseProject(project.id, true)
 
     const response = await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
       report: { state: 'progress', summary: 'halfway there' } })
-    // The report is written; only the wake-up is skipped.
+    // The report is written; only the wake-up waits for the resume.
     expect(response.status).toBe(200)
     expect(control!.store.tickets.get(ticket.id)?.assignments.at(-1)?.report).toBeTruthy()
     expect(node.messages.get(pm.sessionId)).toBeUndefined()
-    expect(control!.pmNotifications()[0]).toMatchObject({ state: 'skipped', projectId: project.id })
+    expect(control!.pmNotifications()[0]).toMatchObject({ state: 'deferred', projectId: project.id })
     expect(control!.pmNotifications()[0]!.reason).toContain('paused')
+  })
+
+  it('sends the wake-up a pause held back when the Project is resumed', async () => {
+    const { project, pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+    control!.engine.pauseProject(project.id, true)
+
+    const response = await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'ready', summary: '结果在这里' } })
+    expect(response.status).toBe(200)
+    // A paused Project has no PM to wake: the wake-up waits, and the result waits for the PM's decision.
+    expect(node.messages.get(pm.sessionId)).toBeUndefined()
+    const review = control!.store.tickets.get(ticket.id)?.reviews?.at(-1)
+    expect(review?.state).toBe('pending')
+
+    await control!.pauseProject(project.id, false)
+    await until(() => (node.messages.get(pm.sessionId)?.length ?? 0) > 0, 'the PM was not woken after the resume')
+    const message = node.messages.get(pm.sessionId)![0]!
+    // The wake-up is the fact the PM needs: the result, the Ticket it is about, and the round it has to decide.
+    expect(message).toContain('结果在这里')
+    expect(message).toContain(ticket.id)
+    expect(message).toContain(review!.id)
+    expect(control!.pmNotifications()[0]).toMatchObject({ state: 'sent' })
+  })
+
+  it('sends the wake-up once, however often the Project is resumed', async () => {
+    const { project, pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+    control!.engine.pauseProject(project.id, true)
+    await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'ready', summary: '只该收到一次' } })
+
+    await control!.pauseProject(project.id, false)
+    await until(() => (node.messages.get(pm.sessionId)?.length ?? 0) > 0, 'the PM was not woken after the resume')
+    await control!.pauseProject(project.id, false)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(node.messages.get(pm.sessionId)).toHaveLength(1)
+  })
+
+  it('keeps the pending wake-up across a control-plane restart', async () => {
+    const { project, pm, ticket, assignment, address } = await open()
+    control!.engine.pauseProject(project.id, true)
+    const response = await post(address, '/v1/tools/worker/report', tokenOf(`worker-${assignment.id}`), {
+      ticketId: ticket.id, report: { state: 'ready', summary: '恢复后验收' },
+    })
+    expect(response.status).toBe(200)
+    const reviewId = control!.store.tickets.get(ticket.id)?.reviews?.at(-1)?.id
+    expect(reviewId).toBeTruthy()
+    await server!.close()
+    server = undefined
+    await control!.close()
+
+    control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: NODE_ID, node, secret: SECRET,
+      workspaceRoot: join(directory, 'workspaces'), now: () => START, confirmationTimeoutMs: 50 })
+    await control.registerNode()
+    await Promise.all([control.pauseProject(project.id, false), control.pauseProject(project.id, false)])
+    expect(node.messages.get(pm.sessionId)?.filter(message => message.includes(reviewId!))).toHaveLength(1)
+  })
+
+  it('sends the wake-up of the round that waits, not of the one that was replaced', async () => {
+    const { project, pm, ticket, assignment, address } = await open()
+    const worker = `worker-${assignment.id}`
+    control!.engine.pauseProject(project.id, true)
+    await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'ready', summary: '第一个结果' } })
+    const first = control!.store.tickets.get(ticket.id)?.reviews?.at(-1)!
+    // The Worker reports again: the round the PM was to decide is gone, and a new one waits.
+    await post(address, '/v1/tools/worker/report', tokenOf(worker), { ticketId: ticket.id,
+      report: { state: 'ready', summary: '第二个结果' } })
+    const second = control!.store.tickets.get(ticket.id)?.reviews?.at(-1)!
+    expect(second!.id).not.toBe(first!.id)
+
+    await control!.pauseProject(project.id, false)
+    await until(() => (node.messages.get(pm.sessionId)?.length ?? 0) > 0, 'the PM was not woken after the resume')
+    const message = node.messages.get(pm.sessionId)![0]!
+    expect(message).toContain('第二个结果')
+    expect(message).not.toContain('第一个结果')
+    expect(message).toContain(second!.id)
+    expect(node.messages.get(pm.sessionId)).toHaveLength(1)
   })
 
   it('refuses the report of an archived Project and wakes nobody', async () => {

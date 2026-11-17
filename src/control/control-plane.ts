@@ -19,7 +19,7 @@ import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
 import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
-import { NodeExecutor } from './executor.ts'
+import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
 import { Reconciler, type ReconcileFinding, type ReconcileResult } from './reconcile.ts'
 import { reportCallKey, reportCallPrefix, reportPayloadHash, type ReportCallRecord } from './report-call.ts'
@@ -106,6 +106,14 @@ const STOP_CLEANUP_TIMEOUT_MS = 15_000
  * tool call open, and a creation that outlives it leaves the stop unconfirmed rather than falsely successful.
  */
 const ENSURE_SETTLE_TIMEOUT_MS = 10_000
+
+/**
+ * How long a message waits for the node's own confirmation before the answer says it was not confirmed.
+ *
+ * The node's command timeout is the real bound; this one is the control plane's own, so a transport that never settles
+ * leaves the operator with an honest answer instead of a request that never returns.
+ */
+const DELIVERY_CONFIRM_TIMEOUT_MS = 30_000
 
 /**
  * How long after its expiry a Session token may still rotate itself through the refresh route.
@@ -310,6 +318,13 @@ export interface ControlPlaneOptions {
    * reported as unconfirmed and no new Assignment starts over it.
    */
   ensureSettleTimeoutMs?: number
+  /**
+   * How long a message waits for the node's own confirmation before it is reported as unconfirmed.
+   *
+   * Defaults to {@link DELIVERY_CONFIRM_TIMEOUT_MS}. A node that never answers leaves the operator with a message that was
+   * not confirmed, instead of a request that never returns.
+   */
+  deliveryConfirmTimeoutMs?: number
   /**
    * Default period of the periodic heartbeat `startHeartbeat` runs; the standalone control plane starts it after a
    * successful registration. The loop is opt-in so an in-process kernel owns no timer it did not ask for.
@@ -608,7 +623,8 @@ export interface PmContextReview {
  *
  * `sent` is the node's acceptance of the message, `skipped` a report that was written but must not wake the PM (a
  * Project that is not active, a PM that does not exist, a report the PM already knows), `failed` a message the node
- * refused or could not receive, and `pending` a wake-up still in flight.
+ * refused or could not receive, `pending` a wake-up still in flight, and `deferred` a wake-up a paused Project held back:
+ * it waits for the resume, and the PM is told then if the result still waits for a decision.
  *
  * The record is the control plane's own fact and lives in memory: it does not outlive a restart of the control plane,
  * which is acceptable while the delivery itself is a best-effort wake-up rather than a durable outbox. The Worker
@@ -623,9 +639,22 @@ export interface PmNotification {
   reportState: string
   /** When the wake-up was recorded. */
   at: string
-  state: 'pending' | 'sent' | 'skipped' | 'failed'
-  /** Why a wake-up was skipped or failed. */
+  state: 'pending' | 'sent' | 'skipped' | 'failed' | 'deferred'
+  /** Why a wake-up was skipped, failed or deferred. */
   reason?: string
+}
+
+/**
+ * One Session as the console reads it: the record itself, and what may still be done with it.
+ *
+ * A Worker Session that a newer Assignment replaced cannot receive a message any more, and the console says so instead of
+ * offering an action the server would refuse.
+ */
+export interface ConsoleSession extends SessionRecord {
+  /** Whether an operator's message may still reach this Session. */
+  deliverable: boolean
+  /** Why it may not, when it may not. */
+  unavailableReason?: string
 }
 
 /** The safe Project summary a PM reads: the identity and goal it manages, not its Mandate or PM Session record. */
@@ -800,6 +829,14 @@ export class ControlPlane {
    */
   private readonly pmNotificationsByTicket = new Map<string, PmNotification>()
   /**
+   * The PM wake-ups a paused Project held back, by the report's own key.
+   *
+   * A Project that is paused has no PM to wake: the report stays written, and the wake-up waits here until the Project is
+   * resumed. Only the wake-ups that still wait are sent then — a result the PM already decided, or one a newer round
+   * replaced, is not a fact the PM still needs.
+   */
+  private readonly resumingPmNotifications = new Set<string>()
+  /**
    * The requests a person made to the Router, and the one instruction each of them may authorize.
    *
    * The ledger is what keeps the Router's authority a person's: a Router tool call that names a request id may relay
@@ -899,7 +936,8 @@ export class ControlPlane {
       const executor = new NodeExecutor({
         createWorkerSession: (projectId, assignmentId, ticketId, prompt) =>
           this.createAssignmentWorker(projectId, assignmentId, ticketId, prompt),
-        sendMessage: (sessionId, text, inputIds) => this.sendMessage(sessionId, text, inputIds, 'system'),
+        sendMessage: (sessionId, text, inputIds, idempotencyKey) => this.sendMessage(sessionId, text, inputIds, 'system',
+          idempotencyKey === undefined ? {} : { idempotencyKey }),
         cancelSession: (sessionId, reason) => this.cancelSession(sessionId, reason, 'system'),
         assignmentStarted: (ticketId, assignmentId) => {
           this.engine.assignmentStarted(ticketId, assignmentId)
@@ -1404,6 +1442,9 @@ export class ControlPlane {
    * A hard pause stops the Project's Workers one by one through the one primitive a person's stop uses, so each ends
    * exactly as it would otherwise, and the domain waits for the node's answer: a Worker that could not be stopped is
    * reported instead of being claimed as stopped. The report says which Workers stopped and which did not.
+   *
+   * A resume also sends the PM wake-ups the pause held back, and only those that still wait: a result the PM has not
+   * decided yet is still worth telling the PM about, and a result it already decided is not asked about again.
    */
   async pauseProject(projectId: string, paused: boolean, mode: 'soft' | 'hard' = 'soft'):
     Promise<{ project: ProjectProfile; workers: { stopped: string[]; failures: { ticketId: string; error: string }[] } }> {
@@ -1412,6 +1453,7 @@ export class ControlPlane {
     this.audit.record({ actor: 'operator', kind: 'project', action: paused ? 'paused' : 'resumed', targetKind: 'project',
       targetId: projectId, outcome: report.workers.failures.length === 0 ? 'ok' : 'failed',
       detail: `${project.title} · ${mode}` })
+    if (!paused) await this.resumeDeferredPmNotifications(projectId)
     return { project: report.project, workers: report.workers }
   }
 
@@ -1526,6 +1568,44 @@ export class ControlPlane {
   }
 
   session(sessionId: string): SessionRecord | undefined { return this.sessions.get(sessionId) }
+
+  /**
+   * The Sessions the console shows, with the facts about what may still be done with them.
+   *
+   * A Worker Session whose Assignment a newer one replaced, or whose Worker is gone, cannot receive a message: the console
+   * shows that it is not deliverable instead of offering an action the server would refuse. The server's own check stays
+   * the rule — this only keeps the console from asking for a refusal it already knows about.
+   */
+  consoleSessions(): ConsoleSession[] {
+    return [...this.sessions.values()].map(record => {
+      const refusal = this.sessionDeliveryRefusal(record)
+      const view: ConsoleSession = { ...record, deliverable: refusal === undefined }
+      if (refusal !== undefined) view.unavailableReason = refusal
+      return view
+    })
+  }
+
+  /**
+   * Why a Session cannot receive an operator's message, or undefined when it can.
+   *
+   * The same rule the write path uses, so the console and the server never disagree about it.
+   */
+  private sessionDeliveryRefusal(record: SessionRecord): string | undefined {
+    if (record.revokedAt) return 'the Session was revoked'
+    if (record.status === 'archived' || record.status === 'stopped' || record.status === 'stopping'
+      || this.stoppingSessions.has(record.sessionId)) {
+      return `the Session is ${record.status === 'stopping' || this.stoppingSessions.has(record.sessionId) ? 'stopping' : record.status}`
+    }
+    if (record.role !== 'worker') return undefined
+    const assignmentId = record.assignmentId
+    if (!assignmentId) return 'the Worker Session has no Assignment'
+    const ticket = this.ticketOfAssignment(assignmentId)
+    if (!ticket) return 'the Worker Session has no Ticket'
+    const latest = latestAssignment(ticket)
+    if (!latest || latest.id !== assignmentId) return 'a newer Assignment of the Ticket took over'
+    if (latest.state === 'ended') return 'the Worker Assignment has ended'
+    return undefined
+  }
 
   /**
    * The Router Session's record, when this control plane has one.
@@ -1851,8 +1931,20 @@ export class ControlPlane {
       const ticket = this.requireStandaloneTicket(targetId)
       if (action === 'message_ticket') {
         if (!text) throw new ToolCallError('invalid', 'A message needs text')
-        const result = this.engine.messageTicket(ticket.id, text)
-        return { ...this.routerTicketResult(result.ticket), delivery: result.delivered }
+        // A standalone Ticket belongs to no Project, so it has no PM to ask: the message goes to its own Worker, with the
+        // same delivery semantics every other message to a Worker has.
+        const result = this.engine.messageTicketTo(ticket.id, text, {
+          standalone: true,
+          // The message is an Input of its own: two messages the Router was asked to send are two Inputs, even when their
+          // words are the same.
+          inputId: key('input', ticket.id, 'note', 'router', randomUUID()),
+        })
+        const assignment = latestAssignment(result.ticket)
+        const delivery = assignment === undefined
+          ? { delivered: result.delivered }
+          : await this.confirmTicketDelivery(assignment.id, result.inputId, result.delivered)
+        return { ...this.routerTicketResult(result.ticket), delivery: delivery.delivered,
+          ...(delivery.error === undefined ? {} : { error: delivery.error }) }
       }
       if (action === 'stop_ticket') {
         const stop = await this.stopStandaloneTicket(ticket, text ?? 'Stopped by the operator through Router')
@@ -2139,7 +2231,10 @@ export class ControlPlane {
     const { project } = this.requireProject(sessionId)
     const ticket = this.requireProjectTicket(project, ticketId)
     if (assignmentId !== undefined) this.requireCurrentAssignment(ticket, assignmentId)
-    return this.engine.messageTicket(ticketId, text, false)
+    // The Assignment is checked again inside the transaction that stores the message: a re-dispatch that happens at the
+    // same moment cannot slip between the check above and the write below.
+    const result = this.engine.messageTicketTo(ticketId, text, assignmentId === undefined ? {} : { assignmentId })
+    return { delivered: result.delivered, ticket: result.ticket }
   }
 
   /**
@@ -2378,9 +2473,9 @@ export class ControlPlane {
    * settled: a request that never reached the Worker says so instead of pretending the Worker was told.
    */
   private async revisionFailure(ticketId: string, assignmentId: string, revisionInputId: string): Promise<string | undefined> {
-    const delivery = this.executor.deliveryInFlight(assignmentId)
-    if (!delivery?.inputIds.includes(revisionInputId)) return undefined
-    await delivery.work
+    const delivery = this.executor.deliveryOf(assignmentId, revisionInputId)
+    if (!delivery) return undefined
+    await delivery.outcome
     const ticket = this.store.tickets.get(ticketId)
     // The revision request reached the Worker when its Input left the Ticket's waiting list.
     if (!ticket?.undelivered.includes(revisionInputId)) return undefined
@@ -2755,10 +2850,12 @@ export class ControlPlane {
    * text as data. It goes to the PM Session of the report's own Project and to no other, so one Project's work never
    * wakes another's PM.
    *
-   * A report that must not wake the PM is skipped and recorded: a Project that is not active (paused, archived or
-   * ended), a PM that does not exist (the control plane never creates one on its own), and a report the PM already
-   * knows. A message the node refuses or cannot receive is recorded as failed with a redacted diagnostic; the report
-   * stays written either way.
+   * A report that must not wake the PM is skipped and recorded: a Project that is not active (archived or ended), a PM
+   * that does not exist (the control plane never creates one on its own), and a report the PM already knows. A message the
+   * node refuses or cannot receive is recorded as failed with a redacted diagnostic; the report stays written either way.
+   *
+   * A paused Project is the one case that waits instead of being given up: it has no PM to wake now, so the wake-up is
+   * held back and sent when the Project is resumed — if the result still waits for the PM's decision by then.
    *
    * The wake-up is not awaited: the PM's Session may be busy with a turn of its own, and a Worker must never wait for
    * the PM. The message is queued by the node, which starts the PM's turn when it can.
@@ -2797,6 +2894,13 @@ export class ControlPlane {
       this.markReportNotified(ledgerKey)
       return
     }
+    if (project && project.status === 'paused') {
+      // A paused Project has no PM to wake. The report stays written, and the wake-up waits for the resume: the PM decides
+      // on the result when the Project is active again, and only then.
+      this.store.set(KV.control.deferredPmReport(ticket.id), { facts, ...(ledgerKey === undefined ? {} : { ledgerKey }) })
+      finish('deferred', 'the Project is paused; the wake-up waits for the resume')
+      return
+    }
     if (project && project.status !== 'active') {
       finish('skipped', `the Project is ${project.status}`)
       this.markReportNotified(ledgerKey)
@@ -2813,30 +2917,105 @@ export class ControlPlane {
       this.markReportNotified(ledgerKey)
       return
     }
-    const key = pmReportKey(facts)
-    const known = this.notifiedReports.get(assignmentId) ?? new Set<string>()
-    if (known.has(key)) {
-      finish('skipped', 'the PM already knows this report')
+    // The wake-up runs in the background: the PM's Session may be busy, and the Worker's report must not wait for it.
+    void this.sendPmWakeUp(manager.sessionId, facts, ledgerKey).then(
+      (outcome) => { finish(outcome.state, outcome.error) },
+      (error: unknown) => { finish('failed', redact(messageOf(error)).slice(0, 300)) })
+  }
+
+  /**
+   * Send one PM wake-up, and record what the PM learned.
+   *
+   * The report's own content is the key: the same Assignment reporting the same content is one fact, so the PM is woken
+   * once for it. A wake-up that failed gives its key back, so a later report with the same content may try again once the
+   * node is reachable, and the report's own ledger entry stays unnotified for the same reason.
+   */
+  private async sendPmWakeUp(managerSessionId: string, facts: PmReportFacts, ledgerKey?: Key<ReportCallRecord>):
+    Promise<{ state: 'sent' | 'skipped' | 'failed'; error?: string }> {
+    const reportKey = pmReportKey(facts)
+    const known = this.notifiedReports.get(facts.assignmentId) ?? new Set<string>()
+    if (known.has(reportKey)) {
+      // The PM already knows this report: the call is recorded as notified and a replay asks nothing of the PM again.
       this.markReportNotified(ledgerKey)
-      return
+      return { state: 'skipped', error: 'the PM already knows this report' }
     }
-    known.add(key)
+    known.add(reportKey)
     // The oldest key goes first, so one Assignment that reports many different texts keeps a bounded memory.
     while (known.size > NOTIFIED_REPORTS_PER_ASSIGNMENT) {
       const oldest = known.values().next().value
       if (oldest === undefined) break
       known.delete(oldest)
     }
-    this.notifiedReports.set(assignmentId, known)
-    // The wake-up runs in the background: the PM's Session may be busy, and the Worker's report must not wait for it.
-    void this.sendMessage(manager.sessionId, pmReportMessage(facts), undefined, 'system').then(
-      () => { finish('sent'); this.markReportNotified(ledgerKey) },
-      (error: unknown) => {
-        // The delivery failed: the report stays written, and the key goes back so a later report with the same content
-        // may try again once the node is reachable. The ledger entry stays unnotified for the same reason.
-        known.delete(key)
-        finish('failed', redact(messageOf(error)).slice(0, 300))
-      })
+    this.notifiedReports.set(facts.assignmentId, known)
+    try {
+      await this.sendMessage(managerSessionId, pmReportMessage(facts), undefined, 'system',
+        facts.reviewId === undefined ? {} : { idempotencyKey: key('pm-report', reportKey) })
+      this.markReportNotified(ledgerKey)
+      return { state: 'sent' }
+    } catch (error) {
+      known.delete(reportKey)
+      return { state: 'failed', error: redact(messageOf(error)).slice(0, 300) }
+    }
+  }
+
+  /**
+   * Send the PM wake-ups a paused Project held back, and only the ones that still wait.
+   *
+   * A result the PM has not decided yet, whose Assignment is still the Ticket's current one, is still worth telling the PM
+   * about: the Project was paused when the Worker reported it, and the pause is over. A result the PM already decided, one
+   * a newer round replaced, and one whose Assignment is no longer the Ticket's current one are not sent again: the PM
+   * would act on a fact that is no longer there.
+   *
+   * The wake-up is sent once. The entry is dropped as soon as it is sent, so a second resume asks nothing of the PM again,
+   * and the report's own ledger entry is marked, so a replay of the same report asks nothing either.
+   */
+  private async resumeDeferredPmNotifications(projectId: string): Promise<void> {
+    const project = this.store.projects.get(projectId)
+    if (!project || project.status !== 'active') return
+    const manager = this.sessions.get(project.pmSessionId)
+    if (!manager || manager.revokedAt || manager.role !== 'pm' || manager.projectId !== project.id) return
+    for (const entryKey of this.store.keys(KV.control.deferredPmReport)) {
+      if (this.store.projects.get(projectId)?.status !== 'active') return
+      if (this.resumingPmNotifications.has(entryKey)) continue
+      const entry = this.store.get(entryKey as ReturnType<typeof KV.control.deferredPmReport>)
+      if (!entry || entry.facts.projectId !== projectId) continue
+      const ticket = this.store.tickets.get(entry.facts.ticketId)
+      if (!ticket || !this.deferredNotificationStillWaits(ticket, entry.facts)) {
+        this.store.delete(entryKey)
+        continue
+      }
+      this.resumingPmNotifications.add(entryKey)
+      const record: PmNotification = { ticketId: ticket.id, projectId, assignmentId: entry.facts.assignmentId,
+        reportState: entry.facts.reportState, at: this.now(), state: 'pending' }
+      this.pmNotificationsByTicket.set(ticket.id, record)
+      try {
+        const outcome = await this.sendPmWakeUp(manager.sessionId, entry.facts, entry.ledgerKey)
+        record.state = outcome.state
+        if (outcome.error !== undefined) record.reason = outcome.error
+        const current = this.store.get(entryKey as ReturnType<typeof KV.control.deferredPmReport>)
+        if (outcome.state !== 'failed' && current && pmReportKey(current.facts) === pmReportKey(entry.facts)) {
+          this.store.delete(entryKey)
+        }
+      } finally {
+        this.resumingPmNotifications.delete(entryKey)
+      }
+    }
+  }
+
+  /**
+   * Whether a wake-up a paused Project held back still waits for the PM's decision.
+   *
+   * The Assignment must still be the Ticket's current one, the report must still be the one that Assignment made, and a
+   * result that waits for a review must still wait for that very review: a round the PM already decided, or one a newer
+   * round replaced, is not a fact the PM still needs.
+   */
+  private deferredNotificationStillWaits(ticket: Ticket, facts: PmReportFacts): boolean {
+    const assignment = latestAssignment(ticket)
+    if (!assignment || assignment.id !== facts.assignmentId) return false
+    const report = assignment.report
+    if (!report || report.state !== facts.reportState || report.summary !== facts.summary || report.at !== facts.at) return false
+    if (facts.reviewId === undefined) return true
+    return pendingReview(ticket)?.id === facts.reviewId
   }
 
   /** The PM wake-ups this control plane made for Worker reports, newest last. */
@@ -3252,8 +3431,18 @@ export class ControlPlane {
    * the work it decides about. A Worker Session does not: a message that reaches a Worker outside its Ticket is a fact
    * the domain never holds, so the message becomes an Input of the Ticket the Worker runs, and the domain delivers it the
    * way it delivers every other message.
+   *
+   * The message is bound to the Session it was written for. A Worker Session a newer Assignment replaced cannot receive
+   * a message: the message would reach the Worker that took its place, so it is refused with the conflict the operator
+   * needs to see, and nothing is written to the Ticket. The Session's own Assignment must still be the Ticket's current
+   * one, and the domain checks that inside the transaction that stores the message, so a re-dispatch that happens at the
+   * same moment cannot slip between the check and the write.
+   *
+   * The answer says what really happened. A message that reached a running Worker waits for the node's own confirmation:
+   * a message the node refused never reached the Worker, so the answer says that instead of claiming a delivery.
    */
-  async sendToSession(sessionId: string, text: string): Promise<{ via: 'session' | 'ticket'; delivered: string }> {
+  async sendToSession(sessionId: string, text: string, options: { assignmentId?: string } = {}):
+    Promise<{ via: 'session' | 'ticket'; delivered: string; inputId?: string }> {
     const record = this.requireSession(sessionId)
     if (record.revokedAt) {
       throw new OperatorError(409, `The Session ${sessionId} was revoked; it cannot receive a message any more`)
@@ -3263,17 +3452,76 @@ export class ControlPlane {
       return { via: 'session', delivered: 'session' }
     }
     if (record.role === 'worker') {
-      const ticket = record.assignmentId ? this.ticketOfAssignment(record.assignmentId) : undefined
+      const assignmentId = record.assignmentId
+      if (!assignmentId) {
+        throw new OperatorError(409, `The Worker Session ${sessionId} has no Assignment; there is nothing to deliver a message to`)
+      }
+      if (options.assignmentId !== undefined && options.assignmentId !== assignmentId) {
+        throw new OperatorError(409,
+          `This message names Assignment ${options.assignmentId}, but the Session ${sessionId} runs ${assignmentId}`)
+      }
+      // A Session that is over cannot receive a message: its Worker is gone, and the message would wait for a Worker that
+      // will never read it. The console is told the same fact, so it does not offer the action in the first place.
+      const refusal = this.sessionDeliveryRefusal(record)
+      if (refusal !== undefined) {
+        throw new OperatorError(409, `The Worker Session ${sessionId} cannot receive a message: ${refusal}`)
+      }
+      const ticket = this.ticketOfAssignment(assignmentId)
       if (!ticket) {
         throw new OperatorError(409, `The Worker Session ${sessionId} has no Ticket; there is nothing to deliver a message to`)
       }
-      const result = this.engine.messageTicket(ticket.id, text, false)
+      const result = this.engine.messageTicketTo(ticket.id, text, {
+        assignmentId,
+        standalone: ticket.projectId === undefined,
+        // The message is an Input of its own: two messages a person wrote on purpose are two Inputs, even when their
+        // words are the same.
+        inputId: key('input', ticket.id, 'note', 'operator', randomUUID()),
+      })
       // The message itself is not copied into the audit: its size and its target are the facts worth keeping.
+      const delivery = await this.confirmTicketDelivery(assignmentId, result.inputId, result.delivered)
       this.audit.record({ actor: 'operator', kind: 'session', action: 'message', targetKind: 'session',
-        targetId: sessionId, detail: `${text.length} 字` })
-      return { via: 'ticket', delivered: result.delivered }
+        targetId: sessionId, outcome: delivery.delivered === 'failed' ? 'failed' : 'ok', detail: `${text.length} 字` })
+      if (delivery.delivered === 'failed') {
+        throw new OperatorError(502, `The node did not take the message: ${delivery.error ?? 'the delivery was refused'}`)
+      }
+      return { via: 'ticket', delivered: delivery.delivered, inputId: result.inputId }
     }
     throw new OperatorError(409, `The Session ${sessionId} cannot receive an operator message`)
+  }
+
+  /**
+   * Wait for the node's answer about one message, and report what really happened.
+   *
+   * A message that reached a running Assignment is delivered by the Executor in the background: the answer a person sees
+   * must wait for the node's own confirmation, because a message the node refused never reached the Worker. The wait is
+   * bounded, so a node that never answers cannot hold the request open.
+   *
+   * A message that is only queued keeps its own answer: nothing was delivered yet, and the Input waits among the Ticket's
+   * undelivered ones until a Worker can take it.
+   */
+  private async confirmTicketDelivery(assignmentId: string, inputId: string,
+    delivered: TicketMessageDelivery): Promise<{ delivered: TicketMessageDelivery; error?: string }> {
+    if (delivered !== 'running') return { delivered }
+    const inFlight = this.executor.deliveryOf(assignmentId, inputId)
+    if (!inFlight) return { delivered: 'failed', error: 'the node did not confirm delivery of this message' }
+    const outcome = await this.settleDeliveryOutcome(inFlight.outcome)
+    if (outcome.delivered) return { delivered }
+    return { delivered: 'failed', ...(outcome.error === undefined ? {} : { error: redact(outcome.error).slice(0, 300) }) }
+  }
+
+  /** The outcome of one delivery, bounded: a node that never answers cannot hold the request open. */
+  private async settleDeliveryOutcome(outcome: Promise<DeliveryOutcome>,
+    timeoutMs = this.options.deliveryConfirmTimeoutMs ?? DELIVERY_CONFIRM_TIMEOUT_MS): Promise<DeliveryOutcome> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const expired = new Promise<DeliveryOutcome>(resolve => {
+      timer = setTimeout(() => resolve({ delivered: false, error: `the node did not answer within ${timeoutMs} ms` }), timeoutMs)
+      timer.unref?.()
+    })
+    try {
+      return await Promise.race([outcome, expired])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }
 
   /**

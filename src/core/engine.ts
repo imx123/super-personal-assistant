@@ -20,8 +20,44 @@ export type { Outcome } from './evals.ts'
 export type { ReceiveResult } from './intake.ts'
 export type { Reply, ReplyRequest } from './replies.ts'
 
-/** How a PM's message to a child Ticket reached its worker: routed to a running one, started an Assignment, queued only, or not started. */
-export type TicketMessageDelivery = 'running' | 'started' | 'queued' | 'not_started'
+/**
+ * How a message to a Ticket's Worker reached it: routed to a running one, started an Assignment, queued only, not started,
+ * or refused by the node that should have carried it.
+ *
+ * `failed` is the honest answer for a message the node refused: it was stored as a Ticket Input, but no Worker received it,
+ * so it stays among the Ticket's undelivered Inputs and is sent again when the node can take it.
+ */
+export type TicketMessageDelivery = 'running' | 'started' | 'queued' | 'not_started' | 'failed'
+
+/**
+ * How one message to a Ticket's Worker is to be delivered.
+ *
+ * The request names the Assignment the message is meant for, so a message never reaches a Worker that replaced the one it
+ * was written for, and the id of the Input it becomes, so two messages with the same text are two Inputs when the caller
+ * wants them to be.
+ */
+export interface TicketMessageRequest {
+  /**
+   * The Assignment the message is meant for.
+   *
+   * It must still be the Ticket's current Assignment when the message is stored: a message that names an Assignment a
+   * later one replaced would reach the Worker that took its place, so it is refused before any Input exists.
+   */
+  assignmentId?: string
+  /**
+   * The id of the Input the message becomes.
+   *
+   * The default is derived from the Ticket and the text, so a repeated request with the same text adds the Input once. A
+   * caller that sends the same text twice on purpose — a person who wrote it twice — gives two ids, and both arrive.
+   */
+  inputId?: string
+  /** Start a new Assignment when the Ticket has none running and may be started again. */
+  wake?: boolean
+  /** Store the message without delivering it or starting anything, for a worker Session that is known to be gone. */
+  queueOnly?: boolean
+  /** The message may reach a Ticket that belongs to no Project: a standalone Ticket the Router owns. */
+  standalone?: boolean
+}
 
 /** What a Project pause did to its Workers: those stopped, and those a failure left running for a person to retry. */
 export interface ProjectPauseWorkers {
@@ -1432,31 +1468,64 @@ export class Engine {
    * archived or ended.
    */
   messageTicket(ticketId: string, text: string, wake = false, queueOnly = false): { delivered: TicketMessageDelivery; ticket: Ticket } {
+    const result = this.messageTicketTo(ticketId, text, { wake, queueOnly })
+    return { delivered: result.delivered, ticket: result.ticket }
+  }
+
+  /**
+   * A message to the Worker of one Ticket, with the Assignment it is meant for.
+   *
+   * It is the one way a message reaches a Worker: the message is stored as a note Input first, so it stays in the Ticket's
+   * history and grants nothing, and only then is it routed. A running Assignment gets it delivered, a pending one is
+   * started, and with `wake` a retryable Ticket gets a new Assignment; otherwise the note waits among the Ticket's
+   * undelivered Inputs.
+   *
+   * The Assignment the message names is checked inside the same transaction that stores it: a message written for an
+   * Assignment a later one replaced is refused before any Input exists, so it can never reach the Worker that took its
+   * place and never waits for an execution that will not come.
+   *
+   * A standalone Ticket belongs to no Project, so it has no Project's pause, archive and end to obey; it is still bound to
+   * its own Assignment, its own manual stop and its own input model. A Project's Ticket is never reachable through the
+   * standalone path, and a standalone Ticket is never reachable through the Project path.
+   * @throws UserError when the Ticket is unknown, ended or archived, when its Assignment is no longer the current one, when
+   * the Ticket belongs to a Project that is paused, archived or ended, or when a standalone Ticket is named as a Project's.
+   */
+  messageTicketTo(ticketId: string, text: string, request: TicketMessageRequest = {}):
+    { delivered: TicketMessageDelivery; ticket: Ticket; inputId: string } {
     return this.repo.atomic(() => {
       const ticket = this.repo.tickets.get(ticketId)
       if (!ticket) throw new UserError('unknownTicket')
-      const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
-      if (!ticket.projectId || !project) throw new UserError('notProjectTicket')
-      if (project.status === 'paused') throw new UserError('projectPaused')
-      if (project.status === 'archived') throw new UserError('projectArchived')
-      if (project.status !== 'active') throw new UserError('projectEnded')
+      if (request.standalone === true) {
+        if (ticket.projectId !== undefined) throw new UserError('notStandaloneTicket')
+      } else {
+        const project = ticket.projectId ? this.repo.projects.get(ticket.projectId) : undefined
+        if (!ticket.projectId || !project) throw new UserError('notProjectTicket')
+        if (project.status === 'paused') throw new UserError('projectPaused')
+        if (project.status === 'archived') throw new UserError('projectArchived')
+        if (project.status !== 'active') throw new UserError('projectEnded')
+      }
       if (ticket.archived) throw new UserError('ticketArchived')
       if (!liveTicket(ticket)) throw new UserError('ticketEnded')
+      // The Assignment the message is meant for must still be the Ticket's current one: the message would otherwise reach
+      // the Worker that replaced it, or wait for an Assignment that is over.
+      if (request.assignmentId !== undefined && latestAssignment(ticket)?.id !== request.assignmentId) {
+        throw new UserError('assignmentEnded')
+      }
       const running = !!runningAssignment(ticket)
       const pending = latestAssignment(ticket)?.state === 'pending' && !waitsForPerson(ticket)
       const canStart = canRetry(ticket)
-      const id = key('input', ticketId, 'note', 'pm', text)
-      if (queueOnly) {
+      const id = request.inputId ?? key('input', ticketId, 'note', 'pm', text)
+      if (request.queueOnly === true) {
         this.tickets.queueNoteWithId(ticketId, text, id)
-        return { delivered: 'not_started', ticket: this.repo.tickets.get(ticketId)! }
+        return { delivered: 'not_started', ticket: this.repo.tickets.get(ticketId)!, inputId: id }
       }
       this.tickets.noteWithId(ticketId, text, id, true)
       let delivered: TicketMessageDelivery
       if (running) delivered = 'running'
       else if (pending) delivered = 'started'
-      else if (wake && canStart) { this.tickets.retry(ticketId); delivered = 'started' }
-      else delivered = wake ? 'not_started' : 'queued'
-      return { delivered, ticket: this.repo.tickets.get(ticketId)! }
+      else if (request.wake === true && canStart) { this.tickets.retry(ticketId); delivered = 'started' }
+      else delivered = request.wake === true ? 'not_started' : 'queued'
+      return { delivered, ticket: this.repo.tickets.get(ticketId)!, inputId: id }
     })
   }
   /**

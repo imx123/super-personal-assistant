@@ -484,6 +484,155 @@ describe('the control plane scheduler', () => {
     expect(message.split('--- end task note ---')).toHaveLength(2)
     expect(message).toContain('[task note]')
   })
+
+  it('computes the next moment of a plan in the time base it is saved in', () => {
+    const db = openDb()
+    const utc = scheduler(db)
+    const plan = utc.createPlan({ projectId: 'p1', name: 'nine', rule: 'daily:09:00', message: 'check' })
+    expect(plan.nextAt).toBe('2026-01-05T09:00:00.000Z')
+    expect(plan.timeZoneOffsetMinutes).toBe(0)
+
+    // The time base changes and the control plane comes back with it: the plan keeps the moment it had...
+    const east = scheduler(db, { timeZoneOffsetMinutes: 480 })
+    expect(east.getPlan(plan.id)?.nextAt).toBe('2026-01-05T09:00:00.000Z')
+    // ...until it is saved again, which computes the moment in the new time base: 09:00 there is 01:00 UTC.
+    const saved = east.updatePlan(plan.id, { name: 'nine' })
+    expect(saved.nextAt).toBe('2026-01-05T01:00:00.000Z')
+    expect(saved.timeZoneOffsetMinutes).toBe(480)
+    expect(east.getPlan(plan.id)?.nextAt).toBe('2026-01-05T01:00:00.000Z')
+  })
+
+  it('keeps the cadence of an interval plan when the time base changes', () => {
+    const db = openDb()
+    const utc = scheduler(db)
+    const plan = utc.createPlan({ projectId: 'p1', name: 'every', rule: 'every:30m', message: 'check' })
+    expect(plan.nextAt).toBe('2026-01-05T00:30:00.000Z')
+
+    // An interval rule has no time of day: an unrelated edit never moves its moment.
+    const east = scheduler(db, { timeZoneOffsetMinutes: 480 })
+    const saved = east.updatePlan(plan.id, { message: 'check again' })
+    expect(saved.nextAt).toBe('2026-01-05T00:30:00.000Z')
+    expect(saved.message).toBe('check again')
+  })
+
+  it('adopts the plans of a file that was written before the time base was recorded', () => {
+    const db = openDb()
+    const first = scheduler(db)
+    const plan = first.createPlan({ projectId: 'p1', name: 'nine', rule: 'daily:09:00', message: 'check' })
+    // The file of an older control plane keeps no time base in its plans.
+    db.exec('ALTER TABLE sched_plan DROP COLUMN tz_offset')
+
+    const east = scheduler(db, { timeZoneOffsetMinutes: 480 })
+    expect(east.getPlan(plan.id)?.timeZoneOffsetMinutes).toBeUndefined()
+    // Saving it computes the moment in the time base of this control plane.
+    expect(east.updatePlan(plan.id, { message: 'check again' }).nextAt).toBe('2026-01-05T01:00:00.000Z')
+  })
+
+  it('delivers the plan as it is when the tick reaches it', async () => {
+    const db = openDb()
+    const sent: ScheduleDelivery[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const deliver: ScheduleDeliverer = async (delivery) => {
+      sent.push(delivery)
+      if (sent.length === 1) await gate
+      return { ok: true, acknowledged: true }
+    }
+    const plans = new Scheduler({ db, deliver, now: () => clock })
+    plans.createPlan({ projectId: 'project-1', name: 'first', rule: 'every:1h', message: 'first message' })
+    at('2026-01-05T00:30:00.000Z')
+    const second = plans.createPlan({ projectId: 'project-1', name: 'second', rule: 'every:1h', message: 'second message' })
+
+    at('2026-01-05T01:30:00.000Z')
+    const ticking = plans.tick()
+    // The first plan is on its way; the second one is edited before it is claimed.
+    await vi.waitFor(() => expect(sent).toHaveLength(1))
+    expect(sent[0]!.message).toContain('first message')
+    plans.updatePlan(second.id, { message: 'the edited message' })
+    release!()
+    const outcomes = await ticking
+
+    expect(outcomes.map(outcome => outcome.status)).toEqual(['delivered', 'delivered'])
+    expect(sent).toHaveLength(2)
+    // The second plan was delivered as it stands now, not as the tick saw it.
+    expect(sent[1]!.message).toContain('the edited message')
+    expect(sent[1]!.message).not.toContain('second message')
+    expect(sent[1]!.planId).toBe(second.id)
+    expect(sent[1]!.name).toBe('second')
+    // The run on the record shows what was really delivered.
+    expect(plans.runs(second.id)[0]!.message).toContain('the edited message')
+  })
+
+  it('delivers the last edit of a plan when two edits carry the same moment', async () => {
+    const db = openDb()
+    const sent: ScheduleDelivery[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const deliver: ScheduleDeliverer = async (delivery) => {
+      sent.push(delivery)
+      if (sent.length === 1) await gate
+      return { ok: true, acknowledged: true }
+    }
+    const plans = new Scheduler({ db, deliver, now: () => clock })
+    plans.createPlan({ projectId: 'project-1', name: 'first', rule: 'every:1h', message: 'first message' })
+    at('2026-01-05T00:30:00.000Z')
+    const second = plans.createPlan({ projectId: 'project-1', name: 'second', rule: 'every:1h', message: 'second message' })
+
+    at('2026-01-05T01:30:00.000Z')
+    const ticking = plans.tick()
+    await vi.waitFor(() => expect(sent).toHaveLength(1))
+    // Two edits of the same plan, written in the same moment: the last one is the plan.
+    plans.updatePlan(second.id, { message: 'the first edit' })
+    plans.updatePlan(second.id, { message: 'the second edit' })
+    release!()
+    await ticking
+
+    expect(sent).toHaveLength(2)
+    expect(sent[1]!.message).toContain('the second edit')
+    expect(sent[1]!.message).not.toContain('the first edit')
+  })
+
+  it('does not run a plan that was disabled, deleted or moved while the tick waited', async () => {
+    const db = openDb()
+    const sent: ScheduleDelivery[] = []
+    let release: (() => void) | undefined
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const deliver: ScheduleDeliverer = async (delivery) => {
+      sent.push(delivery)
+      if (sent.length === 1) await gate
+      return { ok: true, acknowledged: true }
+    }
+    const plans = new Scheduler({ db, deliver, now: () => clock })
+    plans.createPlan({ projectId: 'project-1', name: 'first', rule: 'every:1h', message: 'first message' })
+    at('2026-01-05T00:30:00.000Z')
+    const disabled = plans.createPlan({ projectId: 'project-1', name: 'disabled', rule: 'every:1h', message: 'off' })
+    at('2026-01-05T00:45:00.000Z')
+    const deleted = plans.createPlan({ projectId: 'project-1', name: 'deleted', rule: 'every:1h', message: 'gone' })
+    at('2026-01-05T01:00:00.000Z')
+    const moved = plans.createPlan({ projectId: 'project-1', name: 'moved', rule: 'every:1h', message: 'later' })
+
+    at('2026-01-05T02:00:00.000Z')
+    const ticking = plans.tick()
+    await vi.waitFor(() => expect(sent).toHaveLength(1))
+    plans.pausePlan(disabled.id)
+    plans.deletePlan(deleted.id)
+    // A plan whose rule changed comes due at another moment, which is not this tick's moment.
+    plans.updatePlan(moved.id, { rule: 'every:2h' })
+    release!()
+    const outcomes = await ticking
+
+    // Only the first plan was delivered; the other three were not run at all.
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.message).toContain('first message')
+    expect(outcomes.map(outcome => outcome.status)).toEqual(['delivered', 'skipped', 'skipped', 'skipped'])
+    expect(outcomes[1]!.reason).toContain('disabled')
+    expect(outcomes[2]!.reason).toContain('deleted')
+    expect(outcomes[3]!.reason).toContain('another moment')
+    // Nothing is on the record for a plan that was not run.
+    expect(plans.runs(disabled.id)).toHaveLength(0)
+    expect(plans.runs(deleted.id)).toHaveLength(0)
+    expect(plans.runs(moved.id)).toHaveLength(0)
+  })
 })
 
 /**

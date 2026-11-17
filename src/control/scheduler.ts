@@ -15,8 +15,8 @@
  * fires at the wrong moment. The time base is UTC unless the host names a fixed offset, so the moment a plan fires never
  * depends on the machine's timezone, on a daylight-saving rule or on where the control plane happens to run.
  *
- * A run is claimed atomically before anything is delivered. The claim is one SQL statement that only succeeds for the
- * caller that got there first, so a periodic tick and a manual run cannot both deliver the same slot, and two schedulers
+ * A run is claimed atomically before anything is delivered. The claim takes a SQLite write lock and only succeeds for
+ * the caller that got there first, so a periodic tick and a manual run cannot both deliver the same slot, and two schedulers
  * on one file cannot either. The claim also moves the plan's next moment forward, before the delivery happens: a
  * process that dies between the delivery and the write-back therefore leaves a run that is on the record and a plan that
  * has already moved on. The next start marks that run `interrupted`, and it is never replayed — a message that may or
@@ -108,6 +108,14 @@ export interface SchedulePlan {
   enabled: boolean
   /** The next moment the plan comes due, in UTC. */
   nextAt: string
+  /**
+   * The time base the plan's `nextAt` was computed in, as a fixed offset in minutes east of UTC.
+   *
+   * The offset belongs to the plan, because the plan's own next moment was computed in it: a plan whose time base changed
+   * keeps its old moment until it is saved again, and saving it computes the moment in the new time base. A plan that was
+   * created before this was recorded has no known time base, and saving it computes the moment afresh.
+   */
+  timeZoneOffsetMinutes?: number
   /** When the last run ended. */
   lastAt?: string
   /** How the last run ended. */
@@ -152,6 +160,13 @@ export interface ScheduleRun {
   error?: string
   /** How many moments of the plan were missed and deliberately not replayed. */
   skipped: number
+  /**
+   * The message the run carried, as the plan held it when the run was claimed.
+   *
+   * It is the plan's own note, never a credential: the history shows what was really delivered, which is not always what
+   * the plan held when the tick looked at it.
+   */
+  message: string
 }
 
 /** One message, on its way to the PM of a Project. */
@@ -268,8 +283,13 @@ export interface SchedulerOptions {
 
 /** What one call to run a plan ended with. */
 export interface ScheduleRunOutcome {
-  /** How the call ended. */
-  status: 'delivered' | 'failed' | 'busy' | 'unknown-plan'
+  /**
+   * How the call ended.
+   *
+   * `skipped` is a plan that was not run at all: it was deleted, disabled or moved to another moment between the tick that
+   * looked at it and the claim that would have run it. Nothing was delivered, so nothing is on the record.
+   */
+  status: 'delivered' | 'failed' | 'busy' | 'unknown-plan' | 'skipped'
   /** The run, when there is one. */
   run?: ScheduleRun
   /** A short line about the outcome. */
@@ -365,7 +385,8 @@ CREATE TABLE IF NOT EXISTS sched_plan (
   lease_until TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  deleted INTEGER NOT NULL DEFAULT 0);
+  deleted INTEGER NOT NULL DEFAULT 0,
+  tz_offset INTEGER);
 CREATE INDEX IF NOT EXISTS sched_plan_due ON sched_plan(deleted, enabled, next_at);
 CREATE TABLE IF NOT EXISTS sched_run (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -630,6 +651,21 @@ export class Scheduler {
         'The lease must outlast the delivery timeout, or a slow delivery could overlap the next moment of a plan')
     }
     this.db.exec(SCHEMA)
+    this.migrate()
+  }
+
+  /**
+   * Add the columns a plan gained later, to a file that was created before they existed.
+   *
+   * The time base of a plan is recorded in the plan itself, so a plan that was created before it was recorded has no known
+   * time base: saving such a plan computes its next moment afresh, which is what an operator who changed the time base
+   * expects. Nothing else about the plan changes.
+   */
+  private migrate(): void {
+    this.writeTransaction(() => {
+      const columns = this.db.prepare('PRAGMA table_info(sched_plan)').all() as Record<string, unknown>[]
+      if (!columns.some(column => column.name === 'tz_offset')) this.db.exec('ALTER TABLE sched_plan ADD COLUMN tz_offset INTEGER')
+    })
   }
 
   /** This instance's id; a run carries the id of the instance that delivered it. */
@@ -758,10 +794,10 @@ export class Scheduler {
     if (this.planRow(id) !== undefined) throw new ScheduleError('invalid-input', `The plan ${id} already exists`)
     const nextAt = nextScheduleOccurrence(rule, now, this.offsetMinutes).toISOString()
     this.db.prepare(
-      'INSERT INTO sched_plan (id, project_id, name, rule, message, enabled, next_at, created_at, updated_at, deleted) '
-      + 'VALUES (?,?,?,?,?,?,?,?,?,0)')
+      'INSERT INTO sched_plan (id, project_id, name, rule, message, enabled, next_at, created_at, updated_at, deleted, '
+      + 'tz_offset) VALUES (?,?,?,?,?,?,?,?,?,0,?)')
       .run(id, projectId, name, input.rule.trim(), message, input.enabled === false ? 0 : 1, nextAt, now.toISOString(),
-        now.toISOString())
+        now.toISOString(), this.offsetMinutes)
     const plan = this.getPlan(id)!
     this.writeAudit({ actor: 'operator', action: 'created', targetId: id, outcome: 'ok',
       detail: `rule ${plan.rule}, next at ${plan.nextAt}` })
@@ -793,6 +829,10 @@ export class Scheduler {
    *
    * A change never runs the plan and never moves a moment that already came due: a new rule takes effect from the next
    * moment it names, and a plan that is edited comes due at the next moment of its new rule.
+   *
+   * A plan whose time base changed comes due at the moment its rule names in the new time base, even when the rule itself
+   * was not touched: the moment a plan keeps is the one its own time base computed. An interval rule has no time of day, so
+   * it keeps its moment and its cadence whatever the time base is — an unrelated edit never moves it.
    */
   updatePlan(id: string, patch: {
     name?: string
@@ -801,31 +841,37 @@ export class Scheduler {
     projectId?: string
     enabled?: boolean
   }): SchedulePlan {
-    const plan = this.getPlan(id)
-    if (!plan) throw new ScheduleError('unknown-plan', `Unknown plan ${id}`)
-    const name = patch.name === undefined ? plan.name : patch.name.trim()
-    if (name === '' || name.length > MAX_NAME) {
-      throw new ScheduleError('invalid-input', `The name may be at most ${MAX_NAME} characters`)
-    }
-    const message = patch.message === undefined ? plan.message : patch.message.trim()
-    if (message === '' || message.length > MAX_MESSAGE) {
-      throw new ScheduleError('invalid-input', `The message may be at most ${MAX_MESSAGE} characters`)
-    }
-    const projectId = patch.projectId === undefined ? plan.projectId : patch.projectId.trim()
-    if (projectId === '' || projectId.length > MAX_PROJECT_ID) {
-      throw new ScheduleError('invalid-input', 'A plan needs the Project whose PM it writes to')
-    }
-    const ruleText = patch.rule === undefined ? plan.rule : patch.rule.trim()
-    const rule = parseScheduleRule(ruleText)
-    const now = this.now()
-    const nextAt = ruleText === plan.rule
-      ? plan.nextAt
-      : nextScheduleOccurrence(rule, now, this.offsetMinutes).toISOString()
-    this.db.prepare(
-      'UPDATE sched_plan SET name=?, rule=?, message=?, project_id=?, enabled=?, next_at=?, updated_at=? WHERE id=?')
-      .run(name, ruleText, message, projectId, patch.enabled === undefined ? (plan.enabled ? 1 : 0) : (patch.enabled ? 1 : 0),
-        nextAt, now.toISOString(), id)
-    const updated = this.getPlan(id)!
+    const updated = this.writeTransaction(() => {
+      const plan = this.getPlan(id)
+      if (!plan) throw new ScheduleError('unknown-plan', `Unknown plan ${id}`)
+      const name = patch.name === undefined ? plan.name : patch.name.trim()
+      if (name === '' || name.length > MAX_NAME) {
+        throw new ScheduleError('invalid-input', `The name may be at most ${MAX_NAME} characters`)
+      }
+      const message = patch.message === undefined ? plan.message : patch.message.trim()
+      if (message === '' || message.length > MAX_MESSAGE) {
+        throw new ScheduleError('invalid-input', `The message may be at most ${MAX_MESSAGE} characters`)
+      }
+      const projectId = patch.projectId === undefined ? plan.projectId : patch.projectId.trim()
+      if (projectId === '' || projectId.length > MAX_PROJECT_ID) {
+        throw new ScheduleError('invalid-input', 'A plan needs the Project whose PM it writes to')
+      }
+      const ruleText = patch.rule === undefined ? plan.rule : patch.rule.trim()
+      const rule = parseScheduleRule(ruleText)
+      const now = this.now()
+      // A rule with a time of day is read in the plan's time base; an interval rule is not, so it never moves with it.
+      const timedRule = rule.kind === 'daily' || rule.kind === 'weekly'
+      const timeBaseChanged = plan.timeZoneOffsetMinutes === undefined || plan.timeZoneOffsetMinutes !== this.offsetMinutes
+      const nextAt = ruleText === plan.rule && !(timedRule && timeBaseChanged)
+        ? plan.nextAt
+        : nextScheduleOccurrence(rule, now, this.offsetMinutes).toISOString()
+      this.db.prepare(
+        'UPDATE sched_plan SET name=?, rule=?, message=?, project_id=?, enabled=?, next_at=?, updated_at=?, tz_offset=? '
+        + 'WHERE id=?')
+        .run(name, ruleText, message, projectId, patch.enabled === undefined ? (plan.enabled ? 1 : 0) : (patch.enabled ? 1 : 0),
+          nextAt, now.toISOString(), this.offsetMinutes, id)
+      return this.getPlan(id)!
+    })
     this.writeAudit({ actor: 'operator', action: 'updated', targetId: id, outcome: 'ok',
       detail: `rule ${updated.rule}, next at ${updated.nextAt}` })
     return updated
@@ -855,8 +901,8 @@ export class Scheduler {
     const rule = parseScheduleRule(plan.rule)
     const now = this.now()
     const nextAt = nextScheduleOccurrence(rule, now, this.offsetMinutes).toISOString()
-    this.db.prepare('UPDATE sched_plan SET enabled=1, next_at=?, updated_at=? WHERE id=?')
-      .run(nextAt, now.toISOString(), id)
+    this.db.prepare('UPDATE sched_plan SET enabled=1, next_at=?, updated_at=?, tz_offset=? WHERE id=?')
+      .run(nextAt, now.toISOString(), this.offsetMinutes, id)
     const resumed = this.getPlan(id)!
     this.writeAudit({ actor: 'operator', action: 'resumed', targetId: id, outcome: 'ok',
       detail: `next at ${resumed.nextAt}` })
@@ -973,7 +1019,7 @@ export class Scheduler {
    * Run one plan, once.
    *
    * The order of the steps is the whole point of this method. The run goes on the record before anything is delivered,
-   * the plan is claimed with one statement that only one caller can win, and the outcome is written back after the
+   * the plan is claimed in a SQLite write transaction, and the outcome is written back after the
    * delivery. A process that dies in between leaves a run that is on the record and a plan that has already moved on.
    */
   private async execute(plan: SchedulePlan, reason: ScheduleRunReason): Promise<ScheduleRunOutcome> {
@@ -988,16 +1034,17 @@ export class Scheduler {
       return { status: 'busy', reason: 'this moment is already being run' }
     }
     const claim = this.claim(plan, reason, runId, now)
-    if (!claim.claimed) {
+    if (claim.status !== 'claimed') {
       // Nothing was delivered, so nothing is kept as a run: the plan stays due and comes round again.
       this.deleteRun(runId)
-      return { status: 'busy', reason: claim.reason }
+      return { status: claim.status === 'busy' ? 'busy' : 'skipped', reason: claim.reason }
     }
+    const current = claim.plan
     this.startRun(runId, now)
     const delivery: ScheduleDelivery = {
-      planId: plan.id, projectId: plan.projectId, runId, reason, name: plan.name, rule: plan.rule, plannedAt,
-      message: buildScheduleMessage({ projectId: plan.projectId, name: plan.name, rule: plan.rule, plannedAt, runId,
-        reason, text: plan.message }),
+      planId: current.id, projectId: current.projectId, runId, reason, name: current.name, rule: current.rule, plannedAt,
+      message: buildScheduleMessage({ projectId: current.projectId, name: current.name, rule: current.rule, plannedAt, runId,
+        reason, text: current.message }),
     }
     let result: ScheduleDeliveryResult
     try {
@@ -1025,7 +1072,7 @@ export class Scheduler {
     }
     const run = this.finishRun(runId, 'delivered', { acknowledged: true, skipped: claim.skipped })
     this.writeAudit({ actor: 'system', action: 'run.delivered', targetId: plan.id, outcome: 'ok',
-      detail: `${runId}: rule ${plan.rule}, due ${plannedAt}, acknowledged` })
+      detail: `${runId}: rule ${current.rule}, due ${plannedAt}, acknowledged` })
     await this.notifyFinished(run)
     return { status: 'delivered', run }
   }
@@ -1068,36 +1115,53 @@ export class Scheduler {
   }
 
   /**
-   * Claim the plan for one run.
-   *
-   * The claim is one statement, and the statement itself is the lock: only the caller that changes a row gets the plan,
-   * and the row it changes is the plan's next moment, which moves forward before the delivery happens.
+   * Claim the plan and capture the exact contents for this run under the same SQLite write lock.
    */
   private claim(plan: SchedulePlan, reason: ScheduleRunReason, runId: string, now: Date):
-    { claimed: boolean; reason?: string; skipped: number } {
+    { status: 'claimed'; skipped: number; plan: SchedulePlan } | { status: 'busy' | 'voided'; reason: string } {
     const leaseUntil = new Date(now.getTime() + this.leaseMs).toISOString()
     const at = now.toISOString()
     try {
-      if (reason === 'scheduled') {
-        const rule = parseScheduleRule(plan.rule)
-        const slot = new Date(plan.nextAt)
-        const next = nextAfterSlot(rule, slot, now, this.offsetMinutes)
+      return this.writeTransaction(() => {
+        const current = this.getPlan(plan.id)
+        if (!current) return { status: 'voided', reason: 'the plan was deleted' }
+        let nextAt = current.nextAt
+        let skipped = 0
+        if (reason === 'scheduled') {
+          if (!current.enabled) return { status: 'voided', reason: 'the plan was disabled' }
+          if (current.nextAt !== plan.nextAt || current.nextAt > at) {
+            return { status: 'voided', reason: 'the plan was moved to another moment' }
+          }
+          const offset = current.timeZoneOffsetMinutes ?? this.offsetMinutes
+          const next = nextAfterSlot(parseScheduleRule(current.rule), new Date(current.nextAt), now, offset)
+          nextAt = next.at.toISOString()
+          skipped = next.skipped
+        }
         const result = this.db.prepare(
           'UPDATE sched_plan SET lease_owner=?, lease_holder=?, lease_until=?, next_at=?, updated_at=? '
-          + 'WHERE id=? AND deleted=0 AND enabled=1 AND next_at=? AND (lease_owner IS NULL OR lease_until<=?)')
-          .run(runId, this.instanceId, leaseUntil, next.at.toISOString(), at, plan.id, plan.nextAt, at)
-        if (numberOf(result.changes) !== 1) return { claimed: false, reason: 'another run holds this plan', skipped: 0 }
-        return { claimed: true, skipped: next.skipped }
-      }
-      const result = this.db.prepare(
-        'UPDATE sched_plan SET lease_owner=?, lease_holder=?, lease_until=?, updated_at=? '
-        + 'WHERE id=? AND deleted=0 AND (lease_owner IS NULL OR lease_until<=?)')
-        .run(runId, this.instanceId, leaseUntil, at, plan.id, at)
-      if (numberOf(result.changes) !== 1) return { claimed: false, reason: 'another run holds this plan', skipped: 0 }
-      return { claimed: true, skipped: 0 }
+          + 'WHERE id=? AND (lease_owner IS NULL OR lease_until<=?)')
+          .run(runId, this.instanceId, leaseUntil, nextAt, at, plan.id, at)
+        if (numberOf(result.changes) !== 1) return { status: 'busy', reason: 'another run holds this plan' }
+        this.db.prepare('UPDATE sched_run SET project_id=?, name=?, rule=?, message=? WHERE run_id=?')
+          .run(current.projectId, current.name, current.rule, current.message, runId)
+        return { status: 'claimed', skipped, plan: current }
+      })
     } catch (error) {
       this.report(error)
-      return { claimed: false, reason: 'the plan could not be claimed', skipped: 0 }
+      return { status: 'busy', reason: 'the plan could not be claimed' }
+    }
+  }
+
+  /** Keep the read and write of plan state in one transaction across scheduler instances. */
+  private writeTransaction<T>(work: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = work()
+      this.db.exec('COMMIT')
+      return result
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
     }
   }
 
@@ -1121,7 +1185,7 @@ export class Scheduler {
     }
     this.pruneRuns()
     return run ?? { runId, planId: '', projectId: '', name: '', rule: '', reason: 'scheduled', plannedAt: now,
-      state, acknowledged: options.acknowledged === true, skipped: options.skipped ?? 0,
+      state, acknowledged: options.acknowledged === true, skipped: options.skipped ?? 0, message: '',
       ...(options.error === undefined ? {} : { error: options.error }) }
   }
 
@@ -1230,8 +1294,10 @@ export class Scheduler {
       ? undefined : stringOf(row.last_state) as ScheduleRunState
     const lastError = row.last_error === null || row.last_error === undefined ? undefined : stringOf(row.last_error)
     const lastRunId = row.last_run_id === null || row.last_run_id === undefined ? undefined : stringOf(row.last_run_id)
+    const tzOffset = row.tz_offset === null || row.tz_offset === undefined ? undefined : numberOf(row.tz_offset)
     return { id: stringOf(row.id), projectId: stringOf(row.project_id), name: stringOf(row.name), rule: stringOf(row.rule),
       message: stringOf(row.message), enabled: numberOf(row.enabled) !== 0, nextAt: stringOf(row.next_at),
+      ...(tzOffset === undefined ? {} : { timeZoneOffsetMinutes: tzOffset }),
       ...(lastAt === undefined ? {} : { lastAt }), ...(lastState === undefined ? {} : { lastState }),
       ...(lastError === undefined ? {} : { lastError }), ...(lastRunId === undefined ? {} : { lastRunId }),
       createdAt: stringOf(row.created_at), updatedAt: stringOf(row.updated_at),
@@ -1248,6 +1314,6 @@ export class Scheduler {
       plannedAt: stringOf(row.planned_at), ...(startedAt === undefined ? {} : { startedAt }),
       ...(finishedAt === undefined ? {} : { finishedAt }), state: stringOf(row.state) as ScheduleRunState,
       acknowledged: numberOf(row.acknowledged) !== 0, ...(error === undefined ? {} : { error }),
-      skipped: numberOf(row.skipped) }
+      skipped: numberOf(row.skipped), message: stringOf(row.message) }
   }
 }

@@ -48,7 +48,7 @@ const CONTROL_FIELDS = [
       ['SUPERAGENT_CONSOLE_EVENT_ROWS', '事件保留条数', '至少保留 1 条。降低上限会清理更早的事件。'],
       ['SUPERAGENT_CONSOLE_EVENT_DAYS', '事件保留天数', '0 只按条数限制。降低天数会清理到期事件。'],
       ['SUPERAGENT_CONSOLE_AUDIT_DAYS', '操作日志保留天数', '0 表示长期保留。缩短保留时间会清理到期的操作日志。'],
-      ['SUPERAGENT_SCHEDULER_OFFSET_MINUTES', '定时任务时区（UTC 偏移分钟数）', '北京时间填 480。修改后，重新保存已有的定时任务可更新它们的下次运行时间。'],
+      ['SUPERAGENT_SCHEDULER_OFFSET_MINUTES', '定时任务时区（UTC 偏移分钟数）', '北京时间填 480。修改后重启控制面生效，再到「定时任务」里重新保存已有的任务，它们的下次运行时间会按新时区重新计算。'],
     ],
   },
 ] as const
@@ -298,7 +298,7 @@ function RuntimeSettings(props: { refresh: () => void }): ReactElement {
           </div>
         </div>)}
         <div className="settings-row">
-          <div><b>定时任务时区</b><p>在「部署与凭据」中修改，重启控制面后生效。</p></div>
+          <div><b>定时任务时区</b><p>在「部署与凭据」中修改，重启控制面后生效。改完后到「定时任务」里重新保存已有的任务，它们会按新时区重新计算下次运行时间。</p></div>
           <span>UTC 偏移 {current.schedulerOffsetMinutes} 分钟</span>
         </div>
         <div className="detail-actions">

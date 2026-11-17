@@ -4,6 +4,7 @@
  */
 import type { PromptVersion } from './app/prompts.ts'
 import type { SettingsVersion } from './app/store.ts'
+import type { PmReportFacts } from './control/pm-report.ts'
 import type { ReportCallRecord } from './control/report-call.ts'
 import type { SettingsSave } from './policy.ts'
 import type { SessionRecord } from './shared/protocol.ts'
@@ -45,7 +46,9 @@ export const KV = {
      * It lives in the domain's own KV area, so a report and its ledger entry are written in one transaction: a report can
      * never be written without being recorded, and a recorded call is never forgotten by a restart.
      */
-    reportCall: family<ReportCallRecord, [scope: string, callId: string]>('control/report-call:') },
+    reportCall: family<ReportCallRecord, [scope: string, callId: string]>('control/report-call:'),
+    /** The latest PM notification held back by a pause, one per Ticket. */
+    deferredPmReport: family<{ facts: PmReportFacts; ledgerKey?: Key<ReportCallRecord> }, [ticketId: string]>('control/deferred-pm-report:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

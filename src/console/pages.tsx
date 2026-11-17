@@ -112,13 +112,38 @@ export function useAction(onSuccess?: () => void): {
   return { state, run }
 }
 
-/** The wording of a message that the control plane delivered to a Session, as the answer says it went. */
-function deliveredWording(result: unknown): string {
+/**
+ * The wording of a message that the control plane delivered to a Session, as the answer says it went.
+ *
+ * The answer waits for the node's own confirmation, so `running` really means the Worker has the message. A message the
+ * node refused never comes back as a success: the server answers with an error instead, and the console shows it as one.
+ */
+export function deliveredWording(result: unknown): string {
   const value = result as { via?: string; delivered?: string }
   if (value.via !== 'ticket') return '消息已发出'
   if (value.delivered === 'running') return '消息已送达 Worker'
   if (value.delivered === 'started') return '消息已排队：Worker 启动后会读到它'
+  if (value.delivered === 'failed') return '消息未送达 Worker'
   return '消息已排队：Worker 恢复后会读到它'
+}
+
+/**
+ * The wording of a pause, which says what the pause did to the Project's Workers.
+ *
+ * The pause is written either way, so the answer says so; a Worker the node did not confirm as stopped is named, with the
+ * reason the control plane has, instead of being counted as stopped.
+ */
+export function pauseWording(result: unknown): string {
+  const value = result as { workers?: { stopped?: string[]; failures?: { ticketId: string; error: string }[] } }
+  const workers = value.workers
+  const failures = workers?.failures ?? []
+  const stopped = workers?.stopped ?? []
+  if (failures.length > 0) {
+    const details = failures.map(({ ticketId, error }) => `${ticketId}（${error}）`).join('、')
+    return `项目已暂停。有 ${failures.length} 个 Worker 未确认停止。${details}`
+  }
+  if (stopped.length > 0) return `项目已暂停，${stopped.length} 个 Worker 已停止`
+  return '项目已暂停'
 }
 
 /** The wording of a stop the node may or may not have confirmed. */
@@ -144,7 +169,7 @@ function revokedWording(result: unknown): string {
 }
 
 /** The wording of a Project action that stops Workers: a partial success says so. */
-function projectWording(what: string, result: unknown): string {
+export function projectWording(what: string, result: unknown): string {
   const value = result as { failures?: string[]; stopped?: string[] }
   const failures = value.failures?.length ?? 0
   const stopped = value.stopped?.length ?? 0
@@ -735,7 +760,7 @@ function ProjectDetail(props: { project: ConsoleProject; revision: number; refre
           : null}
         {project.status === 'active'
           ? <button type="button" className="action" disabled={action.state.busy}
-            onClick={() => action.run(() => write(`${path}/pause`, { paused: true, mode: 'hard' }), '项目已暂停')}>暂停</button>
+            onClick={() => action.run(() => write(`${path}/pause`, { paused: true, mode: 'hard' }), pauseWording)}>暂停</button>
           : null}
         {project.status === 'paused'
           ? <button type="button" className="action" disabled={action.state.busy}
@@ -957,6 +982,11 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
   const latest = history.at(-1)?.seq
   const path = `/v1/console/sessions/${encodeURIComponent(session.sessionId)}`
   const revoked = session.revokedAt !== undefined
+  // A Session that cannot receive a message any more is not offered one: a Worker a newer Assignment replaced would pass
+  // the message to the Worker that took its place, and the server refuses it. The server's own check is the rule; this
+  // only keeps the console from asking for a refusal it already knows about.
+  const deliverable = session.deliverable !== false
+  const unavailable = revoked ? '会话权限已撤销' : (deliverable ? '' : '这个会话已结束，无法接收指令')
   // A PM Session is not stopped on its own: ending the Project it manages is the action that fits, and it lives on the
   // Project's own page. A PM of a Project that is still active must not be archived either.
   const pmActive = session.role === 'pm' && props.projectStatus === 'active'
@@ -969,7 +999,7 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
   }, [latest])
 
   const send = (): void => {
-    if (action.state.busy || revoked || text.trim() === '') return
+    if (action.state.busy || !deliverable || text.trim() === '') return
     followLatest.current = true
     action.run(async () => {
       const result = await write(`${path}/message`, { text: text.trim() })
@@ -989,6 +1019,7 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
           {revoked ? '权限已撤销' : (SESSION_STATUS[session.status] ?? session.status)}
         </span>
       </header>
+      {unavailable !== '' ? <p className="notice failure">{unavailable}</p> : null}
       <details className="session-info">
         <summary>会话信息与管理</summary>
         <div className="session-info-body">
@@ -1074,7 +1105,7 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
       <div className="session-bottom">
         <form className="composer session-composer" onSubmit={event => { event.preventDefault(); send() }}>
           <label htmlFor="session-message" className="sr-only">发给这个会话的消息</label>
-          <textarea id="session-message" rows={2} maxLength={4000} value={text} disabled={revoked}
+          <textarea id="session-message" rows={2} maxLength={4000} value={text} disabled={!deliverable}
             onChange={event => setText(event.target.value)}
             onKeyDown={event => {
               if (event.key !== 'Enter' || event.shiftKey || !preferences.enterToSend
@@ -1082,9 +1113,9 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
               event.preventDefault()
               send()
             }}
-            placeholder={revoked ? '会话权限已撤销' : `给 ${name} 发消息`} />
+            placeholder={unavailable === '' ? `给 ${name} 发消息` : unavailable} />
           <button type="submit" className="send-round" aria-label="发送"
-            disabled={action.state.busy || revoked || text.trim() === ''}><Icon name="arrowUp" /></button>
+            disabled={action.state.busy || !deliverable || text.trim() === ''}><Icon name="arrowUp" /></button>
         </form>
         <ActionLine state={action.state} />
       </div>

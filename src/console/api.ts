@@ -123,6 +123,16 @@ export interface SessionView {
   tokenVersion?: number
   revokedAt?: string
   revokedReason?: string
+  /**
+   * Whether an operator's message may still reach this Session.
+   *
+   * A Worker Session that a newer Assignment replaced cannot receive a message: it would reach the Worker that took its
+   * place. The console shows that instead of offering an action the server would refuse — the server's own check is the
+   * rule.
+   */
+  deliverable?: boolean
+  /** Why the Session may not receive a message, when it may not. */
+  unavailableReason?: string
 }
 
 /** One message of a Session. */

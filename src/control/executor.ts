@@ -1,4 +1,5 @@
 /** Engine's Executor port over the control plane's NodePort: one Worker Session per Assignment. */
+import { key } from '../core/ids.ts'
 import type { Assignment, Executor, Ticket, TicketInput } from '../core/index.ts'
 
 /**
@@ -9,8 +10,14 @@ export interface NodeExecutorHost {
   /** Create the Worker Session for an Assignment; resolves with its control-plane Session id. */
   createWorkerSession(projectId: string | undefined, assignmentId: string, ticketId: string, prompt: string):
     Promise<{ sessionId: string }>
-  /** Deliver one message to a Worker Session, naming the Inputs it carries. */
-  sendMessage(sessionId: string, text: string, inputIds?: readonly string[]): Promise<void>
+  /**
+   * Deliver one message to a Worker Session, naming the Inputs it carries.
+   *
+   * The idempotency key names the delivery itself: the same Inputs of the same Assignment are one message, so a delivery
+   * that is repeated — because the transport lost the answer, or because the node was restarted — is executed by the node
+   * at most once.
+   */
+  sendMessage(sessionId: string, text: string, inputIds?: readonly string[], idempotencyKey?: string): Promise<void>
   /** Cancel a Worker Session's turn; a failure propagates to the caller that waits for the cleanup. */
   cancelSession(sessionId: string, reason: string): Promise<void>
   /** The Engine's fact that the Assignment runs. */
@@ -58,6 +65,35 @@ const errorText = (error: unknown): string => error instanceof Error ? error.mes
 /** Sent when the waiting Inputs carry no text of their own, so the Worker still learns that there is new input. */
 const NO_TEXT = 'New input for this Assignment'
 
+/** How many deliveries of one Assignment are remembered, so an answer about an older message is still readable. */
+const MAX_DELIVERIES_PER_ASSIGNMENT = 8
+
+/**
+ * What one delivery to a Worker Session really did.
+ *
+ * `delivered` is the node's own answer: the message reached the Worker's Session. A failure carries the reason, so a
+ * caller that must report the delivery honestly says that the message was refused instead of claiming it arrived.
+ */
+export interface DeliveryOutcome {
+  /** Whether the node took the message. */
+  delivered: boolean
+  /** Why the message did not reach the Worker, when it did not. */
+  error?: string
+}
+
+/**
+ * One delivery of Inputs to a Worker Session.
+ *
+ * It settles when the node answered or refused the message: a caller that must report whether a message really went out
+ * waits for it. The promise never rejects: a failed delivery is recorded on the Ticket, not thrown at the waiter.
+ */
+export interface Delivery {
+  /** What the node did with the message; it settles when the node answered or refused. */
+  outcome: Promise<DeliveryOutcome>
+  /** The Input ids this delivery carries. */
+  inputIds: string[]
+}
+
 /**
  * Executor for the standalone control plane: it maps the Engine's Assignment lifecycle calls onto the Worker Sessions that
  * a NodePort runs. The Engine calls these methods inside a domain transaction, so `start` and `deliver` begin their
@@ -67,20 +103,34 @@ const NO_TEXT = 'New input for this Assignment'
 export class NodeExecutor implements Executor {
   /** Input ids a send has already started for an Assignment, so a second delivery in flight never repeats them. */
   private readonly sending = new Map<string, Set<string>>()
-  /** The delivery in flight for an Assignment, so a caller can wait for the node's answer before it reports one. */
-  private readonly deliveries = new Map<string, { work: Promise<void>; inputIds: string[] }>()
+  /**
+   * The deliveries of one Assignment, newest last.
+   *
+   * The list is bounded, and it keeps more than the newest one: two messages sent at the same time have two deliveries,
+   * and the answer about the first one must not be read from the second.
+   */
+  private readonly deliveries = new Map<string, Delivery[]>()
 
   constructor(private readonly host: NodeExecutorHost) {}
 
   /**
-   * The delivery in flight for one Assignment, if any: the promise and the Input ids it carries.
+   * The newest delivery of one Assignment, if any.
    *
-   * It settles when the node answered or refused the message: a caller that must report whether a message really went out
-   * waits for it and reads the fact the failure left on the Ticket. The promise never rejects: a failed delivery is
-   * recorded on the Ticket, not thrown at the waiter.
+   * Its outcome settles when the node answered or refused the message: a caller that must report whether a message really
+   * went out waits for it. The promise never rejects: a failed delivery is recorded on the Ticket, not thrown at the waiter.
    */
-  deliveryInFlight(assignmentId: string): { work: Promise<void>; inputIds: string[] } | undefined {
-    return this.deliveries.get(assignmentId)
+  deliveryInFlight(assignmentId: string): Delivery | undefined {
+    return this.deliveries.get(assignmentId)?.at(-1)
+  }
+
+  /**
+   * The delivery of one Assignment that carries a given Input, if there is one.
+   *
+   * It is the delivery a caller waits for when it knows which Input its message became: the newest delivery may be
+   * another message's.
+   */
+  deliveryOf(assignmentId: string, inputId: string): Delivery | undefined {
+    return this.deliveries.get(assignmentId)?.find(delivery => delivery.inputIds.includes(inputId))
   }
 
   /**
@@ -116,23 +166,36 @@ export class NodeExecutor implements Executor {
       for (const id of inputIds) sending.delete(id)
       if (sending.size === 0 && this.sending.get(assignment.id) === sending) this.sending.delete(assignment.id)
     }
-    try {
-      const work = this.host.sendMessage(sessionId, text, inputIds)
-        .then(() => {
-          settle()
-          // The message went out: record its Inputs before a later delivery can include them again. A host that cannot
-          // record the fact must not turn a completed send into a failed Assignment.
-          try { this.host.inputsDelivered(ticket.id, assignment.id, inputIds) } catch { /* delivery still happened */ }
-        })
-        .catch(error => {
-          settle()
-          this.fail(ticket.id, assignment.id, errorText(error))
-        })
-      this.deliveries.set(assignment.id, { work, inputIds })
-    } catch (error) {
-      settle()
-      this.fail(ticket.id, assignment.id, errorText(error))
-    }
+    // The key names the delivery, not the attempt: the same Inputs of the same Assignment are one message, so a
+    // delivery that is repeated is executed by the node at most once.
+    const idempotencyKey = key('delivery', assignment.id, [...inputIds].sort().join(','))
+    // The outcome answers what the node did, whoever waits for it: the promise settles exactly once, and it never rejects.
+    const outcome = new Promise<DeliveryOutcome>((resolve) => {
+      const finish = (result: DeliveryOutcome): void => resolve(result)
+      try {
+        void this.host.sendMessage(sessionId, text, inputIds, idempotencyKey)
+          .then(() => {
+            settle()
+            finish({ delivered: true })
+            // The message went out: record its Inputs before a later delivery can include them again. A host that cannot
+            // record the fact must not turn a completed send into a failed Assignment.
+            try { this.host.inputsDelivered(ticket.id, assignment.id, inputIds) } catch { /* delivery still happened */ }
+          })
+          .catch((error: unknown) => {
+            settle()
+            const reason = errorText(error)
+            finish({ delivered: false, error: reason })
+            this.fail(ticket.id, assignment.id, reason)
+          })
+      } catch (error) {
+        settle()
+        const reason = errorText(error)
+        finish({ delivered: false, error: reason })
+        this.fail(ticket.id, assignment.id, reason)
+      }
+    })
+    this.deliveries.set(assignment.id,
+      [...(this.deliveries.get(assignment.id) ?? []), { outcome, inputIds }].slice(-MAX_DELIVERIES_PER_ASSIGNMENT))
   }
 
   /** Cancel the Assignment's Worker Session; a failure propagates to the caller waiting for the Worker's cleanup. */
