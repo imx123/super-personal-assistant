@@ -7,7 +7,7 @@
 | P3-0 | — | 基线、权限和停止矩阵 | DONE |
 | P3-1 | P3-0 | 全角色会话干预，真实 DSH | DONE |
 | P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | DONE |
-| P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | INVESTIGATING |
+| P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | DONE |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | DONE |
 | P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | NOT_STARTED |
 | P4-0 | P3-Gate | 协作事件边界 | NOT_STARTED |
@@ -80,7 +80,25 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验�
 
 类型检查、构建通过。54 文件定向中，711 项通过、1 项因 Windows 目录联接跳过，另有 2 项临时端口 `bad port`；快路由、四条件门禁与文档三个文件复跑 59 项全过。全量测试未重跑。
 
-真实 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live` 和 `dsh-superagent/node` 以本机 Gemma 4 12B 验收。串行样例走高层模型且没有创建 Project。可并行的三模块样例由真实 Router 交付四项判断和原话引用，控制面创建一个 Project 并启动真实 PM，首页显示项目和 PM 会话 ID。证据在本机忽略目录 `.artifacts/phase3-5-20261117/live-gtD3dH/evidence.json`。P3-3B 仍需完成常规高层自动交接与业务闭环验收。
+真实 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live` 和 `dsh-superagent/node` 以本机 Gemma 4 12B 验收。串行样例走高层模型且没有创建 Project。可并行的三模块样例由真实 Router 交付四项判断和原话引用，控制面创建一个 Project 并启动真实 PM，首页显示项目和 PM 会话 ID。证据在本机忽略目录 `.artifacts/phase3-5-20261117/live-gtD3dH/evidence.json`。P3-3B 补齐常规高层交接与真实工单闭环。
+
+## P3-3B
+
+本次在 `next` 本地提交。按用户要求，完成本项验收后暂停。P3-Gate、Phase 4 和 Phase 5 尚未开始。
+
+Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。高层 Router 新增 `control_router_pm_handoff`：模型只决定「哪个项目、说什么」，控制面按本人原话复核后自己把工作交给该项目的 PM，不需要「转告 PM」，也不需要点击确认。复核包括工作意图、唯一目标（或本请求自己建的项目）、逐字来自本人原话的内容边界，以及不越到别的项目、不要新授权、不可逆范围不自动做；歧义、多候选、越权、敏感跨域一律退回复核或走已有授权限制。
+
+旧的 `control_router_pm_proposal` API 与「显式提议 + 人工确认」能力保留不变；普通授权任务走自动交接，与提议互斥，一条请求最多一个主要路由结果。四条件门禁放行并创建项目后，同一请求只为这个新项目发布一次受限任务 brief（本人原话，无历史、附件或其他项目材料），Router 不建工单，PM 自行建单派工；本人明确「仅创建 / 待命」时不发布 brief，保留创建后空闲语义。
+
+持久记录 `router_handoff` 表按请求 ID 唯一：重复、并发、重启后的调用返回既有回执或未确认，不加发，也不凭旧记录恢复已失效授权。目标已暂停 / 结束、PM 被停 / 撤权、节点拒收都给出准确状态，不隐式复活。首页新增「高层 Router 交给项目 PM 的工作」一栏，沿用快路由与门禁的记录样式，显示项目、PM 会话 ID、实际确认与排队 / 未确认 / 失败的原因。快路由投递继续使用原有提示词。高层普通工作和新项目的工作说明提醒 PM 自行决定如何建单和派工。
+
+新增 `src/control/router-handoff.ts`（纯判断，无 store / node / model）与 `tests/control-plane-router-handoff.spec.ts`，覆盖成功、同 ID 去重、过期与重启重放、未知 / 多目标不发、角色与被停边界、节点拒收与缺回执、原话与附件边界、门禁后只发给新项目、「仅创建 / 待命」保持空闲。规范见 [高层自动交接](../021-phase3-router-handoff.zh-CN.md)。
+
+验收修复了模糊引用接受改写后指令、门禁只转发证据短句而遗漏执行要求、相似名称分别出现时漏判歧义、同一请求交给 PM 后还能派独立工单，以及首页不显示拒绝原因的问题。交接使用连续原文，门禁后的工作说明保留整条请求的模块和限制。
+
+类型检查和构建通过。完整定向回归 55 文件，737 项通过、1 项因 Windows 目录联接限制跳过。此前一次随机端口被 fetch 拒绝，原测试文件单跑和整组重跑均通过。全量测试未重跑。
+
+Edge、真实 DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node` 和本机 Gemma 4 12B 验收通过。既有项目收到一次自然语言任务，Worker 写入 `handoff.txt` 并报告，PM 验收同一工单。门禁为三模块任务只创建一个项目，工作说明送达一次，真实 PM 派工，三个文件内容正确，三个工单均验收通过。追加样例核对了三份最终报告和 PM 项目报告进入 Router 收件箱。首页核对了项目、PM 会话和确认状态。证据见本机忽略目录 `.artifacts/phase3-5-20261117/` 的 `live-FKJYKt/evidence.json`、`live-uvwzcl/evidence.json` 与 `live-eO4MtR/evidence.json`。
 
 ## P3-4
 

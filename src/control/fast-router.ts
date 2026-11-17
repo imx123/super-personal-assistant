@@ -516,15 +516,24 @@ function isStateQuery(text: string): boolean {
   return asksForState(text) || isQuestion(text)
 }
 
-/** Whether the words ask for a scope nobody may undo. */
-function asksForIrreversible(text: string): boolean {
+/**
+ * Whether the words ask for a scope nobody may undo.
+ *
+ * The high-level Router's handoff reads the same words: a rule may not act on an irreversible scope, and neither may the
+ * model behind it.
+ */
+export function asksForIrreversible(text: string): boolean {
   for (const word of IRREVERSIBLE_ZH) if (text.includes(word)) return true
   const pattern = new RegExp(`\\b(?:${IRREVERSIBLE_EN.map(escapeRegExp).join('|')})\\b`, 'i')
   return pattern.test(text)
 }
 
-/** Whether the words ask for more authority than the message carries. */
-function asksForAuthority(text: string): boolean {
+/**
+ * Whether the words ask for more authority than the message carries.
+ *
+ * The high-level Router's handoff reads the same words: a request for a new authority is a decision a person makes.
+ */
+export function asksForAuthority(text: string): boolean {
   for (const word of AUTHORITY_ZH) if (text.includes(word)) return true
   const pattern = new RegExp(`\\b(?:${AUTHORITY_EN.map(escapeRegExp).join('|')})\\b`, 'i')
   return pattern.test(text)

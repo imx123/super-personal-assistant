@@ -487,11 +487,11 @@ describe('the gate in the control plane', () => {
     // It may not make a second Project with another title.
     expect((await createProject(requestId, '另一个项目', '另一件工作')).status).toBe(400)
 
-    // The Project it made is its own: the PM may be started again and one relay may be proposed to it.
+    // The Project it made is its own: the PM may be confirmed again, and its work brief has already been delivered.
     const started = await createProject(requestId, made.project.title, made.project.goal)
     expect(started.status).toBe(200)
     expect((await started.json() as { project: { id: string } }).project.id).toBe(made.project.id)
-    expect((await propose(requestId, made.project.id, '先做首页模块')).status).toBe(200)
+    expect((await propose(requestId, made.project.id, '先做首页模块')).status).toBe(400)
 
     expect(control!.projects()).toHaveLength(1)
     expect(control!.tickets()).toEqual([])

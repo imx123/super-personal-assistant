@@ -308,6 +308,49 @@ export interface ProjectGateRecord {
 }
 
 /**
+ * One handoff of a request to a Project's PM, as the console reads it.
+ *
+ * The record is the control plane's own account of one delivery: the Project it went to, the PM Session that took it,
+ * the words that really travelled and how far the delivery got. The stage never claims more than happened — a PM that
+ * was asked to take the work is not working on it until the node says so.
+ */
+export interface RouterHandoffRecord {
+  /** The Router request this handoff is; the message's own id. */
+  requestId: string
+  /**
+   * Which kind of handoff this is.
+   *
+   * `handoff` is the high-level Router's own decision to give a request to the PM of a Project that already existed.
+   * `brief` is the work brief the Project Gate published to the PM of the Project it just created.
+   */
+  kind: 'handoff' | 'brief'
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The Project the work goes to. */
+  projectId: string
+  /** The title of that Project, as the console shows it. */
+  projectTitle: string
+  /** The PM Session that received the work. */
+  pmSessionId: string
+  /** The live status of that PM Session, as the control plane knows it. */
+  pmStatus?: string
+  /** The words that really travelled to that PM. */
+  instruction: string
+  /** The short, checkable reason the Router gave. */
+  rationale: string
+  /** How far the handoff got. */
+  stage: 'accepted' | 'routing' | 'queued' | 'assigned' | 'refused' | 'failed' | 'unconfirmed'
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** Why it failed, when it failed. */
+  error?: string
+}
+
+/**
  * The Router's own facts, as the console reads them.
  *
  * The conversation comes from the node's own message events, so what the console shows is what really happened: the
@@ -345,6 +388,14 @@ export interface RouterState {
    * a record too, so a person may ask why their request did not become a Project.
    */
   gates?: ProjectGateRecord[]
+  /**
+   * The handoffs the high-level Router made to a Project's PM, oldest first.
+   *
+   * A record names the request the work came from, the Project it went to, the PM Session that took it, the words that
+   * really travelled and how far the delivery got. A refusal is a record too, so a person may see why a request did not
+   * reach a PM.
+   */
+  handoffs?: RouterHandoffRecord[]
   /**
    * The notices about stops the Router is the logical superior of.
    *

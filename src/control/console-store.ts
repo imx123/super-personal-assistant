@@ -226,6 +226,49 @@ export interface ProjectGateRow {
 }
 
 /**
+ * One handoff of a request to a Project's PM, and what became of it.
+ *
+ * The row is the durable half of the high-level handoff: it names the request the work came from, the Project it goes
+ * to, the PM Session that received it, the words that really travelled and how far the delivery got. It is written
+ * before anything is sent, so a control plane that died in the middle leaves the fact behind instead of sending the
+ * same work twice, and the request id is unique, so one request may only ever reach one PM.
+ *
+ * The `kind` tells the two handoffs apart: a `handoff` is the high-level Router's own decision to give a request to the
+ * PM of a Project that already existed, and a `brief` is the work brief the Project Gate publishes to the PM of the
+ * Project it just created.
+ */
+export interface RouterHandoffRow {
+  /** The row's own order; the oldest row was handed over first. */
+  seq: number
+  /** The Router request this handoff is; the message's own id, so the same message is handed over once. */
+  requestId: string
+  /** Which kind of handoff this is: `handoff` or `brief`. */
+  kind: string
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The Project the work goes to. */
+  projectId: string
+  /** The title of that Project, as the console shows it. */
+  projectTitle: string
+  /** The PM Session that received the work. */
+  pmSessionId: string
+  /** The words that really travelled to that PM. */
+  instruction: string
+  /** The short, checkable reason the Router gave. */
+  rationale: string
+  /** How far the handoff got: `accepted`, `routing`, `queued`, `assigned`, `refused`, `failed` or `unconfirmed`. */
+  stage: string
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** Why it failed, when it failed. */
+  error: string
+}
+
+/**
  * One message a person sent to the Router, and what became of it.
  *
  * The row is the control plane's own durable fact about a message that is on its way to the Router. It exists because
@@ -343,6 +386,13 @@ CREATE TABLE IF NOT EXISTS project_gate (
   project_id TEXT NOT NULL, pm_session_id TEXT NOT NULL, pm_status TEXT NOT NULL, error TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS project_gate_attempt ON project_gate(request_id, attempt);
 CREATE INDEX IF NOT EXISTS project_gate_request ON project_gate(request_id, seq);
+CREATE TABLE IF NOT EXISTS router_handoff (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, at TEXT NOT NULL, text TEXT NOT NULL,
+  project_id TEXT NOT NULL, project_title TEXT NOT NULL, pm_session_id TEXT NOT NULL,
+  instruction TEXT NOT NULL, rationale TEXT NOT NULL,
+  stage TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL, error TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS router_handoff_stage ON router_handoff(stage, seq);
 `
 
 /** The value of one column of a row, as a number. */
@@ -869,6 +919,100 @@ export class ConsoleStore {
   }
 
   /**
+   * Write one handoff of a request to a Project's PM.
+   *
+   * The request id is unique: a request reaches one PM only. The row is written before the work is sent, so a control
+   * plane that died in the middle leaves the fact behind instead of sending the same work to a PM a second time.
+   *
+   * A row that is already there is replaced when it is a refusal — a refusal sent nothing, so a decision that holds may
+   * follow it — and left alone otherwise, so a delivery is never rewritten.
+   */
+  addRouterHandoff(row: Omit<RouterHandoffRow, 'seq'>): RouterHandoffRow {
+    this.db.prepare('INSERT INTO router_handoff'
+      + ' (request_id, kind, at, text, project_id, project_title, pm_session_id, instruction, rationale,'
+      + ' stage, reason, detail, error)'
+      + ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      + ' ON CONFLICT(request_id) DO UPDATE SET kind = excluded.kind, at = excluded.at, text = excluded.text,'
+      + ' project_id = excluded.project_id, project_title = excluded.project_title,'
+      + ' pm_session_id = excluded.pm_session_id, instruction = excluded.instruction,'
+      + ' rationale = excluded.rationale, stage = excluded.stage, reason = excluded.reason,'
+      + ' detail = excluded.detail, error = excluded.error'
+      + ' WHERE router_handoff.stage = \'refused\'')
+      .run(row.requestId, row.kind, row.at, row.text, row.projectId, row.projectTitle, row.pmSessionId,
+        row.instruction, row.rationale, row.stage, row.reason, row.detail, row.error)
+    return this.routerHandoff(row.requestId)!
+  }
+
+  /** The row of one handoff, when the file still holds it. */
+  routerHandoff(requestId: string): RouterHandoffRow | undefined {
+    const row = this.db.prepare('SELECT seq, request_id, kind, at, text, project_id, project_title, pm_session_id,'
+      + ' instruction, rationale, stage, reason, detail, error FROM router_handoff WHERE request_id = ?')
+      .get(requestId)
+    return row === undefined ? undefined : this.routerHandoffRow(row)
+  }
+
+  /** The handoffs the file holds, newest first. */
+  routerHandoffs(options: { limit?: number; newest?: boolean } = {}): RouterHandoffRow[] {
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 50), 200))
+    const order = options.newest === true ? 'DESC' : 'ASC'
+    const rows = this.db.prepare('SELECT seq, request_id, kind, at, text, project_id, project_title, pm_session_id,'
+      + ' instruction, rationale, stage, reason, detail, error FROM router_handoff'
+      + ` ORDER BY seq ${order} LIMIT ?`).all(limit)
+    return rows.map(row => this.routerHandoffRow(row))
+  }
+
+  /**
+   * Write what became of one handoff.
+   *
+   * The words the person wrote and the target of the work stay as they were read; only the facts that move change, so a
+   * row that is read again still says the same thing.
+   */
+  updateRouterHandoff(requestId: string, patch: { stage?: string; reason?: string; detail?: string
+    pmSessionId?: string; error?: string }): void {
+    const current = this.routerHandoff(requestId)
+    if (!current) return
+    this.db.prepare('UPDATE router_handoff SET stage = ?, reason = ?, detail = ?, pm_session_id = ?, error = ?'
+      + ' WHERE request_id = ?')
+      .run(patch.stage ?? current.stage, patch.reason ?? current.reason, patch.detail ?? current.detail,
+        patch.pmSessionId ?? current.pmSessionId, patch.error ?? current.error, requestId)
+  }
+
+  /** One handoff, read back from its row. */
+  private routerHandoffRow(row: Record<string, unknown>): RouterHandoffRow {
+    return {
+      seq: numberOf(row.seq),
+      requestId: stringOf(row.request_id),
+      kind: stringOf(row.kind),
+      at: stringOf(row.at),
+      text: stringOf(row.text),
+      projectId: stringOf(row.project_id),
+      projectTitle: stringOf(row.project_title),
+      pmSessionId: stringOf(row.pm_session_id),
+      instruction: stringOf(row.instruction),
+      rationale: stringOf(row.rationale),
+      stage: stringOf(row.stage),
+      reason: stringOf(row.reason),
+      detail: stringOf(row.detail),
+      error: stringOf(row.error),
+    }
+  }
+
+  /**
+   * Drop the handoffs the file may no longer keep.
+   *
+   * A handoff that came to rest may go; one that is still on its way is a task and not history.
+   */
+  pruneRouterHandoffs(keep = 200): void {
+    const rows = this.db.prepare(
+      "SELECT seq FROM router_handoff WHERE stage IN ('queued','assigned','refused','failed','unconfirmed')"
+      + ' ORDER BY seq DESC').all()
+    const doomed = rows.slice(keep).map(row => numberOf(row.seq))
+    if (doomed.length === 0) return
+    const remove = this.db.prepare('DELETE FROM router_handoff WHERE seq = ?')
+    for (const seq of doomed) remove.run(seq)
+  }
+
+  /**
    * Drop what the log may no longer keep.
    *
    * The events are bounded twice: by their number and by their age. The audit is bounded by its age alone, and an age of
@@ -890,6 +1034,8 @@ export class ConsoleStore {
     this.pruneFastRoutes()
     // The decisions of the Project Gate are bounded the same way: one that came to rest long ago is history, not a task.
     this.pruneProjectGates()
+    // The handoffs to a Project's PM are bounded the same way: one that came to rest long ago is history, not a task.
+    this.pruneRouterHandoffs()
   }
 
   /** One value of the console's own settings. */

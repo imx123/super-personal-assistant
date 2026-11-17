@@ -4,14 +4,15 @@
 
 ## 1. 现在能做什么
 
-独立控制台已用真实 DSH 跑通两条链路。
+本地 `next` 已完成 P3-3B 的真实 DSH 验收，按指示暂停在 P3-Gate 之前。远端 `next` 已推到 P3-2（`3dfbf4a`）。独立控制台可以操作以下链路。
 
 - 在首页向 Router 派独立任务。控制面创建工单和派工，节点启动 Worker，Worker 把报告写回同一工单，Router 把结果带回首页。
 - Router 正在回答时可以继续提交，插话在当前回合结束后按顺序发送。会话页可独立停止或恢复 PM。停 PM 时项目与其他 Worker 可继续运行。
 - 快路由可派明确的独立任务、续接开放工单，也可向唯一匹配的项目 PM 交接。首页显示分派目标、当前状态和投递结果。见 [快路由](docs/019-phase3-fast-router.zh-CN.md)。
-- 从项目页或 Router 创建项目，由项目 PM 建单和派工。Worker 在项目工作区执行，报告可验收后由 PM 查看只读 Git diff，再通过验收或要求返工。项目报告可回到 Router。Router 自己提的转发提议仍要在控制台等你确认（这条默认行为在 P3-3 迁移）。
+- 属于已有项目的普通任务可以直接交给那个项目的 PM：在首页用自然语言提出即可，不需要说「转告 PM」，也不需要点确认。高层模型只决定是哪个项目和说什么，控制面按你的原话复核后自己投递；首页显示项目、PM 会话 ID 和真实接收状态。见 [高层自动交接](docs/021-phase3-router-handoff.zh-CN.md)。
+- 从项目页或 Router 创建项目，由项目 PM 建单和派工。Worker 在项目工作区执行，报告可验收后由 PM 查看只读 Git diff，再通过验收或要求返工。项目报告可回到 Router。四条件门禁自动建项目后，工作说明 会交给这个新项目的 PM，由它自行建单；Router 显式提出的转发提议仍要在控制台等你确认。
 
-控制台提供运行概览、近期动向、项目和会话管理、定时任务历史、节点状态与清理残留会话。项目页可选已有工作区，路径与项目一起保存，PM 和 Worker 共用该目录。首页支持 Markdown、文本附件和切换 Router 模型，也会显示最近一次请求的上下文用量。连接密钥在当前标签页刷新后可以继续使用。
+控制台提供运行概览、近期动向、项目和会话管理、定时任务历史、节点状态与清理残留会话。项目页可选已有工作区，路径与项目一起保存，PM 和 Worker 共用该目录，页面会提示并行改同一文件可能互相覆盖。首页支持 Markdown、文本附件和切换 Router 模型，也会显示最近一次请求的上下文用量。连接密钥在当前标签页刷新后可以继续使用。
 
 定时任务向已启动、可用的项目 PM 发送一条消息。控制台保存计划与发送结果，发送失败时在近期动向显示。调度间隔、自动清理间隔和令牌过期宽限可立即应用。监听参数、数据库路径、连接密钥和节点默认模型等部署配置保存后，在相应进程重启时应用。
 
@@ -48,7 +49,7 @@
 | 功能 | 当前范围 |
 | --- | --- |
 | 一个入口、工单所有权、PM 与 Worker 协作 | 单节点主流程已跑通。独立工单归 Router，项目工单归项目 PM，多次派工分别对应执行会话。 |
-| 双层路由与项目创建条件 | 确定性快路由和高层 Router 已接入。自动建项目经过四条件校验，首页显示判断依据与真实 PM 状态。高层向现有 PM 的常规自动交接待 P3-3B。 |
+| 双层路由与项目创建条件 | 确定性快路由和高层 Router 已接入。自动建项目经过四条件校验，首页显示判断依据与真实 PM 状态。属于已有项目的普通任务由高层 Router 直接交给该项目的 PM，服务端按本人原话复核，无需人工确认；门禁建项目后工作说明 交给新项目的 PM，由它自行建单。 |
 | 事件订阅和审批 | 定时唤醒和 Agent 主动上报已接通。独立控制面还缺邮件、日历、仓库事件订阅，以及自动拒绝累计到阈值后触发上级审查。 |
 | 多节点与其他运行时 | 当前只连接一个 DSH 节点。同节点恢复已经验证。节点选择、故障时改派其他节点、跨节点同步项目文件，以及 Claude/Codex 执行适配尚未实现。 |
 | 三域记忆 | 已能查实时状态、工单历史和项目备忘。长期记忆的候选、审核、索引、召回和维护还没做。控制台的事件日志受保留规则约束。 |
@@ -57,9 +58,13 @@
 
 节点的角色工具边界由许可列表和运行时守卫执行。`RoleProfile.deny` 尚未作为单独规则使用。给现有角色新增工具时，核对 `src/control/roles.ts` 和节点工具桥两处。
 
+工作区隔离只在 Git 层验证：19 项检查通过，覆盖两个派工写不同文件、写同一文件、linked worktree 合并冲突、失败目录保留和单派工 diff。真实 DSH 没有切换路径，生产继续用共享目录和现有审阅校验，候选方案与取舍见 [工作区实验与设计记录](docs/roadmap/PHASE3_WORKSPACE_SPIKE.md)。
+
 ## 5. 验证范围
 
-2026-11-17 对 `afa1001` 的定向回归通过 **47 个测试文件、483 项测试**，类型检查和构建通过。用 Edge 和隔离 FakeNode 复验了同文连续发送、节点拒收时保留草稿，以及硬暂停后显示停止失败的工单。这一轮没有重跑全量测试或真实模型。
+P3-3B 类型检查、构建通过，55 个定向文件共 737 项通过、1 项跳过。真实 DSH 通过两条新验收链路，包括已有项目免确认交接并完成工单，以及门禁自动创建一个项目后由 PM 派三个工单、Worker 写出三个文件、PM 完成三次验收，项目报告回到 Router 收件箱。证据见 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md)。
+
+本轮未重跑全量测试。此前的 Windows 全量验证仍有旧插件面板、tmux 脚本、飞书和权限相关失败。
 
 2026-11-16 的控制台验收通过 **39 个测试文件、378 项定向测试**和 **5 项打包测试**。真实模型用的是 Windows 上的 DSH Desktop `0.2.2.0`、隔离的 `phase5` profile、`dsh-superagent/node` 与 `opencode-go/deepseek-v4.1-flash`。本机证据在忽略目录 `.artifacts/`，新克隆可按部署文档和相关测试重新验证。
 
@@ -69,9 +74,11 @@
 | `.artifacts/claude-phase5-20261115/real-console-oYPqE5/router-standalone-evidence.json` | Router 派独立工单、Worker 回报回到首页，Router 创建项目并启动待命 PM。 |
 | `.artifacts/settings-20261116/project-workspace.json` | 浏览器指定已有工作区，真实 PM 和 Worker 使用同一路径，Worker 修改其中的样例文件。 |
 | `.artifacts/settings-20261116/sidebar-deployment.json` | 侧栏操作、刷新恢复，重启后新端口、密钥、日志保留、调度偏移与默认模型生效。 |
+| `.artifacts/phase3-workspace/spike-20261117-181345-f41104/checks.md` | P3-4 的 19 项 Git 层检查：并行写不同文件、写同一文件、合并冲突、失败目录保留与单派工 diff。 |
 
 ## 6. 文档入口
 
 - [节点协议](docs/009-node-protocol.zh-CN.md)与[控制面内核](docs/010-control-plane-kernel.zh-CN.md)记录命令、事件、工具及状态转换。
 - [模块与测试索引](docs/007-architecture.md)列出代码和测试位置。上游插件文档保留在 `docs/000` 至 `008`。
 - [阶段记录](docs/BASELINE.zh-CN.md)、[Phase 1B 盘点](docs/011-phase1b-inventory.zh-CN.md)、[Phase 2 计划](docs/012-phase2-plan.zh-CN.md)与[节点历史验收](docs/014-p2d2-recovery.zh-CN.md)保留当时的测试口径。旧插件的 [P2 验收](docs/P2_ACCEPTANCE.zh-CN.md)和 [P3 交接设计](docs/P3_HANDOFF.zh-CN.md)使用各自的阶段编号。
+- 阶段规范：[会话停止](docs/018-phase3-session-stop.zh-CN.md)、[快路由](docs/019-phase3-fast-router.zh-CN.md)、[四条件建项目](docs/020-phase3-project-gate.zh-CN.md)、[高层自动交接](docs/021-phase3-router-handoff.zh-CN.md)。路线与实验记录在 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md) 和 [工作区实验](docs/roadmap/PHASE3_WORKSPACE_SPIKE.md)。

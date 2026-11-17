@@ -19,10 +19,10 @@ import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
 import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectGateRow,
-  type ProjectMemoryRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
+  type ProjectMemoryRow, type RouterHandoffRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
-import { FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
+import { asksForAuthority, asksForIrreversible, FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
   type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
 import { evaluateProjectGate, explicitProjectRequest, namedProject,
@@ -31,7 +31,10 @@ import { evaluateProjectGate, explicitProjectRequest, namedProject,
 import { Reconciler, type ReconcileFinding, type ReconcileResult } from './reconcile.ts'
 import { reportCallKey, reportCallPrefix, reportPayloadHash, type ReportCallRecord } from './report-call.ts'
 import { fenceDiff, PM_REVIEW_DIFF_NOTE, type PmReviewDiff } from './review-diff.ts'
-import { RouterRequests, routerAutoInstructionMessage, routerInstructionMessage, routerRequestMessage, routerRequestOf,
+import { createOnlyRequest, evaluateRouterHandoff, mentionedProjects, readRouterHandoffDecision, RouterHandoffError,
+  type RouterHandoffDecision, type RouterHandoffProject, type RouterHandoffVerdict } from './router-handoff.ts'
+import { RouterRequests, routerAutoInstructionMessage, routerInstructionMessage, routerProjectBriefMessage,
+  routerRequestMessage, routerRequestOf,
   type RouterManagement, routerProjectReportMessage, type RouterProposal, type RouterRequest } from './router.ts'
 import { DEFAULT_TICK_MS, Scheduler, type ScheduleAuditEntry, type ScheduleDelivery, type ScheduleDeliveryResult, type ScheduleOverview,
   type SchedulePlan, type ScheduleRun } from './scheduler.ts'
@@ -225,6 +228,14 @@ const FAST_ROUTE_SHOWN = 50
 const PROJECT_GATE_SHOWN = 50
 
 /**
+ * How many handoffs to a Project's PM the console shows.
+ *
+ * They are the deliveries the high-level Router made on its own, so a person may see where their message went and what
+ * the PM really answered with it.
+ */
+const ROUTER_HANDOFF_SHOWN = 50
+
+/**
  * How many report calls one Session keeps in the ledger.
  *
  * The ledger is what makes a replayed call a replay, so it has to outlive a restart — but it is not a log of everything
@@ -358,6 +369,30 @@ function parseGateProject(value: string): { id: string; title: string } | undefi
 function unsureDecision(decision: FastRouteDecision): FastRouteDecision {
   return { ...decision, outcome: 'escalate', stage: 'escalated', reason: 'low_confidence',
     detail: `规则把握不够（${Math.round(decision.confidence * 100)}%），交给高层 Router。` }
+}
+
+/** The Project a raw handoff decision names, as far as it can be read at all. */
+function readProjectIdOf(input: unknown): string {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return ''
+  const value = (input as Record<string, unknown>).projectId
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/** The instruction a raw handoff decision carries, as far as it can be read at all. */
+function readInstructionOf(input: unknown): string {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return ''
+  const value = (input as Record<string, unknown>).instruction
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * The empty decision a handoff that could not be read is recorded with.
+ *
+ * A decision the control plane cannot read is still a fact about the request, and the record of it says what was asked
+ * for as far as it could be read. Nothing is sent.
+ */
+function decisionOfNothing(input: unknown): RouterHandoffDecision {
+  return { projectId: readProjectIdOf(input), instruction: readInstructionOf(input), rationale: '' }
 }
 
 /**
@@ -654,7 +689,24 @@ export interface RouterState {
    * person may ask later why their request did not become a Project.
    */
   gates?: ProjectGateRecord[]
+  /**
+   * The handoffs the high-level Router made to a Project's PM, oldest first.
+   *
+   * A record is the control plane's own account of one delivery: the Project it went to, the PM Session that took it, the
+   * words that really travelled and how far the delivery got. A refusal is a record as well, so a person may see why a
+   * request did not reach a PM.
+   */
+  handoffs?: RouterHandoffRecord[]
 }
+
+/**
+ * How far a handoff to a Project's PM got.
+ *
+ * The stages are the same ones the Fast Router uses, so the console reads them the same way: `assigned` means the node
+ * confirmed that the PM took the work, `unconfirmed` means nobody confirmed it and the control plane will not say it
+ * again, and `refused` means the decision was judged and nothing was sent.
+ */
+export type RouterHandoffStage = FastRouteStage | 'refused'
 
 /**
  * What became of one message a person sent to the Router.
@@ -815,6 +867,72 @@ export interface ProjectGateRecord {
   pmSessionId?: string
   /** The state of that PM Session, as the control plane knows it. */
   pmStatus?: string
+  /** Why it failed, when it failed. */
+  error?: string
+}
+
+/**
+ * What one handoff to a Project's PM became.
+ *
+ * The answer says plainly what happened: `delivered` names the Project, the PM Session that took the work and the words
+ * that really travelled; `refused` names the reason and sends nothing at all. A refusal is a real answer and not an
+ * error — the model may read it and ask the person the question it names.
+ */
+export interface RouterHandoffOutcome {
+  /** What became of the decision. */
+  outcome: 'delivered' | 'refused' | 'failed' | 'unconfirmed'
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The Project the work goes to, when the decision named one this control plane holds. */
+  project?: { id: string; title: string }
+  /** The PM of that Project: its Session and the state the control plane knows it by. */
+  pm?: { sessionId: string; status: string }
+  /** The words that really travelled, when they travelled. */
+  instruction?: string
+  /** The short reason the Router gave for choosing this Project. */
+  rationale?: string
+}
+
+/**
+ * One handoff to a Project's PM, as the console reads it.
+ *
+ * It names the human request the work came from, the Project it went to, the PM Session that received it, the words that
+ * really travelled and how far the delivery got. A refusal is a record too: it says that nothing was sent and why.
+ */
+export interface RouterHandoffRecord {
+  /** The Router request this handoff is; the message's own id. */
+  requestId: string
+  /**
+   * Which kind of handoff this is.
+   *
+   * `handoff` is the high-level Router's own decision to give a request to the PM of a Project that already existed.
+   * `brief` is the work brief the Project Gate published to the PM of the Project it just created.
+   */
+  kind: 'handoff' | 'brief'
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The Project the work goes to. */
+  projectId: string
+  /** The title of that Project, as the console shows it. */
+  projectTitle: string
+  /** The PM Session that received the work. */
+  pmSessionId: string
+  /** The live status of that PM Session, as the control plane knows it. */
+  pmStatus?: string
+  /** The words that really travelled to that PM. */
+  instruction: string
+  /** The short, checkable reason the Router gave. */
+  rationale: string
+  /** How far the handoff got. */
+  stage: RouterHandoffStage
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
   /** Why it failed, when it failed. */
   error?: string
 }
@@ -1357,6 +1475,13 @@ export class ControlPlane {
    */
   private readonly gateFlights = new Map<string, Promise<ProjectGateOutcome>>()
   /**
+   * The handoffs running right now, by request id: two calls for one request share one run.
+   *
+   * A request is one delivery, so the second call joins the first one instead of sending the same work to the same PM
+   * twice.
+   */
+  private readonly handoffFlights = new Map<string, Promise<RouterHandoffOutcome>>()
+  /**
    * The PM's own operation in flight for one Ticket, so a cancel and a re-dispatch never overlap.
    *
    * The two are ordered, not refused: a re-dispatch that arrives while a stop is running waits for the node's answer
@@ -1519,6 +1644,9 @@ export class ControlPlane {
       // The routings the Fast Router made are the same kind of record: one that was on its way when the process ended
       // is marked as unconfirmed, and it is never carried out again.
       this.reconcileFastRoutes()
+      // The handoffs of the high-level Router are the same kind of record: work that was on its way to a PM when the
+      // process ended may or may not have arrived, and it is never sent again.
+      this.reconcileRouterHandoffs()
       this.audit = new AuditRecorder(consoleDb, () => this.now(), error => {
         // An audit trail that cannot be written is a diagnostic, never a failed report: the work itself stays written.
         process.stderr.write(`superagent control-plane audit write failed: ${
@@ -3044,6 +3172,21 @@ export class ControlPlane {
     }
   }
 
+  /**
+   * Say honestly what a restart left behind the handoffs to a Project's PM.
+   *
+   * Work that was on its way when the process ended may or may not have reached the PM: the receipt is missing, not
+   * negative. It says exactly that, and it is never sent again — the person's request is not repeated to find out.
+   */
+  private reconcileRouterHandoffs(): void {
+    for (const row of this.consoleStore.routerHandoffs({ limit: 200, newest: true })) {
+      if (row.stage !== 'routing') continue
+      this.consoleStore.updateRouterHandoff(row.requestId, { stage: 'unconfirmed', reason: 'delivery_unconfirmed',
+        detail: '控制面在这份工作送达途中停了，无法确认它是否到达，不会再送一次。',
+        error: 'The control plane stopped while this work was on its way; it is not sent again' })
+    }
+  }
+
   /** One row of the Router's queue, as the console reads it. */
   private routerQueueEntry(row: RouterQueueRow): RouterQueueEntry {
     return { id: row.id, at: row.at, text: row.text, attachments: parseRouterAttachments(row.attachments).map(file => file.name),
@@ -3105,6 +3248,10 @@ export class ControlPlane {
     // exist when it let one through.
     const gates = this.projectGateRecords()
     if (gates.length > 0) base.gates = gates
+    // The handoffs the high-level Router made to a Project's PM: the target, the PM Session, the words that really
+    // travelled and how far the delivery got.
+    const handoffs = this.routerHandoffRecords()
+    if (handoffs.length > 0) base.handoffs = handoffs
     if (record === undefined) return base
     // The turn the Router runs right now and the node's own offer to end one: the console shows the interrupt only when
     // the backend confirms both.
@@ -3186,6 +3333,11 @@ export class ControlPlane {
       throw new ToolCallError('invalid', 'This request already carries one proposal; one request is one thing to confirm')
     }
     if (request.dispatchedTicket || request.management) throw new ToolCallError('invalid', 'This request already routed to another action')
+    // The two ways of reaching a PM do not cross: a request that was already given to a PM does not also wait for a
+    // proposal, and a request that waits for a proposal is not given to a PM behind the person's back.
+    if (request.handoff !== undefined || this.consoleStore.routerHandoff(requestId) !== undefined) {
+      throw new ToolCallError('invalid', 'This request already reached a Project PM; one request is one thing to do')
+    }
     if (request.createdProject !== undefined && request.createdProject.id !== projectId) {
       throw new ToolCallError('invalid', 'This request created another Project')
     }
@@ -3196,6 +3348,244 @@ export class ControlPlane {
       targetId: project.id, detail: `${project.title} · 待确认 · ${proposal.instruction.length} 字` })
     return { status: 'pending', proposalId: proposal.id, requestId, projectId: project.id, projectTitle: project.title,
       instruction: proposal.instruction }
+  }
+
+  /**
+   * The high-level Router's own handoff: give this request to the PM of one Project.
+   *
+   * The person asked for work that belongs to a Project, the model worked out which Project, and the control plane does
+   * the delivery itself — no proposal, no confirmation, no second click. What the model may decide is *which* Project and
+   * *what* to say; everything else is checked here against the person's own words: the request has to ask for work, the
+   * Project has to be the one the request names — or the one the request created — and the instruction has to be the
+   * person's own words.
+   *
+   * One request is one delivery. A repeated call for the same request finds the delivery that already happened and
+   * answers with it; a call for a request that went somewhere else is refused; and a call for a request nobody made any
+   * more is refused rather than carried out on a stale permission.
+   */
+  async routerPmHandoff(sessionId: string, requestId: string, input: unknown): Promise<RouterHandoffOutcome> {
+    this.requireToolSession(sessionId, 'router')
+    const running = this.handoffFlights.get(requestId)
+    if (running !== undefined) return running
+    let flight: Promise<RouterHandoffOutcome>
+    flight = this.runRouterHandoff(requestId, input).finally(() => {
+      if (this.handoffFlights.get(requestId) === flight) this.handoffFlights.delete(requestId)
+    })
+    this.handoffFlights.set(requestId, flight)
+    return flight
+  }
+
+  /**
+   * One handoff of one request.
+   *
+   * The request is looked up first: a request that is not in memory is unknown or too old, and the only thing that may
+   * answer for it is the durable record of a delivery that really ran — the receipt of that delivery, and nothing new.
+   */
+  private async runRouterHandoff(requestId: string, input: unknown): Promise<RouterHandoffOutcome> {
+    const request = this.routerRequests.get(requestId)
+    if (request === undefined) return this.replayHandoffOutcome(requestId)
+    // One request is one thing to do: a request that already became a Ticket, a management action or a proposal does
+    // not also reach a PM.
+    if (request.dispatchedTicket || request.management) {
+      throw new ToolCallError('invalid', 'This request already routed to another action')
+    }
+    if (request.proposal !== undefined) {
+      throw new ToolCallError('invalid', 'This request already carries a relay proposal; confirm it in the console')
+    }
+    // A delivery that already happened is the answer to a repeated call: the same work is never sent twice.
+    const recorded = this.consoleStore.routerHandoff(requestId)
+    if (recorded !== undefined) {
+      const same = recorded.projectId === readProjectIdOf(input) && recorded.instruction === readInstructionOf(input)
+      if (same) return this.handoffOutcomeOf(recorded)
+      // A refusal sent nothing, so a decision that holds may follow it; a delivery that was tried does not.
+      if (!this.handoffMayRetry(recorded)) {
+        throw new ToolCallError('invalid', 'This request already handed its work to a Project PM')
+      }
+    }
+    let decision: RouterHandoffDecision
+    try {
+      decision = readRouterHandoffDecision(input)
+    } catch (error) {
+      if (!(error instanceof RouterHandoffError)) throw error
+      return this.recordHandoffRefusal(request, error.reason, error.message, decisionOfNothing(input))
+    }
+    const verdict = evaluateRouterHandoff(decision, { text: request.text, projects: this.handoffProjects(),
+      ...(request.createdProject === undefined ? {} : { createdProjectId: request.createdProject.id }) })
+    if (!verdict.allowed) {
+      return this.recordHandoffRefusal(request, verdict.reason, verdict.detail, decision)
+    }
+    return this.deliverRouterHandoff(request, 'handoff', decision, verdict)
+  }
+
+  /**
+   * The receipt of a delivery that really ran, when the request itself is gone.
+   *
+   * A request that is not in memory is unknown or too old, and only a durable record may answer for it: the record of a
+   * delivery that was carried out is the receipt of that delivery, and it is answered without sending anything and
+   * without sending a command to the node. A delivery that was written down as "on its way" and never finished is
+   * answered as unconfirmed: the control plane cannot say whether it arrived, and it is never sent again.
+   */
+  private replayHandoffOutcome(requestId: string): RouterHandoffOutcome {
+    const row = this.consoleStore.routerHandoff(requestId)
+    if (row === undefined) throw new ToolCallError('invalid', 'This request is unknown or is too old')
+    if (row.stage !== 'routing' && row.stage !== 'accepted') return this.handoffOutcomeOf(row)
+    this.consoleStore.updateRouterHandoff(requestId, { stage: 'unconfirmed', reason: 'delivery_unconfirmed',
+      detail: '上一次交接在送达途中停了，控制面无法确认工作是否到达，不会再送一次。' })
+    return this.handoffOutcomeOf(this.consoleStore.routerHandoff(requestId)!)
+  }
+
+  /**
+   * Deliver the work to the PM of the Project, once.
+   *
+   * The Project is checked again here, at the moment of the delivery: it must exist, still be active and still have the
+   * PM Session that belongs to it. A paused, ended or archived Project, a revoked PM and a PM an operator stopped all
+   * refuse the work, so a routine handoff never walks around a pause, a stop or a withdrawal of authority.
+   *
+   * The record is written before anything is sent, so a control plane that died in the middle leaves the fact behind
+   * instead of sending the same work twice. The delivery carries a stable key, so the node itself executes it at most
+   * once.
+   */
+  private async deliverRouterHandoff(request: RouterRequest, kind: 'handoff' | 'brief', decision: RouterHandoffDecision,
+    verdict: RouterHandoffVerdict): Promise<RouterHandoffOutcome> {
+    // A delivery that already happened is the answer: one request reaches one PM, and the same work is never sent twice.
+    const already = this.consoleStore.routerHandoff(request.id)
+    if (already !== undefined && !this.handoffMayRetry(already)) return this.handoffOutcomeOf(already)
+    const projectId = verdict.project?.id ?? decision.projectId
+    const project = this.store.projects.get(projectId)
+    if (!project) return this.recordHandoffFailure(request, kind, decision, 'unknown_project',
+      `这个控制面里没有项目 ${projectId}。`)
+    if (project.status !== 'active') {
+      return this.recordHandoffFailure(request, kind, decision, 'project_unavailable',
+        `项目「${project.title}」现在是 ${project.status}，没有可以接收工作的 PM。`)
+    }
+    const pm = this.sessions.get(project.pmSessionId)
+    if (!pm) {
+      return this.recordHandoffFailure(request, kind, decision, 'pm_unavailable',
+        `项目「${project.title}」没有 PM 会话。`)
+    }
+    if (pm.revokedAt) {
+      return this.recordHandoffFailure(request, kind, decision, 'pm_revoked',
+        `项目「${project.title}」的 PM 会话已被撤权。`)
+    }
+    const stopped = this.operatorStopRefusal(pm)
+    if (stopped !== undefined) {
+      return this.recordHandoffFailure(request, kind, decision, 'pm_stopped',
+        `项目「${project.title}」的 PM 会话没有在运行：${stopped}`)
+    }
+    const instruction = verdict.instruction ?? decision.instruction
+    this.consoleStore.addRouterHandoff({ requestId: request.id, kind, at: this.now(), text: request.text,
+      projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction,
+      rationale: decision.rationale, stage: 'routing', reason: verdict.reason, detail: verdict.detail, error: '' })
+    request.handoff = { projectId: project.id, instruction }
+    const message = kind === 'brief'
+      ? routerProjectBriefMessage(request.id, instruction, project.title)
+      : routerAutoInstructionMessage(request.id, instruction, project.title, 'work')
+    try {
+      // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once.
+      await this.sendMessage(project.pmSessionId, message, undefined, 'system',
+        { idempotencyKey: `router-${kind}:${request.id}` })
+    } catch (error) {
+      const reason = redact(messageOf(error)).slice(0, 300)
+      // A missing receipt is not a refusal: the work may have arrived, so it is neither "failed" nor to be repeated.
+      const stage: RouterHandoffStage = error instanceof NodeUnconfirmedError ? 'unconfirmed' : 'failed'
+      this.consoleStore.updateRouterHandoff(request.id, { stage, reason: stage === 'unconfirmed' ? 'delivery_unconfirmed'
+        : 'delivery_failed', detail: stage === 'unconfirmed' ? '节点没有确认工作是否送达，不会再送一次。'
+        : '工作没有送到这个项目的 PM。', error: reason })
+      this.audit.record({ actor: 'router', kind: 'session', action: 'routed', targetKind: 'project',
+        targetId: project.id, outcome: 'failed', detail: `${project.title} · ${reason}` })
+      return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
+    }
+    this.consoleStore.updateRouterHandoff(request.id, { stage: 'assigned', reason: verdict.reason, detail: verdict.detail,
+      error: '' })
+    this.audit.record({ actor: 'router', kind: 'session', action: 'routed', targetKind: 'project',
+      targetId: project.id, detail: `${project.title} · ${instruction.length} 字` })
+    return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
+  }
+
+  /**
+   * Write down that a handoff was refused, and answer with the refusal.
+   *
+   * Nothing is sent: the refusal is a record and an answer, and the Project, its PM and its Tickets stay as they were.
+   */
+  private recordHandoffRefusal(request: RouterRequest, reason: string, detail: string,
+    decision: RouterHandoffDecision): RouterHandoffOutcome {
+    const project = this.store.projects.get(decision.projectId)
+    this.consoleStore.addRouterHandoff({ requestId: request.id, kind: 'handoff', at: this.now(), text: request.text,
+      projectId: decision.projectId, projectTitle: project?.title ?? '', pmSessionId: project?.pmSessionId ?? '',
+      instruction: decision.instruction, rationale: decision.rationale, stage: 'refused', reason, detail, error: '' })
+    this.audit.record({ actor: 'router', kind: 'session', action: 'routed', targetKind: 'project',
+      targetId: decision.projectId, outcome: 'skipped', detail })
+    return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
+  }
+
+  /**
+   * Write down that a handoff could not be delivered, and answer with the reason.
+   *
+   * The Project was there and the decision held, but the target was not able to take the work: a paused Project, a PM
+   * without a Session, a PM whose authority was withdrawn or a PM an operator stopped. Nothing is sent and nothing is
+   * brought back: the work waits for the person.
+   */
+  private recordHandoffFailure(request: RouterRequest, kind: 'handoff' | 'brief', decision: RouterHandoffDecision,
+    reason: string, detail: string): RouterHandoffOutcome {
+    const project = this.store.projects.get(decision.projectId)
+    this.consoleStore.addRouterHandoff({ requestId: request.id, kind, at: this.now(), text: request.text,
+      projectId: decision.projectId, projectTitle: project?.title ?? '', pmSessionId: project?.pmSessionId ?? '',
+      instruction: decision.instruction, rationale: decision.rationale, stage: 'failed', reason, detail, error: '' })
+    this.audit.record({ actor: 'router', kind: 'session', action: 'routed', targetKind: 'project',
+      targetId: decision.projectId, outcome: 'failed', detail })
+    return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
+  }
+
+  /**
+   * Whether a recorded handoff may still be decided again.
+   *
+   * A refusal sent nothing, so a decision that holds may follow it — the Router is told what was wrong and may correct
+   * it. A delivery that was tried is a different matter: the work may have reached the PM, and it is never sent again.
+   */
+  private handoffMayRetry(row: RouterHandoffRow): boolean {
+    return row.kind === 'handoff' && row.stage === 'refused'
+  }
+
+  /**
+   * The Projects the handoff reads, as it reads them.
+   *
+   * The handoff may only be told about the Projects this control plane really holds, so it can never name one that does
+   * not exist.
+   */
+  private handoffProjects(): RouterHandoffProject[] {
+    return this.projects().map(project => ({ id: project.id, title: project.title, status: project.status }))
+  }
+
+  /** One handoff, as the console reads it. */
+  private routerHandoffRecord(row: RouterHandoffRow): RouterHandoffRecord {
+    const session = row.pmSessionId === '' ? undefined : this.sessions.get(row.pmSessionId)
+    return { requestId: row.requestId, kind: row.kind === 'brief' ? 'brief' : 'handoff', at: row.at, text: row.text,
+      projectId: row.projectId, projectTitle: row.projectTitle, pmSessionId: row.pmSessionId,
+      ...(session === undefined ? {} : { pmStatus: session.status }), instruction: row.instruction,
+      rationale: row.rationale, stage: row.stage as RouterHandoffStage, reason: row.reason, detail: row.detail,
+      ...(row.error === '' ? {} : { error: row.error }) }
+  }
+
+  /** The handoffs the console shows: what became of the work the high-level Router gave to a Project's PM. */
+  routerHandoffRecords(limit = ROUTER_HANDOFF_SHOWN): RouterHandoffRecord[] {
+    return this.consoleStore.routerHandoffs({ limit, newest: true }).reverse().map(row => this.routerHandoffRecord(row))
+  }
+
+  /** The answer one recorded handoff gives. */
+  private handoffOutcomeOf(row: RouterHandoffRow): RouterHandoffOutcome {
+    const record = this.routerHandoffRecord(row)
+    const project = row.projectId === '' ? undefined : { id: row.projectId, title: row.projectTitle }
+    const pm = row.pmSessionId === '' ? undefined : { sessionId: row.pmSessionId, status: record.pmStatus ?? 'unknown' }
+    const delivered = row.stage === 'assigned'
+    return {
+      outcome: delivered ? 'delivered' : row.stage === 'refused' ? 'refused'
+        : row.stage === 'unconfirmed' ? 'unconfirmed' : 'failed',
+      reason: row.reason, detail: row.detail,
+      ...(project === undefined ? {} : { project }),
+      ...(pm === undefined ? {} : { pm }),
+      ...(row.instruction === '' ? {} : { instruction: row.instruction }),
+      ...(row.rationale === '' ? {} : { rationale: row.rationale }),
+    }
   }
 
   /**
@@ -3221,6 +3611,7 @@ export class ControlPlane {
     if (!request) throw new ToolCallError('invalid', 'This request is unknown or is too old')
     if (request.dispatchedTicket || request.management) throw new ToolCallError('invalid', 'This request already routed to another action')
     if (request.createdProject === undefined) {
+      if (request.handoff !== undefined) throw new ToolCallError('invalid', 'This request already handed its work to a Project PM')
       if (request.proposal !== undefined) throw new ToolCallError('invalid', 'This request already carries a relay proposal')
       if (!explicitProjectRequest(request.text)) {
         throw new ToolCallError('invalid', 'This request does not ask for a Project. Use control_router_project_gate with the '
@@ -3290,6 +3681,9 @@ export class ControlPlane {
     // One request is one Project: a decision that already made one is answered with that Project.
     const created = this.consoleStore.createdProjectGate(request.id)
     if (created !== undefined) return this.projectGateOutcomeOf(created)
+    if (request.handoff !== undefined) {
+      throw new ToolCallError('invalid', 'This request already handed its work to a Project PM')
+    }
     // A request that created a Project by the person's own words does not get a second one through the gate.
     if (request.createdProject !== undefined) {
       throw new ToolCallError('invalid', 'This request already created a Project')
@@ -3346,12 +3740,65 @@ export class ControlPlane {
     }
     this.consoleStore.updateProjectGate(request.id, attempt, { outcome: 'created', pmStatus,
       ...(pmError === '' ? {} : { error: pmError }) })
+    // The work brief: the request's own words, to the PM of the Project this request just created, and to nobody else.
+    // The Router does not create Tickets for this Project — the brief asks its PM to do that itself.
+    await this.publishProjectBrief(request, project, pmStatus === 'unconfirmed')
     this.audit.record({ actor: 'router', kind: 'project', action: 'gate-created', targetKind: 'project',
       targetId: project.id, outcome: pmStatus === 'unconfirmed' ? 'failed' : 'ok',
       detail: `${project.title} · 四项条件均成立` })
     return { outcome: 'created', reason: verdict.reason, detail: verdict.detail,
       project: { id: project.id, title: project.title, goal: project.goal }, pm,
       conditions: verdict.conditions, modules: verdict.modules }
+  }
+
+  /**
+   * Publish the work brief of a Project the gate just created.
+   *
+   * The brief is the same request that passed the gate, including the work and its constraints. It goes to that PM and to
+   * nobody else: no earlier messages, no files, no other Project. The Router creates no Ticket for it; the PM reads the
+   * brief and decides what this Project needs.
+   *
+   * A person who asked for the Project to be created and to wait keeps the PM idle: the brief is not published, and the
+   * record says why. A Project whose PM did not come up gets no brief either, and the record says that too.
+   */
+  private async publishProjectBrief(request: RouterRequest, project: ProjectProfile, pmUnconfirmed: boolean): Promise<void> {
+    const brief = request.text
+    if (createOnlyRequest(request.text)) {
+      this.consoleStore.addRouterHandoff({ requestId: request.id, kind: 'brief', at: this.now(), text: request.text,
+        projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction: brief,
+        rationale: '本人明确只要创建项目并待命。', stage: 'refused', reason: 'create_only_request',
+        detail: '本人明确只要创建项目并待命，没有派发工作 brief，PM 保持空闲。', error: '' })
+      return
+    }
+    if (pmUnconfirmed) {
+      this.consoleStore.addRouterHandoff({ requestId: request.id, kind: 'brief', at: this.now(), text: request.text,
+        projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction: brief,
+        rationale: '门禁放行后创建的项目，工作 brief 交给它自己的 PM。', stage: 'failed', reason: 'pm_unavailable',
+        detail: '这个项目的 PM 没有确认启动，工作 brief 没有送出。', error: '' })
+      return
+    }
+    // The brief is for this Project alone: it may not carry the name of another Project of this control plane.
+    const others = mentionedProjects(brief, this.handoffProjects()).filter(item => item.id !== project.id)
+    if (others.length > 0) {
+      this.consoleStore.addRouterHandoff({ requestId: request.id, kind: 'brief', at: this.now(), text: request.text,
+        projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction: brief,
+        rationale: '门禁放行后创建的项目，工作 brief 交给它自己的 PM。', stage: 'refused', reason: 'cross_project',
+        detail: `工作 brief 说到别的项目「${others[0]!.title}」，没有送出。`, error: '' })
+      return
+    }
+    if (asksForIrreversible(brief) || asksForAuthority(brief)) {
+      this.consoleStore.addRouterHandoff({ requestId: request.id, kind: 'brief', at: this.now(), text: request.text,
+        projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction: brief,
+        rationale: '', stage: 'refused', reason: 'scope_requires_review',
+        detail: '这项工作涉及新的授权或不可逆操作，未自动交给项目 PM。', error: '' })
+      return
+    }
+    const decision: RouterHandoffDecision = { projectId: project.id, instruction: brief,
+      rationale: '门禁放行后创建的项目，工作 brief 交给它自己的 PM。' }
+    const verdict: RouterHandoffVerdict = { allowed: true, reason: 'allowed',
+      detail: '门禁放行后创建的项目，工作 brief 交给它自己的 PM。',
+      project: { id: project.id, title: project.title }, instruction: brief }
+    await this.deliverRouterHandoff(request, 'brief', decision, verdict)
   }
 
   /**
@@ -3472,7 +3919,7 @@ export class ControlPlane {
     this.requireToolSession(sessionId, 'router')
     const request = this.routerRequests.get(requestId)
     if (!request) throw new ToolCallError('invalid', 'This request is unknown or is too old')
-    if (request.createdProject || request.proposal || request.management) {
+    if (request.createdProject || request.proposal || request.management || request.handoff) {
       throw new ToolCallError('invalid', 'This request already routed to another action')
     }
     const dispatched = request.dispatchedTicket
@@ -3549,7 +3996,7 @@ export class ControlPlane {
     this.requireToolSession(sessionId, 'router')
     const request = this.routerRequests.get(requestId)
     if (!request) throw new ToolCallError('invalid', 'This request is unknown or is too old')
-    if (request.createdProject || request.proposal || request.dispatchedTicket) {
+    if (request.createdProject || request.proposal || request.dispatchedTicket || request.handoff) {
       throw new ToolCallError('invalid', 'This request already routed to another action')
     }
     const fingerprint = JSON.stringify([action, targetId, text])

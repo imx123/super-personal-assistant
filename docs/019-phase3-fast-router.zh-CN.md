@@ -31,7 +31,7 @@ P3-2 在 Router 的消息队列内处理目标和动作都明确的请求。命�
 
 `router_queue` 与 `fast_route` 在控制面的控制台数据库内。接受请求及领取快路由动作时，两张表的状态成对写入。同一请求 ID 的重复提交在记录保留期间返回已有结果，正文、附件或模型不同则返回 409。投递拒绝或缺回执时，控制面记录结果并推进下一条。重启时，执行中的动作记为未确认，避免重复创建或投递。
 
-独立工单的创建、Worker 启动及现有工单续接沿用 Engine 和 NodeExecutor。快路由不涉及自动创建 Project。旧 Router 转发提议仍可确认，常规高层自动交接和四条件建项目规则由 P3-3 处理。
+独立工单的创建、Worker 启动及现有工单续接沿用 Engine 和 NodeExecutor。快路由不涉及自动创建 Project。旧 Router 转发提议仍可确认；常规高层自动交接与四条件建项目规则属于 P3-3，文档见 `docs/021-phase3-router-handoff.zh-CN.md` 与 `docs/020-phase3-project-gate.zh-CN.md`。
 
 ## 验收
 

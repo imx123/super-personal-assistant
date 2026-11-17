@@ -1115,6 +1115,17 @@ export class ControlPlaneServer {
       return json(res, 200, result)
     }
 
+    // The high-level Router's own handoff: give this request to the PM of one Project.
+    // The decision is read and judged by the control plane: the request has to ask for work, the Project has to be the
+    // one the request names, and the instruction has to be the person's own words. A request may reach one PM only.
+    if (method === 'POST' && url.pathname === '/v1/tools/router/pm-handoff') {
+      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      const body = await readJson(req)
+      const requestId = text(body.requestId)
+      const result = await this.control.routerPmHandoff(claims.sid, requestId, body.decision)
+      return json(res, 200, result)
+    }
+
     if (method === 'POST' && url.pathname === '/v1/tools/worker/report') {
       if (claims.role !== 'worker') throw new ToolCallError('forbidden', 'A Worker Session token is required')
       const body = await readJson(req)

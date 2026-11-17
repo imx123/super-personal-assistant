@@ -699,7 +699,13 @@ function controlNote(role: 'pm' | 'worker' | 'router', ids: { ticketId?: string;
       + 'and its PM status from the result. When the current message does not ask for a Project but the work really is '
       + 'several independent modules that can be worked at the same time, use control_router_project_gate with the current '
       + 'request id and the four conditions; it creates nothing unless all four hold, and it tells you which one failed. '
-      + 'When the person explicitly asks you to tell a Project\'s PM something, '
+      + 'When the current message asks for work that belongs to a Project that already exists, use control_router_pm_handoff '
+      + 'with the request id that message carries, the id of the Project, the instruction and a short reason. Copy the '
+      + 'instruction from the person\'s own words: the control plane compares it with their request and refuses anything '
+      + 'that is not their words, a request that names no Project and one that names two. The control plane delivers the '
+      + 'work to that Project\'s PM itself — nobody confirms it — and the answer says what happened, so report that and '
+      + 'not that you have done the work. '
+      + 'When the person explicitly asks you to tell a Project\'s PM something and wants it confirmed first, '
       + 'call control_router_pm_proposal once with the request id that message carries, the id of the Project and the '
       + 'instruction itself, in the person\'s own words. The control plane refuses a request id it does not know, one that '
       + 'already carries a proposal and one that is too old, so never invent one and never reuse one. The call proposes '
@@ -821,7 +827,7 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
-    routerProjectGateTool(options), routerManageTool(options), routerPmProposalTool(options),
+    routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
   ]
   return [reportTool(options)]
 }
@@ -1255,6 +1261,59 @@ function routerManageTool(options: ControlToolOptions): ToolDefinition {
         action: requiredString(input.action, 'action'),
         targetId: requiredString(input.targetId, 'targetId'),
         ...(input.text === undefined ? {} : { text: requiredString(input.text, 'text') }),
+      }, exec.signal)
+    },
+  }
+}
+
+/**
+ * `control_router_pm_handoff`: the high-level Router's own delivery to the PM of an existing Project.
+ *
+ * The Router decides which Project a request belongs to and says what should be said; the control plane checks the
+ * decision against the person's own words and does the delivery itself. Nothing waits for a confirmation: the person
+ * asked for the work, and the Project's PM is the one that owns it.
+ *
+ * The instruction has to be the person's own words, copied from their request. The control plane compares it with the
+ * request, so a rewritten instruction, a sentence out of the conversation history and anything out of an attached file
+ * are all refused — and so is a request that names no Project or names two.
+ */
+function routerPmHandoffTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_router_pm_handoff',
+    description: 'Give this request to the PM of a Project that already exists. The person asked for work that belongs '
+      + 'to that Project: name the request id their message carried, the id of the Project, the instruction in their own '
+      + 'words and a short reason for choosing that Project. The instruction must be copied from their request — do not '
+      + 'rewrite it and do not add anything they did not write; the control plane checks it against the request and '
+      + 'refuses anything that is not their words. Resolve the Project id with control_router_summary, and ask the person '
+      + 'which Project they mean when their request does not name one. The control plane delivers the work to that '
+      + 'Project\'s PM itself: nobody confirms it, and the answer says what happened.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['requestId', 'decision'],
+      properties: {
+        requestId: { type: 'string', description: 'The request id the person\'s message carried.' },
+        decision: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['projectId', 'instruction', 'rationale'],
+          description: 'The work to hand over: the Project it belongs to, the words to deliver and the reason.',
+          properties: {
+            projectId: { type: 'string', description: 'The id of the Project whose PM is to receive the work.' },
+            instruction: { type: 'string', maxLength: 2000,
+              description: 'The work, in the person\'s own words, copied from their request.' },
+            rationale: { type: 'string', maxLength: 600,
+              description: 'The short reason this Project is the one the request is about.' },
+          },
+        },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      return requestControl(options, 'POST', '/v1/tools/router/pm-handoff', {
+        requestId: requiredString(input.requestId, 'requestId'),
+        decision: input.decision,
       }, exec.signal)
     },
   }

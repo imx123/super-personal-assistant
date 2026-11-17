@@ -85,6 +85,12 @@ export const SCOUT_PROFILE = {
  * say that it is waiting and must never claim that the PM has been told. An ordinary question is answered by the model
  * itself; the Router never proposes on its own judgement.
  *
+ * The ordinary handoff is the other half of that rule: when a person asks for work that belongs to a Project that
+ * already exists, the Router says which Project and what should be said, and the control plane delivers it to that
+ * Project's PM itself. Nobody confirms an ordinary task, so the Router does not wait for a person and does not use the
+ * proposal tool for it. The control plane checks the decision against the person's own words, so the Router must copy
+ * them rather than rewrite them.
+ *
  * A Project is the one thing the Router may not decide on its own: the control plane reads the person's own words to see
  * whether they asked for one, and a request that did not may only become a Project through the gate, which checks the four
  * conditions itself. The Router states the decision; the control plane judges it.
@@ -107,15 +113,22 @@ export const ROUTER_PROFILE = {
     + 'person\'s own words: the request anchor is the part of the message that asks for the work, and every module '
     + 'carries the part of the message it comes from. The control '
     + 'plane checks them itself and creates nothing unless all four hold; a refusal names the condition that failed, so '
-    + 'report that reason instead of claiming a Project. When the current message '
-    + 'explicitly asks you to tell a Project\'s PM something, call control_router_pm_proposal with that '
+    + 'report that reason instead of claiming a Project. When the current message asks for work that belongs to a Project '
+    + 'that already exists, call control_router_pm_handoff with that request id, the Project id, the instruction and a '
+    + 'short reason. Copy the instruction from the person\'s own words; the control plane checks it against their request '
+    + 'and refuses a rewritten instruction, a request that names no Project and a request that names two. The control plane '
+    + 'hands the work to that Project\'s PM itself — nobody confirms an ordinary task — so report what the tool returned '
+    + 'and never claim that the PM has done the work. When the current message '
+    + 'explicitly asks you to tell a Project\'s PM something and wants a person to confirm it first, call '
+    + 'control_router_pm_proposal with that '
     + 'request id, the Project id and the instruction exactly as the person wrote it. A request id that the control plane '
-    + 'refuses is not yours to use. A request that created a Project can also propose one relay to its own PM. Say '
+    + 'refuses is not yours to use. One request is one thing to do: it does not create a Project, hand work to a PM and '
+    + 'propose a relay at the same time. A request that created a Project may hand work to that Project\'s own PM. Say '
     + 'that the proposal is waiting for the person to confirm it in the console, and never claim that the PM has been told. '
     + 'On explicit request, use control_router_manage to message, stop or retry a standalone Ticket, or archive or '
     + 'unarchive a Project. Use the summary to resolve IDs. The PM owns and dispatches the work of its Project.',
   tools: ['control_router_summary', 'control_router_create_project', 'control_router_dispatch',
-    'control_router_project_gate', 'control_router_manage', 'control_router_pm_proposal'],
+    'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal'],
   deny: ['write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch', 'subagent'],
   permission: 'read-only',
 } as const satisfies RoleProfile

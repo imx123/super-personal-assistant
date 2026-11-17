@@ -13,8 +13,8 @@ import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type FastRouteReceipt,
   type NodeView, type Overview, type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun,
-  type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
-  type SessionView, type StopNotice,
+  type RouterHandoffRecord, type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan,
+  type ScheduleRun, type SessionMessage, type SessionView, type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -246,6 +246,28 @@ const GATE_OUTCOME: Record<string, string> = {
   refused: '未建项目',
   failed: '建项目失败',
   creating: '正在建项目',
+}
+
+/**
+ * Which kind of handoff it was, as the console's own words.
+ *
+ * The two are told apart because they mean different things: one is the Router's own decision about work that belonged
+ * to a Project, and the other is the brief of a Project the Router just created.
+ */
+const HANDOFF_OUTCOME: Record<string, string> = {
+  handoff: '交给项目 PM',
+  brief: '新项目工作说明',
+}
+
+/** How far a handoff got, as the console's own words. */
+const HANDOFF_STAGE: Record<string, string> = {
+  accepted: '已认领，待处理',
+  routing: '正在投递',
+  queued: '待送达',
+  assigned: 'PM 已确认接收',
+  refused: '未投递',
+  failed: '投递失败',
+  unconfirmed: '未确认送达',
 }
 
 /** The four conditions of the Project Gate, as the console's own words. */
@@ -546,6 +568,40 @@ function RouterRoutes(props: { receipts: FastRouteReceipt[]; id: string }): Reac
 }
 
 /**
+ * The handoffs the high-level Router made to a Project's PM, as the console shows them.
+ *
+ * Each line names the request, the Project the work went to and the PM Session that took it, with the words that
+ * really travelled beside the reason the Router gave. The stage says how far the delivery got: a PM that confirmed it
+ * reads as confirmed, a delivery the node did not acknowledge reads as unconfirmed, and a decision the control plane
+ * refused reads as a refusal with the reason — so a person can see that nothing was sent and why.
+ */
+function RouterHandoffs(props: { records: RouterHandoffRecord[]; id: string }): ReactElement {
+  return (
+    <div className="router-queue" id={props.id} aria-label="高层 Router 交给项目 PM 的工作">
+      <p className="quiet">高层 Router 交给项目 PM 的工作（无需人工确认）</p>
+      <ul className="router-queue-list">
+        {props.records.map(record => (
+          <li key={record.requestId} className={record.stage === 'failed' || record.stage === 'refused' ? 'failure' : ''}>
+            <span className="router-queue-text">{record.text}</span>
+            <span className={`chip ${record.stage === 'assigned' ? 'success' : record.stage === 'failed' || record.stage === 'refused' ? 'failure' : 'muted'}`}>
+              {HANDOFF_OUTCOME[record.kind] ?? record.kind}
+            </span>
+            <span className="quiet"> · {HANDOFF_STAGE[record.stage] ?? record.stage}</span>
+            {record.projectTitle || record.projectId ? <span className="quiet"> · 项目 {record.projectTitle || record.projectId}</span> : null}
+            {record.pmSessionId ? <span className="quiet"> · PM 会话 {record.pmSessionId}{record.pmStatus ? `（${SESSION_STATUS[record.pmStatus] ?? record.pmStatus}）` : ''}</span> : null}
+            {record.instruction ? <span className="quiet"> · {record.stage === 'assigned' ? '送达内容' : '拟交内容'}：{record.instruction}</span> : null}
+            {record.rationale ? <span className="quiet"> · 依据：{record.rationale}</span> : null}
+            {record.stage === 'refused' || record.stage === 'failed' || record.stage === 'unconfirmed'
+              ? <span className="quiet"> · {record.detail}</span> : null}
+            {record.error ? <span className="quiet"> · {record.error}</span> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+/**
  * The decisions of the Project Gate, as the console shows them.
  *
  * Each line names the four conditions and what was decided about each of them, the reason the gate gave, and — when a
@@ -619,9 +675,8 @@ const REVIEW_STATE: Record<string, string> = {
  * answer is laid out as Markdown on the left, and the composer stays where it can be reached. A person reading the
  * history keeps the place they were at: the thread follows the newest answer only while they are at its end.
  *
- * The Router never sends anything to a Project on its own. When it proposes to tell a Project's PM something, the
- * proposal waits here, with the text that would really be sent, until the person confirms or cancels it. The page holds
- * no authority of its own: both buttons are the console's own routes, which need the console key.
+ * The control plane sends routine work to a Project's PM and the page shows the delivery receipt. Explicit relay
+ * proposals wait for the person to confirm or cancel them in the console.
  */
 export function HomePage(props: PageProps): ReactElement {
   const [preferences] = useState(readPreferences)
@@ -642,6 +697,7 @@ export function HomePage(props: PageProps): ReactElement {
   const queue: RouterQueueEntry[] = router.data?.queue ?? []
   const routes: FastRouteReceipt[] = router.data?.routes ?? []
   const gates: ProjectGateRecord[] = router.data?.gates ?? []
+  const handoffs: RouterHandoffRecord[] = router.data?.handoffs ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -800,6 +856,7 @@ export function HomePage(props: PageProps): ReactElement {
             </div>
           ) : null}
           {routes.length ? <RouterRoutes receipts={routes} id="router-routes" /> : null}
+          {handoffs.length ? <RouterHandoffs records={handoffs} id="router-handoffs" /> : null}
           {gates.length ? <ProjectGates records={gates} id="router-gates" /> : null}
           {queue.length ? <RouterQueue entries={queue} id="router-queue" /> : null}
           <form className="composer" onSubmit={event => { event.preventDefault(); send(false) }}>
