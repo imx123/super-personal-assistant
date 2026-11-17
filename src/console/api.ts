@@ -227,10 +227,18 @@ export interface FastRouteReceipt {
   at: string
   /** The person's own words. */
   text: string
+  /**
+   * Which way the message went.
+   *
+   * `fast` is a message the rules carried out themselves, without a model turn. `model` is a message the Router's own
+   * model handles in the very same `router.v1` Session — an ordinary conversation, or a request the rules were not sure
+   * about. The console shows the two apart, because they cost different things.
+   */
+  path: 'fast' | 'model'
   /** What the rule decided. */
   outcome: 'existing_ticket' | 'existing_project_pm' | 'standalone_ticket' | 'read_only' | 'escalate' | 'ordinary_reply'
   /** How far the message got. */
-  stage: 'accepted' | 'routing' | 'queued' | 'assigned' | 'escalated' | 'failed' | 'unconfirmed'
+  stage: 'accepted' | 'routing' | 'queued' | 'assigned' | 'escalated' | 'model' | 'failed' | 'unconfirmed'
   /** How sure the rule was, between 0 and 1. */
   confidence: number
   /** The stable code of the reason. */
@@ -254,6 +262,49 @@ export interface FastRouteReceipt {
    * own word about what is true right now.
    */
   answer?: string
+}
+
+/**
+ * One decision of the Project Gate, as the console reads it.
+ *
+ * The four findings are what the decision said about each condition, and the modules are what it said the work is made
+ * of. Both are shown, because the reason the gate gave is only checkable against them.
+ */
+export interface ProjectGateRecord {
+  /** The Router request this decision was made for. */
+  requestId: string
+  /** Which try of that request this is. */
+  attempt: number
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The title the decision would have given the Project. */
+  title: string
+  /** The goal the decision would have given the Project. */
+  goal: string
+  /** What became of it: `created`, `refused` or `failed`. */
+  outcome: string
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The four findings, as they were read. */
+  conditions: { condition: string; met: boolean; evidence: string }[]
+  /** The modules, as they were read. */
+  modules: { name: string; responsibility: string; independent: boolean; evidence: string; anchor: string }[]
+  /** The condition that failed, when one did. */
+  failedCondition?: string
+  /** The Project the request named outright, when it named one. */
+  existingProject?: { id: string; title: string }
+  /** The Project that was created, when one was. */
+  projectId?: string
+  /** The PM Session of that Project, when there is one. */
+  pmSessionId?: string
+  /** The state of that PM Session, as the control plane knows it. */
+  pmStatus?: string
+  /** Why it failed, when it failed. */
+  error?: string
 }
 
 /**
@@ -286,6 +337,14 @@ export interface RouterState {
    * and these receipts say which target it found and how far the work got.
    */
   routes?: FastRouteReceipt[]
+  /**
+   * The decisions of the Project Gate, oldest first.
+   *
+   * A record names the human request the decision was made for, the four findings and the modules they were made of, the
+   * reason the gate gave, and — when a Project really was created — the Project and the PM that belong to it. A refusal is
+   * a record too, so a person may ask why their request did not become a Project.
+   */
+  gates?: ProjectGateRecord[]
   /**
    * The notices about stops the Router is the logical superior of.
    *

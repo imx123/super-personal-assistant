@@ -477,7 +477,7 @@ describe('the fast router of the control plane', () => {
     }, { timeout: 5000 })
     // The fast route is still only a claim: nothing was dispatched behind the operator's back.
     expect(control!.tickets()).toEqual([])
-    expect((await routes())[0]).toMatchObject({ outcome: 'standalone_ticket', stage: 'accepted' })
+    expect((await routes()).at(-1)).toMatchObject({ outcome: 'standalone_ticket', stage: 'accepted' })
   })
 
   it('keeps the queue in order while the Router is busy, and never lets a later task overtake an earlier one', async () => {

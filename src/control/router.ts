@@ -282,7 +282,12 @@ export function routerRequestMessage(request: RouterRequest, attachments: readon
     '',
     'Answer ordinary questions in your own words. If this message explicitly asks you to create a Project, call '
       + 'control_router_create_project with this request id, its title and goal. Ask for missing details. Report the '
-      + 'Project and its PM status separately, using the tool result.',
+      + 'Project and its PM status separately, using the tool result. If this message does not ask for a Project but the '
+      + 'work really is several independent modules that can be worked at the same time, call control_router_project_gate '
+      + 'with this request id and the four conditions; the control plane checks them itself, creates nothing unless all '
+      + 'four hold, and tells you which condition failed when it refuses. The decision has to quote this request: give '
+      + 'the requestAnchor as the words of this request that ask for the work, and give every module the words of this '
+      + 'request that it comes from. A decision whose modules are not in this request is refused.',
     'For an explicit standalone task, use control_router_dispatch with this request id, a short title and the requested '
       + 'goal. Report the Ticket and actual Worker status. Work belonging to an existing Project goes to its PM.',
     'On explicit request, use control_router_manage to message, stop or retry a standalone Ticket, or to archive '

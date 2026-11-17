@@ -17,7 +17,7 @@ import type {} from '@deepseek-ai/dsh-permission-presets'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { cancelled, stopBackground } from '../executor/background.ts'
-import { WORKER_REPORT_STATES, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
+import { WORKER_REPORT_STATES, PROJECT_GATE_CONDITIONS, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
   type RouterModel, type RouterOptions, type WorkerReportState } from '../shared/protocol.ts'
 import { nodeWorkspace, type DshPortEvent, type DshPortHost, type NodeSessionRole } from './dsh-port.ts'
 
@@ -696,7 +696,10 @@ function controlNote(role: 'pm' | 'worker' | 'router', ids: { ticketId?: string;
       + 'control_router_dispatch with the current request id, title and goal. It starts a Worker through a standalone '
       + 'Ticket; use the returned status. When the current message explicitly asks to create a '
       + 'Project, use control_router_create_project with the current request id, title and goal. Report the Project '
-      + 'and its PM status from the result. When the person explicitly asks you to tell a Project\'s PM something, '
+      + 'and its PM status from the result. When the current message does not ask for a Project but the work really is '
+      + 'several independent modules that can be worked at the same time, use control_router_project_gate with the current '
+      + 'request id and the four conditions; it creates nothing unless all four hold, and it tells you which one failed. '
+      + 'When the person explicitly asks you to tell a Project\'s PM something, '
       + 'call control_router_pm_proposal once with the request id that message carries, the id of the Project and the '
       + 'instruction itself, in the person\'s own words. The control plane refuses a request id it does not know, one that '
       + 'already carries a proposal and one that is too old, so never invent one and never reuse one. The call proposes '
@@ -818,7 +821,7 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
-    routerManageTool(options), routerPmProposalTool(options),
+    routerProjectGateTool(options), routerManageTool(options), routerPmProposalTool(options),
   ]
   return [reportTool(options)]
 }
@@ -1141,6 +1144,87 @@ function routerRequestTool(options: ControlToolOptions, action: 'projects' | 'di
         requestId: requiredString(input.requestId, 'requestId'),
         title: requiredString(input.title, 'title'),
         goal: requiredString(input.goal, 'goal'),
+      }, exec.signal)
+    },
+  }
+}
+
+/**
+ * `control_router_project_gate`: the four conditions a request must meet before a Project may be created on the control
+ * plane's own judgement.
+ *
+ * The Router states the decision and the control plane judges it: all four conditions have to hold, each on its own
+ * evidence, and the evidence has to be about the modules the decision names. A refusal creates nothing and says which
+ * condition failed, so the Router may read the reason and try again — or tell the person why no Project was made.
+ */
+function routerProjectGateTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_router_project_gate',
+    description: 'Propose a Project for a request that did not ask for one. The control plane checks the four conditions '
+      + 'itself and creates nothing unless all four hold: several relatively independent modules, reasonable decoupling, '
+      + 'genuine parallelism, and a gain that outweighs the coordination. Name the modules with their responsibilities and '
+      + 'say why each may advance on its own, answer every condition with a yes or a no, and give a short reason for each. '
+      + 'Quote the person\'s own words: the request anchor is the words of this request that ask for the work, and every '
+      + 'module carries the words of this request that it comes from. A decision that quotes nothing the person wrote is '
+      + 'refused. A refusal creates nothing and names the condition that failed.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['requestId', 'decision'],
+      properties: {
+        requestId: { type: 'string', description: 'The request id the person\'s message carried.' },
+        decision: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['title', 'goal', 'requestAnchor', 'modules', 'conditions'],
+          description: 'The proposed Project: its title and goal, the modules the work is split into, and the four findings.',
+          properties: {
+            title: { type: 'string', description: 'Short Project title.' },
+            goal: { type: 'string', description: 'What the Project must achieve.' },
+            requestAnchor: { type: 'string',
+              description: 'The words of the person\'s own request that ask for this work, quoted word for word.' },
+            modules: {
+              type: 'array',
+              description: 'The modules the work is split into; at least two, each responsible for its own part.',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['name', 'responsibility', 'independent', 'evidence', 'anchor'],
+                properties: {
+                  name: { type: 'string', description: 'The module\'s own name.' },
+                  responsibility: { type: 'string', description: 'What this module is responsible for.' },
+                  independent: { type: 'boolean', description: 'Whether this module may advance without the others.' },
+                  evidence: { type: 'string', description: 'Why it may advance on its own.' },
+                  anchor: { type: 'string',
+                    description: 'The words of the person\'s own request that this module comes from, quoted word for word.' },
+                },
+              },
+            },
+            conditions: {
+              type: 'array',
+              description: 'The four findings, one per condition, each with a yes or a no and a short reason.',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['condition', 'met', 'evidence'],
+                properties: {
+                  condition: { type: 'string', enum: [...PROJECT_GATE_CONDITIONS],
+                    description: 'Which condition this finding is about.' },
+                  met: { type: 'boolean', description: 'Whether the condition holds.' },
+                  evidence: { type: 'string', description: 'The short, checkable reason.' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      return requestControl(options, 'POST', '/v1/tools/router/project-gate', {
+        requestId: requiredString(input.requestId, 'requestId'),
+        decision: input.decision,
       }, exec.signal)
     },
   }

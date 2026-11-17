@@ -257,6 +257,23 @@ export interface RouterOptions {
 export const ROUTER_ATTACHMENT_BYTES = 48 * 1024
 export const ROUTER_ATTACHMENT_COUNT = 4
 
+/**
+ * The four conditions of the Project Gate, as the node's tool schema names them.
+ *
+ * The names are the shared vocabulary of both sides: the node offers them in the schema of the Router's gate tool, and
+ * the control plane reads a decision that names them. The order is fixed — a decision is judged condition by condition,
+ * and the first one that fails is the reason the gate gives.
+ */
+export const PROJECT_GATE_CONDITIONS = [
+  'multiple_independent_modules',
+  'reasonable_decoupling',
+  'genuine_parallelism',
+  'benefit_outweighs_coordination',
+] as const
+
+/** One of the four conditions of the Project Gate. */
+export type ProjectGateCondition = typeof PROJECT_GATE_CONDITIONS[number]
+
 export interface RouterTextAttachment {
   name: string
   text: string

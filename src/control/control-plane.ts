@@ -10,20 +10,24 @@ import { assignmentStopped, canRetry, currentReview, latestAssignment, pendingRe
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { redact } from '../infra/redact.ts'
-import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError } from '../shared/protocol.ts'
+import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
+  type ProjectGateCondition } from '../shared/protocol.ts'
 import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
   SessionInspection, SessionRecord, SessionStatus } from '../shared/protocol.ts'
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
-import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectMemoryRow,
-  type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
+import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectGateRow,
+  type ProjectMemoryRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
   type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
+import { evaluateProjectGate, explicitProjectRequest, namedProject,
+  ProjectGateError, readProjectGateDecision, type ProjectGateDecision, type ProjectGateFinding,
+  type ProjectGateModule, type ProjectGateProject, type ProjectGateVerdict } from './project-gate.ts'
 import { Reconciler, type ReconcileFinding, type ReconcileResult } from './reconcile.ts'
 import { reportCallKey, reportCallPrefix, reportPayloadHash, type ReportCallRecord } from './report-call.ts'
 import { fenceDiff, PM_REVIEW_DIFF_NOTE, type PmReviewDiff } from './review-diff.ts'
@@ -213,6 +217,14 @@ const ROUTER_QUEUE_RETRY_MS = 5_000
 const FAST_ROUTE_SHOWN = 50
 
 /**
+ * How many decisions of the Project Gate the console shows.
+ *
+ * The decisions are what a person reads to learn why their request did or did not become a Project, so the newest ones
+ * are the ones that are kept.
+ */
+const PROJECT_GATE_SHOWN = 50
+
+/**
  * How many report calls one Session keeps in the ledger.
  *
  * The ledger is what makes a replayed call a replay, so it has to outlive a restart — but it is not a log of everything
@@ -269,6 +281,83 @@ function routerProposalRefusal(proposal: RouterProposal): string {
 function isClaimedOutcome(outcome: string): boolean {
   return outcome === 'existing_ticket' || outcome === 'existing_project_pm' || outcome === 'standalone_ticket'
     || outcome === 'read_only'
+}
+
+/**
+ * Which way a message went: the rules carried it out, or the Router's own model handles it.
+ *
+ * The two are kept apart in the record and in the console, because they cost different things: a rule acts without a
+ * model turn, and a message the model handles says so instead of pretending that a rule read it.
+ */
+function fastRoutePath(outcome: string): 'fast' | 'model' {
+  return isClaimedOutcome(outcome) ? 'fast' : 'model'
+}
+
+/**
+ * The findings of a recorded decision, read back.
+ *
+ * A record that cannot be read is read as nothing: the console shows the reason the gate gave and no findings, rather
+ * than failing to show the decision at all.
+ */
+function parseGateFindings(value: string): ProjectGateFinding[] {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(entry => typeof entry === 'object' && entry !== null)
+      .map(entry => entry as Record<string, unknown>)
+      .filter(entry => PROJECT_GATE_CONDITIONS.includes(entry.condition as ProjectGateCondition))
+      .map(entry => ({ condition: entry.condition as ProjectGateCondition, met: entry.met === true,
+        evidence: typeof entry.evidence === 'string' ? entry.evidence : '' }))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * The modules of a recorded decision, read back.
+ *
+ * A record that cannot be read is read as nothing, for the same reason the findings are.
+ */
+function parseGateModules(value: string): ProjectGateModule[] {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(entry => typeof entry === 'object' && entry !== null)
+      .map(entry => entry as Record<string, unknown>)
+      .map(entry => ({ name: typeof entry.name === 'string' ? entry.name : '',
+        responsibility: typeof entry.responsibility === 'string' ? entry.responsibility : '',
+        independent: entry.independent === true,
+        evidence: typeof entry.evidence === 'string' ? entry.evidence : '',
+        anchor: typeof entry.anchor === 'string' ? entry.anchor : '' }))
+  } catch {
+    return []
+  }
+}
+
+/** The Project a recorded decision named outright, read back. */
+function parseGateProject(value: string): { id: string; title: string } | undefined {
+  if (value === '') return undefined
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const record = parsed as Record<string, unknown>
+    if (typeof record.id !== 'string' || typeof record.title !== 'string') return undefined
+    return { id: record.id, title: record.title }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The record of a rule that was not sure enough to act.
+ *
+ * The rule did not claim the message, so the message goes to the Router's model — but the reason is its own: the rule
+ * knew what to do and was not sure enough to do it. That is a different fact from "the rules did not know", and a person
+ * asking why their message needed a model is owed the difference.
+ */
+function unsureDecision(decision: FastRouteDecision): FastRouteDecision {
+  return { ...decision, outcome: 'escalate', stage: 'escalated', reason: 'low_confidence',
+    detail: `规则把握不够（${Math.round(decision.confidence * 100)}%），交给高层 Router。` }
 }
 
 /**
@@ -557,6 +646,14 @@ export interface RouterState {
    * says so, and the Session status beside it is the node's own word.
    */
   routes?: FastRouteReceipt[]
+  /**
+   * The decisions of the Project Gate, oldest first.
+   *
+   * A record is the control plane's own account of one decision: the four findings and the modules they were made of, the
+   * reason the gate gave, and the Project and PM that exist when it let one through. A refusal is a record as well, so a
+   * person may ask later why their request did not become a Project.
+   */
+  gates?: ProjectGateRecord[]
 }
 
 /**
@@ -604,6 +701,14 @@ export interface FastRouteReceipt {
   at: string
   /** The person's own words. */
   text: string
+  /**
+   * Which way the message went.
+   *
+   * `fast` is a message the rules carried out themselves; no model turn started for it. `model` is a message the Router's
+   * own model handles — an ordinary conversation, or a request the rules were not sure about — in the very same
+   * `router.v1` Session. The two are kept apart so that a person can see which of their messages needed a model and why.
+   */
+  path: 'fast' | 'model'
   /** What the rule decided. */
   outcome: FastRouteOutcome
   /** How far the message got. */
@@ -642,6 +747,77 @@ export interface FastRouteReceipt {
 export type RouterSendResult =
   | { routed: true; requestId: string; route: FastRouteReceipt }
   | { routed: false; requestId: string; session: SessionRecord; entry: RouterQueueEntry }
+
+/**
+ * What one decision of the Project Gate became.
+ *
+ * The answer says plainly what happened: `created` names the Project and the PM that belong to it, `refused` names the
+ * reason and creates nothing at all. A refusal is a real answer and not an error — the model may read it and try again
+ * with a decision that holds.
+ */
+export interface ProjectGateOutcome {
+  /** What became of the decision. */
+  outcome: 'created' | 'refused'
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The Project that was created, when one was. */
+  project?: { id: string; title: string; goal: string }
+  /** The PM of that Project: its Session and the state the node confirmed, or the reason it did not come up. */
+  pm?: { sessionId: string; status: string } | { status: 'unconfirmed'; error: string }
+  /** The four findings, as they were read. */
+  conditions: ProjectGateFinding[]
+  /** The modules, as they were read. */
+  modules: ProjectGateModule[]
+  /** The condition that failed, when one did. */
+  failedCondition?: ProjectGateCondition
+  /** The Project the request named outright, when it named one. */
+  existingProject?: { id: string; title: string }
+}
+
+/**
+ * One decision of the Project Gate, as the console reads it.
+ *
+ * It names the human request the decision was made for, the four findings and the modules, the reason, and — when a
+ * Project really was created — the Project and the PM that belong to it. A refusal is a record too: it says that nothing
+ * was created and why.
+ */
+export interface ProjectGateRecord {
+  /** The Router request this decision was made for. */
+  requestId: string
+  /** Which try of that request this is. */
+  attempt: number
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The title the decision would have given the Project. */
+  title: string
+  /** The goal the decision would have given the Project. */
+  goal: string
+  /** What became of it. */
+  outcome: string
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The four findings, as they were read. */
+  conditions: ProjectGateFinding[]
+  /** The modules, as they were read. */
+  modules: ProjectGateModule[]
+  /** The condition that failed, when one did. */
+  failedCondition?: ProjectGateCondition
+  /** The Project that was created, when one was. */
+  projectId?: string
+  existingProject?: { id: string; title: string }
+  /** The PM Session of that Project, when there is one. */
+  pmSessionId?: string
+  /** The state of that PM Session, as the control plane knows it. */
+  pmStatus?: string
+  /** Why it failed, when it failed. */
+  error?: string
+}
 
 /**
  * What one interrupt of a running turn did.
@@ -1173,6 +1349,13 @@ export class ControlPlane {
   private readonly version = '0.1.0'
   /** Ensures already running, by Session id: concurrent requests share one node round trip. */
   private readonly pendingEnsures = new Map<string, Promise<SessionRecord>>()
+  /**
+   * The gate decisions running right now, by request id: two calls for one request share one run.
+   *
+   * A request is one result, so the second call joins the first one instead of writing a second "creating" record and
+   * deciding the title and the goal a second time.
+   */
+  private readonly gateFlights = new Map<string, Promise<ProjectGateOutcome>>()
   /**
    * The PM's own operation in flight for one Ticket, so a cancel and a re-dispatch never overlap.
    *
@@ -1785,20 +1968,39 @@ export class ControlPlane {
 
   projectWorkspaceRoot(): string { return resolve(this.options.workspaceRoot) }
 
+  /**
+   * The Trigger one request names, and the Project that follows from it.
+   *
+   * Both ways of making a Project out of a request — the person's own words and the gate — use this one id, so a request
+   * has exactly one Project in the domain: the same id after a restart, the same id when two calls arrive at once, and
+   * the same id whichever way the Project was asked for.
+   */
+  private requestTriggerId(requestId: string): string { return `trigger-${key('project-request', requestId)}` }
+
+  /** The Project one request leads to, whether or not it was made yet. */
+  private requestProjectId(requestId: string): string { return key('project', this.requestTriggerId(requestId)) }
+
   private createProjectFromHumanRequest(title: string, goal: string, requestText: string,
-    actor: 'operator' | 'router', workspace?: string): ProjectProfile {
+    actor: 'operator' | 'router', workspace?: string, triggerId?: string): ProjectProfile {
     // The Trigger's own Thread is the Trigger itself, so a request never joins another request's Thread.
-    const id = `trigger-${randomUUID()}`
+    // A Router's request names its own Trigger, so the same request never becomes a second Project — not after a
+    // restart, and not when two calls of it arrive at once.
+    const id = triggerId ?? `trigger-${randomUUID()}`
     const trigger: Trigger = { id, source: PROJECT_REQUEST_SOURCE,
       threads: [{ source: PROJECT_REQUEST_SOURCE, id }],
       actor: { source: PROJECT_REQUEST_SOURCE, id: PROJECT_REQUEST_ACTOR }, human: true, at: this.now(), text: requestText,
       meta: { title, goal } }
+    // The Project may already be there: the same request names the same Trigger, and the domain is idempotent by it.
+    // A second call finds the Project the first one made, and the trail says the Project was created once.
+    const before = this.projects().map(project => project.id)
     const project = this.store.atomic(() => {
       this.engine.recordTriggerForRouting(trigger)
       return this.engine.createProject(trigger.id, title, goal, workspace)
     })
-    this.audit.record({ actor, kind: 'project', action: 'created', targetKind: 'project',
-      targetId: project.id, detail: project.title })
+    if (!before.includes(project.id)) {
+      this.audit.record({ actor, kind: 'project', action: 'created', targetKind: 'project',
+        targetId: project.id, detail: project.title })
+    }
     return project
   }
 
@@ -2173,8 +2375,11 @@ export class ControlPlane {
     // A message with files belongs to the conversation: the files are read by the Router's own turn, so it is not
     // fast-routed and the model sees it as it always did.
     const decision = attachments.length === 0 ? fastRoute(value, this.fastRouteFacts()) : undefined
-    const claimed = decision !== undefined && decision.outcome !== 'ordinary_reply' && decision.outcome !== 'escalate'
-      && decision.confidence >= FAST_ROUTE_MIN_CONFIDENCE
+    // A rule that is not sure enough does not act: the message goes to the Router's own model, and the record says why.
+    const unsure = decision !== undefined && decision.outcome !== 'ordinary_reply' && decision.outcome !== 'escalate'
+      && decision.confidence < FAST_ROUTE_MIN_CONFIDENCE
+    const claimed = decision !== undefined && !unsure && decision.outcome !== 'ordinary_reply'
+      && decision.outcome !== 'escalate'
     if (!claimed) {
       // The Router Session is ensured here, so the first message a person sends starts it without a detour.
       const session = await this.ensureRouter()
@@ -2183,13 +2388,20 @@ export class ControlPlane {
       const knownNow = this.consoleStore.routerMessage(messageId)
       if (knownNow) return this.knownRouterMessage(knownNow, value, attachments, routerModel)
       const request = this.acceptRouterMessage(messageId, requestId, value, attachments, routerModel)
+      // Every message the rules did not carry out keeps the reason why, so the console can say which way it went: the
+      // rules read it and left it alone, or the rules never read it because it was a conversation. The record is written
+      // before the message goes out, so the order of the records is the order the person wrote them in.
+      if (decision !== undefined) {
+        this.recordModelRoute(requestId, value, request.at, unsure ? unsureDecision(decision) : decision)
+      } else {
+        // A message with files belongs to the conversation: the rules never read it, and the model reads it with the
+        // files. It is recorded as well, so that every message a person sent is accounted for.
+        this.recordModelRoute(requestId, value, request.at, { outcome: 'ordinary_reply', stage: 'model', confidence: 0,
+          reason: 'attachments', detail: '这条消息带着附件，交给高层 Router 一起读。' })
+      }
       // The delivery is awaited when it can happen right away, so the answer says whether the message really went out. A
       // Router that is answering keeps the message: the answer then says it is queued, not that it was read.
       await this.scheduleRouterQueue()
-      // A message the rules left to the high-level Router keeps the reason why, so the console can say what it did with it.
-      if (decision !== undefined && decision.outcome === 'escalate') {
-        this.recordEscalation(requestId, value, request.at, decision)
-      }
       return { routed: false, requestId, session, entry: this.routerQueueEntry(this.consoleStore.routerMessage(messageId)!) }
     }
     // The message is one the rules may carry out by themselves. It is queued like any other message, so it keeps its
@@ -2441,17 +2653,23 @@ export class ControlPlane {
   }
 
   /**
-   * Write down that the rules left a message to the high-level Router, and why.
+   * Write down that a message went to the Router's own model, and why.
    *
    * The reason is the whole point of the record: a person may ask why their message was not carried out at once, and the
-   * answer is a stable code beside the words they wrote.
+   * answer is a stable code beside the words they wrote. A conversation and an escalation are both recorded here — the
+   * first because the model answered it, the second because the rules were not sure — and the two are told apart by their
+   * outcome and their reason, never by a guess.
    */
-  private recordEscalation(requestId: string, text: string, at: string, decision: FastRouteDecision): void {
+  private recordModelRoute(requestId: string, text: string, at: string, decision: FastRouteDecision): void {
     this.consoleStore.addFastRoute({
-      requestId, at, text, outcome: 'escalate', stage: 'escalated', confidence: Math.round(decision.confidence * 100),
+      requestId, at, text, outcome: decision.outcome, stage: decision.outcome === 'escalate' ? 'escalated' : 'model',
+      confidence: Math.round(decision.confidence * 100),
       reason: decision.reason, detail: decision.detail, targetKind: '', targetId: '', targetTitle: '',
       ticketId: '', sessionId: '', ticketTitle: '', ticketGoal: '', error: '',
     })
+    // The audit trail keeps the escalations: a message that needed the model is a fact about the work. A conversation is
+    // not, and a trail of them would bury the work itself.
+    if (decision.outcome !== 'escalate') return
     this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'session', targetId: requestId,
       outcome: 'skipped', detail: decision.detail })
   }
@@ -2484,7 +2702,8 @@ export class ControlPlane {
     const row = this.consoleStore.fastRoute(requestId)
     if (!row) throw new OperatorError(500, 'The routing of this message is not on record')
     const session = row.sessionId === '' ? undefined : this.sessions.get(row.sessionId)
-    return { requestId: row.requestId, at: row.at, text: row.text, outcome: row.outcome as FastRouteOutcome,
+    return { requestId: row.requestId, at: row.at, text: row.text, path: fastRoutePath(row.outcome),
+      outcome: row.outcome as FastRouteOutcome,
       stage: row.stage as FastRouteStage, confidence: row.confidence / 100, reason: row.reason, detail: row.detail,
       ...(row.targetId === '' ? {} : { target: { kind: row.targetKind, id: row.targetId, title: row.targetTitle } }),
       ...(row.ticketId === '' ? {} : { ticketId: row.ticketId }),
@@ -2882,6 +3101,10 @@ export class ControlPlane {
     // it really got, so a person never has to guess where their message went.
     const routes = this.fastRouteReceipts()
     if (routes.length > 0) base.routes = routes
+    // The decisions of the Project Gate: what the gate was asked, what it answered, and the Project and the PM that
+    // exist when it let one through.
+    const gates = this.projectGateRecords()
+    if (gates.length > 0) base.gates = gates
     if (record === undefined) return base
     // The turn the Router runs right now and the node's own offer to end one: the console shows the interrupt only when
     // the backend confirms both.
@@ -2975,6 +3198,20 @@ export class ControlPlane {
       instruction: proposal.instruction }
   }
 
+  /**
+   * Create a Project because a person asked for one.
+   *
+   * The person's own words decide whether this is such a request, and the model is not believed about it: a model that
+   * says the person asked for a Project is answered with the words the person really wrote, and a request that does not
+   * ask for one may not create one. Such a request may still become a Project — through the gate, which asks for the four
+   * conditions and checks them — and the tool says so instead of creating one quietly.
+   *
+   * The request that names a Project that already exists is a request about that Project: a second Project with the same
+   * name is not a new piece of work, it is the same one twice.
+   *
+   * One request is one Project in the domain as well: the Project of this request is the same one whether it was made
+   * here or through the gate, and a request that already has one may only start its PM again — never a second Project.
+   */
   async routerCreateProject(sessionId: string, requestId: string, title: string, goal: string): Promise<{
     project: { id: string; title: string; goal: string }
     pm: { sessionId: string; status: string } | { status: 'unconfirmed'; error: string }
@@ -2985,7 +3222,17 @@ export class ControlPlane {
     if (request.dispatchedTicket || request.management) throw new ToolCallError('invalid', 'This request already routed to another action')
     if (request.createdProject === undefined) {
       if (request.proposal !== undefined) throw new ToolCallError('invalid', 'This request already carries a relay proposal')
-      const project = this.createProjectFromHumanRequest(title, goal, request.text, 'router')
+      if (!explicitProjectRequest(request.text)) {
+        throw new ToolCallError('invalid', 'This request does not ask for a Project. Use control_router_project_gate with the '
+          + 'four conditions when the work really is several independent modules that can run in parallel.')
+      }
+      const existing = namedProject(request.text, this.gateProjects())
+      if (existing !== undefined) {
+        throw new ToolCallError('invalid', `This request names the Project 「${existing.title}」, which already exists; `
+          + 'its work goes to its PM instead of to a second Project')
+      }
+      const project = this.createProjectFromHumanRequest(title, goal, request.text, 'router', undefined,
+        this.requestTriggerId(request.id))
       request.createdProject = { id: project.id, title: project.title, goal: project.goal }
     }
     const project = request.createdProject
@@ -2998,6 +3245,226 @@ export class ControlPlane {
     } catch (error) {
       return { project, pm: { status: 'unconfirmed', error: redact(messageOf(error)).slice(0, 200) } }
     }
+  }
+
+  /**
+   * The Project Gate: may this request become a Project without a person asking for one?
+   *
+   * The decision is checked here and not believed: the four conditions have to hold, each on its own evidence, the
+   * evidence has to be about the modules the decision names, and the decision has to quote the person's own request. A
+   * refusal creates nothing at all — no Project, no PM, no Ticket, no Session — and leaves a record that says which
+   * condition failed and why, so that a person may ask later.
+   *
+   * One request is one result. The record is written before anything is created and names the human request, so a
+   * decision that already made a Project is answered with that Project instead of making a second one: a repeated call, a
+   * call after a restart and a call whose receipt was lost all lead to the same Project. Two calls that arrive at the
+   * same moment share one run, so the record is written once and the title and the goal are the ones of the first call.
+   */
+  async routerProjectGate(sessionId: string, requestId: string, input: unknown): Promise<ProjectGateOutcome> {
+    this.requireToolSession(sessionId, 'router')
+    const running = this.gateFlights.get(requestId)
+    if (running !== undefined) return running
+    let flight: Promise<ProjectGateOutcome>
+    flight = this.runProjectGate(requestId, input).finally(() => {
+      if (this.gateFlights.get(requestId) === flight) this.gateFlights.delete(requestId)
+    })
+    this.gateFlights.set(requestId, flight)
+    return flight
+  }
+
+  /**
+   * One run of the gate for one request.
+   *
+   * The request is looked up first: a request that is not in memory is unknown or too old, and the only thing that may
+   * answer for it is the durable record of a decision that really ran — the receipt of that decision, and nothing new.
+   */
+  private async runProjectGate(requestId: string, input: unknown): Promise<ProjectGateOutcome> {
+    const request = this.routerRequests.get(requestId)
+    if (request === undefined) return this.replayGateOutcome(requestId)
+    if (request.dispatchedTicket || request.management) {
+      throw new ToolCallError('invalid', 'This request already routed to another action')
+    }
+    if (request.proposal !== undefined) {
+      throw new ToolCallError('invalid', 'This request already carries a relay proposal')
+    }
+    // One request is one Project: a decision that already made one is answered with that Project.
+    const created = this.consoleStore.createdProjectGate(request.id)
+    if (created !== undefined) return this.projectGateOutcomeOf(created)
+    // A request that created a Project by the person's own words does not get a second one through the gate.
+    if (request.createdProject !== undefined) {
+      throw new ToolCallError('invalid', 'This request already created a Project')
+    }
+    let decision: ProjectGateDecision
+    try {
+      decision = readProjectGateDecision(input)
+    } catch (error) {
+      if (!(error instanceof ProjectGateError)) throw error
+      const raw = typeof input === 'object' && input !== null && !Array.isArray(input)
+        ? input as Record<string, unknown> : {}
+      return this.recordGateRefusal(request, error.reason, error.message, [], [],
+        typeof raw.title === 'string' ? raw.title.trim() : '', typeof raw.goal === 'string' ? raw.goal.trim() : '')
+    }
+    const verdict = evaluateProjectGate(decision, { text: request.text, projects: this.gateProjects() })
+    if (!verdict.allowed) {
+      return this.recordGateRefusal(request, verdict.reason, verdict.detail, verdict.conditions, verdict.modules,
+        decision.title, decision.goal, verdict)
+    }
+    // The gate opened. The row is written before the Project is, so a control plane that dies in the middle leaves the
+    // fact behind — and the same request leads to the same Project when it is tried again.
+    const attempt = this.nextGateAttempt(request.id)
+    this.consoleStore.addProjectGate({ requestId: request.id, attempt, at: this.now(), text: request.text,
+      title: decision.title, goal: decision.goal, outcome: 'creating', reason: verdict.reason, detail: verdict.detail,
+      conditions: JSON.stringify(verdict.conditions), modules: JSON.stringify(verdict.modules),
+      failedCondition: '', existingProject: '', projectId: '', pmSessionId: '', pmStatus: '', error: '' })
+    let project: ProjectProfile
+    try {
+      project = this.createProjectFromHumanRequest(decision.title, decision.goal, request.text, 'router', undefined,
+        this.requestTriggerId(request.id))
+    } catch (error) {
+      const reason = redact(messageOf(error)).slice(0, 300)
+      this.consoleStore.updateProjectGate(request.id, attempt, { outcome: 'failed', error: reason })
+      this.audit.record({ actor: 'router', kind: 'project', action: 'gate-created', targetKind: 'project',
+        targetId: request.id, outcome: 'failed', detail: reason })
+      throw new ToolCallError('invalid', `The Project could not be created: ${reason}`)
+    }
+    // The Project of this request is the Project of this request: the request may not dispatch a second independent
+    // Ticket or touch another Project afterwards.
+    request.createdProject = { id: project.id, title: project.title, goal: project.goal }
+    this.consoleStore.updateProjectGate(request.id, attempt, { projectId: project.id, pmSessionId: project.pmSessionId })
+    let pm: { sessionId: string; status: string } | { status: 'unconfirmed'; error: string }
+    let pmStatus = ''
+    let pmError = ''
+    try {
+      const session = await this.startProjectPm(project.id)
+      pm = { sessionId: session.sessionId, status: session.status }
+      pmStatus = session.status
+    } catch (error) {
+      // The Project exists; only its PM did not come up. The record says so instead of claiming a PM that is not there.
+      pmError = redact(messageOf(error)).slice(0, 200)
+      pm = { status: 'unconfirmed', error: pmError }
+      pmStatus = 'unconfirmed'
+    }
+    this.consoleStore.updateProjectGate(request.id, attempt, { outcome: 'created', pmStatus,
+      ...(pmError === '' ? {} : { error: pmError }) })
+    this.audit.record({ actor: 'router', kind: 'project', action: 'gate-created', targetKind: 'project',
+      targetId: project.id, outcome: pmStatus === 'unconfirmed' ? 'failed' : 'ok',
+      detail: `${project.title} · 四项条件均成立` })
+    return { outcome: 'created', reason: verdict.reason, detail: verdict.detail,
+      project: { id: project.id, title: project.title, goal: project.goal }, pm,
+      conditions: verdict.conditions, modules: verdict.modules }
+  }
+
+  /**
+   * The receipt of a decision that really ran, when the request itself is gone.
+   *
+   * A request that is not in memory is unknown or too old, and only a durable record may answer for it: the record of a
+   * decision that was carried out is the receipt of that decision, and it is answered without creating anything and
+   * without sending a command to the node. A decision that was written down as "creating" and never finished is decided
+   * by the domain: the Project of this request exists, or nothing was made. It is never made a second time.
+   */
+  private replayGateOutcome(requestId: string): ProjectGateOutcome {
+    const rows = this.consoleStore.projectGatesOfRequest(requestId)
+    if (rows.length === 0) throw new ToolCallError('invalid', 'This request is unknown or is too old')
+    const row = rows[rows.length - 1]!
+    if (row.outcome === 'created' && row.projectId !== '') return this.projectGateOutcomeOf(row)
+    if (row.outcome !== 'creating') return this.projectGateOutcomeOf(row)
+    // The control plane died in the middle of the creation. The domain decides the truth: the Project of this request
+    // exists, or it does not.
+    const project = this.store.projects.get(this.requestProjectId(requestId))
+    if (project !== undefined) {
+      const pm = this.sessions.get(project.pmSessionId)
+      this.consoleStore.updateProjectGate(requestId, row.attempt, { outcome: 'created', projectId: project.id,
+        pmSessionId: project.pmSessionId, pmStatus: pm?.status ?? 'unconfirmed',
+        ...(pm === undefined ? { error: 'The PM Session of this Project was not confirmed.' } : {}) })
+      const settled = this.consoleStore.projectGatesOfRequest(requestId).find(entry => entry.attempt === row.attempt)!
+      return this.projectGateOutcomeOf(settled)
+    }
+    // Nothing can be confirmed: the decision is refused rather than carried out again.
+    this.consoleStore.updateProjectGate(requestId, row.attempt, { outcome: 'failed',
+      error: 'The control plane stopped while this Project was being created; it was not created again' })
+    return { outcome: 'refused', reason: 'creation_unconfirmed',
+      detail: '上一次判定在创建项目的途中停了，控制面无法确认项目是否存在，不会重新创建。', conditions: [], modules: [] }
+  }
+
+  /**
+   * The Projects the gate reads, as it reads them.
+   *
+   * The gate asks whether a request names a Project that already exists, and it may only be told about the Projects this
+   * control plane really holds.
+   */
+  private gateProjects(): ProjectGateProject[] {
+    return this.projects().map(project => ({ id: project.id, title: project.title, status: project.status }))
+  }
+
+  /** The try of one request that comes next. */
+  private nextGateAttempt(requestId: string): number {
+    const rows = this.consoleStore.projectGatesOfRequest(requestId)
+    return rows.length === 0 ? 1 : Math.max(...rows.map(row => row.attempt)) + 1
+  }
+
+  /**
+   * Write down that the gate refused a decision, and answer with the refusal.
+   *
+   * Nothing is created: the refusal is a record and an answer, and the Project, the PM, the Ticket and the Session of the
+   * refused decision stay as they were.
+   */
+  private recordGateRefusal(request: RouterRequest, reason: string, detail: string, conditions: ProjectGateFinding[],
+    modules: ProjectGateModule[], title = '', goal = '', verdict?: ProjectGateVerdict): ProjectGateOutcome {
+    const attempt = this.nextGateAttempt(request.id)
+    this.consoleStore.addProjectGate({ requestId: request.id, attempt, at: this.now(), text: request.text,
+      title, goal, outcome: 'refused', reason, detail,
+      conditions: JSON.stringify(conditions), modules: JSON.stringify(modules),
+      failedCondition: verdict?.failedCondition ?? '', existingProject: verdict?.existingProject
+        ? JSON.stringify(verdict.existingProject) : '',
+      projectId: '', pmSessionId: '', pmStatus: '', error: '' })
+    this.audit.record({ actor: 'router', kind: 'project', action: 'gate-refused', targetKind: 'project',
+      targetId: request.id, outcome: 'skipped', detail })
+    return { outcome: 'refused', reason, detail, conditions, modules,
+      ...(verdict?.failedCondition === undefined ? {} : { failedCondition: verdict.failedCondition }),
+      ...(verdict?.existingProject === undefined ? {} : { existingProject: verdict.existingProject }) }
+  }
+
+  /**
+   * The decisions of the Project Gate, as the console reads them.
+   *
+   * A record is a fact about one decision: the human request it was made for, the four findings and the modules, the
+   * reason, and the Project and the PM when the gate let one through. A refusal is a record too.
+   */
+  projectGateRecords(limit = PROJECT_GATE_SHOWN): ProjectGateRecord[] {
+    return this.consoleStore.projectGates({ limit, newest: true }).reverse().map(row => this.projectGateRecord(row))
+  }
+
+  /** One decision of the gate, as the console reads it. */
+  private projectGateRecord(row: ProjectGateRow): ProjectGateRecord {
+    const conditions = parseGateFindings(row.conditions)
+    const modules = parseGateModules(row.modules)
+    const existing = parseGateProject(row.existingProject)
+    return { requestId: row.requestId, attempt: row.attempt, at: row.at, text: row.text, title: row.title, goal: row.goal,
+      outcome: row.outcome, reason: row.reason, detail: row.detail, conditions, modules,
+      ...(row.failedCondition === '' ? {} : { failedCondition: row.failedCondition as ProjectGateCondition }),
+      ...(existing === undefined ? {} : { existingProject: existing }),
+      ...(row.projectId === '' ? {} : { projectId: row.projectId }),
+      ...(row.pmSessionId === '' ? {} : { pmSessionId: row.pmSessionId }),
+      ...(row.pmStatus === '' ? {} : { pmStatus: row.pmStatus }),
+      ...(row.error === '' ? {} : { error: row.error }) }
+  }
+
+  /** The answer one recorded decision gives, when it is asked for again. */
+  private projectGateOutcomeOf(row: ProjectGateRow): ProjectGateOutcome {
+    const record = this.projectGateRecord(row)
+    if (row.outcome !== 'created' || row.projectId === '') {
+      return { outcome: 'refused', reason: record.reason, detail: record.detail, conditions: record.conditions,
+        modules: record.modules,
+        ...(record.failedCondition === undefined ? {} : { failedCondition: record.failedCondition }),
+        ...(record.existingProject === undefined ? {} : { existingProject: record.existingProject }) }
+    }
+    const project = this.store.projects.get(row.projectId)
+    const pm = row.pmStatus === 'unconfirmed'
+      ? { status: 'unconfirmed' as const, error: row.error }
+      : { sessionId: row.pmSessionId, status: row.pmStatus }
+    return { outcome: 'created', reason: record.reason, detail: record.detail,
+      project: { id: row.projectId, title: project?.title ?? row.title, goal: project?.goal ?? row.goal }, pm,
+      conditions: record.conditions, modules: record.modules }
   }
 
   routerDispatch(sessionId: string, requestId: string, title: string, goal: string):

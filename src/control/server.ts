@@ -1072,6 +1072,15 @@ export class ControlPlaneServer {
       return json(res, 200, result)
     }
 
+    if (method === 'POST' && url.pathname === '/v1/tools/router/project-gate') {
+      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      const body = await readJson(req)
+      const requestId = text(body.requestId)
+      // The decision is read and judged by the control plane: the Router states it, the control plane decides.
+      const result = await this.control.routerProjectGate(claims.sid, requestId, body.decision)
+      return json(res, 200, result)
+    }
+
     if (method === 'POST' && url.pathname === '/v1/tools/router/dispatch') {
       if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
       const body = await readJson(req)

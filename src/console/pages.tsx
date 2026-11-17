@@ -12,9 +12,9 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type FastRouteReceipt,
-  type NodeView, type Overview, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterQueueEntry,
-  type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView,
-  type StopNotice,
+  type NodeView, type Overview, type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun,
+  type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
+  type SessionView, type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -235,8 +235,25 @@ const ROUTE_STAGE: Record<string, string> = {
   queued: '待送达',
   assigned: '目标已确认接收',
   escalated: '已交给高层 Router',
+  model: '由模型处理',
   failed: '失败',
   unconfirmed: '未确认',
+}
+
+/** What a decision of the Project Gate became, as the console's own words. */
+const GATE_OUTCOME: Record<string, string> = {
+  created: '已建项目',
+  refused: '未建项目',
+  failed: '建项目失败',
+  creating: '正在建项目',
+}
+
+/** The four conditions of the Project Gate, as the console's own words. */
+const GATE_CONDITION: Record<string, string> = {
+  multiple_independent_modules: '多个相对独立的模块',
+  reasonable_decoupling: '模块之间合理解耦',
+  genuine_parallelism: '模块可以真实并行',
+  benefit_outweighs_coordination: '并行收益抵消协调成本',
 }
 
 /**
@@ -310,6 +327,8 @@ function activityOf(entry: AuditEntry): { title: string; meta: string; icon: str
     case 'project.archived': return { title: '归档了项目', meta: detail, icon: 'project', tone: '' }
     case 'project.unarchived': return { title: '取消归档项目', meta: detail, icon: 'project', tone: '' }
     case 'project.remembered': return { title: '记下了项目备忘', meta: detail, icon: 'assign', tone: '' }
+    case 'project.gate-created': return { title: '门禁放行后创建了项目', meta: detail, icon: 'project', tone: 'success' }
+    case 'project.gate-refused': return { title: '未自动创建项目', meta: detail, icon: 'fail', tone: 'failure' }
     case 'ticket.created': return {
       title: entry.actor === 'router' ? 'Router 分派了独立工单' : 'PM 分派了工单', meta: detail, icon: 'assign', tone: '',
     }
@@ -476,27 +495,87 @@ function RouterQueue(props: { entries: RouterQueueEntry[]; id: string }): ReactE
 /**
  * The routings the Fast Router made, as the console shows them.
  *
- * Each line names what the rule decided, the target it found and how far the work really got: the Ticket's own id, the
- * Project's title and the Worker Session's live status. A Worker that was asked to start but is not up yet reads as
- * "待送达" — the console never shows a Worker as running before the node says so.
+ * The two ways a message travels are shown apart. A message the rules carried out itself never reached the Router's
+ * model, and it names the target it found and how far the work really got: the Ticket's own id, the Project's title and
+ * the Worker Session's live status. A Worker that was asked to start but is not up yet reads as "待送达" — the console
+ * never shows a Worker as running before the node says so. A message the model handles reads as such, with the reason the
+ * rules left it alone: a conversation, an ambiguity or a rule that was not sure enough.
  */
 function RouterRoutes(props: { receipts: FastRouteReceipt[]; id: string }): ReactElement {
+  const fast = props.receipts.filter(receipt => receipt.path !== 'model')
+  const model = props.receipts.filter(receipt => receipt.path === 'model')
   return (
-    <div className="router-queue" id={props.id} aria-label="快路由的处理结果">
-      <p className="quiet">快路由直接处理的消息（没有进入 Router 对话）</p>
+    <>
+      {fast.length ? (
+        <div className="router-queue" id={props.id} aria-label="快路由的处理结果">
+          <p className="quiet">快路由直接处理的消息（没有进入 Router 对话）</p>
+          <ul className="router-queue-list">
+            {fast.map(receipt => (
+              <li key={receipt.requestId} className={receipt.stage === 'failed' ? 'failure' : ''}>
+                <span className="router-queue-text">{receipt.text}</span>
+                <span className={`chip ${receipt.stage === 'failed' ? 'failure' : receipt.stage === 'assigned' ? 'success' : 'muted'}`}>
+                  {ROUTE_OUTCOME[receipt.outcome] ?? receipt.outcome}
+                </span>
+                <span className="quiet"> · {ROUTE_STAGE[receipt.stage] ?? receipt.stage}</span>
+                {receipt.target ? <span className="quiet"> · {receipt.target.kind === 'ticket' ? '工单' : '项目'} {receipt.target.title || receipt.target.id}</span> : null}
+                {receipt.ticketId ? <span className="quiet"> · 工单 {receipt.ticketId}</span> : null}
+                {receipt.sessionId ? <span className="quiet"> · 会话 {receipt.sessionId}{receipt.sessionStatus ? `（${SESSION_STATUS[receipt.sessionStatus] ?? receipt.sessionStatus}）` : ''}</span> : null}
+                {receipt.answer ? <span className="quiet"> · {receipt.answer}</span> : null}
+                {receipt.error ? <span className="quiet"> · {receipt.error}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {model.length ? (
+        <div className="router-queue" id={`${props.id}-model`} aria-label="交给高层 Router 的消息">
+          <p className="quiet">交给高层 Router 的消息（同一个 router.v1 会话，由模型处理）</p>
+          <ul className="router-queue-list">
+            {model.map(receipt => (
+              <li key={receipt.requestId}>
+                <span className="router-queue-text">{receipt.text}</span>
+                <span className="chip muted">{ROUTE_OUTCOME[receipt.outcome] ?? receipt.outcome}</span>
+                <span className="quiet"> · {receipt.detail}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
+/**
+ * The decisions of the Project Gate, as the console shows them.
+ *
+ * Each line names the four conditions and what was decided about each of them, the reason the gate gave, and — when a
+ * Project really was created — the Project and the PM that belong to it. A refusal shows the condition that failed, so a
+ * person can see that nothing was created and why.
+ */
+function ProjectGates(props: { records: ProjectGateRecord[]; id: string }): ReactElement {
+  return (
+    <div className="router-queue" id={props.id} aria-label="自动建项目的判定">
+      <p className="quiet">自动建项目的判定</p>
       <ul className="router-queue-list">
-        {props.receipts.map(receipt => (
-          <li key={receipt.requestId} className={receipt.stage === 'failed' ? 'failure' : ''}>
-            <span className="router-queue-text">{receipt.text}</span>
-            <span className={`chip ${receipt.stage === 'failed' ? 'failure' : receipt.stage === 'assigned' ? 'success' : 'muted'}`}>
-              {ROUTE_OUTCOME[receipt.outcome] ?? receipt.outcome}
+        {props.records.map(record => (
+          <li key={`${record.requestId}-${record.attempt}`} className={record.outcome === 'refused' ? 'failure' : ''}>
+            <span className="router-queue-text">{record.text}</span>
+            <span className={`chip ${record.outcome === 'created' ? 'success' : record.outcome === 'refused' ? 'failure' : 'muted'}`}>
+              {GATE_OUTCOME[record.outcome] ?? record.outcome}
             </span>
-            <span className="quiet"> · {ROUTE_STAGE[receipt.stage] ?? receipt.stage}</span>
-            {receipt.target ? <span className="quiet"> · {receipt.target.kind === 'ticket' ? '工单' : '项目'} {receipt.target.title || receipt.target.id}</span> : null}
-            {receipt.ticketId ? <span className="quiet"> · 工单 {receipt.ticketId}</span> : null}
-            {receipt.sessionId ? <span className="quiet"> · 会话 {receipt.sessionId}{receipt.sessionStatus ? `（${SESSION_STATUS[receipt.sessionStatus] ?? receipt.sessionStatus}）` : ''}</span> : null}
-            {receipt.answer ? <span className="quiet"> · {receipt.answer}</span> : null}
-            {receipt.error ? <span className="quiet"> · {receipt.error}</span> : null}
+            <span className="quiet"> · {record.detail}</span>
+            {record.conditions.length ? (
+              <span className="quiet"> · {record.conditions.map(finding =>
+                `${GATE_CONDITION[finding.condition] ?? finding.condition}：${finding.met ? '成立' : '不成立'}`).join('；')}</span>
+            ) : null}
+            {record.modules.length ? (
+              <span className="quiet"> · 模块 {record.modules.map(module =>
+                `${module.name}（本人原话：${module.anchor || '无'}）`).join('；')}</span>
+            ) : null}
+            {record.projectId ? <span className="quiet"> · 项目 {record.title || record.projectId}</span> : null}
+            {record.pmSessionId ? <span className="quiet"> · PM 会话 {record.pmSessionId}{record.pmStatus ? `（${SESSION_STATUS[record.pmStatus] ?? record.pmStatus}）` : ''}</span> : null}
+            {record.pmStatus === 'unconfirmed' ? <span className="quiet"> · PM 未确认启动{record.error ? `：${record.error}` : ''}</span> : null}
+            {record.existingProject ? <span className="quiet"> · 已有项目 {record.existingProject.title}</span> : null}
           </li>
         ))}
       </ul>
@@ -562,6 +641,7 @@ export function HomePage(props: PageProps): ReactElement {
   const proposal = router.data?.proposal
   const queue: RouterQueueEntry[] = router.data?.queue ?? []
   const routes: FastRouteReceipt[] = router.data?.routes ?? []
+  const gates: ProjectGateRecord[] = router.data?.gates ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -720,6 +800,7 @@ export function HomePage(props: PageProps): ReactElement {
             </div>
           ) : null}
           {routes.length ? <RouterRoutes receipts={routes} id="router-routes" /> : null}
+          {gates.length ? <ProjectGates records={gates} id="router-gates" /> : null}
           {queue.length ? <RouterQueue entries={queue} id="router-queue" /> : null}
           <form className="composer" onSubmit={event => { event.preventDefault(); send(false) }}>
             {attachments.length ? <ul className="router-files">

@@ -62,6 +62,8 @@ export type FastRouteStage =
   | 'assigned'
   /** The message was handed to the high-level Router. */
   | 'escalated'
+  /** The Router's own model handles the message; the rules never claimed it. */
+  | 'model'
   /** The action could not be carried out. */
   | 'failed'
   /** The action was attempted and nobody confirmed it; the control plane cannot say whether it arrived. */
@@ -159,12 +161,18 @@ const QUESTION_START_EN = ['what', 'how', 'why', 'when', 'where', 'which', 'who'
  *
  * The single character "不" is not one of them: it is part of too many ordinary words ("不存在的项目", "不同的看法"), and a
  * rule that refused every message with a "不" in it would refuse the very sentences that name a Project that is not there.
+ *
+ * The Project Gate reads the same words: it needs to know whether a negation stands in front of the act it refuses.
  */
-const NEGATION_ZH = ['不要', '不用', '不必', '不需', '无需', '不得', '不是', '没有', '别', '勿', '取消', '撤销', '停止',
+export const NEGATION_ZH = ['不要', '不用', '不必', '不需', '无需', '不得', '不是', '没有', '别', '勿', '取消', '撤销', '停止',
   '暂停', '停下', '算了']
 
-/** The English words that make a message a negation or a cancellation. */
-const NEGATION_EN = ["don't", 'don’t', 'dont', 'do not', 'does not', 'doesn’t', 'not', 'never', 'no', 'without',
+/**
+ * The English words that make a message a negation or a cancellation.
+ *
+ * The Project Gate reads the same words: it needs to know whether a negation stands in front of the act it refuses.
+ */
+export const NEGATION_EN = ["don't", 'don’t', 'dont', 'do not', 'does not', 'doesn’t', 'not', 'never', 'no', 'without',
   'cancel', 'abort', 'halt', 'stop', 'skip']
 
 /** The Chinese words that ask for something to be made. */
@@ -377,11 +385,20 @@ function firstWordAfter(text: string, chinese: readonly string[], english: reado
   return found[0]
 }
 
-/** A word that stands inside another word is not a word here. */
-function escapeRegExp(word: string): string { return word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+/**
+ * A word that stands inside another word is not a word here.
+ *
+ * The Project Gate reads the same words: it has to find a negation in front of an act, and the words of the two lists are
+ * ordinary words with ordinary punctuation in them.
+ */
+export function escapeRegExp(word: string): string { return word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 
-/** Whether the message asks a question rather than gives an order. */
-function isQuestion(text: string): boolean {
+/**
+ * Whether the message asks a question rather than gives an order.
+ *
+ * The Project Gate reads the same words: a question never asks for a Project, whoever says it does.
+ */
+export function isQuestion(text: string): boolean {
   if (text.endsWith('?') || text.endsWith('？')) return true
   for (const word of QUESTION_END_ZH) if (text.endsWith(word)) return true
   for (const word of QUESTION_START_ZH) if (text.startsWith(word)) return true
@@ -389,15 +406,28 @@ function isQuestion(text: string): boolean {
   return pattern.test(text)
 }
 
-/** Whether the message carries a negation or a cancellation. */
-function hasNegation(text: string): boolean {
+/**
+ * Whether the message carries a negation or a cancellation.
+ *
+ * The Project Gate reads the same words: a request that negates never asks for a Project, whoever says it does.
+ */
+export function hasNegation(text: string): boolean {
   for (const word of NEGATION_ZH) if (text.includes(word)) return true
   const pattern = new RegExp(`\\b(?:${NEGATION_EN.map(escapeRegExp).join('|')})\\b`, 'i')
   return pattern.test(text)
 }
 
-/** The message without its quoted spans: what the person said, and not what they quoted. */
-function stripQuoted(text: string): string { return text.replace(QUOTED, ' ') }
+/**
+ * The message without its quoted spans: what the person said, and not what they quoted.
+ *
+ * The Project Gate reads the same words: a command that stands only inside a quotation is content, not an order.
+ */
+export function stripQuoted(text: string): string { return text.replace(QUOTED, ' ') }
+
+/** The texts inside the quotations of a message; what they hold is data, not an instruction. */
+export function quotedTexts(text: string): string[] {
+  return quotedSpans(text).map(span => span.content)
+}
 
 /** The quoted spans of the message, and what each of them holds. */
 function quotedSpans(text: string): QuotedSpan[] {

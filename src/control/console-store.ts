@@ -176,6 +176,56 @@ export interface FastRouteRow {
 }
 
 /**
+ * One decision of the Project Gate, and what became of it.
+ *
+ * The row is the durable half of the gate: it names the human request the decision was made for, the four findings and the
+ * modules they were made of, the reason the gate gave, and — when a Project really was created — the Project and the PM
+ * that belong to it. A refusal is a row as well: it says that nothing was created and why, so a person may ask later why
+ * their request did not become a Project.
+ *
+ * The attempt number keeps every try of one request: a decision that was refused may be tried again with a better one, and
+ * both tries are facts. The request id and the attempt together are unique, so one try is recorded once.
+ */
+export interface ProjectGateRow {
+  /** The row's own order; the oldest row was decided first. */
+  seq: number
+  /** The Router request this decision was made for; the message's own id. */
+  requestId: string
+  /** Which try of that request this is, counting from one. */
+  attempt: number
+  /** When the decision was made. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The title the decision would have given the Project. */
+  title: string
+  /** The goal the decision would have given the Project. */
+  goal: string
+  /** What became of it: `created`, `refused` or `failed`. */
+  outcome: string
+  /** The stable code of the reason. */
+  reason: string
+  /** The reason in words. */
+  detail: string
+  /** The four findings, as JSON. */
+  conditions: string
+  /** The modules, as JSON. */
+  modules: string
+  /** The condition that failed, when one did. */
+  failedCondition: string
+  /** The Project the request named outright, as JSON, when it named one. */
+  existingProject: string
+  /** The Project that was created, when one was. */
+  projectId: string
+  /** The PM Session of that Project, when there is one. */
+  pmSessionId: string
+  /** The state of that PM Session, as the control plane knows it. */
+  pmStatus: string
+  /** Why it failed, when it failed. */
+  error: string
+}
+
+/**
  * One message a person sent to the Router, and what became of it.
  *
  * The row is the control plane's own durable fact about a message that is on its way to the Router. It exists because
@@ -285,6 +335,14 @@ CREATE TABLE IF NOT EXISTS fast_route (
   ticket_id TEXT NOT NULL, session_id TEXT NOT NULL, ticket_title TEXT NOT NULL, ticket_goal TEXT NOT NULL,
   error TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS fast_route_stage ON fast_route(stage, seq);
+CREATE TABLE IF NOT EXISTS project_gate (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL, attempt INTEGER NOT NULL, at TEXT NOT NULL, text TEXT NOT NULL,
+  title TEXT NOT NULL, goal TEXT NOT NULL, outcome TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT NOT NULL,
+  conditions TEXT NOT NULL, modules TEXT NOT NULL, failed_condition TEXT NOT NULL, existing_project TEXT NOT NULL,
+  project_id TEXT NOT NULL, pm_session_id TEXT NOT NULL, pm_status TEXT NOT NULL, error TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS project_gate_attempt ON project_gate(request_id, attempt);
+CREATE INDEX IF NOT EXISTS project_gate_request ON project_gate(request_id, seq);
 `
 
 /** The value of one column of a row, as a number. */
@@ -717,11 +775,96 @@ export class ConsoleStore {
    */
   pruneFastRoutes(keep = 200): void {
     const rows = this.db.prepare(
-      "SELECT seq FROM fast_route WHERE stage IN ('queued','assigned','escalated','failed','unconfirmed')"
+      "SELECT seq FROM fast_route WHERE stage IN ('queued','assigned','escalated','model','failed','unconfirmed')"
       + ' ORDER BY seq DESC').all()
     const doomed = rows.slice(keep).map(row => numberOf(row.seq))
     if (doomed.length === 0) return
     const remove = this.db.prepare('DELETE FROM fast_route WHERE seq = ?')
+    for (const seq of doomed) remove.run(seq)
+  }
+
+  /**
+   * Record one decision of the Project Gate.
+   *
+   * The row is written before anything is created, so a control plane that died in the middle leaves the fact behind
+   * instead of creating a second Project when it comes back. The request id and the attempt are unique together: one try
+   * of one request is recorded once.
+   */
+  addProjectGate(row: Omit<ProjectGateRow, 'seq'>): ProjectGateRow {
+    this.db.prepare('INSERT OR IGNORE INTO project_gate'
+      + ' (request_id, attempt, at, text, title, goal, outcome, reason, detail,'
+      + ' conditions, modules, failed_condition, existing_project, project_id, pm_session_id, pm_status, error)'
+      + ' VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.requestId, row.attempt, row.at, row.text, row.title, row.goal, row.outcome, row.reason, row.detail,
+        row.conditions, row.modules, row.failedCondition, row.existingProject, row.projectId, row.pmSessionId,
+        row.pmStatus, row.error)
+    return this.projectGateRow(row.requestId, row.attempt)!
+  }
+
+  /**
+   * Write what became of one decision.
+   *
+   * The Project and the PM it names are facts the control plane learned after the row was written; the reason and the
+   * words stay as they were read.
+   */
+  updateProjectGate(requestId: string, attempt: number, patch: { outcome?: string; reason?: string; detail?: string
+    projectId?: string; pmSessionId?: string; pmStatus?: string; error?: string }): void {
+    const current = this.projectGateRow(requestId, attempt)
+    if (!current) return
+    this.db.prepare('UPDATE project_gate SET outcome = ?, reason = ?, detail = ?, project_id = ?,'
+      + ' pm_session_id = ?, pm_status = ?, error = ? WHERE request_id = ? AND attempt = ?')
+      .run(patch.outcome ?? current.outcome, patch.reason ?? current.reason, patch.detail ?? current.detail,
+        patch.projectId ?? current.projectId, patch.pmSessionId ?? current.pmSessionId, patch.pmStatus ?? current.pmStatus,
+        patch.error ?? current.error, requestId, attempt)
+  }
+
+  /** The decisions the file holds, newest first. */
+  projectGates(options: { limit?: number; newest?: boolean } = {}): ProjectGateRow[] {
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 50), 200))
+    const order = options.newest === true ? 'DESC' : 'ASC'
+    const rows = this.db.prepare('SELECT seq, request_id, attempt, at, text, title, goal, outcome, reason, detail,'
+      + ' conditions, modules, failed_condition, existing_project, project_id, pm_session_id, pm_status, error FROM project_gate'
+      + ` ORDER BY seq ${order} LIMIT ?`).all(limit)
+    return rows.map(row => this.projectGateRowOf(row))
+  }
+
+  /** Every try of one request, oldest first. */
+  projectGatesOfRequest(requestId: string): ProjectGateRow[] {
+    const rows = this.db.prepare('SELECT seq, request_id, attempt, at, text, title, goal, outcome, reason, detail,'
+      + ' conditions, modules, failed_condition, existing_project, project_id, pm_session_id, pm_status, error FROM project_gate'
+      + ' WHERE request_id = ? ORDER BY attempt ASC').all(requestId)
+    return rows.map(row => this.projectGateRowOf(row))
+  }
+
+  /**
+   * The try that really created a Project, when one did.
+   *
+   * It is what makes a repeated call idempotent: a second call for the same request finds the Project the first one made
+   * instead of making another.
+   */
+  createdProjectGate(requestId: string): ProjectGateRow | undefined {
+    const rows = this.projectGatesOfRequest(requestId)
+    return rows.find(row => row.outcome === 'created')
+  }
+
+  /** One decision, by the request it was made for and the try it was. */
+  private projectGateRow(requestId: string, attempt: number): ProjectGateRow | undefined {
+    const row = this.db.prepare('SELECT seq, request_id, attempt, at, text, title, goal, outcome, reason, detail,'
+      + ' conditions, modules, failed_condition, existing_project, project_id, pm_session_id, pm_status, error FROM project_gate'
+      + ' WHERE request_id = ? AND attempt = ?').get(requestId, attempt)
+    return row === undefined ? undefined : this.projectGateRowOf(row)
+  }
+
+  /**
+   * Drop what the file may no longer keep.
+   *
+   * The decisions are bounded the same way the routings are: a decision that came to rest long ago is history, not a task.
+   */
+  pruneProjectGates(keep = 200): void {
+    const rows = this.db.prepare("SELECT seq FROM project_gate ORDER BY seq DESC").all()
+    const doomed = rows.slice(keep).map(row => numberOf(row.seq))
+    if (doomed.length === 0) return
+    const remove = this.db.prepare('DELETE FROM project_gate WHERE seq = ?')
     for (const seq of doomed) remove.run(seq)
   }
 
@@ -745,6 +888,8 @@ export class ConsoleStore {
     this.pruneRouterMessages()
     // The routings the Fast Router made are bounded the same way: one that came to rest long ago is history, not a task.
     this.pruneFastRoutes()
+    // The decisions of the Project Gate are bounded the same way: one that came to rest long ago is history, not a task.
+    this.pruneProjectGates()
   }
 
   /** One value of the console's own settings. */
@@ -796,5 +941,16 @@ export class ConsoleStore {
       targetId: stringOf(row.target_id), targetTitle: stringOf(row.target_title), ticketId: stringOf(row.ticket_id),
       sessionId: stringOf(row.session_id), ticketTitle: stringOf(row.ticket_title), ticketGoal: stringOf(row.ticket_goal),
       error: stringOf(row.error) }
+  }
+
+  /** One decision of the Project Gate, as this store hands it out. */
+  private projectGateRowOf(row: Record<string, unknown>): ProjectGateRow {
+    return { seq: numberOf(row.seq), requestId: stringOf(row.request_id), attempt: numberOf(row.attempt),
+      at: stringOf(row.at), text: stringOf(row.text), title: stringOf(row.title), goal: stringOf(row.goal),
+      outcome: stringOf(row.outcome), reason: stringOf(row.reason), detail: stringOf(row.detail),
+      conditions: stringOf(row.conditions), modules: stringOf(row.modules),
+      failedCondition: stringOf(row.failed_condition), existingProject: stringOf(row.existing_project),
+      projectId: stringOf(row.project_id),
+      pmSessionId: stringOf(row.pm_session_id), pmStatus: stringOf(row.pm_status), error: stringOf(row.error) }
   }
 }

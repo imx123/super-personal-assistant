@@ -7,7 +7,7 @@
 | P3-0 | — | 基线、权限和停止矩阵 | DONE |
 | P3-1 | P3-0 | 全角色会话干预，真实 DSH | DONE |
 | P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | DONE |
-| P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | NOT_STARTED |
+| P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | INVESTIGATING |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | NOT_STARTED |
 | P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | NOT_STARTED |
 | P4-0 | P3-Gate | 协作事件边界 | NOT_STARTED |
@@ -69,3 +69,13 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验�
 真实 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node` 和 Gemma 4 12B 本机模型通过。使用同一条示例文件指令和相同 16K 模型上下文，P3-1 基线走了一轮 Router 模型；P3-2 在 Worker 开始之前的 Router 模型回合为 0。真实 Worker 写入 `hello.txt` 并向原独立 Ticket 报告，首页显示工单和会话 ID。明确交给已存在项目的另一条指令，无需点击确认，真实 PM 收到一次，首页显示正确项目、PM 会话和已确认状态。证据位于本机忽略目录 `.artifacts/phase3-5-20261117/` 的 `live-HxyojW/evidence.json` 与 `live-32OY0o/evidence.json`。
 
 P3-3 处理复杂项目任务的高层分派、四条件门禁和高层 PM 自动交接。确定性快路由已经可用，小模型接入保持可选。
+
+## P3-3A
+
+Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。高层继续使用现有 `router.v1` 会话，页面能追踪快路由与模型路径。自动创建项目由控制面核对四项结构化判断、用户工作意图和原话引用。已存在的项目或同名拟建项目由高层继续澄清。用户明确创建的入口保留。
+
+同一 Router 请求绑定一个领域项目。并发请求合并，重启后的重复调用读取持久回执，已完成的动作无需重新发送节点命令。没有完成记录的未知请求仍被拒绝。先前未完整确认的创建仅从领域记录核对项目。四条件、拒绝无副作用、重放、已有项目和原接口兼容用例见 [自动创建项目](../020-phase3-project-gate.zh-CN.md)。
+
+类型检查、构建通过。54 文件定向中，711 项通过、1 项因 Windows 目录联接跳过，另有 2 项临时端口 `bad port`；快路由、四条件门禁与文档三个文件复跑 59 项全过。全量测试未重跑。
+
+真实 Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live` 和 `dsh-superagent/node` 以本机 Gemma 4 12B 验收。串行样例走高层模型且没有创建 Project。可并行的三模块样例由真实 Router 交付四项判断和原话引用，控制面创建一个 Project 并启动真实 PM，首页显示项目和 PM 会话 ID。证据在本机忽略目录 `.artifacts/phase3-5-20261117/live-gtD3dH/evidence.json`。P3-3B 仍需完成常规高层自动交接与业务闭环验收。
