@@ -84,7 +84,7 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验�
 
 ## P3-3B
 
-本次在 `next` 本地提交。按用户要求，完成本项验收后暂停。P3-Gate、Phase 4 和 Phase 5 尚未开始。
+P3-3B 实现与验收提交为 `b66ca88`。按用户要求，完成本项验收后暂停。P3-Gate、Phase 4 和 Phase 5 尚未开始。
 
 Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。高层 Router 新增 `control_router_pm_handoff`：模型只决定「哪个项目、说什么」，控制面按本人原话复核后自己把工作交给该项目的 PM，不需要「转告 PM」，也不需要点击确认。复核包括工作意图、唯一目标（或本请求自己建的项目）、逐字来自本人原话的内容边界，以及不越到别的项目、不要新授权、不可逆范围不自动做；歧义、多候选、越权、敏感跨域一律退回复核或走已有授权限制。
 
