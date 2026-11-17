@@ -9,7 +9,7 @@
 | P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | DONE |
 | P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | DONE |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | DONE |
-| P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | NOT_STARTED |
+| P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | DONE |
 | P4-0 | P3-Gate | 协作事件边界 | NOT_STARTED |
 | P4-1 | P4-0 | 可靠报告协调，真实 DSH | NOT_STARTED |
 | P4-2 | P4-1 | 信息流订阅，真实 DSH | NOT_STARTED |
@@ -103,3 +103,23 @@ Edge、真实 DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node`
 ## P3-4
 
 Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Codex 在本机修正脚本并实际运行。Git 层 19 项通过，覆盖不同文件、同一文件、合并冲突、失败清理边界和单派工 diff。项目页新增共享目录并行写入提示。生产工作区与审阅实现保持现状。候选方案、未验证的真实 DSH 部分及用户决策范围见 [工作区实验与设计记录](PHASE3_WORKSPACE_SPIKE.md)。
+
+## P3-Gate
+
+2026-11-17，验收通过。受测代码为 `next` 的 `b2ff528`。Windows / Edge，真实 DSH Desktop 0.2.2.0、隔离 `phase3-live` profile、`dsh-superagent/node`，使用本机 llama-server 的 Gemma 4 12B。阶段验收没有修改业务代码。
+
+| 验收项 | 结果 | 本机证据 |
+| --- | --- | --- |
+| 独立工单与快路由 | Worker 在首轮 Router 模型调用之前获派，写出 `hello.txt` 并向原 Ticket 报告完成。Router 收到并回复报告，首页显示实际 Ticket 和 Worker；明确指令也可直接交给已有 PM。 | `live-t5fz3u/evidence.json`、其 SQLite 事件序号 25 和 36 |
+| 已有项目自动交接 | 首页普通任务无需确认，交给正确 PM 一次。真实 Worker 完成文件与报告，PM 验收关单。 | `live-fZBdaQ/evidence.json` |
+| 项目门禁与项目闭环 | 串行任务未建项目，可并行任务的四项条件均有可审计证据。另一组真实任务只建一个项目，三张工单各自产出正确文件和最终报告，PM 验收后项目报告到达 Router。四种拒绝与两种通过由确定性测试覆盖。 | `live-zARWxH/evidence.json`、`live-s7jffS/evidence.json` |
+| Router 插话与打断 | 忙时两条插话按顺序排队，刷新可见，接续进入各自回合。显式中断指定回合后，下一条能执行，项目状态不变。 | `live-CtWYiU/evidence.json` |
+| PM 停止与恢复 | 从浏览器只停 PM，项目仍 active，两个 Worker 与派工身份不变。旧消息和 ensure 被拒，显式恢复后同一 PM 完成下一轮。 | `live-BGTfBA/evidence.json` |
+| Worker 停止、重启与对账 | 节点记录 Worker 活动回合 `aborted`，控制面持久记录已确认停止。更换控制面进程后派工仍结束，旧会话被对账归档。旧消息返回 409，没有新回合。 | `live-7CnToI/evidence.json` |
+| 工作区隔离实验 | 隔离 Git 实验 19 项通过。生产仍共用目录，项目页提示并行改同一文件的覆盖风险。 | `.artifacts/phase3-workspace/spike-20261117-222757-8c37f2/evidence.json` |
+
+类型检查、构建通过。控制面、控制台、停止、Token、Node Protocol、调度器、共享 Engine 等定向回归 56 文件、753 项通过。Windows 全量为 1,834 项通过、47 项失败、1 项跳过，另有 31 个未处理错误。隔离基线 `6875ef9` 使用相同依赖，46 个失败用例与当前版同名，主要涉及旧插件的系统工具、配置及权限；两版另各有一次 Fetch 临时端口失败，当前版该用例在定向回归中通过。两版均有旧面板环境的 `jsdom/undici` 加载错误。当前版多出的未处理错误来自未修改的旧服务脚本测试尝试启动 Windows 上不可用的 `python3/fcntl`。全量结果保留为环境和旧插件基线问题。
+
+真实三模块项目第一次使用 16K 上下文，PM 累积提示词超过上限，三张工单只验收了两张。相同代码将隔离样例上下文调至 24K 后全链路通过。Worker 停止中的节点 `idle` 表示已无活动回合，控制台用持久停止标记和派工状态确认人工停止。
+
+真实证据及全量对照保存在本机忽略目录 `.artifacts/phase3-5-20261117/`。P4-0 可以按新方向进入设计评审，Phase 4 实施仍未开始。

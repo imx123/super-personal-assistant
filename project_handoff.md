@@ -11,10 +11,10 @@
 | P3-2 快路由 | 完成，真实 DSH 跑通独立工单和报告，规则命中可直接向 Worker 或 PM 投递。 | `3dfbf4a` |
 | P3-3 高层路由与项目交接 | 完成，真实 DSH 验证既有项目接单，以及自动创建项目后从派工到报告回 Router。 | `1b38219`、`b66ca88` |
 | P3-4 工作区隔离 | Git 实验和项目页提示完成，生产继续使用共享目录。 | `3364630` |
-| P3-Gate | 待验收。按用户要求于 P3-3B 验收后暂停。 | — |
+| P3-Gate | 验收通过。已在同一版核对两条真实闭环、停止与重启、项目门禁和兼容回归。 | 受测代码 `b2ff528` |
 | Phase 4 协作与事件、Phase 5 记忆 | 尚未启动。 | — |
 
-恢复时先在同一版代码上按任务书完成 P3-Gate，核对独立工单与项目闭环、会话干预与重启、项目门禁，以及旧插件、控制台、节点协议和调度器等兼容项。Gate 通过后进入 P4-0 的协作事件设计。详细证据见 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md)。
+P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定向回归通过；真实 DSH 核对了两条闭环、会话干预和 Worker 停止后的重启恢复。全量测试的遗留问题和真实证据见 [P3-Gate 记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p3-gate)。下一步进入 P4-0 的协作事件设计。详细证据见 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md)。
 
 本轮沿用用户补充的三项约束。停 PM 会话与停项目解耦。Router 忙时可以提交插话，普通消息按顺序在后续回合发出，主动中断是单独操作。快路由首版使用规则，OpenSquilla 可作为后续参考。
 
@@ -78,7 +78,7 @@
 
 P3-3B 类型检查、构建通过，55 个定向文件共 737 项通过、1 项因 Windows 目录联接限制跳过。真实验收使用 Edge、DSH Desktop `0.2.2.0`、隔离 `phase3-live` profile、`dsh-superagent/node` 和本机 Gemma 4 12B，通过两条新验收链路，包括已有项目免确认交接并完成工单，以及门禁自动创建一个项目后由 PM 派三个工单、Worker 写出三个文件、PM 完成三次验收，项目报告回到 Router 收件箱。证据见 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md)。
 
-本轮未重跑全量测试。此前的 Windows 全量验证仍有旧插件面板、tmux 脚本、飞书和权限相关失败。
+P3-3B 当时未重跑全量。随后的 P3-Gate 已与开工基线对照，旧插件、Windows 工具与 jsdom 环境的失败记录见阶段验收。
 
 2026-11-16 的控制台验收通过 **39 个测试文件、378 项定向测试**和 **5 项打包测试**。真实模型用的是 Windows 上的 DSH Desktop `0.2.2.0`、隔离的 `phase5` profile、`dsh-superagent/node` 与 `opencode-go/deepseek-v4.1-flash`。本机证据在忽略目录 `.artifacts/`，新克隆可按部署文档和相关测试重新验证。
 
