@@ -646,6 +646,24 @@ export class Engine {
     })
   }
   /**
+   * A person asks the node to stop a Worker whose Assignment already ended, because that stop was never confirmed.
+   *
+   * The Assignment stays ended and the Ticket keeps its stop; only the node is asked again, and the caller waits for the
+   * answer through `options.cleanups`. This is what makes a failed stop recoverable: the open-stop facts are the domain's
+   * own, and a confirmed stop clears them again — no second bookkeeping of the operator's own.
+   * @throws UserError when the ticket is unknown, or the Assignment is not one of its own.
+   */
+  reconfirmStoppedWorkerByOperator(ticketId: string, assignmentId: string,
+    options: { reason?: string; cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (!ticket) throw new UserError('unknownTicket')
+      this.tickets.restopWorker(ticketId, assignmentId,
+        options.reason ?? 'The stop of this Worker is confirmed again', options.cleanups)
+      return this.repo.tickets.get(ticketId)!
+    })
+  }
+  /**
    * Record that stopping one Worker could not be confirmed, so the Ticket keeps that failure until a later stop confirms it.
    *
    * The failure is what keeps a new Assignment from starting over a Worker that may still run, so a caller that gave up
@@ -1387,8 +1405,19 @@ export class Engine {
     return this.repo.atomic(() => this.tickets.stop(ticketId, reason, cleanups))
   }
 
-  stopAssignment(ticketId: string, assignmentId: string): Ticket {
-    return this.repo.atomic(() => this.tickets.stopAssignment(ticketId, assignmentId))
+  /**
+   * A person's stop of one Worker alone: the current Assignment ends, the Ticket records the stop under the `worker`
+   * scope, and the Executor is asked to stop the Worker's Session.
+   *
+   * The `worker` scope is the one a person owns: the Project's PM may not revive that Worker on its own, and an
+   * automatic retry may not replace it — only a person's explicit approval clears the stop. `confirmStop` writes the
+   * open-stop fact next to the Assignment's end, and `cleanups` receives the Executor's background cleanup, so a caller
+   * that must know whether the node really stopped the Worker can wait for the answer and report a failure.
+   * @throws UserError when the ticket is unknown or ended, or the assignment is not its latest or already ended.
+   */
+  stopAssignment(ticketId: string, assignmentId: string,
+    options: { confirmStop?: boolean; cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): Ticket {
+    return this.repo.atomic(() => this.tickets.stopAssignment(ticketId, assignmentId, options))
   }
   /**
    * A person retries a ticket whose worker reported failed or blocked (or whose input delivery failed): the stalled

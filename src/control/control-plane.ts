@@ -11,13 +11,13 @@ import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { redact } from '../infra/redact.ts'
 import { NODE_PROTOCOL_VERSION } from '../shared/protocol.ts'
-import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, ReviewDiffResult, RoleProfile, RouterModel,
+import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
   SessionInspection, SessionRecord, SessionStatus } from '../shared/protocol.ts'
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
-import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow } from './console-store.ts'
+import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
@@ -158,6 +158,14 @@ export const PROJECT_MEMORY_TEXT_LIMIT = 500
 
 /** How many entries one Project's memory keeps. */
 const PROJECT_MEMORY_KEPT = 200
+
+/**
+ * How many stop notices one reader sees.
+ *
+ * A notice is a fact about a stop, not a log of everything that happened: the newest ones are the ones a PM or the
+ * Router has to know about, and the bound keeps the answer from growing with the life of the control plane.
+ */
+const PROJECT_STOP_NOTICE_LIMIT = 20
 
 /**
  * How many report calls one Session keeps in the ledger.
@@ -462,6 +470,14 @@ export interface RouterState {
    * confirms it in the console.
    */
   proposal?: RouterProposalView
+  /**
+   * The notices about stops the Router is the logical superior of.
+   *
+   * The Router is the superior of every PM Session and of the Workers of the standalone Tickets, so an operator's stop
+   * of any of them leaves a notice here. A notice carries the target, the scope, the impact and the operator — never
+   * the work itself and never another notice's data.
+   */
+  stops?: StopNotice[]
 }
 
 /**
@@ -657,6 +673,69 @@ export interface ConsoleSession extends SessionRecord {
   unavailableReason?: string
 }
 
+/**
+ * What one operator's stop did, as the console and the logical superior read it.
+ *
+ * The scope says how far the stop reached: `session` for a PM or Router Session, `assignment` for one Worker's
+ * Assignment and `ticket` for a whole Ticket. The state says whether the node confirmed it — `requested` is a stop the
+ * node refused, timed out on or never answered.
+ */
+export interface SessionStopView {
+  /** The Session the stop was about. */
+  sessionId: string
+  /** The role that Session has. */
+  role: string
+  /** How far the stop reached. */
+  scope: 'session' | 'assignment' | 'ticket'
+  /** `requested` until the node confirmed the stop; `confirmed` afterwards. */
+  state: 'requested' | 'confirmed'
+  /** When the operator asked for the stop. */
+  at: string
+  /** Who asked. */
+  by: string
+  /** Why, as the operator wrote it. */
+  reason?: string
+  /** When the node confirmed the stop. */
+  confirmedAt?: string
+  /** The redacted diagnostic of a stop the node did not confirm. */
+  error?: string
+  /** What the stop affected. */
+  affected: string[]
+  /** What the stop left running. */
+  unaffected: string[]
+}
+
+/**
+ * One notice about a stop, as the logical superior reads it.
+ *
+ * Every id it names belongs to the one Project the stopped work was part of, so a notice read by one PM never carries
+ * another Project's data.
+ */
+export interface StopNotice {
+  /** The notice's own id. */
+  id: number
+  /** When the stop was recorded. */
+  at: string
+  /** What was stopped. */
+  target: { kind: string; id: string; sessionId?: string }
+  /** How far the stop reached. */
+  scope: string
+  /** `requested` until the node confirmed the stop; `confirmed` afterwards. */
+  state: string
+  /** Who stopped it. */
+  actor: string
+  /** The Project the stopped work belonged to, when it had one. */
+  projectId?: string
+  /** What the stop affected. */
+  affected: string[]
+  /** What the stop left running. */
+  unaffected: string[]
+  /** Who may read the notice. */
+  superior: { kind: string; id?: string }
+  /** The redacted diagnostic of a stop the node did not confirm. */
+  error?: string
+}
+
 /** The safe Project summary a PM reads: the identity and goal it manages, not its Mandate or PM Session record. */
 export interface PmContextProject {
   id: string
@@ -734,6 +813,14 @@ export interface PmContext {
    * Project reads it, and only the newest {@link PROJECT_MEMORY_LIMIT} entries.
    */
   memory?: PmContextMemory[]
+  /**
+   * The notices about stops in this Project, as the PM reads them.
+   *
+   * The PM is the logical superior of the Workers of its own Project, so an operator's stop of one of them leaves a
+   * notice here: the target, the scope, what the stop affected, what it left running and who made it. The notices carry
+   * this Project's ids only — never another Project's.
+   */
+  stops?: StopNotice[]
 }
 
 /** One entry of a Project's memory, as the PM reads it. */
@@ -817,10 +904,31 @@ export class ControlPlane {
    * instead of starting a second Worker over one that may still be running.
    */
   private readonly ticketOperations = new Map<string, Promise<void>>()
+  /**
+   * The stop and the resume of one Session, one at a time.
+   *
+   * They are ordered, not refused: a resume that arrives while a stop is running waits for the node's answer, so the
+   * stop's late cancel can never reach the Session the resume brought back.
+   */
+  private readonly sessionOperations = new Map<string, Promise<void>>()
   /** The stop of the Worker the PM stopped last, by Ticket id: the gate a new Assignment must pass. */
   private readonly stopStates = new Map<string, PmStopState>()
   /** The Sessions a stop is in flight for, so no message and no re-ensure brings them back while they are stopping. */
   private readonly stoppingSessions = new Set<string>()
+  /**
+   * How many times one Session was resumed, by Session id.
+   *
+   * A stop that repeats its cancel after its creation settled must not reach a Session that was resumed in between, so
+   * the resume advances this counter and the repeat only fires while it is unchanged.
+   */
+  private readonly sessionEpochs = new Map<string, number>()
+  /**
+   * The Sessions that were resumed, by Session id.
+   *
+   * A report of the stop that came before the resume is about the old lifecycle: it must not stop the resumed Session
+   * again. A new stop clears the Session from this set — that stop owns the Session's status once more.
+   */
+  private readonly resumedSessions = new Set<string>()
   /**
    * The PM wake-ups this control plane made for Worker reports, by Ticket: the newest one per Ticket.
    *
@@ -1214,6 +1322,11 @@ export class ControlPlane {
     const pm = this.sessions.get(project.pmSessionId)
     if (!pm) return { ok: false, acknowledged: false, error: 'the Project has no PM Session' }
     if (pm.revokedAt) return { ok: false, acknowledged: false, error: 'the PM Session was revoked' }
+    // A PM an operator stopped takes no scheduled message: the plan fails and says why, rather than waking a Session
+    // a person put to rest.
+    if (this.operatorStopRefusal(pm)) {
+      return { ok: false, acknowledged: false, error: 'the PM Session was stopped by an operator' }
+    }
     if (pm.role !== 'pm' || pm.projectId !== project.id) {
       return { ok: false, acknowledged: false, error: 'the PM Session does not belong to the Project' }
     }
@@ -1592,6 +1705,9 @@ export class ControlPlane {
    */
   private sessionDeliveryRefusal(record: SessionRecord): string | undefined {
     if (record.revokedAt) return 'the Session was revoked'
+    // A Session an operator stopped takes no message, whether the node confirmed the stop or not.
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) return stopped
     if (record.status === 'archived' || record.status === 'stopped' || record.status === 'stopping'
       || this.stoppingSessions.has(record.sessionId)) {
       return `the Session is ${record.status === 'stopping' || this.stoppingSessions.has(record.sessionId) ? 'stopping' : record.status}`
@@ -1621,30 +1737,64 @@ export class ControlPlane {
    * The Router comes up the first time a person speaks to it, so the console never has to ask for it on another page
    * first. Concurrent requests share one ensure, and a Session the current node generation already confirmed is returned as
    * it is: a reconnecting node that forgot it gets the same Session id re-ensured, never a second Session beside it.
+   *
+   * A Router an operator stopped is not ensured again: the stop is the operator's own word, and only an explicit resume
+   * takes it back.
    */
   async ensureRouter(): Promise<SessionRecord> {
+    return this.ensureRouterWith({})
+  }
+
+  /**
+   * The Router's own ensure, with the one option a resume needs.
+   *
+   * `resume` is the operator's explicit act: it may bring back a Session an operator stopped, and it skips the fast paths
+   * that would hand the stopped record back as it is. Nothing else passes it, and the public entry never does.
+   */
+  private async ensureRouterWith(options: { resume?: boolean }): Promise<SessionRecord> {
     const known = this.sessions.get(ROUTER_SESSION_ID)
     // A revoked Router stays revoked: re-ensuring it would issue a new token and hand the authority back.
     if (known?.revokedAt) {
       throw new OperatorError(409, 'The Router Session was revoked and cannot be started again')
     }
+    // A Router an operator stopped stays stopped: no ensure brings it back behind the operator's back.
+    if (options.resume !== true && known && this.operatorStopRefusal(known)) {
+      throw new OperatorError(409, 'The Router Session was stopped by an operator and has to be resumed explicitly')
+    }
     this.requireNodeOnline()
     const pending = this.pendingEnsures.get(ROUTER_SESSION_ID)
-    if (pending) return pending
+    if (pending) {
+      // A creation that is still in flight belongs to the stop that came before the resume: joining it would answer with
+      // the Session that stop took away.
+      if (options.resume === true) {
+        throw new OperatorError(409, 'The Router Session is still being created; resume it once that creation settled')
+      }
+      return pending
+    }
     const existing = this.sessions.get(ROUTER_SESSION_ID)
-    if (existing && isNodeConfirmed(existing.status) && !this.needsReensure(existing)) return existing
-    return this.singleFlight(ROUTER_SESSION_ID, () => this.ensureRouterSession())
+    if (options.resume !== true && existing && isNodeConfirmed(existing.status) && !this.needsReensure(existing)) return existing
+    return this.singleFlight(ROUTER_SESSION_ID, () => this.ensureRouterSession(options))
   }
 
   /** The Router's own ensure: the node is asked for one Session of its own, in a workspace of its own. */
-  private async ensureRouterSession(): Promise<SessionRecord> {
+  private async ensureRouterSession(options: { resume?: boolean } = {}): Promise<SessionRecord> {
     const existing = this.sessions.get(ROUTER_SESSION_ID)
     // The same rule as a PM: a confirmed Session from an older generation is re-ensured under the same id.
     const stale = existing !== undefined && this.needsReensure(existing)
-    if (existing && !stale && isNodeConfirmed(existing.status)) return existing
-    if (existing && !stale) {
-      const confirmed = await this.confirmExisting(existing)
-      if (confirmed) return confirmed
+    if (options.resume !== true) {
+      // The fast paths hand the record back as it is, so the stop gate has to be applied here too: an ensure that was
+      // already in flight when the operator stopped the Session must not answer with a Session they stopped.
+      if (existing && !stale && isNodeConfirmed(existing.status)) {
+        await this.enforceOperatorStop(existing)
+        return existing
+      }
+      if (existing && !stale) {
+        const confirmed = await this.confirmExisting(existing)
+        if (confirmed) {
+          await this.enforceOperatorStop(confirmed)
+          return confirmed
+        }
+      }
     }
     const path = this.workspacePath(join(this.options.workspaceRoot, 'router'))
     const at = this.now()
@@ -1664,9 +1814,15 @@ export class ControlPlane {
       await this.options.node.send({ ...this.base(ensureKey), type: 'router.ensure', sessionId: record.sessionId,
         workspace: path, profile: ROUTER_PROFILE, sessionToken: token, prompt: ROUTER_PROFILE.prompt })
     } catch (error) {
-      return this.recoverEnsureFailure(record, error, 'Router')
+      // An ensure that failed on an abnormal receipt must not answer with a Session an operator stopped either.
+      const failed = await this.recoverEnsureFailure(record, error, 'Router')
+      await this.enforceOperatorStop(failed)
+      return failed
     }
-    return this.settleEnsure(record, 'Router')
+    const settled = await this.settleEnsure(record, 'Router')
+    // An ensure that was already in flight when the operator stopped the Session would bring it back.
+    await this.enforceOperatorStop(settled)
+    return settled
   }
 
   /**
@@ -1728,6 +1884,9 @@ export class ControlPlane {
     const base: RouterState = { nodeOnline: this.nodes.get(this.options.nodeId)?.online !== false, messages }
     // The proposal the console shows: the one that waits for a person right now, with the text that would be sent.
     if (proposal !== undefined) base.proposal = routerProposalView(proposal)
+    // The Router is the logical superior of the PM Sessions and of the standalone Workers, so it reads their notices.
+    const stops = this.stopNotices({ superiorKind: 'router', superiorId: ROUTER_SESSION_ID, limit: PROJECT_STOP_NOTICE_LIMIT })
+    if (stops.length > 0) base.stops = stops
     if (record === undefined) return base
     return { ...base, session: { sessionId: record.sessionId, status: record.status, workspace: record.workspace,
       updatedAt: record.updatedAt, ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }) } }
@@ -2102,6 +2261,11 @@ export class ControlPlane {
     if (record.revokedAt) {
       throw new ToolCallError('unauthenticated', 'The Session was revoked; its token opens nothing')
     }
+    // A Session an operator stopped opens no tool route, and no refresh either: the stop is a fact about the Session,
+    // not about one credential. The token may still be valid, but the Session it names is not running.
+    if (this.operatorStopRefusal(record)) {
+      throw new ToolCallError('forbidden', 'The Session was stopped by an operator; it opens nothing until it is resumed')
+    }
     const current = record.tokenVersion ?? 0
     if (claims.tv !== current && !(options.allowPrevious === true && claims.tv === current - 1)) {
       throw new ToolCallError('unauthenticated', 'The Session token has been superseded by a refresh')
@@ -2123,6 +2287,11 @@ export class ControlPlane {
     // A revoked Session may not rotate itself into a fresh credential: the revocation outlasts every token it ever had.
     if (record.revokedAt) {
       throw new ToolCallError('unauthenticated', 'The Session was revoked; its token cannot be refreshed')
+    }
+    // A Session an operator stopped may not rotate itself either: the refresh is the one route that still accepts a
+    // token one generation behind, so it is the one route a stop has to close explicitly.
+    if (this.operatorStopRefusal(record)) {
+      throw new ToolCallError('forbidden', 'The Session was stopped by an operator; its token cannot be refreshed')
     }
     record.tokenVersion = (record.tokenVersion ?? 0) + 1
     this.persist(record)
@@ -2174,12 +2343,15 @@ export class ControlPlane {
     const { project } = this.requireProject(sessionId)
     const tickets = this.tickets().filter(ticket => ticket.projectId === project.id).map(ticket => this.pmTicketCard(ticket))
     const memory = this.projectMemory(project.id, PROJECT_MEMORY_LIMIT)
+    // The PM is the logical superior of the Workers of its own Project, so it reads the notices about them.
+    const stops = this.stopNotices({ superiorKind: 'pm', superiorId: sessionId, limit: PROJECT_STOP_NOTICE_LIMIT })
     return {
       project: { id: project.id, title: project.title, goal: project.goal, status: project.status,
         ...(project.pauseMode === undefined ? {} : { pauseMode: project.pauseMode }),
         ...(project.latestReport === undefined ? {} : { latestReport: project.latestReport }) },
       tickets,
       ...(memory.length === 0 ? {} : { memory: memory.map(entry => ({ at: entry.at, actor: entry.actor, text: entry.text })) }),
+      ...(stops.length === 0 ? {} : { stops }),
     }
   }
 
@@ -2502,6 +2674,24 @@ export class ControlPlane {
   }
 
   /**
+   * Run one stop or one resume of a Session at a time.
+   *
+   * The two are ordered instead of refused: the resume waits for the stop to settle, so a cancel the stop repeats after
+   * its creation settles cannot reach the Session the resume brought back.
+   */
+  private async withSessionOperation<T>(sessionId: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.sessionOperations.get(sessionId)
+    const started = (previous ?? Promise.resolve()).then(work)
+    const tail = started.then(() => undefined, () => undefined)
+    this.sessionOperations.set(sessionId, tail)
+    try {
+      return await started
+    } finally {
+      if (this.sessionOperations.get(sessionId) === tail) this.sessionOperations.delete(sessionId)
+    }
+  }
+
+  /**
    * The Assignment a cancel applies to: the Ticket's current one, or one whose earlier stop was never confirmed.
    *
    * A PM that retries a failed stop names the Assignment it stopped. Any other stale Assignment may not stop anything,
@@ -2540,39 +2730,55 @@ export class ControlPlane {
    */
   private async performStop(project: ProjectProfile, ticketId: string, target: Assignment,
     options: { reason?: string; reconfirm?: boolean }): Promise<{ stopped: boolean; error?: string }> {
+    return this.settleStop(ticketId, target.id, cleanups => {
+      if (options.reconfirm === true) {
+        // The Assignment ended but the node never confirmed the stop: ask it again, so the Worker really stops.
+        this.engine.reconfirmStoppedWorker(project.id, project.pmSessionId, ticketId, target.id,
+          { ...(options.reason ? { reason: options.reason } : {}), cleanups })
+      } else {
+        this.engine.stopProjectWorker(project.id, project.pmSessionId, ticketId, target.id,
+          { ...(options.reason ? { reason: options.reason } : {}), cleanups })
+      }
+    })
+  }
+
+  /**
+   * Run one domain stop of one Assignment and wait for the node to confirm it.
+   *
+   * The domain stop itself is the caller's: `start` ends the Assignment (or asks the node to stop a Worker whose
+   * Assignment is already over) and leaves its cleanup behind. This method owns what happens around it: the open stop is
+   * recorded so a restart still knows that the Worker may run, the node's answer decides whether the Worker is really
+   * gone, and a stop the node refused or never answered leaves the Ticket's own failure in place — so no replacement
+   * starts over a Worker that may still be running.
+   */
+  private async settleStop(ticketId: string, assignmentId: string,
+    start: (cleanups: { ticketId: string; work: Promise<void> }[]) => void): Promise<{ stopped: boolean; error?: string }> {
     const cleanups: { ticketId: string; work: Promise<void> }[] = []
-    if (options.reconfirm === true) {
-      // The Assignment ended but the node never confirmed the stop: ask it again, so the Worker really stops.
-      this.engine.reconfirmStoppedWorker(project.id, project.pmSessionId, ticketId, target.id,
-        { ...(options.reason ? { reason: options.reason } : {}), cleanups })
-    } else {
-      this.engine.stopProjectWorker(project.id, project.pmSessionId, ticketId, target.id,
-        { ...(options.reason ? { reason: options.reason } : {}), cleanups })
-    }
+    start(cleanups)
     const work = cleanups[0]?.work
-    this.setStopState(ticketId, { assignmentId: target.id, state: 'stopping', ...(work ? { work } : {}) })
+    this.setStopState(ticketId, { assignmentId, state: 'stopping', ...(work ? { work } : {}) })
     if (work) {
       // The cleanup settles on its own: it decides the state, whoever is waiting for it.
       void work.then(
-        () => { this.setStopState(ticketId, { assignmentId: target.id, state: 'stopped' }) },
-        (error: unknown) => { this.setStopState(ticketId, { assignmentId: target.id, state: 'failed',
-          error: this.stopDiagnostic(ticketId, target.id, messageOf(error)) }) })
+        () => { this.setStopState(ticketId, { assignmentId, state: 'stopped' }) },
+        (error: unknown) => { this.setStopState(ticketId, { assignmentId, state: 'failed',
+          error: this.stopDiagnostic(ticketId, assignmentId, messageOf(error)) }) })
     }
     if (!work) return { stopped: true }
     const settled = await this.settleStopWork(work)
     if (settled.state === 'stopped') {
-      this.setStopState(ticketId, { assignmentId: target.id, state: 'stopped' })
+      this.setStopState(ticketId, { assignmentId, state: 'stopped' })
       return { stopped: true }
     }
     if (settled.state === 'pending') {
       // The node has not answered: the Worker may still run, so the failure is recorded and no replacement starts.
       const timeoutMs = this.options.stopCleanupTimeoutMs ?? STOP_CLEANUP_TIMEOUT_MS
-      const error = this.noteUnconfirmedStop(ticketId, target.id,
+      const error = this.noteUnconfirmedStop(ticketId, assignmentId,
         `The Worker Session did not stop within ${timeoutMs} ms`)
       return { stopped: false, error }
     }
-    const error = this.stopDiagnostic(ticketId, target.id, settled.error)
-    this.setStopState(ticketId, { assignmentId: target.id, state: 'failed', error })
+    const error = this.stopDiagnostic(ticketId, assignmentId, settled.error)
+    this.setStopState(ticketId, { assignmentId, state: 'failed', error })
     return { stopped: false, error }
   }
 
@@ -3043,6 +3249,17 @@ export class ControlPlane {
    * returns a `starting` record: it either settles on a node fact or marks the record failed.
    */
   async openProject(projectId: string, workspace?: string): Promise<SessionRecord> {
+    return this.openProjectWith(projectId, workspace, {})
+  }
+
+  /**
+   * The PM Session of a Project, with the one option a resume needs.
+   *
+   * `resume` is the operator's explicit act: it may bring back a Session an operator stopped, and it skips the fast paths
+   * that would hand the stopped record back as it is. Nothing else passes it, and the public entry never does.
+   */
+  private async openProjectWith(projectId: string, workspace: string | undefined,
+    options: { resume?: boolean }): Promise<SessionRecord> {
     const project = this.store.projects.get(projectId)
     if (!project) throw new Error(`Unknown project ${projectId}`)
     if (project.workspace && workspace !== undefined
@@ -3054,15 +3271,29 @@ export class ControlPlane {
     if (known?.revokedAt) {
       throw new OperatorError(409, `The PM Session of this Project was revoked and cannot be started again`)
     }
+    // A PM an operator stopped is not ensured again: the stop is the operator's own word, and only an explicit resume
+    // takes it back.
+    if (options.resume !== true && known && this.operatorStopRefusal(known)) {
+      throw new OperatorError(409, 'The PM Session of this Project was stopped by an operator '
+        + 'and has to be resumed explicitly')
+    }
     this.requireNodeOnline()
     // A concurrent request joins the running ensure before reading the record: a node status event may already have made
     // the record `idle` while the ensure still waits on role installation, and returning that record would report 200
     // for an ensure that can still fail.
     const pending = this.pendingEnsures.get(project.pmSessionId)
-    if (pending) return pending
+    if (pending) {
+      // A creation that is still in flight belongs to the stop that came before the resume: joining it would answer with
+      // the Session that stop took away.
+      if (options.resume === true) {
+        throw new OperatorError(409, 'The PM Session of this Project is still being created; '
+          + 'resume it once that creation settled')
+      }
+      return pending
+    }
     const existing = this.sessions.get(project.pmSessionId)
-    if (existing && isNodeConfirmed(existing.status) && !this.needsReensure(existing)) return existing
-    return this.singleFlight(project.pmSessionId, () => this.ensurePm(project, workspace))
+    if (options.resume !== true && existing && isNodeConfirmed(existing.status) && !this.needsReensure(existing)) return existing
+    return this.singleFlight(project.pmSessionId, () => this.ensurePm(project, workspace, options))
   }
 
   /**
@@ -3089,6 +3320,10 @@ export class ControlPlane {
     if (projectId !== undefined && !this.store.projects.get(projectId)) throw new Error(`Unknown project ${projectId}`)
     this.requireNodeOnline()
     const sessionId = `worker-${assignmentId}`
+    // The Ticket decides whether this Assignment may still run: the Session record is the control plane's own fact, and
+    // a Worker that was stopped before its Session existed has no record at all.
+    const refused = this.workerRefusal(assignmentId, { projectId, ticketId })
+    if (refused !== undefined) throw new SessionEnsureError(refused)
     // A Session that is being stopped must not be created again: a re-ensure would bring the Worker back over a stop
     // the node has not confirmed yet.
     if (this.stoppingSessions.has(sessionId)) {
@@ -3099,11 +3334,53 @@ export class ControlPlane {
     if (known?.revokedAt) {
       throw new SessionEnsureError(`The Worker Session ${sessionId} was revoked and cannot be created again`)
     }
+    // A Worker an operator stopped is not created again: the low-level ensure path must not resurrect a Worker that a
+    // person stopped, and only an explicit resume of its Ticket may start a new Assignment.
+    if (known && this.operatorStopRefusal(known)) {
+      throw new SessionEnsureError(`The Worker Session ${sessionId} was stopped by an operator and cannot be created again`)
+    }
     const pending = this.pendingEnsures.get(sessionId)
     if (pending) return pending
     const existing = this.sessions.get(sessionId)
     if (existing && isNodeConfirmed(existing.status) && !this.needsReensure(existing)) return existing
     return this.singleFlight(sessionId, () => this.ensureWorker(projectId, assignmentId, ticketId, prompt))
+  }
+
+  /**
+   * Why the Worker of one Assignment may not be created, or undefined when it may.
+   *
+   * The Ticket is the authority: it knows whether a person stopped the Worker, whether the Assignment ended and whether
+   * that stop is still open. The Session record only knows what this control plane saw, and a Worker stopped before its
+   * Session existed has no record at all. An Assignment no Ticket owns is left alone: the nominal entry point and the
+   * older protocol tests name Assignments the domain never had.
+   */
+  private workerRefusal(assignmentId: string,
+    target?: { projectId: string | undefined; ticketId: string }): string | undefined {
+    const ticket = this.ticketOfAssignment(assignmentId)
+    const assignment = ticket?.assignments.find(item => item.id === assignmentId)
+    if (!ticket || !assignment) return undefined
+    const sessionId = this.workerSessionFor(assignmentId)
+    if (target && (ticket.id !== target.ticketId || ticket.projectId !== target.projectId)) {
+      return `The Worker Session ${sessionId} does not belong to the selected Ticket or Project`
+    }
+    if (ticket.ended) return `The Worker Session ${sessionId} cannot be created: its Ticket ${ticket.id} has ended`
+    const latest = latestAssignment(ticket)
+    if (latest?.id !== assignmentId) {
+      return `The Worker Session ${sessionId} cannot be created: Assignment ${assignmentId} was replaced`
+    }
+    if (assignment.state === 'ended') {
+      return `The Worker Session ${sessionId} cannot be created: Assignment ${assignmentId} has ended`
+    }
+    if (ticket.manualStop) {
+      return `The Worker Session ${sessionId} was stopped by an operator and cannot be created again`
+    }
+    if (ticket.stopPending?.assignmentId === assignmentId) {
+      return `The Worker Session ${sessionId} cannot be created: the stop of Assignment ${assignmentId} is still open`
+    }
+    if (ticket.stopFailure?.assignmentId === assignmentId) {
+      return `The Worker Session ${sessionId} cannot be created: the stop of Assignment ${assignmentId} was not confirmed`
+    }
+    return undefined
   }
 
   /**
@@ -3155,15 +3432,25 @@ export class ControlPlane {
     return lines.join('\n').trim() || undefined
   }
 
-  private async ensurePm(project: ProjectProfile, workspace?: string): Promise<SessionRecord> {
+  private async ensurePm(project: ProjectProfile, workspace?: string, options: { resume?: boolean } = {}): Promise<SessionRecord> {
     const existing = this.sessions.get(project.pmSessionId)
     // A confirmed record from an older generation is re-ensured rather than inspected: the node's answer would be the
     // same stale fact the generation already told us not to trust.
     const stale = existing !== undefined && this.needsReensure(existing)
-    if (existing && !stale && isNodeConfirmed(existing.status)) return existing
-    if (existing && !stale) {
-      const confirmed = await this.confirmExisting(existing)
-      if (confirmed) return confirmed
+    if (options.resume !== true) {
+      // The fast paths hand the record back as it is, so the stop gate has to be applied here too: an ensure that was
+      // already in flight when the operator stopped the Session must not answer with a Session they stopped.
+      if (existing && !stale && isNodeConfirmed(existing.status)) {
+        await this.enforceOperatorStop(existing)
+        return existing
+      }
+      if (existing && !stale) {
+        const confirmed = await this.confirmExisting(existing)
+        if (confirmed) {
+          await this.enforceOperatorStop(confirmed)
+          return confirmed
+        }
+      }
     }
     const path = this.workspacePath(project.workspace ?? workspace ?? existing?.workspace ?? join(this.options.workspaceRoot, project.id))
     const at = this.now()
@@ -3188,9 +3475,14 @@ export class ControlPlane {
         project: { id: project.id, title: project.title, goal: project.goal }, workspace: path, profile: PM_PROFILE,
         sessionToken: token, prompt: PM_PROFILE.prompt })
     } catch (error) {
-      return this.recoverEnsureFailure(record, error, 'PM')
+      // An ensure that failed on an abnormal receipt must not answer with a Session an operator stopped either.
+      const failed = await this.recoverEnsureFailure(record, error, 'PM')
+      await this.enforceOperatorStop(failed)
+      return failed
     }
     const settled = await this.settleEnsure(record, 'PM')
+    // An ensure that was already in flight when the operator stopped the Session would bring it back.
+    await this.enforceOperatorStop(settled)
     if (created) {
       // The Project's PM Session exists and the node confirmed it: the fact the console's Project page shows.
       this.audit.record({ actor: 'system', kind: 'project', action: 'pm-ready', targetKind: 'project',
@@ -3205,10 +3497,18 @@ export class ControlPlane {
     const existing = this.sessions.get(sessionId)
     // Same rule as the PM: a confirmed Session from an older generation is re-ensured under the same id.
     const stale = existing !== undefined && this.needsReensure(existing)
-    if (existing && !stale && isNodeConfirmed(existing.status)) return existing
+    // The fast paths hand the record back as it is, so the stop gate has to be applied here too: an ensure that was
+    // already in flight when the operator stopped the Worker must not answer with a Session they stopped.
+    if (existing && !stale && isNodeConfirmed(existing.status)) {
+      await this.enforceOperatorStop(existing)
+      return existing
+    }
     if (existing && !stale) {
       const confirmed = await this.confirmExisting(existing)
-      if (confirmed) return confirmed
+      if (confirmed) {
+        await this.enforceOperatorStop(confirmed)
+        return confirmed
+      }
     }
     // The wire protocol requires a workspace identifier. An independent Ticket has its own isolated workspace.
     const workspaceId = projectId ?? ticketId
@@ -3231,9 +3531,15 @@ export class ControlPlane {
       await this.options.node.send({ ...this.base(createKey), type: 'worker.create', sessionId, projectId: workspaceId,
         assignmentId, ticketId, workspace: path, profile: WORKER_PROFILE, sessionToken: token, prompt })
     } catch (error) {
-      return this.recoverEnsureFailure(record, error, 'Worker')
+      // An ensure that failed on an abnormal receipt must not answer with a Session an operator stopped either.
+      const failed = await this.recoverEnsureFailure(record, error, 'Worker')
+      await this.enforceOperatorStop(failed)
+      return failed
     }
-    return this.settleEnsure(record, 'Worker')
+    const settled = await this.settleEnsure(record, 'Worker')
+    // An ensure that was already in flight when the operator stopped the Worker would bring it back.
+    await this.enforceOperatorStop(settled)
+    return settled
   }
 
   /**
@@ -3254,6 +3560,17 @@ export class ControlPlane {
     let record = this.requireSession(sessionId)
     // A revoked Session is not a running Session: a message must not bring it back, and it must not re-ensure it either.
     if (record.revokedAt) throw new Error(`Session ${sessionId} was revoked`)
+    // A Session an operator stopped stays stopped: this is the low-level path every message goes through, so it is
+    // where a stopped PM, Router or Worker is kept from being used — and, through the re-ensure below, from being
+    // brought back.
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) throw new Error(`Session ${sessionId} is not running: ${stopped}`)
+    // The Ticket decides whether the Worker may still run: a Worker whose Assignment a person stopped takes no message,
+    // whatever its own Session record says, and the re-ensure below may not bring it back either.
+    if (record.role === 'worker' && record.assignmentId !== undefined) {
+      const refused = this.workerRefusal(record.assignmentId)
+      if (refused !== undefined) throw new Error(`Session ${sessionId} is not running: ${refused}`)
+    }
     if (record.status === 'archived' || record.status === 'stopped' || record.status === 'stopping'
       || this.stoppingSessions.has(sessionId)) {
       throw new Error(`Session ${sessionId} is not running`)
@@ -3272,6 +3589,9 @@ export class ControlPlane {
       if (record.status === 'stopping' || this.stoppingSessions.has(sessionId)) {
         throw new Error(`Session ${sessionId} is not running`)
       }
+      // The Session may have been stopped by an operator while it was re-ensured; a message must not revive it either.
+      const stoppedAfterEnsure = this.operatorStopRefusal(record)
+      if (stoppedAfterEnsure !== undefined) throw new Error(`Session ${sessionId} is not running: ${stoppedAfterEnsure}`)
     }
     const token = this.tokens.get(sessionId) ?? this.issueToken(record)
     this.tokens.set(sessionId, token)
@@ -3348,7 +3668,8 @@ export class ControlPlane {
       if (settled.state === 'pending') {
         unconfirmed = true
         // The creation may still complete: the cancel is repeated once it settles, so the Worker cannot come back.
-        const repeat = (): void => { void this.stopSession(sessionId, reason).catch(() => {}) }
+        const epoch = this.sessionEpoch(sessionId)
+        const repeat = (): void => { void this.repeatStop(sessionId, reason, epoch).catch(() => {}) }
         void pending.then(repeat, repeat)
       }
     }
@@ -3394,6 +3715,28 @@ export class ControlPlane {
   private async stopSession(sessionId: string, reason?: string): Promise<void> {
     await this.options.node.send({ ...this.base(this.uniqueKey('cancel', sessionId)), type: 'session.cancel', sessionId,
       ...(reason ? { reason } : {}) })
+  }
+
+  /**
+   * Cancel one Session again, unless a resume took it away in the meantime.
+   *
+   * A stop whose creation was still in flight repeats its cancel once that creation settles, so the Session cannot come
+   * back after the stop. A resume that happened in between owns the Session now: the late cancel must not stop it. The
+   * epoch is what tells the two apart — the resume advances it, and the repeat only fires while it is unchanged.
+   */
+  private async repeatStop(sessionId: string, reason: string | undefined, epoch: number): Promise<void> {
+    if (this.sessionEpoch(sessionId) !== epoch) return
+    await this.stopSession(sessionId, reason)
+  }
+
+  /** How many times one Session was resumed: a cancel of an older stop may not reach it any more. */
+  private sessionEpoch(sessionId: string): number {
+    return this.sessionEpochs.get(sessionId) ?? 0
+  }
+
+  /** Advance the epoch of one Session, so the cancels of the stops before it are known to be stale. */
+  private advanceSessionEpoch(sessionId: string): void {
+    this.sessionEpochs.set(sessionId, this.sessionEpoch(sessionId) + 1)
   }
 
   /**
@@ -3446,6 +3789,12 @@ export class ControlPlane {
     const record = this.requireSession(sessionId)
     if (record.revokedAt) {
       throw new OperatorError(409, `The Session ${sessionId} was revoked; it cannot receive a message any more`)
+    }
+    // A Session an operator stopped takes no message: the console is told the same fact, so it does not offer the
+    // action in the first place.
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) {
+      throw new OperatorError(409, `The Session ${sessionId} cannot receive a message: ${stopped}`)
     }
     if (record.role === 'pm') {
       await this.sendMessage(sessionId, text, undefined, 'operator')
@@ -3528,33 +3877,632 @@ export class ControlPlane {
    * Stop a Session, by the role that Session has.
    *
    * A Worker Session is stopped through its Ticket: the Assignment ends in the domain, the node is asked to stop the
-   * Worker, and the answer decides whether the Worker is really gone. The stop shares the Ticket's own serial queue with
-   * the PM's re-dispatch, so a cleanup never starts a second Worker over one that may still run.
+   * Worker, and the answer decides whether the Worker is really gone. It is a person's stop: the domain records it under
+   * the `worker` scope, so only a person may approve the resume.
    *
-   * A PM Session is refused: it has no Assignment of its own, and stopping it would leave its Project without the PM that
-   * manages it — while ending that Project is a decision about the Project, not about one Session. The Project's own
-   * lifecycle is the action that fits, and the operator takes it there.
+   * A PM or Router Session is stopped on its own: its Project, Tickets, Workers and PM Mandates stay exactly as they
+   * were. Stopping a PM is not a decision about its Project and not a revocation — only an explicit resume brings it back.
+   *
+   * The stop and the resume of one Session are ordered, so the cancel a stop repeats after its creation settled cannot
+   * reach the Session a resume brought back.
    */
-  async stopSessionByOperator(sessionId: string, reason?: string): Promise<{ stopped: boolean; scope: string; error?: string }> {
+  async stopSessionByOperator(sessionId: string, reason?: string):
+    Promise<{ stopped: boolean; scope: 'session' | 'assignment'; confirmed: boolean; error?: string }> {
     const record = this.requireSession(sessionId)
-    if (record.role === 'pm') {
-      throw new OperatorError(409, 'Stopping a PM Session is not an operator action: end the Project it manages instead')
+    if (record.role === 'worker') {
+      return this.withSessionOperation(sessionId, async () => {
+        const current = this.requireSession(sessionId)
+        if (current.assignmentId === undefined) {
+          throw new OperatorError(409, `The Worker Session ${sessionId} has no Assignment; there is nothing to stop`)
+        }
+        // A Worker Session whose Assignment no Ticket owns has no domain work behind it: only the node Session is left
+        // to stop, and the domain keeps whatever it has.
+        const owned = this.ticketOfAssignment(current.assignmentId)
+        const outcome = owned
+          ? await this.stopWorkerAssignment(current.assignmentId, reason ?? 'An operator stopped this Worker',
+            { stale: 'cancel' })
+          : await this.stopOrphanWorkerSession(current, reason ?? 'An operator stopped this Worker')
+        this.audit.record({ actor: 'operator', kind: 'session', action: 'stopped', targetKind: 'session', targetId: sessionId,
+          outcome: outcome.stopped ? 'ok' : 'failed', detail: 'worker' })
+        this.noticeWorkerStop({ sessionId, assignmentId: current.assignmentId, ticket: owned },
+          outcome, 'assignment')
+        return { stopped: outcome.stopped, scope: 'assignment', confirmed: outcome.stopped,
+          ...(outcome.error ? { error: outcome.error } : {}) }
+      })
     }
-    if (record.role !== 'worker') {
+    if (record.role !== 'pm' && record.role !== 'router') {
       throw new OperatorError(409, `The Session ${sessionId} cannot be stopped by an operator`)
     }
-    const outcome = await this.stopWorkerSession(record, reason ?? 'An operator stopped this Worker')
-    this.audit.record({ actor: 'operator', kind: 'session', action: 'stopped', targetKind: 'session', targetId: sessionId,
-      outcome: outcome.stopped ? 'ok' : 'failed', detail: 'worker' })
-    return { stopped: outcome.stopped, scope: 'worker', ...(outcome.error ? { error: outcome.error } : {}) }
+    return this.withSessionOperation(sessionId, async () => {
+      const current = this.requireSession(sessionId)
+      const outcome = await this.stopManagerSession(current, reason ?? 'An operator stopped this Session')
+      this.audit.record({ actor: 'operator', kind: 'session', action: 'stopped', targetKind: 'session', targetId: sessionId,
+        outcome: outcome.stopped ? 'ok' : 'failed', detail: current.role })
+      this.noticeManagerStop(current, outcome)
+      return { stopped: outcome.stopped, scope: 'session', confirmed: outcome.stopped,
+        ...(outcome.error ? { error: outcome.error } : {}) }
+    })
+  }
+
+  /**
+   * Why a Session an operator stopped may not be used, or undefined when it may.
+   *
+   * The marker is the control plane's own durable fact, so it survives a restart. An unconfirmed stop refuses just like a
+   * confirmed one: the operator's intent is what holds, not the node's answer.
+   */
+  private operatorStopRefusal(record: SessionRecord): string | undefined {
+    const stop = record.operatorStop
+    if (!stop) return undefined
+    return stop.state === 'confirmed'
+      ? `the Session was stopped by an operator at ${stop.at}`
+      : `the Session carries an operator stop from ${stop.at} that the node has not confirmed`
+  }
+
+  /**
+   * Write the operator's stop of a Session, before the node is asked.
+   *
+   * Written first, so anything that arrives while the node is stopping the Session already finds it. A confirmed stop
+   * is not turned back into an open one by a repeated request: the second request is another attempt at the same stop.
+   */
+  private markOperatorStop(record: SessionRecord, reason: string | undefined): OperatorStop {
+    const existing = record.operatorStop
+    const confirmed = existing !== undefined && existing.state === 'confirmed'
+    const why = reason ?? existing?.reason
+    const stop: OperatorStop = {
+      at: confirmed && existing !== undefined ? existing.at : this.now(),
+      by: 'operator',
+      ...(why === undefined ? {} : { reason: why }),
+      state: confirmed ? 'confirmed' : 'requested',
+      ...(existing?.confirmedAt === undefined ? {} : { confirmedAt: existing.confirmedAt }),
+      ...(existing?.error === undefined ? {} : { error: existing.error }),
+    }
+    record.operatorStop = stop
+    record.updatedAt = this.now()
+    // A new stop owns the Session's status once more: the reports of an older stop no longer apply to it.
+    this.resumedSessions.delete(record.sessionId)
+    this.persist(record)
+    return stop
+  }
+
+  /**
+   * Record that the node confirmed that the Session is gone.
+   *
+   * The node's answer to the cancel command is the confirmation, and so is a status that reports the Session as stopped
+   * or archived. A node that acknowledged the stop without reporting a status is confirmed all the same: the receipt is
+   * the node's own word, and its Session may still show `idle`. A later live status does not undo the confirmation.
+   */
+  private confirmOperatorStop(record: SessionRecord, at = this.now()): void {
+    const stop = record.operatorStop
+    if (!stop || stop.state === 'confirmed') return
+    record.operatorStop = { ...stop, state: 'confirmed', confirmedAt: at }
+    record.updatedAt = at
+    this.persist(record)
+  }
+
+  /**
+   * Record that a stop the node did not confirm failed, keeping the operator's intent open.
+   *
+   * The stop stays `requested` and keeps its diagnostic, so the console shows an open stop that can be retried. A
+   * marker a resume took away in the meantime is not written back: the resume owns the Session now.
+   */
+  private failOperatorStop(record: SessionRecord, error: string | undefined): void {
+    const stop = record.operatorStop
+    if (!stop || error === undefined) return
+    record.operatorStop = { ...stop, error }
+    this.persist(record)
+  }
+
+  /**
+   * Keep an operator's stop true after an ensure that was already in flight.
+   *
+   * An ensure that started before the stop reaches the node after the cancel and brings the Session back. The Session is
+   * therefore stopped again before the caller hears anything: an ensure that answers with a Session a person stopped is
+   * worse than one that fails.
+   */
+  private async enforceOperatorStop(record: SessionRecord): Promise<void> {
+    const stop = record.operatorStop
+    if (!stop) return
+    try {
+      await this.stopSession(record.sessionId, stop.reason ?? 'The Session was stopped by an operator')
+      this.confirmOperatorStop(record)
+    } catch {
+      // The node did not take the second cancel either: the operator's intent stays recorded and open.
+    }
+    throw new OperatorError(409, `The Session ${record.sessionId} was stopped by an operator `
+      + 'and has to be resumed explicitly before it may be used again')
+  }
+
+  /**
+   * Stop a PM or Router Session on its own.
+   *
+   * The stop reaches that Session and nothing else. A creation that is still in flight is awaited first, bounded: a
+   * cancel that reaches the node before the Session exists cancels nothing. The node's answer decides whether the stop
+   * is confirmed; a refused, timed-out or lost answer keeps the operator's intent and its diagnostic.
+   */
+  private async stopManagerSession(record: SessionRecord, reason: string):
+    Promise<{ stopped: boolean; error?: string }> {
+    this.markOperatorStop(record, reason)
+    const pending = this.pendingEnsures.get(record.sessionId)
+    let unconfirmed = false
+    if (pending) {
+      const settled = await this.settlePendingEnsure(pending)
+      if (settled.state === 'pending') {
+        unconfirmed = true
+        // The creation may still complete: the cancel is repeated once it settles, so the Session cannot come back.
+        const epoch = this.sessionEpoch(record.sessionId)
+        const repeat = (): void => { void this.repeatStop(record.sessionId, reason, epoch).catch(() => {}) }
+        void pending.then(repeat, repeat)
+      }
+    }
+    try {
+      await this.stopSession(record.sessionId, reason)
+    } catch (error) {
+      const failure = redact(messageOf(error)).slice(0, 300)
+      this.failOperatorStop(record, failure)
+      return { stopped: false, error: failure }
+    }
+    if (unconfirmed) {
+      const failure = `The Session ${record.sessionId} was still being created, so its stop is not confirmed`
+      this.failOperatorStop(record, failure)
+      return { stopped: false, error: failure }
+    }
+    this.confirmOperatorStop(record)
+    return { stopped: true }
+  }
+
+  /**
+   * Stop one Worker's Assignment, on the operator's word.
+   *
+   * The stop reaches the Assignment and nothing else: the Ticket stays open and the other Workers of the same Project keep
+   * running. It is a person's stop, so the Project's PM may not revive that Worker on its own.
+   */
+  async stopAssignmentByOperator(assignmentId: string, reason?: string):
+    Promise<{ stopped: boolean; scope: 'assignment'; confirmed: boolean; assignmentId: string; ticketId: string;
+      error?: string }> {
+    const outcome = await this.stopWorkerAssignment(assignmentId, reason ?? 'An operator stopped this Worker')
+    this.audit.record({ actor: 'operator', kind: 'assignment', action: 'stopped', targetKind: 'assignment',
+      targetId: assignmentId, outcome: outcome.stopped ? 'ok' : 'failed', detail: outcome.ticket.id })
+    this.noticeWorkerStop({ sessionId: outcome.sessionId, assignmentId, ticket: outcome.ticket }, outcome, 'assignment')
+    return { stopped: outcome.stopped, scope: 'assignment', confirmed: outcome.stopped, assignmentId,
+      ticketId: outcome.ticket.id, ...(outcome.error ? { error: outcome.error } : {}) }
+  }
+
+  /**
+   * Stop the node Session of a Worker no Ticket owns.
+   *
+   * There is no domain work behind that Assignment — the nominal entry point and the older protocol tests name
+   * Assignments the domain never had — so only the node Session is left to stop. The operator's marker is written all
+   * the same, and the node's own answer is the confirmation.
+   */
+  private async stopOrphanWorkerSession(record: SessionRecord, reason: string): Promise<{ stopped: boolean; error?: string }> {
+    this.markOperatorStop(record, reason)
+    try {
+      await this.cancelSession(record.sessionId, reason)
+    } catch (error) {
+      const failure = redact(messageOf(error)).slice(0, 300)
+      this.failOperatorStop(record, failure)
+      return { stopped: false, error: failure }
+    }
+    this.confirmOperatorStop(record)
+    return { stopped: true }
+  }
+
+  /**
+   * The one stop of one Worker's Assignment, shared by both entries.
+   *
+   * The Session route and the Assignment route come here, so the two never keep two stop states of their own: the marker
+   * on the Session, the `worker` stop on the Ticket and the open-stop facts are written once.
+   *
+   * The Assignment must still be the Ticket's current one, and the Session record is chosen inside the Ticket's own queue:
+   * a record of an Assignment a newer one replaced is not marked, confirmed or notified here. An Assignment that already
+   * ended is asked again — that is what turns an unconfirmed stop into a confirmed one — and the domain's own completion
+   * facts are the ones that clear it.
+   *
+   * `stale: 'cancel'` keeps the Session route's own use: a Session whose Assignment was replaced still stops the node
+   * Session that is left over, and the domain keeps the newer Assignment untouched.
+   */
+  private async stopWorkerAssignment(assignmentId: string, reason: string,
+    options: { stale?: 'refuse' | 'cancel' } = {}): Promise<{
+      stopped: boolean; error?: string; sessionId?: string; ticket: Ticket
+    }> {
+    const ticket = this.store.tickets.list().find(item => item.assignments.some(one => one.id === assignmentId))
+    if (!ticket) throw new OperatorError(404, `There is no Assignment ${assignmentId}`)
+    return this.withTicketOperation(ticket.id, async (): Promise<{
+      stopped: boolean; error?: string; sessionId?: string; ticket: Ticket
+    }> => {
+      const current = this.store.tickets.get(ticket.id) ?? ticket
+      const latest = latestAssignment(current)
+      const sessionId = this.workerSessionFor(assignmentId)
+      if (!latest || latest.id !== assignmentId) {
+        if (options.stale !== 'cancel') {
+          throw new OperatorError(409, `The Assignment ${assignmentId} is not the current one of Ticket ${current.id}; `
+            + 'the Session of a replaced Assignment cannot stop the Worker that took its place')
+        }
+        // The Assignment this Session ran was replaced: only the node Session is left over, and stopping that is the
+        // Session route's own use. The domain keeps the newer Assignment exactly as it is.
+        const stale = this.sessions.get(sessionId)
+        if (stale) this.markOperatorStop(stale, reason)
+        try {
+          await this.cancelSession(sessionId, reason)
+        } catch (error) {
+          const failure = redact(messageOf(error)).slice(0, 300)
+          if (stale) this.failOperatorStop(stale, failure)
+          return { stopped: false, error: failure, sessionId, ticket: current }
+        }
+        if (stale) this.confirmOperatorStop(stale)
+        return { stopped: true, sessionId, ticket: current }
+      }
+      // The operator's intent is written before the node is asked: a message or an ensure that arrives in between must
+      // find the Worker stopped.
+      const record = this.sessions.get(sessionId)
+      if (record) this.markOperatorStop(record, reason)
+      const outcome = latest.state === 'ended'
+        // The Assignment is already over: the node is asked again, and a confirmed stop clears the open facts.
+        ? await this.settleStop(current.id, assignmentId, cleanups => {
+          this.engine.reconfirmStoppedWorkerByOperator(current.id, assignmentId, { reason, cleanups })
+        })
+        : await this.settleStop(current.id, assignmentId, cleanups => {
+          this.engine.stopAssignment(current.id, assignmentId, { confirmStop: true, cleanups })
+        })
+      if (record) {
+        // The node's own answer is the confirmation: a stop that was not confirmed keeps the operator's intent open.
+        if (outcome.stopped) this.confirmOperatorStop(record)
+        else this.failOperatorStop(record, outcome.error)
+      }
+      return { ...outcome, sessionId, ticket: current }
+    })
+  }
+
+  /**
+   * Cancel a whole Ticket, on the operator's word.
+   *
+   * The stop reaches the Ticket: it ends, its Assignment ends with it, and the Worker Session is asked to stop. This is
+   * the action that withdraws the Ticket's Mandate; the assignment stop is the narrower one that leaves the Ticket open.
+   *
+   * The stop shares the Ticket's own serial queue with the PM's re-dispatch and with the assignment stop, so a cleanup
+   * never starts a second Worker over one that may still run.
+   */
+  async cancelTicketByOperator(ticketId: string, reason?: string):
+    Promise<{ stopped: boolean; scope: 'ticket'; confirmed: boolean; ticketId: string; error?: string }> {
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket) throw new OperatorError(404, `There is no such Ticket ${ticketId}`)
+    const outcome = await this.withTicketOperation(ticket.id, async (): Promise<{
+      stopped: boolean; error?: string; sessionId?: string; assignmentId?: string; ticket: Ticket
+    }> => {
+      const current = this.store.tickets.get(ticket.id)
+      if (!current) throw new OperatorError(404, `There is no such Ticket ${ticketId}`)
+      // The Assignment and the Session record are chosen inside the Ticket's own queue: a Worker a newer Assignment
+      // replaced must not be marked, confirmed or notified here.
+      const assignment = latestAssignment(current)
+      const sessionId = assignment ? this.workerSessionFor(assignment.id) : undefined
+      // The operator's intent is written before the node is asked: a message or an ensure that arrives in between must
+      // find the Worker stopped.
+      const record = sessionId ? this.sessions.get(sessionId) : undefined
+      if (record) this.markOperatorStop(record, reason ?? 'An operator cancelled this Ticket')
+      let stopped = true
+      let error: string | undefined
+      if (current.ended) {
+        // The Ticket is already over: only the node Session can be left over.
+        if (sessionId && this.sessions.has(sessionId)) {
+          await this.cancelSession(sessionId, reason ?? 'An operator cancelled this Ticket')
+        }
+      } else {
+        const cleanups: { ticketId: string; work: Promise<void> }[] = []
+        this.engine.stopTicket(ticket.id, reason ?? 'An operator cancelled this Ticket', cleanups)
+        const work = cleanups[0]?.work
+        if (work) {
+          const settled = await this.settleStopWork(work)
+          if (settled.state !== 'stopped') {
+            stopped = false
+            error = redact(settled.state === 'pending'
+              ? `The Worker Session did not stop within ${this.options.stopCleanupTimeoutMs ?? STOP_CLEANUP_TIMEOUT_MS} ms`
+              : settled.error).slice(0, 200)
+          }
+        }
+      }
+      if (record) {
+        // The node's own answer is the confirmation: a stop that was not confirmed keeps the operator's intent open.
+        if (stopped) this.confirmOperatorStop(record)
+        else this.failOperatorStop(record, error)
+      }
+      return { stopped, ...(error === undefined ? {} : { error }), sessionId, assignmentId: assignment?.id, ticket: current }
+    })
+    this.audit.record({ actor: 'operator', kind: 'ticket', action: 'cancelled', targetKind: 'ticket', targetId: ticket.id,
+      outcome: outcome.stopped ? 'ok' : 'failed', detail: ticket.title })
+    this.noticeWorkerStop({ sessionId: outcome.sessionId, assignmentId: outcome.assignmentId, ticket: outcome.ticket },
+      outcome, 'ticket')
+    return { stopped: outcome.stopped, scope: 'ticket', confirmed: outcome.stopped, ticketId: ticket.id,
+      ...(outcome.error ? { error: outcome.error } : {}) }
+  }
+
+  /**
+   * Resume a Worker a person stopped, on the operator's explicit word.
+   *
+   * The resume clears the person's stop on the Ticket and nothing else: it starts no Worker and revives no Session. The
+   * Project's PM decides on its next request whether the Ticket gets a new Assignment.
+   *
+   * A Worker whose stop the node never confirmed is not resumed: the old Worker may still run, and a new Assignment would
+   * overlap it. The resume shares the Ticket's queue with the stop, so it never clears a stop that is still open.
+   */
+  async resumeTicketWorker(ticketId: string, reason?: string): Promise<{ ticket: Ticket; resumed: boolean }> {
+    const ticket = this.store.tickets.get(ticketId)
+    if (!ticket) throw new OperatorError(404, `There is no such Ticket ${ticketId}`)
+    return this.withTicketOperation(ticket.id, async () => {
+      const current = this.store.tickets.get(ticketId) ?? ticket
+      if (current.manualStop?.scope !== 'worker') {
+        throw new OperatorError(409, `The Ticket ${ticketId} carries no Worker stop of a person to resume`)
+      }
+      if (current.stopPending || current.stopFailure) {
+        const open = current.stopPending
+          ? `the stop of Assignment ${current.stopPending.assignmentId} is still open`
+          : (current.stopFailure?.error ?? 'the node did not confirm the stop')
+        throw new OperatorError(409, `The Worker of Ticket ${ticketId} was not confirmed stopped (${open}); `
+          + 'stop it again and wait for the node\'s confirmation before resuming it')
+      }
+      const cleared = this.engine.allowResume(ticketId)
+      this.audit.record({ actor: 'operator', kind: 'ticket', action: 'resumed', targetKind: 'ticket', targetId: ticketId,
+        detail: `${cleared.title}${reason ? ` · ${reason}` : ''}` })
+      return { ticket: cleared, resumed: true }
+    })
+  }
+
+  /**
+   * Resume a PM or Router Session an operator stopped, on the operator's explicit word.
+   *
+   * The resume is a separate act that needs the operator's authority: nothing else clears the marker. The Session keeps
+   * everything it had — role, Project, Assignment, permission boundary — and only its credential changes: the token
+   * generation advances by two, so the token that was in circulation during the stop opens nothing afterwards.
+   *
+   * Only a confirmed stop is resumed: a stop the node refused or never answered leaves a Worker that may still run, and a
+   * new Session over that one would overlap it. The resume shares the Session's queue with the stop, so a late cancel
+   * cannot reach the Session it brings back. A resume that cannot bring the Session back keeps the stop.
+   */
+  async resumeSessionByOperator(sessionId: string, reason?: string):
+    Promise<{ resumed: boolean; session: SessionRecord; tokenVersion: number }> {
+    const selected = this.requireSession(sessionId)
+    if (selected.revokedAt) {
+      throw new OperatorError(409, `The Session ${sessionId} was revoked; a revoked Session cannot be resumed`)
+    }
+    if (selected.role === 'worker') {
+      throw new OperatorError(409, `A Worker Session is not resumed on its own: resume its Ticket, `
+        + 'which lets the Project PM start a new Assignment')
+    }
+    if (!selected.operatorStop) {
+      throw new OperatorError(409, `The Session ${sessionId} was not stopped by an operator; there is nothing to resume`)
+    }
+    return this.withSessionOperation(sessionId, async () => {
+      const record = this.requireSession(sessionId)
+      if (record.revokedAt) {
+        throw new OperatorError(409, `The Session ${sessionId} was revoked; a revoked Session cannot be resumed`)
+      }
+      const stop = record.operatorStop
+      // The same Session must still carry the stop the operator asked to undo: another stop or resume changed it, so
+      // this one fails closed instead of undoing somebody else's decision.
+      if (!stop) {
+        throw new OperatorError(409, `The Session ${sessionId} was not stopped by an operator; there is nothing to resume`)
+      }
+      if (stop.state !== 'confirmed') {
+        const open = stop.error ?? 'the node did not confirm the stop'
+        throw new OperatorError(409, `The Session ${sessionId} was not confirmed stopped (${open}); `
+          + 'stop it again and wait for the node\'s answer before resuming it')
+      }
+      if (record.role === 'pm') {
+        const project = this.store.projects.get(record.projectId)
+        if (!project) throw new OperatorError(404, `Unknown project ${record.projectId}`)
+        // A Project that is over gets no PM back: it would leave a Session behind that no work will ever use.
+        if (project.status === 'ended' || project.status === 'archived') {
+          throw new OperatorError(409, `This Project is ${project.status}; its PM Session cannot be resumed`)
+        }
+      }
+      const at = this.now()
+      // The cancels of the stops before this one are stale from now on: a late cancel must not stop the Session again.
+      this.advanceSessionEpoch(sessionId)
+      // A report of the stop that came before this resume is about the old lifecycle and must not stop the Session again.
+      this.resumedSessions.add(sessionId)
+      delete record.operatorStop
+      // The credential of the stopped Session is retired: the resume brings a new one, and the old one opens nothing.
+      record.tokenVersion = (record.tokenVersion ?? 0) + 2
+      record.updatedAt = at
+      this.persist(record)
+      this.audit.record({ actor: 'operator', kind: 'session', action: 'resumed', targetKind: 'session', targetId: sessionId,
+        detail: `${record.role}${reason ? ` · ${reason}` : ''}` })
+      try {
+        // The Session comes back under its own id, with the token generation the resume just retired.
+        const session = record.role === 'router'
+          ? await this.ensureRouterWith({ resume: true })
+          : await this.openProjectWith(record.projectId, undefined, { resume: true })
+        if (session.status === 'stopped' || session.status === 'archived') {
+          throw new OperatorError(409, `The node did not bring the Session ${sessionId} back; it still reports it as ${session.status}`)
+        }
+        return { resumed: true, session, tokenVersion: record.tokenVersion ?? 0 }
+      } catch (error) {
+        // The resume failed: the Session stays stopped, with the operator's own stop on it.
+        record.operatorStop = stop
+        record.updatedAt = this.now()
+        this.persist(record)
+        throw error
+      }
+    })
+  }
+
+  /**
+   * The logical superior of stopped work: the PM of the Project it belongs to, the Router for work that belongs to no
+   * Project, and the operator for the Router's own Session.
+   *
+   * Derived from the stopped work itself, never from a request body, so a notice can never be addressed to a Session
+   * that has no business reading it.
+   */
+  private superiorOf(record: SessionRecord): { kind: string; id?: string } {
+    if (record.role === 'router') return { kind: 'operator' }
+    if (record.role === 'pm') return { kind: 'router', id: ROUTER_SESSION_ID }
+    return this.superiorOfTicket(record.assignmentId ? this.ticketOfAssignment(record.assignmentId) : undefined)
+  }
+
+  /** The logical superior of one Ticket's work: its Project's PM, or the Router for a Ticket that belongs to none. */
+  private superiorOfTicket(ticket: Ticket | undefined): { kind: string; id?: string } {
+    if (!ticket || ticket.projectId === undefined) return { kind: 'router', id: ROUTER_SESSION_ID }
+    const pmSessionId = this.store.projects.get(ticket.projectId)?.pmSessionId
+    return pmSessionId === undefined ? { kind: 'operator' } : { kind: 'pm', id: pmSessionId }
+  }
+
+  /**
+   * The work of one Project that a stop did not touch, as the ids a notice carries: that Project's own Tickets and their
+   * Worker Sessions, and nothing of another Project.
+   */
+  private unaffectedWorkOf(projectId: string | undefined, excludeTicketId?: string): string[] {
+    if (projectId === undefined) return []
+    const items: string[] = []
+    for (const ticket of this.store.tickets.list()) {
+      if (ticket.projectId !== projectId || ticket.id === excludeTicketId) continue
+      items.push(ticket.id)
+      const assignment = latestAssignment(ticket)
+      if (assignment) items.push(this.workerSessionFor(assignment.id))
+    }
+    return items
+  }
+
+  /** The standalone Tickets the Router owns: its own subtasks, which belong to no Project. */
+  private standaloneTicketsOf(): string[] {
+    return this.store.tickets.list().filter(ticket => ticket.projectId === undefined).map(ticket => ticket.id)
+  }
+
+  /**
+   * Write the notice of a stopped PM or Router Session, for the logical superior: the Session, the scope, what it
+   * affected, what it left running and the operator — and nothing beyond that Project.
+   */
+  private noticeManagerStop(record: SessionRecord, outcome: { stopped: boolean; error?: string }): void {
+    const project = record.role === 'pm' ? this.store.projects.get(record.projectId) : undefined
+    const unaffected = record.role === 'pm'
+      ? this.unaffectedWorkOf(record.projectId)
+      : this.standaloneTicketsOf()
+    this.recordStopNotice({
+      target: { kind: 'session', id: record.sessionId, sessionId: record.sessionId },
+      scope: 'session',
+      state: outcome.stopped ? 'confirmed' : 'requested',
+      actor: 'operator',
+      ...(project === undefined ? {} : { projectId: project.id }),
+      affected: [record.sessionId],
+      unaffected,
+      superior: this.superiorOf(record),
+      ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    })
+  }
+
+  /**
+   * Write the notice of a stopped Worker, for the logical superior of its work: the Assignment or the Ticket that was
+   * stopped, the Session that was asked to stop, the work that keeps running and the operator.
+   */
+  private noticeWorkerStop(target: { sessionId?: string; assignmentId?: string; ticket?: Ticket },
+    outcome: { stopped: boolean; error?: string }, scope: 'assignment' | 'ticket'): void {
+    const ticket = target.ticket
+    const affected: string[] = []
+    if (target.sessionId !== undefined) affected.push(target.sessionId)
+    if (target.assignmentId !== undefined) affected.push(target.assignmentId)
+    if (scope === 'ticket' && ticket !== undefined) affected.push(ticket.id)
+    this.recordStopNotice({
+      target: { kind: scope, id: scope === 'ticket' && ticket !== undefined
+        ? ticket.id : (target.assignmentId ?? target.sessionId ?? ''),
+        ...(target.sessionId === undefined ? {} : { sessionId: target.sessionId }) },
+      scope,
+      state: outcome.stopped ? 'confirmed' : 'requested',
+      actor: 'operator',
+      ...(ticket?.projectId === undefined ? {} : { projectId: ticket.projectId }),
+      affected,
+      unaffected: this.unaffectedWorkOf(ticket?.projectId, ticket?.id),
+      superior: this.superiorOfTicket(ticket),
+      ...(outcome.error === undefined ? {} : { error: outcome.error }),
+    })
+  }
+
+  /**
+   * Write one notice about a stop, for the logical superior of the stopped work.
+   *
+   * The notice is the control plane's own durable fact: it lives in the console's own file, so it survives a restart and
+   * stays queryable long after the Session it is about is gone. Nothing else is written with it.
+   */
+  private recordStopNotice(notice: {
+    target: { kind: string; id: string; sessionId?: string }
+    scope: string
+    state: 'requested' | 'confirmed'
+    actor: string
+    projectId?: string
+    affected: string[]
+    unaffected: string[]
+    superior: { kind: string; id?: string }
+    error?: string
+  }): StopNotice {
+    const at = this.now()
+    const id = this.consoleStore.addStopNotice({ at, targetKind: notice.target.kind, targetId: notice.target.id,
+      sessionId: notice.target.sessionId ?? '', scope: notice.scope, state: notice.state, actor: notice.actor,
+      projectId: notice.projectId ?? '', affected: JSON.stringify(notice.affected),
+      unaffected: JSON.stringify(notice.unaffected), superiorKind: notice.superior.kind,
+      superiorId: notice.superior.id ?? '', error: notice.error ?? '' })
+    return { id, at, target: notice.target, scope: notice.scope, state: notice.state, actor: notice.actor,
+      ...(notice.projectId === undefined ? {} : { projectId: notice.projectId }), affected: notice.affected,
+      unaffected: notice.unaffected, superior: notice.superior,
+      ...(notice.error === undefined ? {} : { error: notice.error }) }
+  }
+
+  /**
+   * The notices about stops, as the console and the logical superior read them.
+   *
+   * The filter is what keeps one Project's notice out of another Project's PM: a superior reads the notices meant for
+   * it, and the operator reads them all.
+   */
+  stopNotices(options: { limit?: number; superiorKind?: string; superiorId?: string; projectId?: string } = {}): StopNotice[] {
+    return this.consoleStore.stopNotices(options).map(row => this.stopNoticeView(row))
+  }
+
+  /**
+   * Every operator stop this control plane holds, as the console reads it.
+   *
+   * The view joins what the Session record knows (who stopped it, when, and whether the node confirmed it) with what
+   * the notice knows (what the stop reached and what it left running). A Session that is gone leaves its stop behind:
+   * the fact outlives the Session it is about.
+   */
+  stopViews(): SessionStopView[] {
+    return this.stopNotices({ limit: 500 }).map(notice => {
+      const record = notice.target.sessionId === undefined ? undefined : this.sessions.get(notice.target.sessionId)
+      return {
+        sessionId: notice.target.sessionId ?? notice.target.id,
+        role: record?.role ?? '',
+        scope: notice.scope as SessionStopView['scope'],
+        state: notice.state as SessionStopView['state'],
+        at: notice.at,
+        by: notice.actor,
+        affected: notice.affected,
+        unaffected: notice.unaffected,
+        ...(notice.error === undefined ? {} : { error: notice.error }),
+      }
+    })
+  }
+
+  /** One notice, as the console reads it. */
+  private stopNoticeView(row: StopNoticeRow): StopNotice {
+    return { id: row.id, at: row.at,
+      target: { kind: row.targetKind, id: row.targetId, ...(row.sessionId === '' ? {} : { sessionId: row.sessionId }) },
+      scope: row.scope, state: row.state, actor: row.actor,
+      ...(row.projectId === '' ? {} : { projectId: row.projectId }),
+      affected: this.stringListOf(row.affected), unaffected: this.stringListOf(row.unaffected),
+      superior: { kind: row.superiorKind, ...(row.superiorId === '' ? {} : { id: row.superiorId }) },
+      ...(row.error === '' ? {} : { error: row.error }) }
+  }
+
+  /** A stored list of ids, read back as ids; a broken row is an empty list rather than a failure. */
+  private stringListOf(value: string): string[] {
+    const parsed = this.parseJson(value)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((item): item is string => typeof item === 'string')
   }
 
   /**
    * Stop one Worker's Assignment and wait for the node to confirm it.
    *
    * The Assignment ends in the domain and the node is asked to stop the Session; the answer decides whether the Worker is
-   * really gone. A Worker whose Assignment is already over only has the node Session left to stop. A Project that is not
-   * active takes no project-scope stop, so the person's own stop ends the Ticket instead.
+   * really gone. A Worker whose Assignment is already over only has the node Session left to stop.
+   *
+   * The stop is a person's stop: the domain records it under the `worker` scope, so the Project's PM may not revive that
+   * Worker on its own and an automatic retry may not replace it.
    */
   private async stopWorkerSession(record: SessionRecord, reason: string): Promise<{ stopped: boolean; error?: string }> {
     const assignmentId = record.assignmentId
@@ -3564,35 +4512,18 @@ export class ControlPlane {
       await this.cancelSession(record.sessionId, reason)
       return { stopped: true }
     }
-    if (ticket.projectId === undefined) {
-      return this.withTicketOperation(ticket.id, async () => {
-        const current = this.requireStandaloneTicket(ticket.id)
-        if (latestAssignment(current)?.id === assignmentId) return this.stopStandaloneTicket(current, reason)
-        await this.cancelSession(record.sessionId, reason)
-        return { stopped: true }
-      })
-    }
-    const project = ticket.projectId ? this.store.projects.get(ticket.projectId) : undefined
-    if (!project) {
-      await this.cancelSession(record.sessionId, reason)
-      return { stopped: true }
-    }
     // The stop and a re-dispatch of the same Ticket never overlap: they share the Ticket's own serial queue.
     return this.withTicketOperation(ticket.id, async (): Promise<{ stopped: boolean; error?: string }> => {
       const current = this.store.tickets.get(ticket.id) ?? ticket
       const latest = latestAssignment(current)
       if (!latest || latest.id !== assignmentId || latest.state === 'ended') {
-        // The Assignment this Session ran is over: only the node Session can be left over.
+        // The Assignment this Session ran is over or was replaced: only the node Session can be left over.
         await this.cancelSession(record.sessionId, reason)
         return { stopped: true }
       }
-      if (project.status === 'active') {
-        return this.performStop(project, ticket.id, latest, { reason })
-      }
-      // A paused, ended or archived Project takes no project-scope stop, so the person's own stop ends the Ticket.
-      this.engine.stopTicket(ticket.id, reason)
-      await this.cancelSession(record.sessionId, reason)
-      return { stopped: true }
+      return this.settleStop(ticket.id, assignmentId, cleanups => {
+        this.engine.stopAssignment(ticket.id, assignmentId, { confirmStop: true, cleanups })
+      })
     })
   }
 
@@ -4385,11 +5316,18 @@ export class ControlPlane {
     const record = this.sessions.get(event.sessionId)
     if (!record) return
     if (event.type === 'session.status') {
-      record.status = event.status
-      record.updatedAt = event.at
-      if (event.status === 'archived') record.archivedAt = event.at
+      // A report of the stop that came before a resume is about the old lifecycle: it must not stop the resumed Session.
+      const stale = this.resumedSessions.has(event.sessionId)
+      if (!stale) {
+        record.status = event.status
+        record.updatedAt = event.at
+        if (event.status === 'archived') record.archivedAt = event.at
+      }
       // The node confirmed the Session is gone: it must not be brought back by a message or a re-ensure.
       if (event.status === 'stopped' || event.status === 'archived') this.stoppingSessions.delete(event.sessionId)
+      // A node that reports the Session as gone confirms an operator's stop. A late report that the Session is still
+      // live does not undo it: the operator's stop holds, and the Session stays unusable until a person resumes it.
+      if (event.status === 'stopped' || event.status === 'archived') this.confirmOperatorStop(record, event.at)
     } else if (event.type === 'session.inspected') {
       const inspection = event.inspection
       record.updatedAt = event.at

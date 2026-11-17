@@ -194,7 +194,7 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 | 动作 | PM 会话 | Worker 会话 |
 | --- | --- | --- |
 | 发送消息 | 直接发给该 PM | 通过该会话对应的项目工单或独立工单追加 Ticket Input。控制面校验当前 Assignment 和会话，已结束、停止中、已撤权或已被替换的会话返回 409。运行中的投递等待节点应答，未确认时返回 502 |
-| 停止 | **被拒（409）**：PM 没有自己的 Assignment，停它等于让这个项目失去管理，而**终结项目是关于项目的决定**，不是关于一个会话的决定——请在项目页上「结束项目」 | **走真实票据**：Assignment 在领域里结束（`Engine.stopProjectWorker`），节点被问停 Worker，回答决定它是不是真的没了。停止与复派共用同一张工单的串行队列，不会并发起第二个 Worker。回答里的 `cancelled:false` 表示节点没有确认，控制台会照实说 |
+| 停止 | **只停这个 Session**：项目状态、项目工单、同一项目的其他 Worker 和 PM Mandate 全部不动。它不调用 `Engine.stopProject`，也不调用 `pauseProject(hard)`——终结项目是关于项目的决定，不是关于一个会话的决定。停止是持久的：`ensure`、消息、角色工具、令牌刷新、定时任务、自动报告、重连和重启都不会把它带回来，只有显式恢复才会（详见 `docs/018-phase3-session-stop.zh-CN.md`） | **走真实票据**：Assignment 在领域里结束（`Engine.stopAssignment`，`worker` 作用域），节点被问停 Worker，回答决定它是不是真的没了。停止与复派共用同一张工单的串行队列，不会并发起第二个 Worker。`worker` 作用域意味着**只有人**能批准恢复，PM 不能自行 revive。回答里的 `cancelled:false` 表示节点没有确认，控制台会照实说 |
 | 归档 | 只有项目已经不是 active 时才允许（否则项目就没有 PM 了） | 只有 Assignment 已经结束时才允许（否则领域还等着它） |
 | 权限 | `permission.set` 到节点 | 同左 |
 | 撤权 | 见下面「撤权」 | 同左 |
@@ -207,6 +207,19 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 Router 的 `message_ticket` 也支持独立工单。每次主动发送都会生成独立的 Input，节点命令按 Assignment 和 Input ID 幂等。投递失败的 Input 保持未送达，可在后续投递中重试。
 
 **撤权**（`POST /v1/console/sessions/:id/revoke`）：`tokenVersion += 2`，于是这个 Session 现在的 token 落到两代之前——普通工具路由不认，**宽限刷新**（只认上一代）也不认。同时记录 `revokedAt` 并持久化：`verifyToolToken`、`refreshToolToken`、`openProject`、`createWorkerSession`、`sendMessage` 全部拒绝被撤权的 Session。所以撤权**不会被自动 re-ensure 或后续 send 悄悄恢复**：没有任何路径会给它发新 token。撤权后 Session 也会停掉（Worker 走它那张工单结束 Assignment，PM 在节点上停掉），因为一个没有授权却还在跑的 Session 会让领域一直等它。
+
+**操作员停止与防复活（P3-1A）**
+
+停止与撤权是两件事：撤权拿走授权，停止只让那个 Session 停下来，被停的 Session 保留角色、项目、Assignment 和权限边界，所有权不转移。停止的事实写在 Session 记录上（`operatorStop`），因此跨重启成立。
+
+- **只停 Session**：`POST /v1/console/sessions/:id/cancel`（PM / Router）。不写领域：项目、工单、Worker、PM Mandate 一律不动。
+- **停 Assignment**：`POST /v1/console/assignments/:id/stop`。工单保持开着，领域记 `worker` 作用域的停止，PM 不能自行 revive。
+- **取消 Ticket**：`POST /v1/console/tickets/:id/cancel`。工单结束，Mandate 撤回。
+- **恢复**：`POST /v1/console/sessions/:id/resume` 与 `POST /v1/console/tickets/:id/resume`。恢复轮换凭据（`tokenVersion += 2`），被撤权的 Session 不可恢复，项目已结束/归档时它的 PM 也不可恢复。**只有节点确认过的停止才可以恢复**：未确认意味着那个 Worker 可能还在跑，恢复会压上去（409）。恢复失败时停止标记原样留下，接口不回报「已恢复」。
+- **未确认**：节点拒收、超时或回执丢失时回答是 `cancelled:false` 且 `confirmed:false`，停止记录留在 `requested` 状态等待对账；只有节点确认才写 `confirmed`。
+- **上级通知**：每次停止给逻辑上级（项目里的 Worker → PM，独立工单 → Router，PM → Router，Router → 操作员）留一条持久通知，写在控制台自己的文件里。
+
+完整的语义、路由与 P3-1B 的接线合同见 `docs/018-phase3-session-stop.zh-CN.md`。
 
 ## Router
 

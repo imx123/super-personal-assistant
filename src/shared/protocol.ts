@@ -89,6 +89,34 @@ export type BackendKind = 'dsh' | 'claude' | 'codex'
 export type SessionStatus = 'starting' | 'idle' | 'running' | 'stopping' | 'stopped' | 'archived' | 'failed'
 
 /**
+ * An operator's own stop of one Session.
+ *
+ * The stop is a fact about the Session, not about the work it was doing: a PM Session that was stopped leaves its
+ * Project, its Tickets and its Workers exactly as they were, and a Router Session that was stopped leaves every
+ * Ticket and every PM Mandate exactly as it was. The record is durable, so an `ensure`, a message, a scheduled
+ * task, a report or a reconnect that comes in later cannot quietly bring the Session back: only an explicit resume
+ * does that.
+ *
+ * `requested` is the state of a stop the node has not confirmed — a refused, timed-out or lost stop keeps the
+ * operator's intent and stays reconcilable. `confirmed` is written only when the node itself confirmed that the
+ * Session is gone.
+ */
+export interface OperatorStop {
+  /** When the operator asked for the stop. */
+  at: string
+  /** Who asked for it. */
+  by: string
+  /** Why, as the operator wrote it. */
+  reason?: string
+  /** `requested` until the node confirmed the stop; `confirmed` afterwards. */
+  state: 'requested' | 'confirmed'
+  /** When the node confirmed that the Session is gone. */
+  confirmedAt?: string
+  /** The redacted diagnostic of a stop the node did not confirm. */
+  error?: string
+}
+
+/**
  * The control plane's record of one Session.
  *
  * `sessionId` is the control-plane primary key: stable, backend-independent, and what tools, audit and
@@ -138,6 +166,14 @@ export interface SessionRecord {
   revokedAt?: string
   /** Why the authority was revoked, as the operator wrote it. */
   revokedReason?: string
+  /**
+   * The operator's own stop of this Session, when there is one.
+   *
+   * The field is optional, so a record persisted before an operator could stop a Session loads as not stopped. A
+   * stopped Session is not a revoked one: its ownership and its permission boundary stay exactly as they were, and only
+   * an explicit resume clears the marker.
+   */
+  operatorStop?: OperatorStop
 }
 
 /**

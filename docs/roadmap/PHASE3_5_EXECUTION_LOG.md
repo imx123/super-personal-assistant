@@ -5,7 +5,7 @@
 | Task | 依赖 | 交付 | 状态 |
 | --- | --- | --- | --- |
 | P3-0 | — | 基线、权限和停止矩阵 | DONE |
-| P3-1 | P3-0 | 全角色会话干预，真实 DSH | NOT_STARTED |
+| P3-1 | P3-0 | 全角色会话干预，真实 DSH | INVESTIGATING |
 | P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | NOT_STARTED |
 | P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | NOT_STARTED |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | NOT_STARTED |
@@ -31,3 +31,13 @@
 Claude Code（MiniMax-M3.1-Flash）完成基线调查。Codex 对照源码、任务书和本机测试复核，补充随机端口失败记录，并区分纯回合中断和节点全会话停止。[基线](PHASE3_BASELINE.md)包含当前能力、状态变化、权限和停止作用域、自动交接迁移及 P3-1 计划。
 
 本轮 12 个文件 198 项通过、1 项跳过。类型检查和直接运行 tsdown 通过。全量与真实模型未重跑。旧审计仍为本地未跟踪文件。本次提交只包含这两份文档。
+
+## P3-1A
+
+Claude Code（MiniMax-M3.1-Flash）实施，Codex 独立验收。操作员可分开停止 PM 或 Router 会话、停止单个 Worker 派工以及取消工单。停止 PM 保留项目、工单、Mandate 和其他 Worker。恢复须由操作员明确发起，节点未确认停下时拒绝恢复。持久停止标记和领域事实同时保护重启后的消息、ensure 与恢复入口。操作范围及 API 见 [P3-1A 规范](../018-phase3-session-stop.zh-CN.md)。
+
+复核补齐了并发停止与恢复、停止前尚无会话的 Worker，以及低层入口绑定 Ticket 和 Project 的校验。旧 Assignment 的停止诊断保留在原派工上。类型检查、构建与 47 文件定向回归通过，605 通过、1 跳过（Windows 目录联接）。定向回归之间有一次随机临时端口导致 fetch 报 `bad port`，完整定向重跑通过。本轮未跑全量。
+
+真实 DSH Desktop 0.2.2.0、隔离 `phase3-live` profile 和 `dsh-superagent/node` 使用本机 llama-server 的 Gemma 4 12B。停下 PM 后项目仍 active，两组 Worker 与 Assignment 保持原身份，消息和 ensure 拒绝隐式恢复，Router 可读停止通知。经显式恢复，原 PM 接收下一条消息并执行第 2 轮，该轮因模型达到输出上限结束。故障注入由 FakeNode 测试覆盖。验收脚本和脱敏证据保存在本地忽略目录 `.artifacts/phase3-5-20261117/`，证据文件为 `live-edI3Mg/evidence.json`。
+
+P3-1A 已验收。P3-1B 接回合中断、Router 顺序插话和前端，完成后再验收 P3-1。

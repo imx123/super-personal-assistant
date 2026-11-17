@@ -821,10 +821,18 @@ export class Tickets extends EnginePart {
   }
   /**
    * A person's stop of the selected Worker alone: see `hardStopWorker`.
+   *
+   * The options let a caller that must know whether the node really stopped the Worker wait for the answer, and record
+   * that the stop is still open until it comes: `confirmStop` writes the open-stop fact next to the Assignment's end, so
+   * a restart before the answer still knows that this Worker may run, and `cleanups` receives the Executor's background
+   * cleanup. Without them the stop stays what a person's stop always was: the Assignment ends and the node is asked.
    * @throws UserError when the ticket is unknown or ended, or the assignment is not its latest or already ended.
    */
-  stopAssignment(ticketId: string, assignmentId: string): Ticket {
-    return this.hardStopWorker(ticketId, { scope: 'worker', by: 'user', assignmentId })
+  stopAssignment(ticketId: string, assignmentId: string,
+    options: { confirmStop?: boolean; cleanups?: { ticketId: string; work: Promise<void> }[] } = {}): Ticket {
+    return this.hardStopWorker(ticketId, { scope: 'worker', by: 'user', assignmentId,
+      ...(options.confirmStop === undefined ? {} : { confirmStop: options.confirmStop }),
+      ...(options.cleanups === undefined ? {} : { cleanups: options.cleanups }) })
   }
   /**
    * Replaces the stalled or explicitly stopped assignment of a retryable open ticket.

@@ -106,7 +106,7 @@ node lib/control.js
 | 操作 | PM 会话 | Worker 会话 |
 | --- | --- | --- |
 | 发送消息 | 直接送达 PM | 给当前执行会话对应的工单追加指令，支持项目工单和独立工单。页面分别显示「已送达」「已排队」和发送失败 |
-| 停止 | **不提供**：结束它管理的项目才是合适的动作，在项目页上 | Assignment 在领域里结束，节点确认后才算停；没确认时页面照实说没确认 |
+| 停止 | **本轮后端已支持，前端待 P3-1B**：只停这个 Session，项目状态、项目工单和同一项目的其他 Worker 都不动（不是「结束项目」） | Assignment 在领域里结束，节点确认后才算停；没确认时页面照实说没确认 |
 | 归档 | 项目不再 active 时才允许 | Assignment 已结束时才允许 |
 | 权限 | `PUT /v1/console/sessions/:id/permission` | 同左 |
 | 撤销权限 | **二次确认**后才执行 | 同左 |
@@ -117,6 +117,18 @@ Worker 被替换后，请打开新会话再发消息。向旧会话发送会返�
 
 条件不满足的动作（例如给还在跑活的 Worker 归档）会显示控制面返回的 409 原因，不是一个没有解释的失败。
 
+P3-1A 在后端补齐了控制台停止所需的动作，页面本身留给 P3-1B：
+
+| 动作 | 路由 | 说明 |
+| --- | --- | --- |
+| 停 PM / Router 会话 | `POST /v1/console/sessions/:id/cancel` | 只停那个会话；项目状态、项目工单、同一项目的其他 Worker 和 PM Mandate 都不动 |
+| 停一个 Assignment | `POST /v1/console/assignments/:id/stop` | 工单保持开着；只有人能批准恢复 |
+| 取消一个工单 | `POST /v1/console/tickets/:id/cancel` | 工单结束，Mandate 撤回 |
+| 恢复 | `POST /v1/console/sessions/:id/resume`、`POST /v1/console/tickets/:id/resume` | 显式的操作员动作；恢复后停止期间流通的令牌一律无效；节点没确认过的停止不能恢复 |
+| 停止通知 | `GET /v1/console/stops` | 目标、作用域、影响、未受影响的子任务、操作人和时间 |
+
+回答里的 `stopped` 与 `confirmed` 是两件事：前者是这次请求的结果，后者是节点确认过。节点拒收或回执丢失时，页面必须照实说没有确认。
+
 ## 3.3 底层路由与控制台路由的关系
 
 控制台的所有写操作都走 `/v1/console/*`；Phase 2 起就有的底层路由保持原语义，老客户端不受影响：
@@ -125,7 +137,7 @@ Worker 被替换后，请打开新会话再发消息。向旧会话发送会返�
 | --- | --- |
 | `POST /v1/projects/:id/pm` | 底层只为任意项目 ensure PM；控制台那一条在项目已结束/归档时拒绝（409） |
 | `POST /v1/sessions/:id/message` | 底层把消息直接送到那个 Session；控制台那一条按角色：PM 直达，Worker 走它那张工单 |
-| `POST /v1/sessions/:id/cancel` | 底层只在节点上停掉那个 Session，**不终结整个项目**；控制台那一条按角色做领域内的停止，并拒绝停 PM 会话 |
+| `POST /v1/sessions/:id/cancel` | 底层只在节点上停掉那个 Session，**不终结整个项目**；控制台那一条按角色做领域内的停止：Worker 走它那张工单，PM 只停它自己（不终结项目、不连带其他 Worker） |
 | `POST /v1/sessions/:id/archive` | 底层照旧归档那个 Session（项目还在 active 也一样）；控制台那一条在活还在跑时拒绝（409） |
 | `POST /v1/projects/:id/workers` | 底层低层入口：为已有 Assignment 拉起 Worker Session。**浏览器不暴露**它 |
 

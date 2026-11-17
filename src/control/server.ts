@@ -672,7 +672,46 @@ export class ControlPlaneServer {
       return json(res, 200, { entries: this.control.projectMemory(projectId) })
     }
 
-    const sessionPath = /^\/v1\/console\/sessions\/([^/]+)(?:\/(message|messages|cancel|archive|permission|revoke))?$/.exec(path)
+    // The notices about stops: what an operator stopped, what it affected and what it left running. They are the
+    // control plane's own durable facts, and they are readable by the operator and by the logical superior of the work.
+    if (method === 'GET' && path === '/v1/console/stops') {
+      const superiorKind = url.searchParams.get('superiorKind') ?? undefined
+      const superiorId = url.searchParams.get('superiorId') ?? undefined
+      const projectId = url.searchParams.get('projectId') ?? undefined
+      return json(res, 200, { stops: this.control.stopNotices({
+        limit: this.limit(url.searchParams.get('limit')) ?? 50,
+        ...(superiorKind === undefined ? {} : { superiorKind }),
+        ...(superiorId === undefined ? {} : { superiorId }),
+        ...(projectId === undefined ? {} : { projectId }),
+      }), sessions: this.control.stopViews() })
+    }
+
+    // The Assignment stop: one Worker's Assignment ends, its Ticket stays open and the other Workers keep running.
+    const assignmentAction = /^\/v1\/console\/assignments\/([^/]+)\/(stop)$/.exec(path)
+    if (method === 'POST' && assignmentAction) {
+      const assignmentId = decodeURIComponent(assignmentAction[1]!)
+      const body = await readJson(req)
+      const result = await this.control.stopAssignmentByOperator(assignmentId,
+        typeof body.reason === 'string' ? body.reason : undefined)
+      return json(res, 200, result)
+    }
+
+    // The Ticket's own lifecycle: a cancel ends it, a resume clears the stop a person put on its Worker.
+    const ticketAction = /^\/v1\/console\/tickets\/([^/]+)\/(cancel|resume)$/.exec(path)
+    if (method === 'POST' && ticketAction) {
+      const ticketId = decodeURIComponent(ticketAction[1]!)
+      const body = await readJson(req)
+      if (ticketAction[2] === 'cancel') {
+        const result = await this.control.cancelTicketByOperator(ticketId,
+          typeof body.reason === 'string' ? body.reason : undefined)
+        return json(res, 200, result)
+      }
+      const result = await this.control.resumeTicketWorker(ticketId,
+        typeof body.reason === 'string' ? body.reason : undefined)
+      return json(res, 200, result)
+    }
+
+    const sessionPath = /^\/v1\/console\/sessions\/([^/]+)(?:\/(message|messages|cancel|archive|permission|revoke|resume))?$/.exec(path)
     if (sessionPath) {
       const sessionId = decodeURIComponent(sessionPath[1]!)
       const action = sessionPath[2]
@@ -700,6 +739,13 @@ export class ControlPlaneServer {
           typeof body.reason === 'string' ? body.reason : undefined)
         // A stop the node did not confirm is reported, never hidden behind a success.
         return json(res, 200, { cancelled: result.stopped, ...result })
+      }
+      if (method === 'POST' && action === 'resume') {
+        const body = await readJson(req)
+        // The resume is the operator's own act: nothing else clears a stop, and only the operator may say so.
+        const result = await this.control.resumeSessionByOperator(sessionId,
+          typeof body.reason === 'string' ? body.reason : undefined)
+        return json(res, 200, result)
       }
       if (method === 'POST' && action === 'archive') {
         const result = await this.control.archiveSessionByOperator(sessionId)

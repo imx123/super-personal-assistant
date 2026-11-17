@@ -2,9 +2,10 @@
  * The operator's own routes: a Project's lifecycle, a Session's actions by its role, and the revocation of a Session.
  *
  * Every action here goes through the domain's own primitives: a pause stops the Project's Workers through the one
- * primitive a person's stop uses, and a Worker is stopped through its Ticket. A PM Session is not stopped on its own —
- * ending the Project it manages is the action that fits, and it lives on the Project's own route. A revocation takes the
- * Session's authority away for good: neither the token it holds nor the grace refresh nor a re-ensure may bring it back.
+ * primitive a person's stop uses, and a Worker is stopped through its Ticket. A PM Session is stopped on its own — the
+ * Session is gone, and the Project it manages is left exactly as it was; ending that Project is a separate decision and
+ * lives on the Project's own route. A revocation takes the Session's authority away for good: neither the token it holds
+ * nor the grace refresh nor a re-ensure may bring it back.
  */
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -209,7 +210,7 @@ describe('the operator routes', () => {
       'the message did not reach the Worker')
   })
 
-  it('stops a Worker through its Ticket and refuses to stop a PM on its own', async () => {
+  it('stops a Worker through its Ticket and stops a PM Session on its own', async () => {
     await open()
     const { projectId, pmSessionId, ticketId, assignmentId } = await projectWithWorker()
     const workerSession = `worker-${assignmentId}`
@@ -219,11 +220,15 @@ describe('the operator routes', () => {
     // The Assignment ends in the domain and the node confirms the Worker is gone.
     expect(control!.store.tickets.get(ticketId)?.assignments.at(-1)?.state).toBe('ended')
     expect(node.sessions.get(workerSession)?.status).toBe('stopped')
+    // The Ticket stays open: stopping one Worker is not ending its Ticket.
+    expect(control!.store.tickets.get(ticketId)?.ended).toBeUndefined()
 
-    // A PM Session has no Assignment of its own: stopping it is not an operator action, and it never ends the Project.
+    // A PM Session is stopped on its own: the Session is gone, and the Project it manages is left exactly as it was.
     const stoppedPm = await post(`/v1/console/sessions/${pmSessionId}/cancel`, { reason: 'PM 到此为止' })
-    expect(stoppedPm.status).toBe(409)
+    expect(stoppedPm.status).toBe(200)
+    expect(node.sessions.get(pmSessionId)?.status).toBe('stopped')
     expect(control!.store.projects.get(projectId)?.status).toBe('active')
+    expect(control!.store.tickets.get(ticketId)?.ended).toBeUndefined()
   })
 
   it('keeps the low-level Session routes on their own semantics', async () => {

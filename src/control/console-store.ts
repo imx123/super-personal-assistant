@@ -88,6 +88,48 @@ export interface ReconcileRunRow {
   boundary: string
 }
 
+/**
+ * One notice about a stop, written for the logical superior of the stopped work.
+ *
+ * The notice is the control plane's own durable fact: a PM that was stopped, a Worker that was stopped and a Ticket
+ * that was cancelled each leave one behind, so the superior — the Router, the PM, or the operator — can read what
+ * happened without the work itself having to carry it.
+ *
+ * The notice names the target, the scope, what the stop affected, what it left running, who acted and when. It names
+ * nothing else: the ids it carries belong to the one Project the stopped work was part of, so a notice never carries
+ * another Project's data.
+ */
+export interface StopNoticeRow {
+  /** The notice's own id, newest last. */
+  id: number
+  /** When the stop was recorded. */
+  at: string
+  /** What was stopped: `session`, `assignment` or `ticket`. */
+  targetKind: string
+  /** The id of the stopped thing. */
+  targetId: string
+  /** The Session the stop was about, when there is one. */
+  sessionId: string
+  /** The scope of the stop: `session`, `assignment` or `ticket`. */
+  scope: string
+  /** `requested` until the node confirmed the stop; `confirmed` afterwards. */
+  state: string
+  /** Who stopped it. */
+  actor: string
+  /** The Project the stopped work belonged to, when it had one. */
+  projectId: string
+  /** What the stop affected, as JSON. */
+  affected: string
+  /** What the stop left running, as JSON. */
+  unaffected: string
+  /** Who may read the notice: `pm`, `router` or `operator`. */
+  superiorKind: string
+  /** The Session of the superior, when the superior is one. */
+  superiorId: string
+  /** The redacted diagnostic of a stop the node did not confirm. */
+  error: string
+}
+
 /** What the log keeps and for how long. */
 export interface ConsoleStoreOptions {
   /** How many events the log keeps; the oldest are dropped first. */
@@ -104,6 +146,14 @@ export const DEFAULT_EVENT_ROWS = 20_000
 export const DEFAULT_EVENT_DAYS = 7
 /** How many days the audit keeps by default; `0` means the audit is permanent. */
 export const DEFAULT_AUDIT_DAYS = 0
+
+/**
+ * How many stop notices the file keeps.
+ *
+ * A notice is a fact about a stop that a superior has to be able to read; it is not a log of every action the control
+ * plane ever took. The newest ones are the ones that matter, and the bound keeps the file from growing without limit.
+ */
+export const DEFAULT_STOP_NOTICES = 1000
 
 /** The tables of the console's own file. */
 const SCHEMA = `
@@ -128,6 +178,14 @@ CREATE TABLE IF NOT EXISTS reconcile_run (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   at TEXT NOT NULL, node_online INTEGER NOT NULL, checked INTEGER NOT NULL,
   findings TEXT NOT NULL, counts TEXT NOT NULL, boundary TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS stop_notice (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL, target_kind TEXT NOT NULL, target_id TEXT NOT NULL, session_id TEXT NOT NULL,
+  scope TEXT NOT NULL, state TEXT NOT NULL, actor TEXT NOT NULL, project_id TEXT NOT NULL,
+  affected TEXT NOT NULL, unaffected TEXT NOT NULL, superior_kind TEXT NOT NULL, superior_id TEXT NOT NULL,
+  error TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS stop_notice_at ON stop_notice(at);
+CREATE INDEX IF NOT EXISTS stop_notice_superior ON stop_notice(superior_kind, superior_id, id);
 `
 
 /** The value of one column of a row, as a number. */
@@ -333,6 +391,57 @@ export class ConsoleStore {
   }
 
   /**
+   * Record one notice about a stop, for the logical superior of the stopped work.
+   *
+   * The notice is written in the console's own file, so it survives a restart of the control plane and outlives the
+   * Session it is about. Nothing else is written with it: no Project, no Ticket and no Assignment changes because a
+   * notice was recorded.
+   */
+  addStopNotice(row: Omit<StopNoticeRow, 'id'>): number {
+    const result = this.db.prepare(
+      'INSERT INTO stop_notice (at, target_kind, target_id, session_id, scope, state, actor, project_id,'
+      + ' affected, unaffected, superior_kind, superior_id, error) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(row.at, row.targetKind, row.targetId, row.sessionId, row.scope, row.state, row.actor, row.projectId,
+        row.affected, row.unaffected, row.superiorKind, row.superiorId, row.error)
+    return numberOf(result.lastInsertRowid)
+  }
+
+  /**
+   * The notices about stops, newest first.
+   *
+   * A superior reads the notices meant for it: the PM of a Project reads the ones about that Project's own work, the
+   * Router reads the ones about the Sessions it is the superior of, and the operator reads them all. The filter is
+   * what keeps one Project's notice out of another Project's PM.
+   */
+  stopNotices(filter: { limit?: number; superiorKind?: string; superiorId?: string; projectId?: string } = {}): StopNoticeRow[] {
+    const limit = Math.max(1, Math.min(Math.trunc(filter.limit ?? 50), 500))
+    const clauses: string[] = []
+    const values: (string | number)[] = []
+    if (filter.superiorKind !== undefined) {
+      clauses.push('superior_kind = ?')
+      values.push(filter.superiorKind)
+    }
+    if (filter.superiorId !== undefined) {
+      clauses.push('superior_id = ?')
+      values.push(filter.superiorId)
+    }
+    if (filter.projectId !== undefined) {
+      clauses.push('project_id = ?')
+      values.push(filter.projectId)
+    }
+    const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
+    const rows = this.db.prepare(
+      'SELECT id, at, target_kind, target_id, session_id, scope, state, actor, project_id, affected, unaffected,'
+      + ` superior_kind, superior_id, error FROM stop_notice${where} ORDER BY id DESC LIMIT ?`)
+      .all(...values, limit)
+    return rows.map(row => ({ id: numberOf(row.id), at: stringOf(row.at), targetKind: stringOf(row.target_kind),
+      targetId: stringOf(row.target_id), sessionId: stringOf(row.session_id), scope: stringOf(row.scope),
+      state: stringOf(row.state), actor: stringOf(row.actor), projectId: stringOf(row.project_id),
+      affected: stringOf(row.affected), unaffected: stringOf(row.unaffected), superiorKind: stringOf(row.superior_kind),
+      superiorId: stringOf(row.superior_id), error: stringOf(row.error) }))
+  }
+
+  /**
    * Drop what the log may no longer keep.
    *
    * The events are bounded twice: by their number and by their age. The audit is bounded by its age alone, and an age of
@@ -346,6 +455,8 @@ export class ConsoleStore {
     if (this.auditDays > 0) {
       this.db.prepare('DELETE FROM audit WHERE at < ?').run(this.olderThan(now, this.auditDays))
     }
+    // The notices are bounded by their number alone: a stop that a superior still has to read stays, an old one goes.
+    this.db.prepare('DELETE FROM stop_notice WHERE id <= (SELECT MAX(id) FROM stop_notice) - ?').run(DEFAULT_STOP_NOTICES)
   }
 
   /** One value of the console's own settings. */

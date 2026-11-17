@@ -987,8 +987,7 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
   // only keeps the console from asking for a refusal it already knows about.
   const deliverable = session.deliverable !== false
   const unavailable = revoked ? '会话权限已撤销' : (deliverable ? '' : '这个会话已结束，无法接收指令')
-  // A PM Session is not stopped on its own: ending the Project it manages is the action that fits, and it lives on the
-  // Project's own page. A PM of a Project that is still active must not be archived either.
+  // PM stop is available through the API. The session detail will expose it alongside other turn controls in P3-1B.
   const pmActive = session.role === 'pm' && props.projectStatus === 'active'
   const name = session.role === 'pm' ? 'PM' : 'Worker'
   const pending = messages.data === undefined && !messages.error
