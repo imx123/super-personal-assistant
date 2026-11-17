@@ -14,6 +14,30 @@
 export const NODE_PROTOCOL_VERSION = 1
 
 /**
+ * The capability a node advertises when it can interrupt one running turn of one Session.
+ *
+ * The capability is what keeps the change backward compatible: a node that does not advertise it never receives the
+ * command, and the control plane says plainly that the node cannot interrupt a turn instead of pretending it did.
+ */
+export const NODE_CAPABILITY_TURN_INTERRUPT = 'turn-interrupt'
+
+/**
+ * The failure of a command whose outcome is unknown.
+ *
+ * A node that never answered may have carried the command out anyway: the receipt is missing, not negative. A refusal
+ * is the opposite — the node answered and said no — and it keeps the plain error it always had. The control plane tells
+ * the two apart, because a message whose receipt is missing may not be sent again and may not be given a fresh
+ * authority, while a message the node refused is simply over.
+ */
+export class NodeUnconfirmedError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message)
+    this.name = 'NodeUnconfirmedError'
+    if (options?.cause !== undefined) this.cause = options.cause
+  }
+}
+
+/**
  * The report states a Worker may submit through the control plane's tool API.
  *
  * `waiting` is the Executor's own state — recorded when a Worker's turn ends with nothing to do — and is never a claim a
@@ -244,6 +268,13 @@ export interface SessionInspection {
   found: boolean
   /** The node's current status; present when `found`. */
   status?: SessionStatus
+  /**
+   * The turn the Session runs right now, when the node knows one.
+   *
+   * The number is what an interrupt names, and it is the node's own fact: after a reconnect or a control-plane restart
+   * it is the only way to learn which turn runs, so the interrupt never ends a turn that started in the meantime.
+   */
+  turn?: number
   /** The backend's own resume id, when the node knows it. */
   backendSessionId?: string
   /** Whether the role profile and tools finished installing; absent when the node does not track it. */
@@ -328,6 +359,26 @@ export type NodeCommand =
   | (CommandEnvelope & { type: 'session.message'; sessionId: string; text: string; sessionToken?: string
     inputIds?: readonly string[]; routerModel?: RouterModel })
   | (CommandEnvelope & { type: 'session.cancel'; sessionId: string; reason?: string })
+  | (CommandEnvelope & {
+    /**
+     * Interrupt the Session's current turn, and only that turn.
+     *
+     * It is not a stop: the Session keeps its identity, its authority, its Assignment and its Ticket, and the messages
+     * that wait for the next turn stay in the Session's inbox. Only the turn that runs right now is ended, and the node
+     * answers after it saw that turn end.
+     *
+     * `turn` names the turn the caller believes is running. A node that is already running another turn refuses the
+     * command instead of ending that one: a turn that started after the operator's request is not the turn the operator
+     * asked to interrupt. The field is optional, and a node without it interrupts whichever turn it is running.
+     *
+     * The command is additive: a node that does not know it refuses it, and an older control plane never sends it, so
+     * the protocol version does not move.
+     */
+    type: 'session.interrupt'
+    sessionId: string
+    reason?: string
+    turn?: number
+  })
   | (CommandEnvelope & { type: 'session.archive'; sessionId: string })
   | (CommandEnvelope & { type: 'session.inspect'; sessionId: string; routerDetails?: true })
   | (CommandEnvelope & { type: 'permission.set'; sessionId: string; permission: string })
@@ -369,6 +420,14 @@ export type NodeEvent =
   | (EventEnvelope & {
     type: 'session.event'
     kind: 'message' | 'turn-start' | 'turn-end' | 'error' | 'usage'
+    /**
+     * The event's own facts.
+     *
+     * A `turn-start` names the turn it opened and the Input ids it took; a `turn-end` names the turn it closed, why it
+     * ended (`completed`, `aborted`, `blocked`, `error`, `max-tokens`, `interrupted`) and, for an `aborted` turn, the
+     * `cause` that aborted it (`user` for a turn a person interrupted). The cause is what tells an interrupted turn from
+     * one that failed on its own.
+     */
     data?: unknown
   })
   | (EventEnvelope & { type: 'session.inspected'; requestId: string; inspection: SessionInspection })

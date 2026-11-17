@@ -10,14 +10,15 @@ import { assignmentStopped, canRetry, currentReview, latestAssignment, pendingRe
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { redact } from '../infra/redact.ts'
-import { NODE_PROTOCOL_VERSION } from '../shared/protocol.ts'
+import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError } from '../shared/protocol.ts'
 import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
   SessionInspection, SessionRecord, SessionStatus } from '../shared/protocol.ts'
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
-import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow, type StopNoticeRow } from './console-store.ts'
+import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type ProjectMemoryRow, type RouterQueueRow,
+  type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
@@ -166,6 +167,40 @@ const PROJECT_MEMORY_KEPT = 200
  * Router has to know about, and the bound keeps the answer from growing with the life of the control plane.
  */
 const PROJECT_STOP_NOTICE_LIMIT = 20
+
+/**
+ * How many of the Router's queued messages one reader sees.
+ *
+ * The queue is a task list, not a history: the messages that wait and the ones that failed are what a person has to see,
+ * and the ones that were read long ago are only noise.
+ */
+const ROUTER_QUEUE_SHOWN = 50
+
+/**
+ * How many messages the Router's queue holds at most.
+ *
+ * The queue is a task list, not a history: a person may write while the Router answers, and the messages wait in the
+ * order they were written. The bound is what keeps that promise honest — a queue that grows without end would promise a
+ * turn that never comes. A full queue refuses the new message before it is accepted, and the messages that are already
+ * there keep their place: nothing is pushed out to make room.
+ */
+const ROUTER_QUEUE_LIMIT = 50
+
+/**
+ * How many messages the queue still holds, counted over the states that are not final.
+ *
+ * A message that waits, that is on its way, that the node took or whose receipt is missing is still a task: it occupies
+ * the queue until a turn reads it or a refusal ends it.
+ */
+const ROUTER_QUEUE_PENDING = ['queued', 'sending', 'sent', 'unconfirmed'] as const
+
+/**
+ * How long the queue waits before it looks at the Router again.
+ *
+ * The Router's own turn end is what usually releases the queue. This is the safety net for the case where that event
+ * never arrived: a message that waits must not wait for ever because one event was lost.
+ */
+const ROUTER_QUEUE_RETRY_MS = 5_000
 
 /**
  * How many report calls one Session keeps in the ledger.
@@ -457,8 +492,15 @@ export interface RouterSummary {
  * person's own words on one side, the model's answers on the other, and nothing in between that the console made up.
  */
 export interface RouterState {
-  /** The Router Session, when it has been started. */
-  session?: { sessionId: string; status: string; workspace: string; updatedAt: string; revokedAt?: string }
+  /**
+   * The Router Session, when it has been started.
+   *
+   * `currentTurn` is the turn the Router runs right now, as the node reported it, and `interruptible` says whether the
+   * node offers to end one turn at all. The console offers the interrupt only when the backend says so: an action the
+   * server would refuse is not offered.
+   */
+  session?: { sessionId: string; status: string; workspace: string; updatedAt: string; revokedAt?: string
+    currentTurn?: number; interruptible?: boolean }
   /** Whether the node the Router runs on is reachable. */
   nodeOnline: boolean
   /** The conversation, oldest first. */
@@ -478,6 +520,64 @@ export interface RouterState {
    * the work itself and never another notice's data.
    */
   stops?: StopNotice[]
+  /**
+   * The messages that wait for the Router, oldest first.
+   *
+   * The queue is the control plane's own durable record of what a person said to the Router and what became of it. A
+   * message that is still `queued` waits for the Router's next turn; a `sent` one reached the node's inbox; a `read` one
+   * was really taken by a turn; a `failed` one the node refused, with the reason it gave.
+   */
+  queue?: RouterQueueEntry[]
+}
+
+/**
+ * What became of one message a person sent to the Router.
+ *
+ * The states are facts about different moments, and the console keeps them apart: the node's inbox is not a turn, and an
+ * HTTP answer of 200 is neither.
+ *
+ * `queued` is a message that was never attempted, `sending` one that is on its way, `sent` one the node took into the
+ * Session's inbox, `read` one a turn of that Session really took, `failed` one the node refused, and `unconfirmed` one
+ * whose receipt is missing — the control plane cannot say whether it arrived, and says exactly that.
+ */
+export type RouterQueueState = 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed'
+
+/** One message a person sent to the Router, as the console reads it. */
+export interface RouterQueueEntry {
+  /** The message's own id: the stable id the node knows it by. */
+  id: string
+  /** When the person sent it. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The names of the files the message carried. */
+  attachments: string[]
+  /** What became of it. */
+  state: RouterQueueState
+  /** Why it failed, or why it still waits; empty when there is nothing to say. */
+  error?: string
+  /** The Router request the message is. */
+  requestId: string
+}
+
+/**
+ * What one interrupt of a running turn did.
+ *
+ * `interrupted` says that the turn was ended and `confirmed` that the node itself said so. A refusal is named by
+ * `refusal`, so a caller can tell "there was no turn to interrupt" from "the node does not know how" and from "the node
+ * refused" without reading the diagnostic.
+ */
+export interface InterruptOutcome {
+  /** Whether the turn was ended. */
+  interrupted: boolean
+  /** Whether the node confirmed that the turn ended. */
+  confirmed: boolean
+  /** The turn that was interrupted, when the caller named one. */
+  turn?: number
+  /** Why it was not interrupted, when it was not. */
+  error?: string
+  /** The kind of refusal, when the request itself was refused. */
+  refusal?: 'no-running-turn' | 'unsupported' | 'stopped' | 'revoked' | 'replaced'
 }
 
 /**
@@ -671,6 +771,19 @@ export interface ConsoleSession extends SessionRecord {
   deliverable: boolean
   /** Why it may not, when it may not. */
   unavailableReason?: string
+  /**
+   * The turn this Session runs, when the node reported one.
+   *
+   * The number is what an interrupt names: the node is asked to end that very turn, so a turn that started in the
+   * meantime is never ended in its place.
+   */
+  currentTurn?: number
+  /**
+   * Whether the node can interrupt one running turn of one Session.
+   *
+   * A node that does not offer it says so here, and the console does not offer an action the server would refuse.
+   */
+  interruptible: boolean
 }
 
 /**
@@ -866,6 +979,75 @@ function turnInputIds(data: unknown): string[] {
 }
 
 /**
+ * The turn number a node reported, when it reported one.
+ *
+ * The number is what makes an interrupt precise: the node is asked to end that very turn, and refuses when another one
+ * is running. A node that reports no number leaves the interrupt without a target, and the node then decides.
+ */
+function turnNumber(data: unknown): number | undefined {
+  if (typeof data !== 'object' || data === null) return undefined
+  const value = (data as { turn?: unknown }).turn
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/** The shape of a message id a person may choose for themselves: a UUID. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The attachments a queued message carries, read back from the row that holds them.
+ *
+ * A row that cannot be read is a row without attachments: the message itself is still the person's own words, and a
+ * broken attachment list must not take the message away.
+ */
+function parseRouterAttachments(value: string): RouterTextAttachment[] {
+  if (value === '') return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.flatMap(entry => {
+      if (typeof entry !== 'object' || entry === null) return []
+      const file = entry as { name?: unknown; text?: unknown }
+      if (typeof file.name !== 'string' || typeof file.text !== 'string') return []
+      return [{ name: file.name, text: file.text }]
+    })
+  } catch {
+    return []
+  }
+}
+
+/** The model a queued message asked for, read back from the row that holds it. */
+function parseRouterModel(value: string): RouterModel | undefined {
+  if (value === '') return undefined
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (typeof parsed !== 'object' || parsed === null) return undefined
+    const model = parsed as { provider?: unknown; model?: unknown }
+    if (typeof model.provider !== 'string' || typeof model.model !== 'string') return undefined
+    if (model.provider === '' || model.model === '') return undefined
+    return { provider: model.provider, model: model.model }
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Whether two file lists are the same files in the same order.
+ *
+ * The comparison is by name and by content: a message that carries another file under the same id is another message,
+ * and the queue may not hold both of them.
+ */
+function sameAttachments(left: readonly RouterTextAttachment[], right: readonly RouterTextAttachment[]): boolean {
+  if (left.length !== right.length) return false
+  return left.every((file, index) => file.name === right[index]?.name && file.text === right[index]?.text)
+}
+
+/** Whether a queued message asked for the same model as the one a person sends now. */
+function sameModel(left: RouterModel | undefined, right: RouterModel | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right
+  return left.provider === right.provider && left.model === right.model
+}
+
+/**
  * The kernel owns the domain Store and Engine, while a NodePort owns execution. It never imports
  * DSH: the same object can front the current plugin or a FakeNode in tests.
  */
@@ -952,6 +1134,26 @@ export class ControlPlane {
    */
   private readonly routerRequests = new RouterRequests(() => this.now())
   /**
+   * The turn each Session runs, by the node's own turn facts.
+   *
+   * The number is what makes an interrupt precise: the node is asked to end that very turn and refuses when another one
+   * is running, so a turn that started after the operator's request is never ended in its place.
+   */
+  private readonly sessionTurns = new Map<string, number>()
+  /**
+   * The Router's delivery queue, one link at a time.
+   *
+   * The chain is what keeps two messages in the order the person wrote them: the second delivery waits for the first to
+   * settle, so the node's inbox holds them in that order however many requests arrived at once.
+   */
+  private routerQueuePump: Promise<void> = Promise.resolve()
+  /**
+   * The timer that looks at the queue again when the Router still claims to be answering.
+   *
+   * One timer serves the whole queue: a hundred waiting messages do not mean a hundred lookups.
+   */
+  private routerQueueRetry: ReturnType<typeof setTimeout> | undefined
+  /**
    * The report contents a PM was already woken for, by Assignment.
    *
    * A replayed report is one fact, not two, so the same content wakes a PM once. A wake-up that failed gives its key
@@ -1034,6 +1236,9 @@ export class ControlPlane {
       this.lastEventSeq = consoleDb.lastEventSeq()
       // The log is bounded; a restart is a good moment to drop what it may no longer keep.
       this.pruneConsoleLog()
+      // The Router's queue is the control plane's own durable record, and a message that was on its way when this
+      // process ended has an unknown outcome: it is marked as such instead of being sent again.
+      this.reconcileRouterQueue()
       this.audit = new AuditRecorder(consoleDb, () => this.now(), error => {
         // An audit trail that cannot be written is a diagnostic, never a failed report: the work itself stays written.
         process.stderr.write(`superagent control-plane audit write failed: ${
@@ -1690,10 +1895,13 @@ export class ControlPlane {
    * the rule — this only keeps the console from asking for a refusal it already knows about.
    */
   consoleSessions(): ConsoleSession[] {
+    const interruptible = this.nodeSupportsTurnInterrupt()
     return [...this.sessions.values()].map(record => {
       const refusal = this.sessionDeliveryRefusal(record)
-      const view: ConsoleSession = { ...record, deliverable: refusal === undefined }
+      const view: ConsoleSession = { ...record, deliverable: refusal === undefined, interruptible }
       if (refusal !== undefined) view.unavailableReason = refusal
+      const turn = this.sessionTurns.get(record.sessionId)
+      if (turn !== undefined) view.currentTurn = turn
       return view
     })
   }
@@ -1822,31 +2030,274 @@ export class ControlPlane {
     const settled = await this.settleEnsure(record, 'Router')
     // An ensure that was already in flight when the operator stopped the Session would bring it back.
     await this.enforceOperatorStop(settled)
+    // The Router is up: the messages that waited for it may go now.
+    this.scheduleRouterQueue()
     return settled
   }
 
   /**
    * Deliver a person's message to the Router.
    *
+   * The message is queued first and delivered second, so a person can write while the Router is still answering: the
+   * message waits in the queue until the turn that runs now ends, and the turn that follows reads it. The person does
+   * not have to press send again.
+   *
    * The message is recorded as a request before it goes out, so the Router may act for it — and only for it. The Router
    * Session is ensured here, so the first message a person sends starts it without a detour through another page.
+   *
+   * `options.id` is the message's own id, and it is what makes a repeated send the same message: a message that is
+   * already queued is not queued twice, so a browser that repeats its request cannot make the Router read it twice. The
+   * same id with other words is a conflict and is refused: the queue holds one message under one id, and the person
+   * would not know which of the two the Router reads.
    */
-  async sendToRouter(text: string, attachments: readonly RouterTextAttachment[] = [],
-    routerModel?: RouterModel): Promise<{ requestId: string; session: SessionRecord }> {
+  async sendToRouter(text: string, attachments: readonly RouterTextAttachment[] = [], routerModel?: RouterModel,
+    options: { id?: string } = {}): Promise<{ requestId: string; session: SessionRecord; entry: RouterQueueEntry }> {
     const value = text.trim()
     if (value === '') throw new OperatorError(400, 'A message to the Router needs a text')
+    const id = options.id !== undefined && UUID.test(options.id) ? options.id : randomUUID()
+    const messageId = `router-msg-${id}`
+    const requestId = `router-req-${id}`
+    // The same id is the same message: a message that is already in the queue is not queued twice.
+    const known = this.consoleStore.routerMessage(messageId)
+    if (known) return this.knownRouterMessage(known, value, attachments, routerModel)
     const session = await this.ensureRouter()
-    const request = this.routerRequests.record(value)
-    try {
-      await this.sendMessage(ROUTER_SESSION_ID, routerRequestMessage(request, attachments), undefined, 'operator',
-        routerModel ? { routerModel } : {})
-    } catch (error) {
-      // A message that never left leaves no open request behind: the Router never saw the id, so it must not be able
-      // to propose for it either.
-      this.routerRequests.discard(request.id)
-      throw error
+    // The ensure awaited: two copies of one message may arrive at the same moment, and the second one finds the row the
+    // first one wrote instead of writing a second row.
+    const knownNow = this.consoleStore.routerMessage(messageId)
+    if (knownNow) return this.knownRouterMessage(knownNow, value, attachments, routerModel)
+    // The queue is bounded: a message that does not fit is refused before it is accepted, and the messages that are
+    // already there keep their place. The person still holds the words in the browser.
+    const pending = this.consoleStore.routerMessageCount(ROUTER_QUEUE_PENDING)
+    if (pending >= ROUTER_QUEUE_LIMIT) {
+      throw new OperatorError(409, `The Router queue holds ${pending} messages and cannot take more `
+        + `(the limit is ${ROUTER_QUEUE_LIMIT}); this message was not queued`)
     }
-    return { requestId: request.id, session }
+    // The request is recorded before the message goes out, so the Router may act for this message — and only for it.
+    const request = this.routerRequests.record(value, requestId)
+    this.consoleStore.addRouterMessage({
+      id: messageId,
+      at: request.at,
+      text: value,
+      attachments: JSON.stringify(attachments),
+      model: routerModel === undefined ? '' : JSON.stringify(routerModel),
+      requestId,
+      state: 'queued',
+      error: '',
+    })
+    // The delivery is awaited when it can happen right away, so the answer says whether the message really went out. A
+    // Router that is answering keeps the message: the answer then says it is queued, not that it was read.
+    await this.scheduleRouterQueue()
+    return { requestId, session, entry: this.routerQueueEntry(this.consoleStore.routerMessage(messageId)!) }
+  }
+
+  /**
+   * The answer for a message the queue already holds.
+   *
+   * The same id with the same words is the same message, so its own result is returned: a browser that repeats its
+   * request neither queues a second message nor gets a second answer. The same id with other words, other files or
+   * another model is a conflict and is refused — the queue cannot hold both, and a person would not know which one the
+   * Router is going to read.
+   */
+  private async knownRouterMessage(row: RouterQueueRow, text: string, attachments: readonly RouterTextAttachment[],
+    routerModel?: RouterModel): Promise<{ requestId: string; session: SessionRecord; entry: RouterQueueEntry }> {
+    const same = row.text === text
+      && sameAttachments(parseRouterAttachments(row.attachments), attachments)
+      && sameModel(parseRouterModel(row.model), routerModel)
+    if (!same) {
+      throw new OperatorError(409, `The message id ${row.id} was already used for another message; `
+        + 'send this one with a new id')
+    }
+    const session = this.sessions.get(ROUTER_SESSION_ID) ?? await this.ensureRouter()
+    return { requestId: row.requestId, session, entry: this.routerQueueEntry(row) }
+  }
+
+  /**
+   * Deliver the Router's queued messages, oldest first.
+   *
+   * The chain is what keeps the order: the second delivery waits for the first to settle, so the node's inbox holds the
+   * messages in the order the person wrote them however many requests arrived at once.
+   *
+   * A message is delivered when the Router is not running. An interjection waits for the turn that runs now to end, and
+   * the turn that follows reads it — that is what the queue is for.
+   */
+  private scheduleRouterQueue(): Promise<void> {
+    if (this.closed) return Promise.resolve()
+    this.routerQueuePump = this.routerQueuePump
+      .then(() => this.pumpRouterQueue())
+      .catch(error => {
+        // A queue that failed is reported and left alone: the messages stay in it and the next run tries again.
+        process.stderr.write(`superagent control-plane Router queue failed: ${messageOf(error)}\n`)
+      })
+    return this.routerQueuePump
+  }
+
+  /** Deliver the Router's queued messages, oldest first. */
+  private async pumpRouterQueue(): Promise<void> {
+    while (!this.closed) {
+      const next = this.consoleStore.routerMessages({ limit: 1, states: ['queued'] })[0]
+      if (!next) return
+      const record = this.sessions.get(ROUTER_SESSION_ID)
+      if (!record) {
+        // The Router Session is not there yet: the message waits for it rather than failing.
+        this.consoleStore.updateRouterMessage(next.id, { error: 'The Router Session is not running yet' })
+        return
+      }
+      // A Router an operator stopped takes no message: it waits for the explicit resume instead of failing.
+      const stopped = this.operatorStopRefusal(record)
+      if (stopped !== undefined) {
+        this.consoleStore.updateRouterMessage(next.id, { state: 'queued', error: stopped })
+        return
+      }
+      // A Router that is answering waits: the message goes out in the turn that follows the one that runs now. The
+      // node's own answer decides, so an old "running" cannot hold the queue for ever.
+      if (!await this.routerIsFree(record)) {
+        this.scheduleRouterQueueRetry()
+        return
+      }
+      if (this.closed) return
+      const outcome = await this.deliverRouterMessage(next)
+      if (outcome === 'delivered') {
+        // One message per round: the next one goes out in the round that follows the one this message starts, so the
+        // model that runs now is not switched under it. The Router's own turn end brings the queue back, and the retry
+        // is the safety net for a turn end that never arrived.
+        this.scheduleRouterQueueRetry()
+        return
+      }
+      if (outcome === 'unconfirmed') {
+        // The receipt is missing: the next message waits for the next look, so nothing is sent twice.
+        this.scheduleRouterQueueRetry()
+        return
+      }
+      if (outcome === 'waiting') return
+      // The node refused this message: it is over, and the next one still has to move. The queue does not stop at the
+      // first refusal, and it does not push the waiting messages out either.
+    }
+  }
+
+  /**
+   * Whether the Router may take a message right now.
+   *
+   * The node's own answer is the authority: the control plane's status is the last event it saw, and an event that never
+   * arrived leaves a status that says "running" for ever — or one that says "idle" for a Router that really answers.
+   * The question goes through the command and event path the control plane already uses, so it needs no second
+   * connection to the node, and a Router that really answers is never interrupted mid-turn: the model that runs now is
+   * not switched under it.
+   */
+  private async routerIsFree(record: SessionRecord): Promise<boolean> {
+    const inspection = await this.inspectOverProtocol(ROUTER_SESSION_ID)
+    if (this.closed) return false
+    if (inspection?.found && inspection.status !== undefined) {
+      this.adoptInspection(record, inspection)
+      return inspection.status !== 'running'
+    }
+    // The node could not answer: its own last word is the record's status, and a Router that is answering waits.
+    return record.status !== 'running'
+  }
+
+  /**
+   * Look at the queue again after a while.
+   *
+   * The Router's own turn end is what usually releases the queue. This is the safety net for the case where that event
+   * never arrived: a message that waits must not wait for ever because one event was lost. One timer serves the whole
+   * queue, so a hundred waiting messages do not mean a hundred lookups.
+   */
+  private scheduleRouterQueueRetry(): void {
+    if (this.closed || this.routerQueueRetry !== undefined) return
+    const timer = setTimeout(() => {
+      this.routerQueueRetry = undefined
+      void this.scheduleRouterQueue()
+    }, ROUTER_QUEUE_RETRY_MS)
+    timer.unref?.()
+    this.routerQueueRetry = timer
+  }
+
+  /**
+   * Deliver one queued message to the Router, and write down what became of it.
+   *
+   * The message names its own id, so the node reports it under that id when a turn really takes it. The inbox and the
+   * turn are two facts: the message is `sent` once the node took it, and only a turn that names it makes it `read`.
+   *
+   * The request the Router may act for is restored here, and only here: a message that waited across a restart gets its
+   * own id, its own words and the time it was written back. The window it may act in is the one it was given — never a
+   * new one — and a message that was already sent or read never gets an executable authority back.
+   */
+  private async deliverRouterMessage(entry: RouterQueueRow): Promise<'delivered' | 'failed' | 'waiting' | 'unconfirmed'> {
+    const attachments = parseRouterAttachments(entry.attachments)
+    const model = parseRouterModel(entry.model)
+    const request = { id: entry.requestId, at: entry.at, text: entry.text }
+    // The request the Router may act for: it is the one the message was written with, restored with the time it was
+    // written, so the window it may act in is the one it was given.
+    if (this.routerRequests.get(entry.requestId) === undefined) {
+      this.routerRequests.record(entry.text, entry.requestId, entry.at)
+    }
+    // The message is on its way: the state says so before the node answers, so a restart in the middle leaves an honest
+    // record behind instead of a message that looks as if it never left.
+    this.consoleStore.updateRouterMessage(entry.id, { state: 'sending', error: '' })
+    try {
+      await this.sendMessage(ROUTER_SESSION_ID, routerRequestMessage(request, attachments), [entry.id], 'operator', {
+        idempotencyKey: `router-msg:${entry.id}`,
+        ...(model === undefined ? {} : { routerModel: model }),
+      })
+    } catch (error) {
+      if (this.closed) return 'unconfirmed'
+      const reason = redact(messageOf(error)).slice(0, 300)
+      const current = this.consoleStore.routerMessage(entry.id)
+      // A turn that really took the message says so more strongly: a later failure must not overwrite that fact.
+      if (current?.state === 'read') return 'delivered'
+      // A missing receipt is not a refusal: the message may have reached the node, so it is neither sent again nor
+      // given an authority back. It is marked as what it is.
+      if (error instanceof NodeUnconfirmedError) {
+        this.consoleStore.updateRouterMessage(entry.id, { state: 'unconfirmed', error: reason })
+        this.routerRequests.discard(entry.requestId)
+        return 'unconfirmed'
+      }
+      // A node that is not reachable keeps the message: it waits for the node instead of failing.
+      if (this.nodeOffline()) {
+        this.consoleStore.updateRouterMessage(entry.id, { state: 'queued', error: reason })
+        return 'waiting'
+      }
+      this.consoleStore.updateRouterMessage(entry.id, { state: 'failed', error: reason })
+      // A message that never reached the Router leaves no open request behind: the Router never saw the id, so it must
+      // not be able to propose for it either.
+      this.routerRequests.discard(entry.requestId)
+      return 'failed'
+    }
+    if (this.closed) return 'unconfirmed'
+    // The node took the message. A turn that already read it says so more strongly, and that fact is not undone here.
+    if (this.consoleStore.routerMessage(entry.id)?.state !== 'read') {
+      this.consoleStore.updateRouterMessage(entry.id, { state: 'sent', error: '' })
+    }
+    return 'delivered'
+  }
+
+  /** Write down that a turn of the Router really took one of the queued messages. */
+  private markRouterMessagesRead(inputIds: readonly string[]): void {
+    for (const id of inputIds) {
+      const row = this.consoleStore.routerMessage(id)
+      if (!row || row.state === 'read') continue
+      this.consoleStore.updateRouterMessage(id, { state: 'read', error: '' })
+    }
+  }
+
+  /**
+   * Say honestly what a restart left behind.
+   *
+   * A message that was on its way when the process ended may or may not have reached the node: the receipt is missing,
+   * not negative. It is marked as that — it is neither sent again nor given an authority back — and the messages that
+   * were still waiting keep waiting, with the request they were written with.
+   */
+  private reconcileRouterQueue(): void {
+    for (const row of this.consoleStore.routerMessages({ limit: ROUTER_QUEUE_LIMIT, states: ['sending'] })) {
+      this.consoleStore.updateRouterMessage(row.id, { state: 'unconfirmed',
+        error: 'The control plane stopped while this message was on its way; it is not sent again' })
+      this.routerRequests.discard(row.requestId)
+    }
+  }
+
+  /** One row of the Router's queue, as the console reads it. */
+  private routerQueueEntry(row: RouterQueueRow): RouterQueueEntry {
+    return { id: row.id, at: row.at, text: row.text, attachments: parseRouterAttachments(row.attachments).map(file => file.name),
+      state: row.state as RouterQueueState, ...(row.error === '' ? {} : { error: row.error }), requestId: row.requestId }
   }
 
   async routerOptions(): Promise<RouterOptions> {
@@ -1887,9 +2338,21 @@ export class ControlPlane {
     // The Router is the logical superior of the PM Sessions and of the standalone Workers, so it reads their notices.
     const stops = this.stopNotices({ superiorKind: 'router', superiorId: ROUTER_SESSION_ID, limit: PROJECT_STOP_NOTICE_LIMIT })
     if (stops.length > 0) base.stops = stops
+    // The messages a person sent to the Router, and what became of them: the console shows the queue, so a reloaded
+    // page explains it instead of hiding it. The newest are kept and shown in the order they were written, because
+    // that is the order they will be delivered in.
+    const queue = this.consoleStore.routerMessages({ limit: ROUTER_QUEUE_SHOWN, newest: true })
+      .reverse()
+      .map(row => this.routerQueueEntry(row))
+    if (queue.length > 0) base.queue = queue
     if (record === undefined) return base
+    // The turn the Router runs right now and the node's own offer to end one: the console shows the interrupt only when
+    // the backend confirms both.
+    const turn = this.sessionTurns.get(ROUTER_SESSION_ID)
     return { ...base, session: { sessionId: record.sessionId, status: record.status, workspace: record.workspace,
-      updatedAt: record.updatedAt, ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }) } }
+      updatedAt: record.updatedAt, ...(record.revokedAt === undefined ? {} : { revokedAt: record.revokedAt }),
+      ...(turn === undefined ? {} : { currentTurn: turn }),
+      interruptible: this.nodeSupportsTurnInterrupt() } }
   }
 
   /**
@@ -3599,7 +4062,7 @@ export class ControlPlane {
     await this.options.node.send({ ...this.base(key), type: 'session.message', sessionId, text,
       sessionToken: token, ...(inputIds && inputIds.length ? { inputIds } : {}),
       ...(options.routerModel ? { routerModel: options.routerModel } : {}) })
-    if (origin === 'operator') {
+    if (origin === 'operator' && !this.closed) {
       // The message itself is not copied into the audit: its size and its target are the facts worth keeping.
       this.audit.record({ actor: 'operator', kind: 'session', action: 'message', targetKind: 'session',
         targetId: sessionId, detail: `${text.length} 字` })
@@ -3922,6 +4385,141 @@ export class ControlPlane {
       return { stopped: outcome.stopped, scope: 'session', confirmed: outcome.stopped,
         ...(outcome.error ? { error: outcome.error } : {}) }
     })
+  }
+
+  /**
+   * Interrupt the Session's current turn, and only that turn.
+   *
+   * An interrupt is not a stop. The Session keeps its identity, its authority, its Assignment and its Ticket; the
+   * messages that wait for the next turn stay in the Session's inbox; no Project, Ticket or Assignment changes; and no
+   * other Session is touched. A Worker a newer Assignment replaced is refused, because the domain — not this kernel —
+   * decides which Worker may still work.
+   *
+   * The node is asked to end the turn that runs now, and it confirms only after it saw that turn end. A node that does
+   * not offer the interrupt is told so plainly, and a node that already runs another turn refuses: a turn that started
+   * after the operator's request is not the turn the operator asked about.
+   *
+   * `turn` names the turn the caller believes is running. A turn that started in the meantime is not that turn, so the
+   * request is refused instead of ending the wrong one: the target of one round never drifts into the next.
+   */
+  async interruptSessionByOperator(sessionId: string, reason?: string, turn?: number): Promise<InterruptOutcome> {
+    const outcome = await this.interruptTurn(sessionId, reason, turn)
+    if (outcome.refusal === 'no-running-turn') {
+      throw new OperatorError(409, `The Session ${sessionId} has no running turn the control plane knows of`)
+    }
+    if (outcome.refusal === 'unsupported') {
+      throw new OperatorError(409, `The node ${this.options.nodeId} cannot interrupt a turn: it does not offer `
+        + `"${NODE_CAPABILITY_TURN_INTERRUPT}"`)
+    }
+    if (outcome.refusal === 'stopped') {
+      throw new OperatorError(409, `The Session ${sessionId} was stopped by an operator and has no turn to interrupt`)
+    }
+    if (outcome.refusal === 'revoked') {
+      throw new OperatorError(409, `The Session ${sessionId} was revoked and has no turn to interrupt`)
+    }
+    if (outcome.refusal === 'replaced') {
+      throw new OperatorError(409, `The Session ${sessionId} cannot be interrupted: ${outcome.error ?? 'its Assignment was replaced'}`)
+    }
+    this.audit.record({ actor: 'operator', kind: 'session', action: 'interrupted', targetKind: 'session',
+      targetId: sessionId, outcome: outcome.interrupted ? 'ok' : 'failed',
+      detail: outcome.turn === undefined ? 'session' : `turn ${outcome.turn}` })
+    return outcome
+  }
+
+  /**
+   * Interrupt one turn, and report what really happened.
+   *
+   * The refusal kinds are what a caller needs: "there was no turn", "the node cannot do this", "the Session is gone".
+   * Everything else is the node's own answer, and it is reported as it came.
+   */
+  private async interruptTurn(sessionId: string, reason?: string, asked?: number): Promise<InterruptOutcome> {
+    const record = this.requireSession(sessionId)
+    if (record.revokedAt) {
+      return { interrupted: false, confirmed: false, refusal: 'revoked', error: 'The Session was revoked' }
+    }
+    if (record.role === 'worker' && record.assignmentId !== undefined) {
+      // The Ticket decides whether this Worker may still run: a Worker a newer Assignment replaced is not interrupted,
+      // and neither is the Worker of a Ticket that is over.
+      const ticket = this.ticketOfAssignment(record.assignmentId)
+      const latest = ticket === undefined ? undefined : latestAssignment(ticket)
+      if (ticket !== undefined && (latest === undefined || latest.id !== record.assignmentId)) {
+        return { interrupted: false, confirmed: false, refusal: 'replaced',
+          error: `The Assignment ${record.assignmentId} was replaced by a newer one; this Session may not interrupt it` }
+      }
+      if (ticket?.ended) {
+        return { interrupted: false, confirmed: false, refusal: 'replaced',
+          error: `The Ticket ${ticket.id} has ended; this Session may not interrupt a turn` }
+      }
+    }
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) {
+      return { interrupted: false, confirmed: false, refusal: 'stopped', error: stopped }
+    }
+    if (!this.nodeSupportsTurnInterrupt()) {
+      return { interrupted: false, confirmed: false, refusal: 'unsupported',
+        error: `The node ${this.options.nodeId} does not offer "${NODE_CAPABILITY_TURN_INTERRUPT}"` }
+    }
+    const turn = this.sessionTurns.get(sessionId)
+    if (turn === undefined) {
+      return { interrupted: false, confirmed: false, refusal: 'no-running-turn',
+        error: 'The Session has no running turn to interrupt' }
+    }
+    // The turn the caller named is the turn it wants to end. A turn that started in the meantime is another turn, and
+    // ending it would interrupt work the operator never asked about.
+    if (asked !== undefined && asked !== turn) {
+      return { interrupted: false, confirmed: false,
+        error: `The Session ${sessionId} runs turn ${turn}, not turn ${asked}; it was not interrupted` }
+    }
+    try {
+      // The turn is named, so a node that already runs another turn refuses instead of ending that one.
+      await this.options.node.send({ ...this.base(this.uniqueKey('interrupt', sessionId)), type: 'session.interrupt',
+        sessionId, ...(reason ? { reason } : {}), turn })
+    } catch (error) {
+      return { interrupted: false, confirmed: false, error: redact(messageOf(error)).slice(0, 300) }
+    }
+    return { interrupted: true, confirmed: true, turn }
+  }
+
+  /**
+   * Interrupt one Session's current turn, and say something next.
+   *
+   * The two are separate facts and the answer carries both. A turn that could not be interrupted does not swallow the
+   * message: the message still goes out, in the round that follows. And a message that could not be delivered does not
+   * undo the interrupt that worked — the turn really ended.
+   *
+   * A message to a Worker goes through its Ticket, so the domain keeps the record of it; a message to the Router joins
+   * the Router's queue, where it waits for the turn that follows the one that was just ended.
+   */
+  async interruptAndSendToSession(sessionId: string, text: string,
+    options: { reason?: string; attachments?: readonly RouterTextAttachment[]; model?: RouterModel; id?: string
+      turn?: number } = {}): Promise<{ interrupt: InterruptOutcome; delivered: string }> {
+    const record = this.requireSession(sessionId)
+    const outcome = await this.interruptTurn(sessionId, options.reason, options.turn)
+    this.audit.record({ actor: 'operator', kind: 'session', action: 'interrupted', targetKind: 'session',
+      targetId: sessionId, outcome: outcome.interrupted ? 'ok' : 'failed',
+      detail: outcome.turn === undefined ? record.role : `turn ${outcome.turn}` })
+    const value = text.trim()
+    if (value === '') return { interrupt: outcome, delivered: 'none' }
+    if (record.role === 'router') {
+      const queued = await this.sendToRouter(value, options.attachments ?? [], options.model,
+        options.id === undefined ? {} : { id: options.id })
+      // The answer says what became of the message, in the queue's own words: a message that waits is queued, one the
+      // node took is sent, one the node refused is failed, and one whose receipt is missing is unconfirmed.
+      return { interrupt: outcome, delivered: queued.entry.state }
+    }
+    const sent = await this.sendToSession(sessionId, value)
+    return { interrupt: outcome, delivered: sent.delivered }
+  }
+
+  /** Whether the node offers to interrupt one running turn of one Session. */
+  private nodeSupportsTurnInterrupt(): boolean {
+    const capabilities = this.nodes.get(this.options.nodeId)?.capabilities
+    return Array.isArray(capabilities) && capabilities.includes(NODE_CAPABILITY_TURN_INTERRUPT)
+  }
+
+  /** Whether the node is known to be unreachable right now. */
+  private nodeOffline(): boolean {
+    return this.nodes.get(this.options.nodeId)?.online === false
   }
 
   /**
@@ -4838,6 +5436,11 @@ export class ControlPlane {
     this.closed = true
     this.stopHeartbeat()
     this.stopReconcile()
+    // The queue's own lookups stop with the kernel: a closed control plane looks at nothing.
+    if (this.routerQueueRetry !== undefined) {
+      clearTimeout(this.routerQueueRetry)
+      this.routerQueueRetry = undefined
+    }
     // The scheduler writes to the console's own file, so it is stopped before that file is closed: a delivery still in
     // flight gets its record written instead of finding a closed database.
     await this.stopScheduler()
@@ -4846,6 +5449,7 @@ export class ControlPlane {
     this.sessions.clear()
     this.tokens.clear()
     this.stoppingSessions.clear()
+    this.sessionTurns.clear()
     // A PM waiting for a diff must not wait for a kernel that is gone: every waiting request is answered with the fact.
     for (const pending of [...this.pendingReviewDiffs.values()]) {
       pending.settle({ status: 'failed', reason: 'The control plane closed before the node answered the review diff' })
@@ -5043,6 +5647,10 @@ export class ControlPlane {
       record.status = inspection.status
       if (inspection.status === 'archived') record.archivedAt ??= at
     }
+    // The turn the node reports is the turn an interrupt may name, and an idle Session runs no turn: after a reconnect
+    // or a restart the node's own answer is what tells the two apart.
+    if (inspection.turn !== undefined) this.sessionTurns.set(record.sessionId, inspection.turn)
+    else if (inspection.status === 'idle') this.sessionTurns.delete(record.sessionId)
     this.persist(record)
   }
 
@@ -5195,6 +5803,8 @@ export class ControlPlane {
       this.audit.record({ actor: 'system', kind: 'node', action: status.online ? 'online' : 'offline',
         targetKind: 'node', targetId: status.nodeId, detail: status.backend })
     }
+    // A node that came back may take the messages that waited for it.
+    if (status.nodeId === this.options.nodeId && status.online) this.scheduleRouterQueue()
   }
 
   /**
@@ -5328,6 +5938,8 @@ export class ControlPlane {
       // A node that reports the Session as gone confirms an operator's stop. A late report that the Session is still
       // live does not undo it: the operator's stop holds, and the Session stays unusable until a person resumes it.
       if (event.status === 'stopped' || event.status === 'archived') this.confirmOperatorStop(record, event.at)
+      // The Router is idle again: the messages that waited behind its turn may go now.
+      if (event.sessionId === ROUTER_SESSION_ID && event.status === 'idle') this.scheduleRouterQueue()
     } else if (event.type === 'session.inspected') {
       const inspection = event.inspection
       record.updatedAt = event.at
@@ -5338,6 +5950,9 @@ export class ControlPlane {
       }
     } else {
       record.updatedAt = event.at
+      if (event.type === 'session.event') {
+        this.applyTurnFact(event)
+      }
       if (event.type === 'session.event' && record.assignmentId !== undefined
         && (event.kind === 'turn-start' || event.kind === 'turn-end')) {
         const ticket = this.ticketOfAssignment(record.assignmentId)
@@ -5356,6 +5971,32 @@ export class ControlPlane {
     }
     this.persist(record)
     this.notifyStatusWaiters(record.sessionId)
+  }
+
+  /**
+   * Record what a node reported about one Session's turn.
+   *
+   * The turn number is the fact an interrupt needs: the node is asked to end that very turn, so a turn that started in
+   * the meantime is never ended in its place.
+   *
+   * A `turn-start` also names the Input ids the turn really took. That is the only fact that makes a queued message
+   * `read`: the node's inbox says the message is there, and only a turn says it was taken.
+   */
+  private applyTurnFact(event: NodeEvent): void {
+    if (event.type !== 'session.event') return
+    const sessionId = event.sessionId
+    if (event.kind === 'turn-start') {
+      const turn = turnNumber(event.data)
+      if (turn !== undefined) this.sessionTurns.set(sessionId, turn)
+      if (sessionId === ROUTER_SESSION_ID) this.markRouterMessagesRead(turnInputIds(event.data))
+      return
+    }
+    if (event.kind === 'turn-end') {
+      const turn = turnNumber(event.data)
+      if (turn === undefined || this.sessionTurns.get(sessionId) === turn) this.sessionTurns.delete(sessionId)
+      // The Router's turn ended: the messages that waited behind it may go now.
+      if (sessionId === ROUTER_SESSION_ID) this.scheduleRouterQueue()
+    }
   }
 
   /**

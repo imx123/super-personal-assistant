@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs'
 import {
+  NODE_CAPABILITY_TURN_INTERRUPT,
   NODE_PROTOCOL_VERSION,
   type NodeCommand,
   type NodeEvent,
@@ -32,6 +33,13 @@ export interface FakeNodeOptions {
   now?: () => string
   /** The bounds of the read-only Git review this node offers; the defaults bound it tightly. */
   reviewDiff?: ReviewDiffLimits
+  /**
+   * The capabilities this node advertises.
+   *
+   * The default is what the fake really offers: it can interrupt one running turn of one Session. A test that needs an
+   * older node passes `[]`, and the control plane then says plainly that the node cannot interrupt a turn.
+   */
+  capabilities?: readonly string[]
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
@@ -48,6 +56,14 @@ export class FakeNode implements NodePort {
   readonly commands: NodeCommand[] = []
   readonly events: NodeEvent[] = []
   readonly registrations: NodeRegistration[] = []
+  /**
+   * The turn each Session runs, and the messages that wait for the next one.
+   *
+   * The fake has no model, so a turn only exists when a test opens one with {@link holdTurn}: that is what lets a test
+   * act on a Session that is running, interrupt the turn it runs, and watch the message that waits behind it.
+   */
+  private readonly turns = new Map<string, { current?: number; counter: number }>()
+  private readonly pending = new Map<string, { text: string; inputIds: string[] }[]>()
 
   private readonly options: FakeNodeOptions
   private readonly idempotencyKeys = new Map<string, true>()
@@ -56,6 +72,17 @@ export class FakeNode implements NodePort {
 
   constructor(options: FakeNodeOptions) {
     this.options = options
+  }
+
+  /**
+   * The capabilities this node reports.
+   *
+   * The fake's own capabilities are always part of the answer: they are what it can really do, and a node that hides
+   * them would make the control plane refuse an action the node would have carried out.
+   */
+  private capabilitiesOf(reported: readonly string[] | undefined): string[] {
+    const own = this.options.capabilities ?? [NODE_CAPABILITY_TURN_INTERRUPT]
+    return [...new Set([...own, ...(reported ?? [])])]
   }
 
   async send(command: NodeCommand): Promise<void> {
@@ -78,16 +105,14 @@ export class FakeNode implements NodePort {
           version: registration.version,
           online: true,
           at: this.now(),
-          ...(registration.capabilities === undefined
-            ? {}
-            : { capabilities: registration.capabilities }),
+          capabilities: this.capabilitiesOf(registration.capabilities),
         }
         this.emitNodeStatus(status)
         break
       }
 
       case 'node.heartbeat':
-        this.emitNodeStatus(command.status)
+        this.emitNodeStatus({ ...command.status, capabilities: this.capabilitiesOf(command.status.capabilities) })
         break
 
       case 'workspace.ensure': {
@@ -183,6 +208,13 @@ export class FakeNode implements NodePort {
         texts.push(command.text)
         this.messages.set(command.sessionId, texts)
 
+        // A Session that runs a turn takes the message for the next one: the message waits in the inbox and the turn
+        // that follows reads it. This is what a real backend's next-turn queue does.
+        if (this.turnOf(command.sessionId).current !== undefined) {
+          this.pendingOf(command.sessionId).push({ text: command.text, inputIds: [...(command.inputIds ?? [])] })
+          break
+        }
+
         this.transitionSession(session, 'running')
         this.emit({
           ...this.sessionEnvelope(session),
@@ -191,6 +223,36 @@ export class FakeNode implements NodePort {
           data: { text: command.text },
         })
         this.transitionSession(session, 'idle')
+        break
+      }
+
+      // The interrupt ends the turn the Session runs and nothing else: the Session keeps its identity, and the messages
+      // that wait for the next turn stay in the inbox.
+      case 'session.interrupt': {
+        const session = this.requireSession(command.sessionId)
+        if (session.status === 'archived' || session.status === 'stopped') {
+          throw new Error(`session ${command.sessionId} is ${session.status}`)
+        }
+        const turn = this.turnOf(command.sessionId)
+        if (turn.current === undefined) {
+          throw new Error(`Session ${command.sessionId} has no running turn to interrupt`)
+        }
+        // A turn that started after the request is not the turn the request named: the wrong turn is never ended.
+        if (command.turn !== undefined && command.turn !== turn.current) {
+          throw new Error(`Session ${command.sessionId} is running turn ${turn.current}, not turn ${command.turn}; `
+            + 'it was not interrupted')
+        }
+        const ended = turn.current
+        turn.current = undefined
+        this.emit({
+          ...this.sessionEnvelope(session),
+          type: 'session.event',
+          kind: 'turn-end',
+          data: { turn: ended, reason: 'aborted', cause: 'user' },
+        })
+        this.transitionSession(session, 'idle')
+        // The messages that waited behind the interrupted turn run in the turn that follows it.
+        this.runPending(session)
         break
       }
 
@@ -288,10 +350,13 @@ export class FakeNode implements NodePort {
   private inspectOf(sessionId: string): SessionInspection {
     const session = this.sessions.get(sessionId)
     if (!session) return { sessionId, found: false }
+    // The turn the Session runs right now: the fake's own fact, so an inspection names the turn an interrupt may end.
+    const turn = this.turns.get(sessionId)?.current
     return {
       sessionId,
       found: true,
       status: session.status,
+      ...(turn === undefined ? {} : { turn }),
       ...(session.backendSessionId === undefined ? {} : { backendSessionId: session.backendSessionId }),
     }
   }
@@ -305,6 +370,90 @@ export class FakeNode implements NodePort {
       args,
       toolCallId: `fake-tool-${this.seq + 1}`,
     })
+  }
+
+  /**
+   * Open a turn the Session keeps running, and report the turn's number.
+   *
+   * The fake has no model, so a turn exists only when a test opens one: that is what lets a test act on a Session that
+   * is running — interrupt the turn it runs, or send a message that has to wait for the next turn.
+   */
+  holdTurn(sessionId: string): number {
+    const session = this.requireSession(sessionId)
+    const turn = this.turnOf(sessionId)
+    turn.current = ++turn.counter
+    this.transitionSession(session, 'running')
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'session.event',
+      kind: 'turn-start',
+      data: { turn: turn.current },
+    })
+    return turn.current
+  }
+
+  /** End the turn the Session runs, and let the messages that waited behind it run in the turn that follows. */
+  releaseTurn(sessionId: string): void {
+    const session = this.requireSession(sessionId)
+    const turn = this.turnOf(sessionId)
+    if (turn.current === undefined) return
+    const ended = turn.current
+    turn.current = undefined
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'session.event',
+      kind: 'turn-end',
+      data: { turn: ended, reason: 'completed' },
+    })
+    this.transitionSession(session, 'idle')
+    this.runPending(session)
+  }
+
+  /** The turn state of one Session, created on demand. */
+  private turnOf(sessionId: string): { current?: number; counter: number } {
+    let turn = this.turns.get(sessionId)
+    if (!turn) { turn = { counter: 0 }; this.turns.set(sessionId, turn) }
+    return turn
+  }
+
+  /** The messages that wait for the Session's next turn, created on demand. */
+  private pendingOf(sessionId: string): { text: string; inputIds: string[] }[] {
+    let waiting = this.pending.get(sessionId)
+    if (!waiting) { waiting = []; this.pending.set(sessionId, waiting) }
+    return waiting
+  }
+
+  /** Run the messages that waited behind a turn, in the turn that follows it. */
+  private runPending(session: SessionRecord): void {
+    const waiting = this.pending.get(session.sessionId)
+    if (!waiting || waiting.length === 0) return
+    this.pending.delete(session.sessionId)
+    const turn = this.turnOf(session.sessionId)
+    const number = ++turn.counter
+    turn.current = number
+    this.transitionSession(session, 'running')
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'session.event',
+      kind: 'turn-start',
+      data: { turn: number, inputIds: waiting.flatMap(message => message.inputIds) },
+    })
+    for (const message of waiting) {
+      this.emit({
+        ...this.sessionEnvelope(session),
+        type: 'session.event',
+        kind: 'message',
+        data: { text: message.text },
+      })
+    }
+    turn.current = undefined
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'session.event',
+      kind: 'turn-end',
+      data: { turn: number, reason: 'completed' },
+    })
+    this.transitionSession(session, 'idle')
   }
 
   /**

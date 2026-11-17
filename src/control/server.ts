@@ -514,8 +514,22 @@ export class ControlPlaneServer {
       const attachments = routerAttachments(body.attachments)
       const message = attachments.length > 0 && (body.text === undefined || body.text === '')
         ? '请阅读本条消息附带的文件。' : text(body.text)
-      const result = await this.control.sendToRouter(message, attachments, routerModel(body.model))
-      return json(res, 200, { sent: true, requestId: result.requestId })
+      // The message's own id makes a repeated send the same message: a browser that repeats its request cannot make
+      // the Router read it twice.
+      const id = typeof body.id === 'string' && body.id !== '' ? body.id : undefined
+      const result = await this.control.sendToRouter(message, attachments, routerModel(body.model),
+        id === undefined ? {} : { id })
+      // The fields say what the queue says: a message that waits is not sent, a message the node took is sent, and a
+      // message the node refused is neither — it is answered with the reason instead of a success that never happened.
+      const state = result.entry.state
+      if (state === 'failed') {
+        throw new HttpError(502, `The node did not take the message: ${result.entry.error ?? 'the delivery was refused'}`)
+      }
+      if (state === 'unconfirmed') {
+        throw new HttpError(502, `The node did not confirm the message: ${result.entry.error ?? 'the receipt is missing'}`)
+      }
+      return json(res, 200, { sent: state === 'sent' || state === 'read',
+        queued: state === 'queued' || state === 'sending', requestId: result.requestId, queue: result.entry })
     }
     // The proposal a person confirms or cancels. These routes live in the console's own namespace, so they need the
     // console key: a Router Session token may propose, but only a person may confirm. A proposal that was cancelled or
@@ -711,7 +725,7 @@ export class ControlPlaneServer {
       return json(res, 200, result)
     }
 
-    const sessionPath = /^\/v1\/console\/sessions\/([^/]+)(?:\/(message|messages|cancel|archive|permission|revoke|resume))?$/.exec(path)
+    const sessionPath = /^\/v1\/console\/sessions\/([^/]+)(?:\/(message|messages|cancel|archive|permission|revoke|resume|interrupt))?$/.exec(path)
     if (sessionPath) {
       const sessionId = decodeURIComponent(sessionPath[1]!)
       const action = sessionPath[2]
@@ -745,6 +759,39 @@ export class ControlPlaneServer {
         // The resume is the operator's own act: nothing else clears a stop, and only the operator may say so.
         const result = await this.control.resumeSessionByOperator(sessionId,
           typeof body.reason === 'string' ? body.reason : undefined)
+        return json(res, 200, result)
+      }
+      if (method === 'POST' && action === 'interrupt') {
+        const body = await readJson(req)
+        // A Session this kernel does not know is a client error here, as it is for the other session routes.
+        if (!this.control.session(sessionId)) throw new HttpError(404, 'Session not found')
+        const reason = typeof body.reason === 'string' ? body.reason : undefined
+        // The turn the caller saw: it names the round the operator acted on, so a round that started in the meantime is
+        // never ended in its place.
+        const turn = typeof body.turn === 'number' && Number.isSafeInteger(body.turn) && body.turn > 0 ? body.turn : undefined
+        const said = typeof body.text === 'string' ? body.text : ''
+        // The interrupt on its own ends the turn that runs now. With a text it is an interruption and a message: the
+        // turn ends, and the message goes out in the round that follows it.
+        if (said.trim() === '') {
+          const result = await this.control.interruptSessionByOperator(sessionId, reason, turn)
+          return json(res, 200, result)
+        }
+        const attachments = routerAttachments(body.attachments)
+        const model = routerModel(body.model)
+        const id = typeof body.id === 'string' && body.id !== '' ? body.id : undefined
+        if (attachments.length > 0 || model !== undefined) {
+          const session = this.control.session(sessionId)
+          if (!session || session.role !== 'router') {
+            throw new HttpError(400, 'Only a message to the Router may carry attachments or a model')
+          }
+        }
+        const result = await this.control.interruptAndSendToSession(sessionId, said, {
+          ...(reason === undefined ? {} : { reason }),
+          ...(turn === undefined ? {} : { turn }),
+          ...(id === undefined ? {} : { id }),
+          attachments,
+          ...(model === undefined ? {} : { model }),
+        })
         return json(res, 200, result)
       }
       if (method === 'POST' && action === 'archive') {

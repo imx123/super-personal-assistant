@@ -25,6 +25,10 @@ class FakeHost implements DshPortHost {
   readonly cancelled: string[] = []
   /** The reason each cancel carried, proving the command's own reason reaches the host. */
   readonly cancelReasons: (string | undefined)[] = []
+  /** The turns each interrupt named, proving the command's own turn reaches the host. */
+  readonly interrupted: { sessionId: string; turn?: number }[] = []
+  /** When set, an interrupt fails with this error, proving the port reports the host's refusal. */
+  interruptError?: Error
   readonly archived: string[] = []
   readonly permissions: { sessionId: string; permission: string }[] = []
   readonly listeners = new Set<(event: DshPortEvent) => void>()
@@ -46,6 +50,10 @@ class FakeHost implements DshPortHost {
     if (this.cancelError) throw this.cancelError
     this.cancelled.push(sessionId)
     this.cancelReasons.push(reason)
+  }
+  async interruptSession(sessionId: string, options: { turn?: number; reason?: string }): Promise<void> {
+    if (this.interruptError) throw this.interruptError
+    this.interrupted.push({ sessionId, ...(options.turn === undefined ? {} : { turn: options.turn }) })
   }
   async archiveSession(sessionId: string): Promise<void> { this.archived.push(sessionId) }
   async inspectSession(sessionId: string): Promise<SessionInspection> {
@@ -172,6 +180,23 @@ describe('DshNodePort', () => {
     expect(host.cancelReasons).toEqual(['operator'])
     expect(host.archived).toEqual(['pm-1'])
     expect(host.permissions).toEqual([{ sessionId: 'pm-1', permission: 'workspace-write' }])
+  })
+
+  it('interrupts one turn and names it to the host', async () => {
+    await port.send({ ...envelope('interrupt-1'), type: 'session.interrupt', sessionId: 'pm-1', reason: 'operator',
+      turn: 3 })
+    await port.send({ ...envelope('interrupt-2'), type: 'session.interrupt', sessionId: 'pm-2' })
+
+    // The turn the caller named reaches the host, so the node can refuse when another turn is running.
+    expect(host.interrupted).toEqual([{ sessionId: 'pm-1', turn: 3 }, { sessionId: 'pm-2' }])
+    // And the interrupt is not a stop: nothing was cancelled.
+    expect(host.cancelled).toEqual([])
+  })
+
+  it('fails the interrupt command with the host’s refusal', async () => {
+    host.interruptError = new Error('Session pm-1 has no running turn to interrupt')
+    await expect(port.send({ ...envelope('interrupt-failure-1'), type: 'session.interrupt', sessionId: 'pm-1' }))
+      .rejects.toThrow('Session pm-1 has no running turn to interrupt')
   })
 
   it('waits for the host cancel cleanup before acknowledging the command', async () => {
@@ -641,5 +666,158 @@ describe('createDshPortHost inspection of a persisted Session', () => {
     await expect(host.inspectSession('pm-1')).resolves.toEqual({ sessionId: 'pm-1', found: true, status: 'archived',
       backendSessionId: 'pm-1' })
     expect(observeSession).not.toHaveBeenCalled()
+  })
+})
+
+describe('createDshPortHost interrupt of one turn', () => {
+  /**
+   * A host over a Context that watches the Session events, with one Agent that records what it was told.
+   *
+   * The Agent stands in for DSH's: it knows the turn it runs and takes the cancel the host asks for. The Context records
+   * which services were asked for, so a test can see that the interrupt did not run the whole-Session cleanup — the one
+   * that kills shell jobs and releases subagents.
+   */
+  function interruptHost(options: { watch?: boolean } = {}): { host: DshPortHost
+    emit: (sessionId: string, event: unknown) => void
+    cancels: { kind: unknown; options: unknown }[]
+    services: string[] } {
+    const fake = fakeContext()
+    const cancels: { kind: unknown; options: unknown }[] = []
+    const services: string[] = []
+    const agent = { id: 'worker-1', status: 'running' as const,
+      cancel: (kind: unknown, cancelOptions: unknown) => { cancels.push({ kind, options: cancelOptions }) } }
+    const context = {
+      ...(options.watch === false ? {} : fake.context),
+      agents: { get: () => agent },
+      workspaceRegistry: { archivedSessionIds: [] },
+      get: (name: string) => { services.push(name); return fake.context.get(name) },
+    }
+    return {
+      host: createDshPortHost({ context, nodeRuntime: { sessions: {
+        async ensure() { return {} },
+        async prompt() {},
+      } }, nodeId: NODE_ID, root, cancelTimeoutMs: 500 }),
+      emit: (sessionId, event) => fake.emit('session/event', { id: sessionId }, event),
+      cancels,
+      services,
+    }
+  }
+
+  /** The turn end a node reports for a turn that ended because a person interrupted it. */
+  const aborted = (turn: number): unknown => ({ type: 'turn/end', data: { turn, reason: { kind: 'aborted',
+    reason: { kind: 'user' } } } })
+  /** The turn end a node reports for a turn that finished on its own. */
+  const completed = (turn: number): unknown => ({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+
+  it('confirms the interrupt when the turn it named really ended because of it', async () => {
+    const { host: portHost, emit, cancels } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      emit('worker-1', { type: 'turn/start', data: { turn: 3 } })
+      const interrupted = portHost.interruptSession!('worker-1', { turn: 3 })
+      // The turn end is the confirmation, so it is emitted after the cancel was requested.
+      emit('worker-1', aborted(3))
+      await expect(interrupted).resolves.toBeUndefined()
+
+      // The cancel is the backend's own user cancel, and it keeps the inbox: the messages that wait for the next turn
+      // stay where they are.
+      expect(cancels).toEqual([{ kind: { kind: 'user' }, options: { keepInbox: true } }])
+    } finally {
+      dispose()
+    }
+  })
+
+  it('does not call the whole-Session cleanup, and keeps the inbox', async () => {
+    const { host: portHost, emit, services } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      const interrupted = portHost.interruptSession!('worker-1', { turn: 1 })
+      emit('worker-1', aborted(1))
+      await interrupted
+
+      // The shell jobs and the subagents of the Session are left alone: an interrupt is not a stop.
+      expect(services).not.toContain('jobs')
+      expect(services).not.toContain('subagents')
+    } finally {
+      dispose()
+    }
+  })
+
+  it('never claims an interrupt for a turn that ended on its own', async () => {
+    const { host: portHost, emit } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      emit('worker-1', { type: 'turn/start', data: { turn: 2 } })
+      const interrupted = portHost.interruptSession!('worker-1', { turn: 2 })
+      // The turn finished by itself before the cancel reached it: the node says so instead of claiming an interrupt.
+      emit('worker-1', completed(2))
+      await expect(interrupted).rejects.toThrow(/ended on its own/)
+    } finally {
+      dispose()
+    }
+  })
+
+  it('waits for the turn it named, and not for another one', async () => {
+    const { host: portHost, emit } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      emit('worker-1', { type: 'turn/start', data: { turn: 1 } })
+      const interrupted = portHost.interruptSession!('worker-1', { turn: 1 })
+
+      // Another turn starts and ends: it is another turn's fact and confirms nothing.
+      emit('worker-1', { type: 'turn/start', data: { turn: 2 } })
+      emit('worker-1', aborted(2))
+      let settled = false
+      void interrupted.then(() => { settled = true }, () => { settled = true })
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+
+      // The turn the caller named ends: that is the confirmation.
+      emit('worker-1', aborted(1))
+      await expect(interrupted).resolves.toBeUndefined()
+    } finally {
+      dispose()
+    }
+  })
+
+  it('refuses a turn that is not the one that runs', async () => {
+    const { host: portHost, emit, cancels } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      emit('worker-1', { type: 'turn/start', data: { turn: 5 } })
+      await expect(portHost.interruptSession!('worker-1', { turn: 4 })).rejects.toThrow(/running turn 5, not turn 4/)
+      // The wrong turn is never ended: no cancel went out at all.
+      expect(cancels).toEqual([])
+    } finally {
+      dispose()
+    }
+  })
+
+  it('refuses a Session that runs no turn', async () => {
+    const { host: portHost, cancels } = interruptHost()
+    const dispose = portHost.onEvent(() => {})
+    try {
+      await expect(portHost.interruptSession!('worker-1', {})).rejects.toThrow(/no running turn/)
+      expect(cancels).toEqual([])
+    } finally {
+      dispose()
+    }
+  })
+
+  it('says that it cannot interrupt when the node does not watch the Session events', async () => {
+    // A host that never took a subscription watches no Session event, so it knows no turn and says so.
+    const { host: portHost } = interruptHost({ watch: false })
+    await expect(portHost.interruptSession!('worker-1', { turn: 1 }))
+      .rejects.toThrow(/does not watch the Session events/)
+  })
+
+  it('builds over a Context that offers no Session events at all', () => {
+    // The minimal host surface stays minimal: a Context without `on` is a Context the host may be built over.
+    const context = { agents: { get: () => undefined }, workspaceRegistry: { archivedSessionIds: [] } }
+    expect(() => createDshPortHost({ context, nodeRuntime: { sessions: {
+      async ensure() { return {} },
+      async prompt() {},
+    } }, nodeId: NODE_ID, root })).not.toThrow()
   })
 })

@@ -5,7 +5,7 @@
 | Task | 依赖 | 交付 | 状态 |
 | --- | --- | --- | --- |
 | P3-0 | — | 基线、权限和停止矩阵 | DONE |
-| P3-1 | P3-0 | 全角色会话干预，真实 DSH | INVESTIGATING |
+| P3-1 | P3-0 | 全角色会话干预，真实 DSH | DONE |
 | P3-2 | P3-1 | 快路由、自动派工及回执，真实 DSH | NOT_STARTED |
 | P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | NOT_STARTED |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | NOT_STARTED |
@@ -41,3 +41,15 @@ Claude Code（MiniMax-M3.1-Flash）实施，Codex 独立验收。操作员可分
 真实 DSH Desktop 0.2.2.0、隔离 `phase3-live` profile 和 `dsh-superagent/node` 使用本机 llama-server 的 Gemma 4 12B。停下 PM 后项目仍 active，两组 Worker 与 Assignment 保持原身份，消息和 ensure 拒绝隐式恢复，Router 可读停止通知。经显式恢复，原 PM 接收下一条消息并执行第 2 轮，该轮因模型达到输出上限结束。故障注入由 FakeNode 测试覆盖。验收脚本和脱敏证据保存在本地忽略目录 `.artifacts/phase3-5-20261117/`，证据文件为 `live-edI3Mg/evidence.json`。
 
 P3-1A 已验收。P3-1B 接回合中断、Router 顺序插话和前端，完成后再验收 P3-1。
+
+## P3-1B
+
+Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 实施，Codex 独立验收。Router 忙时仍可提交，普通插话先持久排队，当前回合结束后按顺序进入后续回合。刷新可查看排队状态，节点入箱与回合读取分别显示。重复请求按 ID 去重，明确拒收保留原因，缺回执标记未确认。重启后只对尚未投递的排队消息恢复原有请求窗口。
+
+打断请求绑定当前回合编号，由节点确认该回合以 `aborted` 结束。控制台会话页可查看 Router、PM、Worker，操作员可单独停止和恢复 PM 或 Router，停止未确认时可重试，取消整个工单须确认。
+
+类型检查、构建及 51 文件定向回归通过，653 项通过、1 项因 Windows 目录联接限制跳过。覆盖节点拒收、丢回执、持久队列重启、过时回合、旧派工和权限边界。全量测试未重跑。
+
+Edge、DSH Desktop 0.2.2.0、隔离 `phase3-live`、`dsh-superagent/node` 和本机 Gemma 4 12B 复验通过。两条插话在第一轮生成时提交，刷新后仍列在队列中，随后分别进入第二、第三轮。点击中断并插话后，第四轮以 `aborted` 结束，第五轮收到新消息，项目状态不变。会话页点击停止 PM 后，项目仍 active，两个 Worker 派工保持原身份，显式恢复后原 PM 收到了新消息。证据位于本地忽略目录 `.artifacts/phase3-5-20261117/` 的 `live-09FYhL/evidence.json`、`live-N7c91D/evidence.json`。
+
+P3-1 已验收，下一项为 P3-2。快路由首版用确定性规则，OpenSquilla 与小模型接入可选。

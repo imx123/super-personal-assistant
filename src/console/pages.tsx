@@ -12,8 +12,8 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type NodeView, type Overview,
-  type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterState, type ScheduleCounts, type SchedulePlan,
-  type ScheduleRun, type SessionMessage, type SessionView,
+  type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterQueueEntry, type RouterState, type ScheduleCounts,
+  type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView, type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -148,9 +148,70 @@ export function pauseWording(result: unknown): string {
 
 /** The wording of a stop the node may or may not have confirmed. */
 function stoppedWording(result: unknown): string {
-  const value = result as { cancelled?: boolean; error?: string }
-  if (value.cancelled === true) return 'Worker 已停止'
+  const value = result as { cancelled?: boolean; stopped?: boolean; error?: string }
+  if (value.cancelled === true || value.stopped === true) return 'Worker 已停止'
   return `Worker 未确认停止${value.error === undefined ? '' : `：${value.error}`}`
+}
+
+/**
+ * The wording of a cancel of a whole Ticket.
+ *
+ * The scope is part of the answer: the Ticket is over, and the other Tickets and Workers of the Project are not.
+ */
+function ticketStoppedWording(result: unknown): string {
+  const value = result as { stopped?: boolean; confirmed?: boolean; error?: string }
+  if (value.stopped !== true) return `工单未确认结束${value.error === undefined ? '' : `：${value.error}`}`
+  return '工单已结束（同一项目的其他工单与 Worker 不受影响）'
+}
+
+/**
+ * The wording of a stop of a PM or Router Session.
+ *
+ * The scope is part of the answer: a PM that was stopped is only that PM, and a Router that was stopped is only that
+ * Router. The words say so, because the operator has to know that the Project and its Tickets are untouched.
+ */
+function sessionStoppedWording(result: unknown): string {
+  const value = result as { stopped?: boolean; scope?: string; error?: string }
+  if (value.stopped !== true) return `会话未确认停止${value.error === undefined ? '' : `：${value.error}`}`
+  if (value.scope === 'assignment') return '派工已停止，工单仍然开着'
+  return '会话已停止（只停这一个会话）'
+}
+
+/**
+ * The wording of an interrupt.
+ *
+ * The node's own answer decides: a turn that was not interrupted says why, and a turn that was names the turn it was.
+ */
+function interruptedWording(result: unknown): string {
+  const value = result as { interrupted?: boolean; turn?: number; error?: string }
+  if (value.interrupted !== true) return `未打断当前回合${value.error === undefined ? '' : `：${value.error}`}`
+  return value.turn === undefined ? '当前回合已打断' : `第 ${value.turn} 回合已打断`
+}
+
+/**
+ * The wording of a message a person sent to the Router.
+ *
+ * A message that waits says so, and a message the node refused says why: the queue shows the same facts, and the line
+ * under the composer must not claim more than the control plane knows. An interruption and a message are two facts, and
+ * the wording names both.
+ */
+function routerSendWording(result: unknown): string {
+  const value = result as { queue?: { state?: string; error?: string }; delivered?: string
+    interrupt?: { interrupted?: boolean } }
+  const state = value.queue?.state ?? value.delivered
+  if (state === 'failed') {
+    return `消息发送失败${value.queue?.error === undefined ? '' : `：${value.queue.error}`}`
+  }
+  if (state === 'unconfirmed') {
+    return `节点未确认消息是否送达${value.queue?.error === undefined ? '' : `：${value.queue.error}`}`
+  }
+  if (value.interrupt?.interrupted === true) {
+    return state === 'sent' || state === 'read'
+      ? '已打断当前回合，消息已交给下一轮'
+      : '已打断当前回合，消息已排队交给下一轮'
+  }
+  if (state === 'queued' || state === 'sending') return '消息已排队，当前回合结束后自动交给下一轮'
+  return '消息已送达 Router'
 }
 
 /**
@@ -291,6 +352,78 @@ const SESSION_STATUS: Record<string, string> = {
   failed: '失败',
 }
 
+/** The role of a Session, in the console's own words. */
+const SESSION_ROLE: Record<string, string> = {
+  router: 'Router',
+  pm: 'PM',
+  worker: 'Worker',
+  scout: '侦察',
+}
+
+/**
+ * The id one message carries, so a repeated request is the same message.
+ *
+ * A browser that cannot make a UUID still gets an id; the control plane then names the message itself, and the only
+ * thing that is lost is the protection against a repeated request.
+ */
+function messageId(): string {
+  try {
+    return crypto.randomUUID()
+  } catch {
+    // A browser without the UUID API still gets an id; the control plane then names the message itself, and the only
+    // thing that is lost is the protection against a repeated request.
+    return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  }
+}
+
+/**
+ * The stop notices one Session's logical superior reads.
+ *
+ * The superior of a PM is the Router, the superior of a Worker is the PM of its Project (the Router, for a standalone
+ * Ticket), and the Router has no superior above it — so it reads the notices about the work it is above.
+ */
+function superiorQuery(session: SessionView, superiorId: string): string {
+  if (session.role === 'pm') return `superiorKind=pm&superiorId=${encodeURIComponent(session.sessionId)}`
+  if (session.role === 'router') return 'superiorKind=router&superiorId=router'
+  if (superiorId === '' || superiorId === 'router') return 'superiorKind=router&superiorId=router'
+  return `superiorKind=pm&superiorId=${encodeURIComponent(superiorId)}`
+}
+
+/** What became of a message a person sent to the Router, in the console's own words. */
+const QUEUE_STATE: Record<string, string> = {
+  queued: '排队中',
+  sending: '正在送出',
+  sent: '已送达节点，等待回合读取',
+  read: '已被回合读取',
+  failed: '发送失败',
+  unconfirmed: '节点未确认是否送达',
+}
+
+/**
+ * The messages a person sent to the Router, as the console shows them.
+ *
+ * The home page and the Router's own Session show the same list, because they are the same queue: what one page shows
+ * the other shows too, so a reloaded page explains the wait instead of hiding it.
+ */
+function RouterQueue(props: { entries: RouterQueueEntry[]; id: string }): ReactElement {
+  return (
+    <div className="router-queue" id={props.id} aria-label="发给 Router 的排队消息">
+      <p className="quiet">发给 Router 的消息（按发送顺序；排队中的会在当前回合结束后自动交给下一轮）</p>
+      <ul className="router-queue-list">
+        {props.entries.map(entry => (
+          <li key={entry.id} className={entry.state === 'failed' ? 'failure' : ''}>
+            <span className="router-queue-text">{entry.text}</span>
+            <span className={`chip ${entry.state === 'failed' ? 'failure' : entry.state === 'read' ? 'success' : 'muted'}`}>
+              {QUEUE_STATE[entry.state] ?? entry.state}
+            </span>
+            {entry.error ? <span className="quiet"> · {entry.error}</span> : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 /** The status of a Project, in the console's own words. */
 const PROJECT_STATUS: Record<string, string> = {
   active: '进行中',
@@ -347,6 +480,7 @@ export function HomePage(props: PageProps): ReactElement {
   const messages = router.data?.messages ?? []
   const session = router.data?.session
   const proposal = router.data?.proposal
+  const queue: RouterQueueEntry[] = router.data?.queue ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -406,29 +540,51 @@ export function HomePage(props: PageProps): ReactElement {
     element.style.height = `${Math.min(element.scrollHeight, 220)}px`
   }, [text])
 
-  const send = (): void => {
+  const send = (interrupt: boolean): void => {
     const value = text.trim()
     if (!online || action.state.busy || attaching || (value === '' && attachments.length === 0)) return
     followLatest.current = true
+    // The message carries its own id, so a request the browser repeats is the same message and not a second one.
+    const id = messageId()
+    // The turn the operator acted on: it names the round, so a round that started in the meantime is never ended in its
+    // place.
+    const turn = interrupt ? session?.currentTurn : undefined
     action.run(async () => {
-      await write('/v1/console/router/message', { text: value,
+      const result = await write(interrupt ? '/v1/console/sessions/router/interrupt' : '/v1/console/router/message', {
+        text: value,
+        id,
+        ...(turn === undefined ? {} : { turn }),
         ...(attachments.length ? { attachments: attachments.map(({ name, text }) => ({ name, text })) } : {}),
         ...(requestedModel ? { model: requestedModel } : {}),
       })
       setText(current => current === text ? '' : current)
       setAttachments([])
       setAttachmentError('')
-    }, '')
+      return result
+    }, routerSendWording)
+  }
+
+  // The interrupt ends the turn the Router runs now and nothing else: the messages that wait for the next turn stay
+  // where they are, and the Router keeps its identity.
+  const interrupt = (): void => {
+    if (!online || action.state.busy) return
+    action.run(() => write('/v1/console/sessions/router/interrupt',
+      session?.currentTurn === undefined ? {} : { turn: session.currentTurn }), interruptedWording)
   }
 
   // The state the Router is in, as the control plane reports it.
+  const waiting = queue.filter(entry => entry.state === 'queued' || entry.state === 'sending' || entry.state === 'sent').length
   const state = !online
     ? '节点离线，暂时无法和 Router 对话。'
     : session === undefined
       ? '发送第一条消息时会启动 Router。'
       : session.status === 'running'
-        ? 'Router 正在回答……'
-        : 'Router 已就绪。'
+        ? waiting > 0
+          ? `Router 正在回答……有 ${waiting} 条消息在排队，当前回合结束后自动交给下一轮。`
+          : 'Router 正在回答……'
+        : waiting > 0
+          ? `有 ${waiting} 条消息在排队，等 Router 空闲后送出。`
+          : 'Router 已就绪。'
 
   return (
     <>
@@ -482,7 +638,8 @@ export function HomePage(props: PageProps): ReactElement {
               </div>
             </div>
           ) : null}
-          <form className="composer" onSubmit={event => { event.preventDefault(); send() }}>
+          {queue.length ? <RouterQueue entries={queue} id="router-queue" /> : null}
+          <form className="composer" onSubmit={event => { event.preventDefault(); send(false) }}>
             {attachments.length ? <ul className="router-files">
               {attachments.map((file, index) => <li key={index}><Icon name="file" /><span title={file.name}>{file.name}</span>
                 <button type="button" aria-label={`移除 ${file.name}`} disabled={action.state.busy || attaching}
@@ -505,7 +662,7 @@ export function HomePage(props: PageProps): ReactElement {
                 if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return
                 if (event.key !== 'Enter' || event.shiftKey || !online || !preferences.enterToSend) return
                 event.preventDefault()
-                send()
+                send(false)
               }}
               placeholder={online ? '问进度，或告诉 Router 接下来要做什么' : '节点离线，暂时发不出去'} />
             <div className="composer-foot">
@@ -540,6 +697,17 @@ export function HomePage(props: PageProps): ReactElement {
                   </div>
                 </details>
               </div>
+              {session?.status === 'running' && session.interruptible === true && session.currentTurn !== undefined ? (
+                <div className="composer-turn">
+                  <button type="button" id="router-interrupt" className="action" disabled={action.state.busy || !online}
+                    title="只打断 Router 当前这一回合：排队的消息不会丢，会话和工单都不变。"
+                    onClick={() => interrupt()}>打断当前回合</button>
+                  <button type="button" id="router-interrupt-and-send" className="action"
+                    disabled={action.state.busy || !online || (text.trim() === '' && attachments.length === 0)}
+                    title="先打断 Router 当前这一回合，再把下面写的话交给下一轮。"
+                    onClick={() => send(true)}>中断并插话</button>
+                </div>
+              ) : null}
               <button type="submit" id="router-send" className="send-round" aria-label="发送"
                 disabled={action.state.busy || !online || attaching || (text.trim() === '' && attachments.length === 0)}>
                 <Icon name="arrowUp" />
@@ -867,9 +1035,9 @@ export function SessionsPage(props: PageProps): ReactElement {
   const [creating, setCreating] = useState(false)
   const [projectId, setProjectId] = useState('')
   const action = useAction(props.refresh)
-  // The Router has its own place on the home page; this page is about the PM and Worker Sessions.
-  const list = (sessions.data?.sessions ?? []).filter(session => session.role !== 'router'
-    && (role === 'all' || session.role === role))
+  // The Router is a Session of its own, and it is listed here beside the PM and the Worker Sessions: an operator has to
+  // be able to stop it, resume it and interrupt its turn from the same place.
+  const list = (sessions.data?.sessions ?? []).filter(session => role === 'all' || session.role === role)
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
   const current = list.find(session => session.sessionId === selected) ?? list[0]
   useEffect(() => {
@@ -884,9 +1052,25 @@ export function SessionsPage(props: PageProps): ReactElement {
   const projectStatus = (id: string): string =>
     projects.data?.projects.find(project => project.id === id)?.status ?? ''
   const sessionTitle = (session: SessionView): string => {
+    if (session.role === 'router') return 'Router'
     const project = projects.data?.projects.find(item => item.id === session.projectId)
     const ticket = project?.tickets.find(item => item.assignment?.id === session.assignmentId)
     return ticket?.title ?? projectTitle(session.projectId)
+  }
+  /** The Ticket a Worker Session runs, when it has one: the worker's own actions go through it. */
+  const ticketOf = (session: SessionView): ConsoleTicket | undefined => {
+    if (session.role !== 'worker') return undefined
+    const project = projects.data?.projects.find(item => item.id === session.projectId)
+    const ticket = project?.tickets.find(item => item.assignment?.id === session.assignmentId)
+    return ticket ?? standaloneTicket(session.projectId)
+  }
+  /** The Session that is the logical superior of this one: the PM of its Project, or the Router. */
+  const superiorOf = (session: SessionView): string => {
+    if (session.role === 'pm') return session.sessionId
+    if (session.role === 'router') return 'router'
+    const project = projects.data?.projects.find(item => item.id === session.projectId)
+    // A Worker of a standalone Ticket is below the Router, not below a Project's PM.
+    return project?.pmSessionId ?? 'router'
   }
   const startable = (projects.data?.projects ?? []).filter(project => project.status === 'active' || project.status === 'paused')
   const target = startable.find(project => project.id === projectId) ?? startable[0]
@@ -912,6 +1096,7 @@ export function SessionsPage(props: PageProps): ReactElement {
             <select aria-label="会话类型" title="筛选会话类型" value={role}
               onChange={event => { setRole(event.target.value); setSelected('') }}>
               <option value="all">全部</option>
+              <option value="router">Router</option>
               <option value="pm">PM</option>
               <option value="worker">Worker</option>
             </select>
@@ -924,10 +1109,13 @@ export function SessionsPage(props: PageProps): ReactElement {
               onClick={() => { setSelected(session.sessionId); setCreating(false); setShowDetail(true) }}>
               <span className="workspace-item-name">
                 <b>{sessionTitle(session)}</b>
-                <span className="quiet">{session.role === 'pm' ? 'PM' : 'Worker'} · {timeOf(session.updatedAt)}</span>
+                <span className="quiet">{SESSION_ROLE[session.role] ?? session.role} · {timeOf(session.updatedAt)}</span>
               </span>
               <span className={`chip ${session.status === 'running' ? '' : 'muted'}`}>
-                {session.revokedAt ? '权限已撤销' : (SESSION_STATUS[session.status] ?? session.status)}
+                {session.revokedAt ? '权限已撤销'
+                  : session.operatorStop?.state === 'requested' ? '停止未确认'
+                    : session.operatorStop?.state === 'confirmed' ? '已停止'
+                    : (SESSION_STATUS[session.status] ?? session.status)}
               </span>
             </button>
           ))}
@@ -957,6 +1145,8 @@ export function SessionsPage(props: PageProps): ReactElement {
         ) : current ? <SessionDetail key={current.sessionId} session={current}
           title={sessionTitle(current)} projectTitle={projectTitle(current.projectId)}
           standalone={standaloneTicket(current.projectId)}
+          ticket={ticketOf(current)}
+          superiorId={superiorOf(current)}
           projectStatus={projectStatus(current.projectId)} revision={props.revision} refresh={props.refresh} />
           : !sessions.error ? <p className="workspace-empty">从列表选择一个会话，或打开项目的 PM 会话。</p> : null}
       </section>
@@ -966,15 +1156,29 @@ export function SessionsPage(props: PageProps): ReactElement {
 
 /** One Session: its facts, the actions its role allows, and the messages it really exchanged. */
 function SessionDetail(props: { session: SessionView; title: string; projectTitle: string; projectStatus: string; revision: number
-  refresh: () => void; standalone?: ConsoleTicket | undefined }): ReactElement {
+  refresh: () => void; standalone?: ConsoleTicket | undefined; ticket?: ConsoleTicket | undefined
+  superiorId?: string }): ReactElement {
   const [preferences] = useState(readPreferences)
   const messages = useLoaded(
     () => read<{ messages: SessionMessage[] }>(`/v1/console/sessions/${encodeURIComponent(props.session.sessionId)}/messages`),
     props.revision, props.session.sessionId)
+  // The notices the logical superior of this Session reads. A stop of this work leaves one behind, so an operator sees
+  // what the PM or the Router was told about it.
+  const notices = useLoaded(
+    () => read<{ stops: StopNotice[] }>(`/v1/console/stops?${superiorQuery(props.session, props.superiorId ?? '')}`),
+    props.revision, props.session.sessionId)
+  // The Router's queue, read from the Router's own state: the session page and the home page show the same queue, so
+  // what one page shows the other shows too. Another Session has no queue, and nothing is read for it.
+  const router = useLoaded(
+    () => props.session.role === 'router'
+      ? read<RouterState>('/v1/console/router')
+      : Promise.resolve({ nodeOnline: false, messages: [] } as RouterState),
+    props.revision, props.session.role === 'router' ? props.session.sessionId : '')
   const session = props.session
   const [text, setText] = useState('')
   const [permission, setPermission] = useState('read-only')
   const [confirming, setConfirming] = useState(false)
+  const [confirmingTicket, setConfirmingTicket] = useState(false)
   const action = useAction(props.refresh)
   const thread = useRef<HTMLDivElement>(null)
   const followLatest = useRef(true)
@@ -986,11 +1190,19 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
   // the message to the Worker that took its place, and the server refuses it. The server's own check is the rule; this
   // only keeps the console from asking for a refusal it already knows about.
   const deliverable = session.deliverable !== false
-  const unavailable = revoked ? '会话权限已撤销' : (deliverable ? '' : '这个会话已结束，无法接收指令')
-  // PM stop is available through the API. The session detail will expose it alongside other turn controls in P3-1B.
+  // The operator's own stop of this Session: a stopped PM or Router is resumed by hand and never by a message.
+  const stopped = session.operatorStop
+  const unavailable = revoked ? '会话权限已撤销'
+    : !deliverable && stopped === undefined ? '这个会话无法接收指令' : ''
   const pmActive = session.role === 'pm' && props.projectStatus === 'active'
-  const name = session.role === 'pm' ? 'PM' : 'Worker'
+  const name = SESSION_ROLE[session.role] ?? session.role
   const pending = messages.data === undefined && !messages.error
+  // A turn can only be interrupted while the node reports one, and only on a node that offers the interrupt at all.
+  const interruptible = session.interruptible === true && session.currentTurn !== undefined
+  const ticket = props.ticket
+  const assignmentId = session.assignmentId
+  // The Router's queue, on the Router's own page only: another Session has no queue of its own.
+  const queue = session.role === 'router' ? (router.data?.queue ?? []) : []
 
   useEffect(() => {
     const element = thread.current
@@ -1007,6 +1219,24 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
     }, session.role === 'pm' ? '' : deliveredWording)
   }
 
+  // The interrupt ends the turn that runs now and nothing else: the Session keeps its identity, its Assignment and its
+  // Ticket, and the messages that wait for the next turn stay where they are.
+  const interrupt = (withMessage: boolean): void => {
+    if (action.state.busy || !interruptible) return
+    if (withMessage && text.trim() === '') return
+    followLatest.current = true
+    // The turn the operator acted on is named, so a turn that started in the meantime is never ended in its place.
+    const turn = session.currentTurn
+    action.run(async () => {
+      const result = await write(`${path}/interrupt`, {
+        ...(withMessage ? { text: text.trim() } : {}),
+        ...(turn === undefined ? {} : { turn }),
+      })
+      if (withMessage) setText(current => current === text ? '' : current)
+      return result
+    }, withMessage ? '' : interruptedWording)
+  }
+
   return (
     <div className="session-view">
       <header className="session-header">
@@ -1015,10 +1245,20 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
           <p>{name}{session.model ? ` · ${session.model}` : ''}</p>
         </div>
         <span className={`chip ${session.status === 'running' && !revoked ? 'success' : 'muted'}`}>
-          {revoked ? '权限已撤销' : (SESSION_STATUS[session.status] ?? session.status)}
+          {revoked ? '权限已撤销'
+            : stopped?.state === 'requested' ? '停止未确认'
+              : stopped?.state === 'confirmed' ? '已停止'
+              : (SESSION_STATUS[session.status] ?? session.status)}
         </span>
       </header>
       {unavailable !== '' ? <p className="notice failure">{unavailable}</p> : null}
+      {stopped !== undefined ? (
+        <p className="notice">
+          操作员于 {stampOf(stopped.at)} 请求停止会话。
+          {stopped.state === 'confirmed' ? '节点已确认停止。' : '节点尚未确认停止。'}
+          {stopped.error ? ` ${stopped.error}` : ''}
+        </p>
+      ) : null}
       <details className="session-info">
         <summary>会话信息与管理</summary>
         <div className="session-info-body">
@@ -1040,14 +1280,45 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
 
           <div className="detail-actions">
             {session.role === 'worker'
-              ? <button type="button" className="action" disabled={action.state.busy || revoked}
-                onClick={() => action.run(() => write(`${path}/cancel`, { reason: '操作员在控制台停止了这个 Worker' }),
-                  stoppedWording)}>停止</button>
-              : null}
+              ? <>
+                <button type="button" className="action" disabled={action.state.busy || revoked || assignmentId === undefined}
+                  title="只结束这一次派工：工单仍然开着，同一项目的其他 Worker 继续运行。"
+                  onClick={() => action.run(() => write(`/v1/console/assignments/${encodeURIComponent(assignmentId!)}/stop`,
+                    { reason: '操作员在控制台停止了这个 Worker 的派工' }), stoppedWording)}>停止这次派工</button>
+                {ticket ? <>
+                  <button type="button" className="action" disabled={action.state.busy || revoked || confirmingTicket}
+                    title="结束整个工单：同一项目的其他工单与 Worker 不受影响。"
+                    onClick={() => setConfirmingTicket(true)}>取消工单</button>
+                  <button type="button" className="action" disabled={action.state.busy || revoked}
+                    title="清除工单上人工停止的标记，让 PM 可以申请新的派工；不会自己启动任何 Worker。"
+                    onClick={() => action.run(() => write(`/v1/console/tickets/${encodeURIComponent(ticket.id)}/resume`,
+                      { reason: '操作员在控制台允许了这个 Worker 恢复' }), '工单已允许恢复')}>允许恢复</button>
+                </> : null}
+              </> : <>
+                <button type="button" className="action" disabled={action.state.busy || revoked || stopped?.state === 'confirmed'}
+                  title={session.role === 'pm'
+                    ? '只停止这个 PM 会话：项目、工单、派工和其他 Worker 一律不动，需要人工恢复。'
+                    : '只停止这个 Router 会话：已有工单和 PM 授权一律不动，需要人工恢复。'}
+                  onClick={() => action.run(() => write(`${path}/cancel`, { reason: '操作员在控制台停止了这个会话' }),
+                    sessionStoppedWording)}>{stopped?.state === 'requested' ? '重试停止会话' : '停止会话'}</button>
+                {stopped?.state === 'confirmed' ? <button type="button" className="action" disabled={action.state.busy || revoked}
+                  title="只有操作员能恢复这个会话；恢复后旧令牌一律失效。"
+                  onClick={() => action.run(() => write(`${path}/resume`, { reason: '操作员在控制台恢复了这个会话' }),
+                    '会话已恢复')}>恢复会话</button> : null}
+              </>}
             {session.role !== 'worker' && !pmActive
               ? <button type="button" className="action" disabled={action.state.busy || revoked}
                 onClick={() => action.run(() => write(`${path}/archive`, {}), '会话已归档')}>归档</button>
               : null}
+            {interruptible ? <>
+              <button type="button" id="session-interrupt" className="action" disabled={action.state.busy}
+                title="只打断当前这一回合：会话、派工和工单都不变，排队的消息也不会被丢掉。"
+                onClick={() => interrupt(false)}>打断当前回合</button>
+              <button type="button" id="session-interrupt-and-send" className="action"
+                disabled={action.state.busy || text.trim() === ''}
+                title="先打断当前这一回合，再把下面写的话交给下一轮。"
+                onClick={() => interrupt(true)}>中断并插话</button>
+            </> : null}
             <label className="quiet">
               权限{' '}
               <select value={permission} onChange={event => setPermission(event.target.value)}>
@@ -1072,6 +1343,18 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
               : <button type="button" id="session-revoke" className="action danger" disabled={action.state.busy || revoked}
                 onClick={() => setConfirming(true)}>撤销权限</button>}
           </div>
+          {confirmingTicket && ticket ? (
+            <div className="notice failure">
+              <p>取消会结束工单「{ticket.title}」和它当前的派工。其他工单继续运行。</p>
+              <button type="button" className="action danger" disabled={action.state.busy || revoked}
+                onClick={() => {
+                  setConfirmingTicket(false)
+                  action.run(() => write(`/v1/console/tickets/${encodeURIComponent(ticket.id)}/cancel`,
+                    { reason: '操作员在控制台取消了这个工单' }), ticketStoppedWording)
+                }}>确认取消工单</button>
+              <button type="button" className="action" onClick={() => setConfirmingTicket(false)}>返回</button>
+            </div>
+          ) : null}
           {confirming ? (
             <p className="notice failure">
               撤销后，此会话将永久失去工具权限。系统也会尝试停止会话。
@@ -1079,6 +1362,26 @@ function SessionDetail(props: { session: SessionView; title: string; projectTitl
           ) : null}
         </div>
       </details>
+      {notices.data?.stops?.length ? (
+        <details className="session-info" open>
+          <summary>上级收到的停止通知</summary>
+          <div className="session-info-body">
+            <ul className="notice-list">
+              {notices.data.stops.map(notice => (
+                <li key={notice.id}>
+                  <b>{notice.target.kind} {notice.target.id}</b> · {notice.scope} ·
+                  {' '}{notice.state === 'confirmed' ? '节点已确认' : '节点未确认'}
+                  {notice.affected.length ? ` · 影响 ${notice.affected.join('、')}` : ''}
+                  {notice.unaffected.length ? ` · 未受影响 ${notice.unaffected.join('、')}` : ''}
+                  {notice.error ? ` · ${notice.error}` : ''}
+                  <span className="quiet"> · {stampOf(notice.at)}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </details>
+      ) : null}
+      {queue.length ? <RouterQueue entries={queue} id="session-router-queue" /> : null}
       <div className="session-thread" ref={thread} role="log" aria-label="对话"
         onScroll={event => {
           const element = event.currentTarget

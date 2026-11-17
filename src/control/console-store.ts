@@ -130,6 +130,46 @@ export interface StopNoticeRow {
   error: string
 }
 
+/**
+ * One message a person sent to the Router, and what became of it.
+ *
+ * The row is the control plane's own durable fact about a message that is on its way to the Router. It exists because
+ * the Router's inbox is the node's, not the control plane's: without a row of its own, a message that waited, failed or
+ * was read would be visible only while the process lived, and a console that reloaded would show a queue it cannot
+ * explain.
+ *
+ * `state` says what really happened: `queued` while the message waits for its turn, `sent` once the node took it into
+ * the Session's inbox, `read` once a turn of that Session took it, and `failed` when the node refused it. The inbox and
+ * the turn are two different facts, and the row keeps them apart.
+ */
+export interface RouterQueueRow {
+  /** The message's own id: the stable Input id the node reports it under. */
+  id: string
+  /** The queue's own order; the oldest row is delivered first. */
+  seq: number
+  /** When the person sent it. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The files the message carried, as JSON. */
+  attachments: string
+  /** The model the message asked for, as JSON; empty when it asked for none. */
+  model: string
+  /** The Router request the message is; the Router names this id when it proposes something for it. */
+  requestId: string
+  /**
+   * What became of the message.
+   *
+   * The states are facts about different moments, and the queue keeps them apart: `queued` while the message waits for
+   * its turn, `sending` while it is on its way to the node, `sent` once the node took it into the Session's inbox,
+   * `read` once a turn of that Session took it, `failed` when the node refused it, and `unconfirmed` when the control
+   * plane cannot say whether it arrived — a restart in the middle of a delivery leaves exactly that fact behind.
+   */
+  state: string
+  /** Why the delivery failed, or why it still waits; empty when there is nothing to say. */
+  error: string
+}
+
 /** What the log keeps and for how long. */
 export interface ConsoleStoreOptions {
   /** How many events the log keeps; the oldest are dropped first. */
@@ -186,6 +226,11 @@ CREATE TABLE IF NOT EXISTS stop_notice (
   error TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS stop_notice_at ON stop_notice(at);
 CREATE INDEX IF NOT EXISTS stop_notice_superior ON stop_notice(superior_kind, superior_id, id);
+CREATE TABLE IF NOT EXISTS router_queue (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL UNIQUE, at TEXT NOT NULL, text TEXT NOT NULL, attachments TEXT NOT NULL,
+  model TEXT NOT NULL, request_id TEXT NOT NULL, state TEXT NOT NULL, error TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS router_queue_state ON router_queue(state, seq);
 `
 
 /** The value of one column of a row, as a number. */
@@ -442,6 +487,92 @@ export class ConsoleStore {
   }
 
   /**
+   * Record one message a person sent to the Router, and return its place in the queue.
+   *
+   * The row is written before the message reaches the node, so a message that never left is still a fact the console can
+   * show: an interjection is never lost because the node was busy, offline or slow. The id is unique, and a message that
+   * is already in the queue keeps its row: the same id is the same message, however many times it is sent.
+   */
+  addRouterMessage(row: Omit<RouterQueueRow, 'seq'>): number {
+    const result = this.db.prepare(
+      'INSERT INTO router_queue (id, at, text, attachments, model, request_id, state, error)'
+      + ' VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING')
+      .run(row.id, row.at, row.text, row.attachments, row.model, row.requestId, row.state, row.error)
+    return numberOf(result.lastInsertRowid)
+  }
+
+  /**
+   * The messages the Router's queue holds.
+   *
+   * `states` narrows the answer to the ones in the given state; the queue itself is read without it. The rows are
+   * ordered oldest first, which is the order they are delivered in; `newest` asks for the other order, which is what a
+   * console shows. The rows are bounded by the caller, and the oldest are dropped first: a message that was read long
+   * ago is history, not a task.
+   */
+  routerMessages(options: { limit?: number; states?: readonly string[]; newest?: boolean } = {}): RouterQueueRow[] {
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 50), 200))
+    const order = options.newest === true ? 'DESC' : 'ASC'
+    const rows = options.states === undefined || options.states.length === 0
+      ? this.db.prepare(
+        `SELECT seq, id, at, text, attachments, model, request_id, state, error FROM router_queue ORDER BY seq ${order} LIMIT ?`)
+        .all(limit)
+      : this.db.prepare(
+        'SELECT seq, id, at, text, attachments, model, request_id, state, error FROM router_queue'
+        + ` WHERE state IN (${options.states.map(() => '?').join(',')}) ORDER BY seq ${order} LIMIT ?`)
+        .all(...options.states, limit)
+    return rows.map(row => this.routerQueueRow(row))
+  }
+
+  /** The row of one message, when the queue still holds it. */
+  routerMessage(id: string): RouterQueueRow | undefined {
+    const row = this.db.prepare(
+      'SELECT seq, id, at, text, attachments, model, request_id, state, error FROM router_queue WHERE id = ?').get(id)
+    return row === undefined ? undefined : this.routerQueueRow(row)
+  }
+
+  /**
+   * Write what became of one message.
+   *
+   * The state and the diagnostic are the only things that change: the text the person wrote and the id the node knows it
+   * by never do, so a row that is read again still says the same thing.
+   */
+  updateRouterMessage(id: string, patch: { state?: string; error?: string }): void {
+    const current = this.routerMessage(id)
+    if (!current) return
+    this.db.prepare('UPDATE router_queue SET state = ?, error = ? WHERE id = ?')
+      .run(patch.state ?? current.state, patch.error ?? current.error, id)
+  }
+
+  /**
+   * Drop what the queue may no longer keep: the rows that really ended long ago.
+   *
+   * Only a row with a final state may go: a message that still waits, that is on its way, or whose outcome the control
+   * plane does not know, is a task and not history. The oldest final rows go first, and a message that has not been
+   * delivered yet is never dropped — a queue that silently forgot a person's words would deliver them never.
+   */
+  pruneRouterMessages(keep = 200): void {
+    const rows = this.db.prepare(
+      "SELECT seq FROM router_queue WHERE state IN ('read','failed') ORDER BY seq DESC").all()
+    const doomed = rows.slice(keep).map(row => numberOf(row.seq))
+    if (doomed.length === 0) return
+    const remove = this.db.prepare('DELETE FROM router_queue WHERE seq = ?')
+    for (const seq of doomed) remove.run(seq)
+  }
+
+  /**
+   * How many messages the queue holds in the given states.
+   *
+   * The count is what keeps the queue bounded: a person who sends more than the queue may hold is told so before the
+   * message is accepted, and the messages that are already there are never pushed out to make room.
+   */
+  routerMessageCount(states: readonly string[]): number {
+    if (states.length === 0) return 0
+    const row = this.db.prepare(
+      `SELECT COUNT(*) AS count FROM router_queue WHERE state IN (${states.map(() => '?').join(',')})`).get(...states)
+    return row === undefined ? 0 : numberOf(row.count)
+  }
+
+  /**
    * Drop what the log may no longer keep.
    *
    * The events are bounded twice: by their number and by their age. The audit is bounded by its age alone, and an age of
@@ -457,6 +588,8 @@ export class ConsoleStore {
     }
     // The notices are bounded by their number alone: a stop that a superior still has to read stays, an old one goes.
     this.db.prepare('DELETE FROM stop_notice WHERE id <= (SELECT MAX(id) FROM stop_notice) - ?').run(DEFAULT_STOP_NOTICES)
+    // The Router's queue is bounded the same way: a message that was read or failed long ago is history, not a task.
+    this.pruneRouterMessages()
   }
 
   /** One value of the console's own settings. */
@@ -491,5 +624,12 @@ export class ConsoleStore {
     return { seq: numberOf(row.seq), at: stringOf(row.at), actor: stringOf(row.actor), kind: stringOf(row.kind),
       action: stringOf(row.action), targetKind: stringOf(row.target_kind), targetId: stringOf(row.target_id),
       outcome: stringOf(row.outcome), detail: stringOf(row.detail) }
+  }
+
+  /** One row of the Router's queue, as this store hands it out. */
+  private routerQueueRow(row: Record<string, unknown>): RouterQueueRow {
+    return { seq: numberOf(row.seq), id: stringOf(row.id), at: stringOf(row.at), text: stringOf(row.text),
+      attachments: stringOf(row.attachments), model: stringOf(row.model), requestId: stringOf(row.request_id),
+      state: stringOf(row.state), error: stringOf(row.error) }
   }
 }

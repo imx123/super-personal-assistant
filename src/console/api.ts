@@ -133,6 +133,20 @@ export interface SessionView {
   deliverable?: boolean
   /** Why the Session may not receive a message, when it may not. */
   unavailableReason?: string
+  /**
+   * The turn this Session runs, when the node reported one.
+   *
+   * The number is what an interrupt names, so the console can say which turn it would end.
+   */
+  currentTurn?: number
+  /**
+   * Whether the node can interrupt one running turn of one Session.
+   *
+   * A node that does not offer it says so here, and the console does not offer an action the server would refuse.
+   */
+  interruptible?: boolean
+  /** The operator's own stop of this Session, when there is one. */
+  operatorStop?: { at: string; by: string; state: string; reason?: string; error?: string }
 }
 
 /** One message of a Session. */
@@ -175,20 +189,86 @@ export interface RouterProposal {
 }
 
 /**
+ * One message a person sent to the Router, and what became of it.
+ *
+ * The states are facts about different moments: `queued` while the message waits for the Router's next turn, `sending`
+ * while it is on its way to the node, `sent` once the node took it into the Session's inbox, `read` once a turn of that
+ * Session really took it, `failed` when the node refused it, and `unconfirmed` when the control plane cannot say
+ * whether it arrived. The inbox is not a turn, and the console never shows one as the other.
+ */
+export interface RouterQueueEntry {
+  /** The message's own id. */
+  id: string
+  /** When the person sent it. */
+  at: string
+  /** The person's own words. */
+  text: string
+  /** The names of the files the message carried. */
+  attachments?: string[]
+  /** What became of it. */
+  state: 'queued' | 'sending' | 'sent' | 'read' | 'failed' | 'unconfirmed'
+  /** Why it failed, or why it still waits. */
+  error?: string
+  /** The Router request the message is. */
+  requestId: string
+}
+
+/**
  * The Router's own facts, as the console reads them.
  *
  * The conversation comes from the node's own message events, so what the console shows is what really happened: the
  * person's words on one side, the model's answers on the other, and nothing in between that the console made up.
  */
 export interface RouterState {
-  /** The Router Session, when it has been started. */
-  session?: { sessionId: string; status: string; workspace: string; updatedAt: string; revokedAt?: string }
+  /**
+   * The Router Session, when it has been started.
+   *
+   * `currentTurn` is the turn the Router runs right now, as the node reported it, and `interruptible` says whether the
+   * node offers to end one turn at all. The console offers the interrupt only when the backend confirms both.
+   */
+  session?: { sessionId: string; status: string; workspace: string; updatedAt: string; revokedAt?: string
+    currentTurn?: number; interruptible?: boolean }
   /** Whether the node the Router runs on is reachable. */
   nodeOnline: boolean
   /** The conversation, oldest first. */
   messages: RouterMessage[]
   /** The proposal that waits for a person right now, when there is one. Nothing has been sent yet. */
   proposal?: RouterProposal
+  /** The messages that wait for the Router, oldest first. */
+  queue?: RouterQueueEntry[]
+  /**
+   * The notices about stops the Router is the logical superior of.
+   *
+   * The Router is the superior of every PM Session and of the Workers of the standalone Tickets, so an operator's stop
+   * of any of them leaves a notice here.
+   */
+  stops?: StopNotice[]
+}
+
+/** One notice about an operator's stop, as the console reads it. */
+export interface StopNotice {
+  /** The notice's own id. */
+  id: number
+  /** When the stop was recorded. */
+  at: string
+  /** What was stopped. */
+  target: { kind: string; id: string; sessionId?: string }
+  /** How far the stop reached. */
+  scope: string
+  /** `requested` until the node confirmed the stop; `confirmed` afterwards. */
+  state: string
+  /** Who stopped it. */
+  actor: string
+  /** The Project the stopped work belonged to, when it had one. */
+  projectId?: string
+  /** What the stop affected. */
+  affected: string[]
+  /** What the stop left running. */
+  unaffected: string[]
+  /** Who may read the notice. */
+  superior: { kind: string; id?: string }
+  /** The diagnostic of a stop the node did not confirm. */
+  error?: string
 }
 
 /** One node as the control plane knows it. */

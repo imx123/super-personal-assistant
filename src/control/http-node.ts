@@ -1,6 +1,6 @@
 /** A `NodePort` over the node's HTTP + SSE transport; no DSH imports. */
 import { randomUUID } from 'node:crypto'
-import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type SessionInspection }
+import { NODE_PROTOCOL_VERSION, NodeUnconfirmedError, type NodeCommand, type NodeEvent, type NodePort, type SessionInspection }
   from '../shared/protocol.ts'
 
 export interface HttpNodePortOptions {
@@ -105,10 +105,13 @@ export class HttpNodePort implements NodePort {
    * and this transport still needs its own total bound for every command no caller aborts. A timeout rejects with an error
    * naming the command type and the limit (never the token), so `ControlPlane.heartbeat` records the node offline and its
    * loop can retry instead of awaiting a fetch that will never settle. The timer and abort listener are always removed.
+   *
+   * The two failures are told apart: a node that answered and refused is a plain error, while a node that never answered
+   * leaves the outcome unknown — the command may have been carried out — and says so with {@link NodeUnconfirmedError}.
    */
   async send(command: NodeCommand, signal?: AbortSignal): Promise<void> {
     const controller = new AbortController()
-    const timeoutError = new Error(`The node did not answer ${command.type} within ${this.commandTimeoutMs} ms`)
+    const timeoutError = new NodeUnconfirmedError(`The node did not answer ${command.type} within ${this.commandTimeoutMs} ms`)
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
@@ -122,7 +125,12 @@ export class HttpNodePort implements NodePort {
     try {
       const response = await fetch(`${this.baseUrl}/commands`, { method: 'POST', redirect: 'error',
         headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify(command), signal: controller.signal })
+        body: JSON.stringify(command), signal: controller.signal }).catch((error: unknown) => {
+        // A caller-owned abort surfaces unchanged; a transport failure leaves the outcome unknown, not a refusal.
+        if (signal?.aborted) throw error
+        // The command never reached the node, or the answer never came back: the outcome is unknown, not a refusal.
+        throw new NodeUnconfirmedError(`The node did not answer ${command.type}: ${describe(error)}`, { cause: error })
+      })
       if (response.ok) return
       const detail = await response.text().catch(() => '')
       throw new Error(`Node rejected ${command.type}: HTTP ${response.status}${detail ? `: ${detail.slice(0, 500)}` : ''}`)

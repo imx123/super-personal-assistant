@@ -164,6 +164,98 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
    */
   const deliveries = new Map<string, Map<string, PendingDelivery>>()
 
+  /**
+   * The turn each Session is running, by the node's own turn facts.
+   *
+   * The backend's turn numbers are the authority for an interrupt: a turn that started after the operator's request is
+   * not the turn the operator asked to interrupt, so the node refuses rather than ending the wrong one. `last` is the
+   * newest turn the node saw, which is what a Session that is not running reports.
+   */
+  const turnState = new Map<string, { current?: number; last: number }>()
+  /** The waiters for the end of one turn, by Session. */
+  const turnWaiters = new Map<string, { turn: number; resolve: (reason: string) => void; reject: (error: Error) => void }[]>()
+  /**
+   * Whether the node watches the Session events at all.
+   *
+   * The turn facts come from the Session log, so a node that does not watch it knows no turn: it says so instead of
+   * ending a turn it cannot name. The watch is the one the host already keeps for its own events, so there is no second
+   * registration and nothing extra to release.
+   */
+  let observesSessionEvents = false
+
+  /** The turn state of one Session, created on demand. */
+  const turnsOf = (sessionId: string): { current?: number; last: number } => {
+    let state = turnState.get(sessionId)
+    if (!state) { state = { last: 0 }; turnState.set(sessionId, state) }
+    return state
+  }
+
+  /**
+   * Wait for one turn of one Session to end, and say how it ended.
+   *
+   * The wait is the turn's own end, never the Session's idleness: `whenIdle` also waits for the work that is queued
+   * behind the turn, so it cannot say which turn was interrupted. The reason the turn ended is part of the answer: a
+   * turn that completed on its own was not interrupted, whatever the caller asked for.
+   */
+  const waitForTurnEnd = (sessionId: string, turn: number, timeoutMs: number): Promise<string> => {
+    const waiting = turnWaiters.get(sessionId) ?? []
+    turnWaiters.set(sessionId, waiting)
+    return new Promise<string>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const waiter = {
+        turn,
+        resolve: (reason: string): void => {
+          if (timer !== undefined) clearTimeout(timer)
+          resolve(reason)
+        },
+        reject: (error: Error): void => {
+          if (timer !== undefined) clearTimeout(timer)
+          reject(error)
+        },
+      }
+      timer = setTimeout(() => {
+        const list = turnWaiters.get(sessionId)
+        if (list) {
+          const remaining = list.filter(item => item !== waiter)
+          if (remaining.length === 0) turnWaiters.delete(sessionId)
+          else turnWaiters.set(sessionId, remaining)
+        }
+        waiter.reject(new Error(`The turn ${turn} of the Session ${sessionId} did not end within ${timeoutMs} ms`))
+      }, timeoutMs)
+      timer.unref?.()
+      waiting.push(waiter)
+    })
+  }
+
+  /**
+   * Read one Session event as the turn fact it is.
+   *
+   * A turn start names the turn that runs now; a turn end names the turn that ended and why. Only the turn the caller
+   * named may confirm an interrupt: another turn's end is another turn's fact, and a turn that ended on its own did not
+   * end because of the interrupt.
+   */
+  const noteTurnFact = (sessionId: string, event: SessionEvent): void => {
+    if (event.type !== 'turn/start' && event.type !== 'turn/end') return
+    const state = turnsOf(sessionId)
+    const turn = event.data.turn
+    if (event.type === 'turn/start') {
+      state.current = turn
+      if (turn > state.last) state.last = turn
+      return
+    }
+    if (state.current === turn) state.current = undefined
+    if (turn > state.last) state.last = turn
+    const waiting = turnWaiters.get(sessionId)
+    if (!waiting) return
+    const remaining = waiting.filter(waiter => {
+      if (waiter.turn !== turn) return true
+      waiter.resolve(event.data.reason.kind)
+      return false
+    })
+    if (remaining.length === 0) turnWaiters.delete(sessionId)
+    else turnWaiters.set(sessionId, remaining)
+  }
+
   /** The message-keyed deliveries of one Session, created on demand. */
   const deliveriesOf = (sessionId: string): Map<string, PendingDelivery> => {
     let byMessage = deliveries.get(sessionId)
@@ -387,6 +479,54 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
       })(), cancelTimeoutMs, () => new Error(
         `Stopping the Session ${sessionId} did not settle within ${cancelTimeoutMs} ms`))
     },
+    /**
+     * Interrupt the Session's current turn, and only that turn.
+     *
+     * The turn is ended with the backend's own user cancel, and the inbox is kept: the messages that wait for the next
+     * turn stay in it and are read by that turn, so an interruption never throws away what the person queued. It is not
+     * a stop: the Session keeps its identity, its authority, its Assignment and its Ticket, and the whole-Session
+     * cleanup a stop performs is never run here.
+     *
+     * The command resolves after the node saw that turn end, and only when that turn really ended because of the
+     * interrupt: a turn that completed on its own was not interrupted, and the node says so instead of claiming it.
+     * `whenIdle` is not the confirmation either: it also waits for the work that is queued behind the turn, so it cannot
+     * say which turn was interrupted.
+     *
+     * A Session with no running turn is refused, and a Session that already runs another turn than the one the caller
+     * named is refused too: ending that turn would interrupt work the caller never asked about.
+     */
+    async interruptSession(sessionId, options: { turn?: number; reason?: string }) {
+      // A node that does not watch the Session events knows no turn: it says so rather than ending one it cannot name.
+      if (!observesSessionEvents) {
+        throw new Error(`This node cannot interrupt a turn: it does not watch the Session events`)
+      }
+      const agent = context.agents.get(sessionId as SessionId)
+      if (!agent) throw new Error(`Session ${sessionId} is not loaded on this node`)
+      const state = turnsOf(sessionId)
+      const current = state.current
+      if (current === undefined) {
+        throw new Error(`Session ${sessionId} has no running turn to interrupt`)
+      }
+      if (options.turn !== undefined && options.turn !== current) {
+        throw new Error(`Session ${sessionId} is running turn ${current}, not turn ${options.turn}; it was not interrupted`)
+      }
+      const ended = waitForTurnEnd(sessionId, current, cancelTimeoutMs)
+      try {
+        // The cancel keeps the inbox: the messages that wait for the next turn stay there and are read by that turn.
+        agent.cancel({ kind: 'user' }, { keepInbox: true })
+      } catch (error) {
+        // The cancel that could not be requested leaves the turn running: the wait is dropped and the failure reported.
+        void ended.catch(() => {})
+        throw error
+      }
+      const reason = await ended
+      // Only an aborted turn was interrupted. A turn that ended on its own is not an interruption, whatever the caller
+      // asked for, and the node says that instead of reporting a turn it did not end.
+      if (reason !== 'aborted') {
+        throw new Error(`The turn ${current} of the Session ${sessionId} ended on its own (${reason}); `
+          + 'it was not interrupted')
+      }
+    },
     async archiveSession(sessionId) {
       // A Session with running work refuses the archive; the control plane asked for the archive, so stop that work too.
       await context.workspaceRegistry.archiveSession(sessionId as SessionId, { stopActivity: true })
@@ -415,10 +555,14 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
       const status: SessionStatus | undefined = archived ? 'archived'
         : agent === undefined ? undefined : agent.status === 'running' ? 'running' : 'idle'
       const backendSessionId = agent !== undefined || archived ? sessionId : undefined
+      // The turn the Session runs right now: the node's own fact, and the only one an interrupt may name. It is
+      // reported from the turn facts the node watches, so a control plane that lost the stream learns it again here.
+      const turn = turnState.get(sessionId)?.current
       return {
         sessionId,
         found: true,
         ...(status === undefined ? {} : { status }),
+        ...(turn === undefined ? {} : { turn }),
         ...(backendSessionId === undefined ? {} : { backendSessionId }),
         ...(preparation === undefined ? {} : { ready: preparation.ready,
           ...(preparation.error === undefined ? {} : { error: preparation.error }) }),
@@ -443,11 +587,27 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
         }),
         context.on('session/event', (session, event) => {
           const sessionId = String(session.id)
+          // The node's own turn facts are read in the one place the Session events are already watched: the interrupt
+          // names the turn it ends, and a second registration would be a second thing to register and to release.
+          noteTurnFact(sessionId, event)
           const mapped = portEvent(sessionId, event, takeReadyInputs)
           if (mapped) listener(mapped)
         }),
       ]
-      return () => { for (const dispose of disposers) dispose() }
+      // The turn facts are facts only while they are observed: a node that stops watching them does not know which turn
+      // runs, and says so rather than naming a turn that ended long ago.
+      observesSessionEvents = true
+      return () => {
+        for (const dispose of disposers) dispose()
+        observesSessionEvents = false
+        for (const waiters of turnWaiters.values()) {
+          for (const waiter of waiters) {
+            waiter.reject(new Error('The node stopped watching the Session events'))
+          }
+        }
+        turnWaiters.clear()
+        turnState.clear()
+      }
     },
     nodeStatus(): NodeStatus {
       return { nodeId: input.nodeId, backend: 'dsh', version, online: true, at: new Date().toISOString(),
@@ -1229,6 +1389,8 @@ function portEvent(sessionId: string, event: SessionEvent,
     case 'turn/end':
       return { type: 'session.event', sessionId, kind: 'turn-end', data: { turn: event.data.turn,
         reason: event.data.reason.kind,
+        // The cause of an aborted turn is what tells a turn a person interrupted from one that failed on its own.
+        ...(event.data.reason.kind === 'aborted' ? { cause: event.data.reason.reason.kind } : {}),
         // A failed turn is the one place the loop reports a model or tool failure as a fact.
         ...(event.data.reason.kind === 'error' ? { error: event.data.reason.error.message } : {}) } }
     case 'user/message':

@@ -114,9 +114,20 @@ export class RouterRequests {
    *
    * The id is the only handle the Router has on the request, so it is unique for the whole life of the control plane:
    * it is a random UUID behind a readable prefix, never a counter that a restart would reset.
+   *
+   * `id` names the request itself when the caller already has one: a message that waits in the Router's queue keeps the
+   * id it was given, so the same message is never recorded twice under two names. A request that is already recorded is
+   * handed back as it is: the same id is the same request, and recording it a second time would only renew the window
+   * it may act in.
+   *
+   * `at` is the moment the request was made, when the caller knows it. A message that waited across a restart is
+   * restored with the time it was written, so the window it may act in is the one it was given and not a new one.
    */
-  record(text: string): RouterRequest {
-    const request: RouterRequest = { id: `router-req-${randomUUID()}`, at: this.now(), text }
+  record(text: string, id?: string, at?: string): RouterRequest {
+    const requestId = id ?? `router-req-${randomUUID()}`
+    const existing = this.requests.get(requestId)
+    if (existing) return existing
+    const request: RouterRequest = { id: requestId, at: at ?? this.now(), text }
     this.requests.set(request.id, request)
     while (this.requests.size > REQUESTS_KEPT) {
       const oldest = this.requests.keys().next().value

@@ -66,6 +66,19 @@ export interface DshPortHost {
     inputIds?: readonly string[], routerModel?: RouterModel): Promise<void>
   /** Cancel the Session's current turn and resolve once that turn has settled; keep unclaimed messages. */
   cancelSession(sessionId: string, reason?: string): Promise<void>
+  /**
+   * Interrupt the Session's current turn, and only that turn.
+   *
+   * The host resolves after it saw that turn end: the confirmation is the turn's own end, never the Session's idleness —
+   * an idle Session may still have work queued behind it, and `whenIdle` would follow that work instead of the turn.
+   *
+   * `turn` names the turn the caller believes is running; a host that is already running another turn refuses instead
+   * of ending that one.
+   *
+   * The call is optional, because a host that does not offer it is an older node: the port refuses the command with a
+   * plain reason instead of pretending the turn ended.
+   */
+  interruptSession?(sessionId: string, options: { turn?: number; reason?: string }): Promise<void>
   /** Archive the Session with the host; rejects when the archive did not happen. */
   archiveSession(sessionId: string): Promise<void>
   /** Report what the host knows about one Session, without changing it. */
@@ -257,6 +270,18 @@ export class DshNodePort implements NodePort {
       case 'session.cancel':
         await this.host.cancelSession(command.sessionId, command.reason)
         break
+
+      // The interrupt ends one turn and leaves the Session alone. The host resolves only after it saw that turn end.
+      case 'session.interrupt': {
+        const interrupt = this.host.interruptSession
+        // A host without the call is an older node: it says so rather than ending a turn by accident.
+        if (!interrupt) throw new NodeCommandError('execution-failed', 'This node cannot interrupt a turn')
+        await interrupt.call(this.host, command.sessionId, {
+          ...(command.turn === undefined ? {} : { turn: command.turn }),
+          ...(command.reason === undefined ? {} : { reason: command.reason }),
+        })
+        break
+      }
 
       case 'session.archive':
         await this.host.archiveSession(command.sessionId)

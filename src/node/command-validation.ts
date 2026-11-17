@@ -130,6 +130,18 @@ export function validateNodeCommand(value: unknown): NodeCommand {
       optionalString(command, 'reason', type)
       break
 
+    // The interrupt ends one turn of one Session. The turn it names is optional, but a present one must be a turn
+    // number: a node compares it with the turn it is running and refuses when they differ.
+    case 'session.interrupt':
+      identifier(command, 'sessionId', type)
+      optionalString(command, 'reason', type)
+      if (command.turn !== undefined) {
+        if (typeof command.turn !== 'number' || !Number.isSafeInteger(command.turn) || command.turn < 1) {
+          throw new NodeCommandError('invalid-command', 'session.interrupt.turn must be a positive integer')
+        }
+      }
+      break
+
     case 'session.archive':
       identifier(command, 'sessionId', type)
       break
