@@ -1083,6 +1083,7 @@ function ProjectDetail(props: { project: ConsoleProject; revision: number; refre
         <div><dt>最近报告</dt><dd>{project.latestReport
           ? `${project.latestReport.summary}（${stampOf(project.latestReport.at)}）` : '—'}</dd></div>
       </dl>
+      <p className="quiet">项目 Worker 共用此工作区。并行修改同一文件可能覆盖彼此的改动。</p>
 
       <div className="detail-actions">
         {(pm === undefined || pm.status === 'failed') && project.status !== 'ended' && project.status !== 'archived'
