@@ -17,7 +17,7 @@
 | P4-3 | P4-1 | 真实权限守卫与拒绝上报，优先于订阅扩展 | DONE |
 | P4-2 | P4-1 | 零 LLM 下级增量摘要，真实后端验证 | DONE |
 | P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | DONE |
-| P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | IN_PROGRESS |
+| P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | DONE |
 | P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | NOT_STARTED |
 | P5-0 | P4-Gate | 三域数据契约与设计 | NOT_STARTED |
 | P5-1 | P5-0 | Live State | NOT_STARTED |
@@ -220,4 +220,11 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Code
 
 ## P4-5
 
-2026-11-18 开始实施。以本地 `next` 的 `f9b4e50` 为基线，Claude Code 以 `max` effort 在 `phase4/p4-5` 实施。Codex 在交付后独立验收入队、回执、重启对账、授权变更和原幂等键重试。
+2026-11-18 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 在 `phase4/p4-5` 实施。Codex 独立验收候选提交 `5efa318`，本地 `next` 的 `bfbd1e6` 与受测源码、测试和技术文档一致。
+
+- 自动派单与交接、Worker 和 PM 报告、信息流摘要、权限拒绝审查、外部订阅唤醒各自写入同一张 SQLite 投递表。故障注入覆盖原幂等键恢复、缺失回执、软暂停与恢复、补发次数、订阅修订和目标代际。旧版人工 Relay 仍须先获确认才可投递，已失效的提案不复活。
+- FakeNode 在给出明确未收到的证据且授权仍有效时最多补发一次。未知结果保留为 `unconfirmed`。真实 DSH 可通过持久历史或实时收件箱证明入箱，无法证明消息被哪个回合读取，也无法证明消息从未到达。
+- 隔离的 DSH Desktop 0.2.2.0 使用 `phase3-live` profile、`dsh-superagent/node` 插件及本机脚本模型。合成短信真实入箱后，模拟控制面遗漏回执，仅回拨测试 SQLite 记账状态，再重启控制子进程。重启后经真实节点查到原消息并恢复为 `delivered_inbox`，尝试次数 1、补发次数 0。再次注入模拟群聊和短信复验直达、负例和双层路由。证据见 `.artifacts/phase3-5-20261117/live-BceOCc/evidence.json` 与 `.artifacts/phase3-5-20261117/live-Pb0237/evidence.json`。
+- 类型检查和构建通过。73 个定向文件中 1,102 项通过、1 项跳过。Windows 全量 2,065 项通过、45 项失败、1 项跳过。与 P4-4 基线比对，失败断言和测试文件错误集合均无新增。报告见 `.artifacts/phase4-p4-5-20261118/accepted-focused.json` 和 `.artifacts/phase4-p4-5-20261118/accepted-vitest.json`。
+
+下一项是 P4-Gate，验收单节点协作闭环。双节点在跨设备分支合入时独立复跑。
