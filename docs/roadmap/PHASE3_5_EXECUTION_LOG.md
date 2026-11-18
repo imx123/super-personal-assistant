@@ -20,8 +20,8 @@
 | P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | DONE |
 | P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | DONE |
 | P5-0 | P4-Gate | 三域数据契约与设计 | DONE |
-| P5-1 | P5-0 | Live State | IN_PROGRESS |
-| P5-2 | P5-0 | 持久 Event History | NOT_STARTED |
+| P5-1 | P5-0 | Live State | DONE |
+| P5-2 | P5-0 | 持久 Event History | IN_PROGRESS |
 | P5-3 | P5-0 | Memory Service 与候选队列 | NOT_STARTED |
 | P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | NOT_STARTED |
 | P5-5 | P5-1、P5-2、P5-3 | 按需检索与排序，验证检索进入模型 | NOT_STARTED |
@@ -250,3 +250,13 @@ P4-Gate 单节点通过。双节点验收在跨设备分支合入时独立执行
 - 类型检查和构建通过，12 个定向文件共 197 项通过。Windows 全量 2,116 项通过、45 项失败、1 项跳过，失败断言与 P4-Gate 基线一致。报告见 `.artifacts/phase5-p5-0-20261119/`。
 
 P5-1 开始实施按角色授权的实时状态查询与配套页面。
+
+## P5-1
+
+2026-11-19 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 实施，Codex 独立验收。候选 `f49f95e` 与本地 `next` 的 `c2fc46a` 在受测文件上一致。
+
+- 控制台和 `control_live_state` 使用按角色授权的只读实时快照。测试复验 Router 管辖范围、PM 项目、Worker 当前派工绑定、撤权和旧代际拦截，并核对读取无持久写入和节点执行命令。节点重连前的未知与明确离线分别显示。
+- 在隔离 DSH Desktop 0.2.2.0 的 `phase3-live` profile 加载 `dsh-superagent/node`。真实 Router 调用工具。Edge 显示真实项目、定时计划和节点状态，经隔离心跳注入验证在线、离线和恢复在线，390px 无横向溢出。证据见 `.artifacts/phase3-5-20261117/live-BEAWN1/evidence.json` 及同目录截图。
+- 类型检查、构建和 16 个定向文件通过，共 275 项。Windows 全量 2,142 项通过、45 项失败，失败断言集合与 P5-0 基线一致。结果在 `.artifacts/phase5-p5-1-20261119/`。
+
+P5-2 开始实现持久事件历史和控制台精确查询。
