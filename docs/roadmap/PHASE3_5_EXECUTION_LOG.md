@@ -19,8 +19,8 @@
 | P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | DONE |
 | P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | DONE |
 | P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | DONE |
-| P5-0 | P4-Gate | 三域数据契约与设计 | NOT_STARTED |
-| P5-1 | P5-0 | Live State | NOT_STARTED |
+| P5-0 | P4-Gate | 三域数据契约与设计 | DONE |
+| P5-1 | P5-0 | Live State | IN_PROGRESS |
 | P5-2 | P5-0 | 持久 Event History | NOT_STARTED |
 | P5-3 | P5-0 | Memory Service 与候选队列 | NOT_STARTED |
 | P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | NOT_STARTED |
@@ -240,3 +240,13 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Code
 - 类型检查、构建和 63 文件的定向回归通过，共 888 项通过、1 项跳过，Scheduler 43 项通过。Windows 全量为 2,102 项通过、45 项失败、1 项跳过，失败断言集合与 P4-5 基线逐项一致。旧面板 13 个文件在默认环境因 `jsdom` 解析到不匹配的 `undici` 未运行。用预加载方式仅对测试进程加载锁定版 `undici` 后，在基线和候选上各复跑这 13 个文件，两版均为 12 项通过、104 项失败，React 渲染失败用例逐项一致。原始报告、面板对照及故障矩阵见 `.artifacts/phase4-gate-20261118/`。
 
 P4-Gate 单节点通过。双节点验收在跨设备分支合入时独立执行。下一项是 P5-0。
+
+## P5-0
+
+2026-11-19 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 完成契约与只读「记忆」页，Codex 独立验收。候选 `a4b3dfb` 与本地 `next` 的 `b1722ae` 在受测文件上一致。
+
+- [三域记忆数据契约](../023-phase5-memory-contract.zh-CN.md) 清查控制面库、控制台库、节点会话来源和工作区，定义五类对象、作用域、来源与审核边界。首版采用 SQLite 可逆方案。墓碑抑制与永久删除的草案分歧已记录，遗忘与备份穿透决策尚未实施。
+- 控制台新增 `#/memory`。实时状态沿用已有概况。事件历史按需加载真实项目和短期日志。长期记忆标明服务尚未开放，提供项目备忘入口。隔离 DSH Desktop 0.2.2.0 的 `phase3-live` profile 加载 `dsh-superagent/node`，Edge 验证三个面板、项目详情、直接链接及 390px 无横向溢出。证据见 `.artifacts/phase3-5-20261117/live-Ofc3q5/evidence.json` 与同目录截图。
+- 类型检查和构建通过，12 个定向文件共 197 项通过。Windows 全量 2,116 项通过、45 项失败、1 项跳过，失败断言与 P4-Gate 基线一致。报告见 `.artifacts/phase5-p5-0-20261119/`。
+
+P5-1 开始实施按角色授权的实时状态查询与配套页面。
