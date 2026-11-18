@@ -485,6 +485,51 @@ export interface CoordinationDelivery {
 }
 
 /**
+ * One stream subscription, as the console reads it.
+ *
+ * It carries the scope, the state and the reference the console needs, and never the digest itself: the digest quotes
+ * the child's own words, and a console that showed it would show untrusted text as if it were the control plane's own.
+ */
+export interface StreamSubscription {
+  /** The subscription's own id. */
+  subscriptionId: string
+  /** The Session that asked for the digests. */
+  subscriberSessionId: string
+  /** What that Session is for. */
+  subscriberRole: string
+  /** The Session the digests are about. */
+  targetSessionId: string
+  /** What that Session is for. */
+  targetRole: string
+  /** The Project the child belongs to; empty for a standalone Ticket. */
+  targetProjectId: string
+  /** The Ticket the child works on; empty for a PM. */
+  targetTicketId: string
+  /** The Assignment the child runs; empty for a PM. */
+  targetAssignmentId: string
+  /** The interval between two digests, in seconds. */
+  intervalSeconds: number
+  /** `active`, `unsubscribed` or `terminal`. */
+  status: string
+  /** The event watermark the subscription has reached. */
+  lastPushedSeq: number
+  /** When the last digest really reached the superior. */
+  lastDeliveredAt: string
+  /** When the next digest is due. */
+  nextDueAt: string
+  /** When the subscription was made. */
+  createdAt: string
+  /** Why the subscription is in this state, when there is something to say. */
+  reason: string
+  /** How the last digest ended. */
+  digestStatus: string
+  /** Why the last digest ended that way. */
+  digestReason: string
+  /** The console path of the child's own session panel. */
+  contextRef: string
+}
+
+/**
  * One permission denial review, as the console reads it.
  *
  * It carries the facts of the refusal and what became of the review. The message that was sent to a superior is not part

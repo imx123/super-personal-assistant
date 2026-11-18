@@ -503,6 +503,21 @@ export class ConsoleStore {
       .all(sessionId, 'message', limit).map(row => this.eventRow(row))
   }
 
+  /**
+   * The events of one Session between two sequences, newest first.
+   *
+   * The range is read newest first on purpose: a digest is the *latest* increment of a Session's activity, so a long
+   * silence produces the newest facts rather than the oldest ones, and the caller may still move its watermark past the
+   * whole range. The rows are capped by the caller, and a payload that cannot be parsed is the caller's to skip.
+   */
+  sessionEventsBetween(sessionId: string, after: number, upTo: number, limit: number): ConsoleEventRow[] {
+    const rows = this.db.prepare(
+      'SELECT seq, at, node_id, node_seq, session_id, type, kind, payload FROM event_log '
+      + 'WHERE session_id = ? AND seq > ? AND seq <= ? ORDER BY seq DESC LIMIT ?')
+      .all(sessionId, after, upTo, Math.max(1, Math.min(limit, 5000)))
+    return rows.map(row => this.eventRow(row))
+  }
+
   /** The sequence the log will give its next event: the counter of the file, which never goes back. */
   private readSequence(): number {
     try {

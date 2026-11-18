@@ -15,7 +15,7 @@ import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedE
   GUARD_DENIAL_REASON_CODES, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
 import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
-  SessionInspection, SessionRecord, SessionStatus, GuardDenialFacts } from '../shared/protocol.ts'
+  SessionInspection, SessionRecord, SessionStatus, GuardDenialFacts, ToolFact } from '../shared/protocol.ts'
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
@@ -31,6 +31,8 @@ import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts
 import { SingleNodeResolver, assignmentEpochOf } from './node-resolver.ts'
 import { ReportCoordinator, CoordinationTargetUnavailableError, notificationStateOf, projectReportKindOf,
   type CoordinationDeliveryRow, type CoordinationDeliveryView, type PmProjectReportKind } from './report-coordinator.ts'
+import { StreamSubscriptionRefusedError, StreamSubscriptionService, safeRelativePath,
+  type StreamSubscriptionView } from './stream-subscriptions.ts'
 import { evaluateProjectGate, explicitProjectRequest, namedProject,
   ProjectGateError, readProjectGateDecision, type ProjectGateDecision, type ProjectGateFinding,
   type ProjectGateModule, type ProjectGateProject, type ProjectGateVerdict } from './project-gate.ts'
@@ -598,6 +600,14 @@ export interface ControlPlaneOptions {
    * inbox, and only the turn that keeps hitting the same wall is ended.
    */
   denialFuseLimit?: number
+  /**
+   * The interval between two stream digests of the same subscription, in seconds.
+   *
+   * The default is two minutes, and a subscription may ask for a shorter one down to thirty seconds. The interval only
+   * says how often the digest is *looked for*: a range that holds nothing worth reporting is skipped silently, so a
+   * short interval never turns into a stream of empty digests.
+   */
+  streamIntervalSeconds?: number
 }
 
 export interface ControlPlaneState {
@@ -653,8 +663,9 @@ export interface RouterSummaryTicket {
   id: string
   title: string
   status: string
-  /** The Ticket's latest Assignment and its own last report. */
-  assignment?: { id: string; state: string; report?: { state: string; summary: string; at: string } }
+  /** The Ticket's latest Assignment, the Session it runs in and its own last report. */
+  assignment?: { id: string; state: string; sessionId?: string;
+    report?: { state: string; summary: string; at: string } }
 }
 
 /** One Project as the Router reads it. */
@@ -1076,8 +1087,8 @@ export interface ConsoleTicket {
   projectId?: string
   /** The status a PM reads for it: `open`, `running`, `waiting`, `blocked`, `failed`, `completed`, `stopped` or `archived`. */
   status: PmTicketStatus
-  /** Its latest Assignment and that Assignment's own last report. */
-  assignment?: { id: string; state: string; report?: { state: string; summary: string; at: string } }
+  /** Its latest Assignment, the Session it runs in and that Assignment's own last report. */
+  assignment?: { id: string; state: string; sessionId?: string; report?: { state: string; summary: string; at: string } }
   /** The review of its latest result, when it has one. */
   review?: { id: string; state: string; assignmentId: string; at: string; summary?: string }
   /** The open question a Worker asked a person. */
@@ -1517,6 +1528,44 @@ function safeToolName(value: unknown): string {
 }
 
 /**
+ * How many paths one fact may name.
+ *
+ * The fact is a summary of a call, not a listing of a workspace: a handful of paths is what a digest needs, and the
+ * bound keeps one call from filling a log row.
+ */
+const TOOL_FACT_PATH_LIMIT = 20
+
+/**
+ * The facts of one tool call this control plane may keep.
+ *
+ * A fact is a small set of names: the tool, how the call ended, the identity of the call and the relative paths it
+ * changed inside the Session's own workspace. Everything else a node may have put into a fact is dropped here, and a
+ * path that is absolute, that climbs out of the workspace or that carries control characters is left out: a digest may
+ * name a place in the work, never a place on the machine.
+ *
+ * The arguments of the call and the output of the tool are not part of a fact at all, and they never reach the log.
+ */
+function sanitizedToolFact(fact: ToolFact): ToolFact {
+  const turnId = fact.turnId === undefined ? undefined : safeIdentity(fact.turnId)
+  const changedPaths: string[] = []
+  for (const candidate of fact.changedPaths ?? []) {
+    if (typeof candidate !== 'string') continue
+    const path = safeRelativePath(candidate)
+    if (path === '' || changedPaths.includes(path)) continue
+    changedPaths.push(path)
+    if (changedPaths.length >= TOOL_FACT_PATH_LIMIT) break
+  }
+  return {
+    toolName: safeToolName(fact.toolName),
+    outcome: fact.outcome === 'failed' ? 'failed' : 'succeeded',
+    callId: safeIdentity(fact.callId),
+    ...(turnId === undefined || turnId === '' ? {} : { turnId }),
+    ...(fact.backend === CONTROL_BACKEND ? { backend: fact.backend } : {}),
+    ...(changedPaths.length === 0 ? {} : { changedPaths }),
+  }
+}
+
+/**
  * An identifier this control plane may keep.
  *
  * An identifier is a bounded token without whitespace and without control characters: a turn number, a tool call id, a
@@ -1641,6 +1690,14 @@ export class ControlPlane {
    * a model's output, a log line or an arbitrary tool error.
    */
   private readonly denials: DenialEscalator
+  /**
+   * The periodic stream digests a superior asks for.
+   *
+   * It owns the durable subscriptions, the rules about who may watch whom, the programmatic aggregation of a range of
+   * the child's activity and the delivery of the digest it produced. Nothing here calls a model: a digest is a bounded
+   * read of the control plane's own event log.
+   */
+  private readonly streams: StreamSubscriptionService
   /**
    * The escalations a refusal started and that have not settled yet.
    *
@@ -1946,6 +2003,27 @@ export class ControlPlane {
         ...(options.denialCooldownMs === undefined ? {} : { cooldownMs: options.denialCooldownMs }),
         ...(options.denialFuseLimit === undefined ? {} : { fuseLimit: options.denialFuseLimit }),
       })
+      // The stream digests a superior asks for: the subscriptions live in this control plane's own file, next to the
+      // other coordination tables, and the aggregation is a programmatic read of the event log — never a model call.
+      this.streams = new StreamSubscriptionService(this.store, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        session: sessionId => this.sessions.get(sessionId),
+        project: projectId => this.store.projects.get(projectId),
+        ticketOfAssignment: assignmentId => this.ticketOfAssignment(assignmentId),
+        routerSessionId: () => ROUTER_SESSION_ID,
+        eventHighWaterMark: () => this.consoleStore.lastEventSeq(),
+        eventsOf: (sessionId, after, upTo, limit) => this.consoleStore.sessionEventsBetween(sessionId, after, upTo, limit)
+          .map(row => ({ seq: row.seq, at: row.at, payload: row.payload })),
+        currentTurn: sessionId => this.sessionTurns.get(sessionId),
+        targetEpochs: sessionId => this.targetEpochs(sessionId),
+        resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
+        resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        audit: input => { this.audit.record(input) },
+      }, { ...(options.streamIntervalSeconds === undefined ? {} : { intervalSeconds: options.streamIntervalSeconds }) })
       // The scheduler keeps its plans in the console's own file, in tables of its own: the domain's schema is untouched, and
       // an old plugin binary never opens this file. The kernel owns the delivery — it is the only one that knows a Project's
       // PM Session and whether the node really holds it.
@@ -2057,8 +2135,11 @@ export class ControlPlane {
    * revoked, replaced or stopped in the meantime does not receive the message.
    */
   private async deliverCoordinationMessage(sessionId: string, text: string, idempotencyKey: string,
-    validateForSend?: () => void): Promise<void> {
+    validateForSend?: () => void, validateBeforeEnsure?: () => void): Promise<void> {
     const record = this.requireSession(sessionId)
+    // The check that has to run before anything leaves this control plane: a subscription that is over, or a target whose
+    // life ended while the delivery was on its way, must not even re-ensure the Session it was planned for.
+    validateBeforeEnsure?.()
     if (!this.isCurrentGeneration(record)) {
       try {
         await this.ensureForMessage(record)
@@ -2091,6 +2172,15 @@ export class ControlPlane {
     // The node is there: the deliveries a previous run left open can be looked at now, and only now.
     await this.recoverReportDeliveries()
     await this.recoverDenials()
+    // The stream subscriptions of a previous run are running again: a digest that was on its way when the control plane
+    // stopped has an unknown outcome, and a subscription that was running keeps the watermark it had reached.
+    try {
+      this.streams.recover()
+    } catch (error) {
+      // A recovery that fails is a diagnostic: the records stay as they are and the work continues.
+      process.stderr.write(`superagent control-plane stream subscription recovery failed: ${
+        error instanceof Error ? error.message : String(error)}\n`)
+    }
   }
 
   /**
@@ -3716,6 +3806,7 @@ export class ControlPlane {
           const card: RouterSummaryTicket = { id: ticket.id, title: ticket.title, status: pmTicketStatus(ticket) }
           if (assignment !== undefined) {
             card.assignment = { id: assignment.id, state: assignment.state,
+              sessionId: this.workerSessionFor(assignment.id),
               ...(assignment.report === undefined ? {} : { report: { state: assignment.report.state,
                 summary: assignment.report.summary.slice(0, 400), at: assignment.report.at } }) }
           }
@@ -6027,6 +6118,62 @@ export class ControlPlane {
   denialAuthorizations(limit = 50): DenialAuthorizationView[] { return this.denials.authorizations(limit) }
 
   /**
+   * Subscribe the caller's own Session to the stream of a Session it supervises.
+   *
+   * The subscriber is the caller's own Session and is never named by the request: a token decides who acts, so a
+   * request may only ever watch what the token already names. The target must be a lawful subordinate — a live PM or a
+   * current standalone Worker for the Router, the current Worker of its own Project for a PM — and a refusal says
+   * nothing about whether the target exists.
+   *
+   * A repeated subscription is harmless: the watermark stays where it is, so nothing is replayed and nothing is skipped.
+   */
+  subscribeSessionStream(sessionId: string, targetSessionId: string, intervalSeconds?: number,
+    callId?: string): StreamSubscriptionView {
+    try {
+      return this.streams.subscribe(sessionId, targetSessionId, intervalSeconds)
+    } catch (error) {
+      if (error instanceof StreamSubscriptionRefusedError) {
+        // A refusal that reached outside the caller's own scope is typed and counted; an unknown, a replaced and a
+        // foreign target are ordinary refusals and stay out of the denial counters.
+        if (error.scope) this.recordScopeDenial(sessionId, 'control_subscribe_session_stream', callId)
+        throw new ToolCallError('forbidden', error.reason)
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Stop the stream of a Session the caller's own Session supervises.
+   *
+   * The subscription is over at once: no digest goes out again, and one that is on its way does not go out either.
+   */
+  unsubscribeSessionStream(sessionId: string, targetSessionId: string, callId?: string): StreamSubscriptionView {
+    try {
+      return this.streams.unsubscribe(sessionId, targetSessionId)
+    } catch (error) {
+      if (error instanceof StreamSubscriptionRefusedError) {
+        if (error.scope) this.recordScopeDenial(sessionId, 'control_unsubscribe_session_stream', callId)
+        throw new ToolCallError('forbidden', error.reason)
+      }
+      throw error
+    }
+  }
+
+  /** The stream subscriptions the console shows, newest first. */
+  streamSubscriptions(limit = 50): StreamSubscriptionView[] { return this.streams.views(limit) }
+
+  /**
+   * Deliver the stream digests that are due, now.
+   *
+   * The kernel's own timer does this on its own; the call is here so a test, a shutdown or an operator may ask for it
+   * explicitly. One tick at a time: a tick that is running is never joined by another.
+   */
+  async runStreamDigests(): Promise<void> { await this.streams.runDue() }
+
+  /** The stream subscriptions of one Session, as the console shows them. */
+  streamSubscriptionsOf(sessionId: string): StreamSubscriptionView[] { return this.streams.viewsOf(sessionId) }
+
+  /**
    * Ensure the Project's PM Session. The workspace is created under `workspaceRoot`; the PM gets a short-lived token
    * and the PM role profile. A record the current node generation already confirmed (`idle`, `running`, `stopped`,
    * `archived`, …) is returned as it is.
@@ -7808,6 +7955,7 @@ export class ControlPlane {
       ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
       status: pmTicketStatus(ticket),
       ...(assignment === undefined ? {} : { assignment: { id: assignment.id, state: assignment.state,
+        sessionId: this.workerSessionFor(assignment.id),
         ...(assignment.report === undefined ? {} : { report: { state: assignment.report.state,
           summary: assignment.report.summary, at: assignment.report.at } }) } }),
       ...(review === undefined ? {} : { review: { id: review.id, state: review.state, assignmentId: review.assignmentId,
@@ -7877,6 +8025,9 @@ export class ControlPlane {
     // The coordination's own timer stops with it, and a flush that is running is waited for: a held-back report waits
     // for a control plane that is still there, and a delivery that is on its way is written down before the file closes.
     await this.reports.close()
+    // The stream digests stop with it too: the timer is cleared and a digest that is on its way is waited for, so the
+    // record of what it did is written before the file closes.
+    await this.streams.close()
     // The scheduler writes to the console's own file, so it is stopped before that file is closed: a delivery still in
     // flight gets its record written instead of finding a closed database.
     await this.stopScheduler()
@@ -8279,6 +8430,12 @@ export class ControlPlane {
       this.applyEvent(event)
       return
     }
+    // The event belongs to the node that sent it: an event of another machine is not this Session's business. The check
+    // runs before the recording, because a row the log holds is a row a digest may quote later on.
+    if (origin === 'node' && !this.ownsEvent(event)) return
+    // The facts of a tool call are the narrowest of the events: they name a Session, a role and an Assignment, and a fact
+    // that does not match the Session it claims is not a fact about the work at all.
+    if (origin === 'node' && event.type === 'tool.fact' && !this.acceptsToolFact(event)) return
     const recorded = this.record(event, origin)
     this.events.push(recorded)
     // The durable log keeps the history; this array is the recent window, and it stays bounded.
@@ -8288,6 +8445,69 @@ export class ControlPlane {
     } finally {
       this.notifyEvent(recorded)
     }
+  }
+
+  /**
+   * Whether the event came from the node the Session it names belongs to.
+   *
+   * The rule is the one the kernel has always applied when it folds an event into the state: an event that names a node
+   * is only this Session's business when that node is the Session's own, and an event that names no node is left alone,
+   * because an older node does not send one. The difference now is where the rule runs: it runs before the recording, so
+   * an event of another machine never becomes a row of the log.
+   */
+  private ownsEvent(event: NodeEvent): boolean {
+    if (event.nodeId === '') return true
+    if (event.sessionId === '') return true
+    // An inspection answers a request this control plane sent, and it answers it whoever answers it: the check that
+    // follows the request is the one that says whether the answer is about the right Session.
+    if (event.type === 'session.inspected') return true
+    const record = this.sessions.get(event.sessionId)
+    // A Session this control plane does not hold is not judged here: the record may still arrive, and the digests only
+    // ever quote a Session they watch.
+    if (record === undefined) return true
+    return record.nodeId === event.nodeId
+  }
+
+  /**
+   * Whether one fact about a tool call may be recorded at all.
+   *
+   * A fact must come from this control plane's own node, and it must be about the very Session it names: the Session has
+   * to be one this control plane holds, it has to have the role and the Assignment the fact names, and it has to belong
+   * to the Project the fact names. A standalone Worker's Project is its own Ticket — the convention the node follows — so
+   * the fact names that Ticket and is accepted.
+   *
+   * A fact that fails any of these is not a fact about the work: it is dropped before it reaches the log, the stream or
+   * the console.
+   */
+  private acceptsToolFact(event: NodeEvent & { type: 'tool.fact' }): boolean {
+    // The node that reported the fact must be the node this control plane talks to, and the backend that made the call
+    // must be the backend this control plane runs: a fact of another machine or of another backend is not a fact about
+    // this work.
+    if (event.nodeId !== this.options.nodeId) return false
+    if (event.fact.backend !== undefined && event.fact.backend !== CONTROL_BACKEND) return false
+    // The identity of the call is required: a fact without one cannot be told apart from a replay of another fact, and
+    // a fact that is counted twice is a fact that says something that is not true.
+    if (safeIdentity(event.fact.callId) === '') return false
+    const record = this.sessions.get(event.sessionId)
+    if (record === undefined) return false
+    if (record.role !== event.role) return false
+    if ((record.assignmentId ?? '') !== (event.assignmentId ?? '')) return false
+    const project = this.effectiveProjectOf(record)
+    return event.projectId === '' || event.projectId === project
+  }
+
+  /**
+   * The Project a Session belongs to, as the node's own events name it.
+   *
+   * A Worker belongs to the Project of its Ticket; a Ticket that belongs to no Project is its own scope, and the node
+   * names that Ticket. A PM belongs to its own Project, and the Router to none.
+   */
+  private effectiveProjectOf(record: SessionRecord): string {
+    if (record.role === 'worker' && record.assignmentId !== undefined) {
+      const ticket = this.ticketOfAssignment(record.assignmentId)
+      if (ticket !== undefined) return ticket.projectId ?? ticket.id
+    }
+    return record.projectId
   }
 
   /**
@@ -8351,6 +8571,25 @@ export class ControlPlane {
       case 'session.inspected': return { ...event, seq, nodeSeq }
       // The arguments of a tool call are the model's input; the log keeps the call, not its input.
       case 'tool.call': return { ...event, seq, nodeSeq, args: undefined }
+      // The facts of a tool call are already the bounded form of it: the tool's name, how the call ended and the paths it
+      // changed inside the Session's own workspace. Nothing else of the call is kept, and the envelope around them is
+      // built here instead of spread: a node may not add a field of its own to an event the control plane records.
+      case 'tool.fact': {
+        const recorded: Extract<NodeEvent, { type: 'tool.fact' }> = {
+          protocolVersion: event.protocolVersion,
+          nodeId: event.nodeId,
+          sessionId: event.sessionId,
+          projectId: event.projectId,
+          ...(event.assignmentId === undefined ? {} : { assignmentId: event.assignmentId }),
+          role: event.role,
+          seq,
+          ...(nodeSeq === undefined ? {} : { nodeSeq }),
+          at: event.at,
+          type: 'tool.fact',
+          fact: sanitizedToolFact(event.fact),
+        }
+        return recorded
+      }
       // A scheduled run is the control plane's own fact; it carries no node counter.
       case 'schedule.run': return { ...event, seq, nodeSeq: undefined }
     }

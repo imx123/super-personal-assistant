@@ -153,6 +153,24 @@ function reportProgressIntervalMs(env: Record<string, string | undefined>): numb
   return milliseconds
 }
 
+/**
+ * The interval between two stream digests of the same subscription, in seconds.
+ *
+ * Unset keeps the kernel's own default of two minutes. A configured value must be a whole number of seconds and at
+ * least thirty: a shorter rhythm would wake a superior far more often than the work deserves, and the digest is only
+ * worth sending when it holds something.
+ */
+function streamIntervalSeconds(env: Record<string, string | undefined>): number | undefined {
+  const value = env.SUPERAGENT_STREAM_INTERVAL_SECONDS
+  if (value === undefined || value === '') return undefined
+  if (!/^\d+$/.test(value)) throw new Error('SUPERAGENT_STREAM_INTERVAL_SECONDS is invalid')
+  const seconds = Number(value)
+  if (!Number.isSafeInteger(seconds) || seconds < 30 || seconds > 3_600) {
+    throw new Error('SUPERAGENT_STREAM_INTERVAL_SECONDS is invalid')
+  }
+  return seconds
+}
+
 function retentionNumber(env: Record<string, string | undefined>, name: string, minimum: number): number | undefined {
   const raw = env[name]
   if (!raw) return undefined
@@ -288,6 +306,9 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
   const denialThreshold = denialNumber(env, 'SUPERAGENT_DENIAL_THRESHOLD', 1)
   const denialCooldown = denialNumber(env, 'SUPERAGENT_DENIAL_COOLDOWN_MS', 0)
   const denialFuse = denialNumber(env, 'SUPERAGENT_DENIAL_FUSE_LIMIT', 1)
+  // The rhythm of the stream digests a superior asks for: the default is two minutes and a subscription may ask for a
+  // shorter one down to thirty seconds.
+  const streamInterval = streamIntervalSeconds(env)
 
   const nodeUrl = env.SUPERAGENT_NODE_URL
   const node: NodePort = options.node ?? (nodeUrl
@@ -305,7 +326,8 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
     ...(denialWindow === undefined ? {} : { denialWindowMs: denialWindow }),
     ...(denialThreshold === undefined ? {} : { denialThreshold: denialThreshold }),
     ...(denialCooldown === undefined ? {} : { denialCooldownMs: denialCooldown }),
-    ...(denialFuse === undefined ? {} : { denialFuseLimit: denialFuse }) }
+    ...(denialFuse === undefined ? {} : { denialFuseLimit: denialFuse }),
+    ...(streamInterval === undefined ? {} : { streamIntervalSeconds: streamInterval }) }
   const control = new ControlPlane(controlOptions)
   hasSessions = () => control.sessions.size !== 0
   // The viewer token is optional: unset (or empty), the API keeps exactly the single-token behaviour it always had.

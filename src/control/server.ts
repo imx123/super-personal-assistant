@@ -177,6 +177,19 @@ function stringValue(value: unknown, name: string, required: boolean): string | 
   return trimmed
 }
 
+/**
+ * The interval one stream subscription asks for, in seconds.
+ *
+ * A number is what the node's proxy tool sends, and a plain whole number in text is what a console sends. Anything else
+ * is not an interval: the answer is `NaN`, which the caller refuses as an invalid request.
+ */
+function streamIntervalOf(value: unknown): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'number') return value
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) return Number(value.trim())
+  return Number.NaN
+}
+
 /** One `threads` entry: a bare `source:id` key or its object form, as the Engine's task type accepts it. */
 function threadValue(value: unknown, name: string): { key: string; contextOnly?: boolean } {
   if (typeof value === 'string') return { key: stringValue(value, name, true)! }
@@ -617,6 +630,14 @@ export class ControlPlaneServer {
     if (method === 'GET' && path === '/v1/console/coordination/deliveries') {
       const limit = this.limit(url.searchParams.get('limit'))
       return json(res, 200, { deliveries: this.control.coordinationDeliveries(limit ?? 50) })
+    }
+
+    // The stream subscriptions a superior asked for: who watches whom, at which rhythm, how far the watermark reached and
+    // what became of the last digest. The record is durable, so the console shows it after a restart as well. The digest
+    // itself is not part of it: the console shows the scope and the state, never the lower-trust text of a child Session.
+    if (method === 'GET' && path === '/v1/console/stream-subscriptions') {
+      const limit = this.limit(url.searchParams.get('limit'))
+      return json(res, 200, { subscriptions: this.control.streamSubscriptions(limit ?? 50) })
     }
 
     // The permission denials the guards refused: what each refusal was, how many the window held and what became of the
@@ -1269,6 +1290,33 @@ export class ControlPlaneServer {
       const reviewId = text(body.reviewId)
       const application = this.control.requestDenialAuthorization(claims.sid, reviewId)
       return json(res, 200, { application })
+    }
+
+    // The subscription of a PM or the Router to the stream of a Session it supervises.
+    //
+    // The subscriber is the token's own Session and is never named by the request: a token decides who acts, so the
+    // request may only ever watch what the token already names. The target must be a lawful subordinate, and a refusal
+    // says nothing about whether the target exists. The subscription is off by default and the answer says what it
+    // became, so a repeated call is harmless.
+    if (method === 'POST' && url.pathname === '/v1/tools/stream/subscribe') {
+      this.control.requireTool(claims.sid, 'control_subscribe_session_stream', ['pm', 'router'], callId)
+      const body = await readJson(req)
+      const sessionId = text(body.sessionId)
+      const intervalSeconds = streamIntervalOf(body.intervalSeconds)
+      if (intervalSeconds !== undefined && !Number.isSafeInteger(intervalSeconds)) {
+        throw new ToolCallError('invalid', 'intervalSeconds must be a whole number of seconds')
+      }
+      const subscription = this.control.subscribeSessionStream(claims.sid, sessionId, intervalSeconds, callId)
+      return json(res, 200, { subscription })
+    }
+
+    // The end of one subscription. It takes effect at once: a digest that is on its way does not go out either.
+    if (method === 'POST' && url.pathname === '/v1/tools/stream/unsubscribe') {
+      this.control.requireTool(claims.sid, 'control_unsubscribe_session_stream', ['pm', 'router'], callId)
+      const body = await readJson(req)
+      const sessionId = text(body.sessionId)
+      const subscription = this.control.unsubscribeSessionStream(claims.sid, sessionId, callId)
+      return json(res, 200, { subscription })
     }
 
     throw new HttpError(404, 'Not found')

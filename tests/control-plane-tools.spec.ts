@@ -333,6 +333,10 @@ describe('control-plane tool API', () => {
     expect(PM_PROFILE.prompt).toContain('control_review_diff')
     expect(PM_PROFILE.tools).toContain('control_request_authorization')
     expect(PM_PROFILE.prompt).toContain('control_request_authorization')
+    expect(PM_PROFILE.tools).toContain('control_subscribe_session_stream')
+    expect(PM_PROFILE.prompt).toContain('control_subscribe_session_stream')
+    expect(PM_PROFILE.tools).toContain('control_unsubscribe_session_stream')
+    expect(PM_PROFILE.prompt).toContain('control_unsubscribe_session_stream')
     expect(WORKER_PROFILE.tools).toContain('control_report')
     expect(WORKER_PROFILE.prompt).toContain('control_report')
   })
@@ -343,7 +347,8 @@ describe('control-plane tool API', () => {
     // PM Session, which is registered and unchanged.
     expect([...PM_PROFILE.tools]).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
-      'control_project_report', 'control_request_authorization'])
+      'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
+      'control_unsubscribe_session_stream'])
     expect(PM_PROFILE.tools.some(name => name.startsWith('orchestrator_'))).toBe(false)
   })
 })
@@ -910,7 +915,8 @@ describe('node control tools', () => {
     const agent = agents.get('pm-1')!
     expect([...agent.tools.keys()]).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
-      'control_project_report', 'control_request_authorization'])
+      'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
+      'control_unsubscribe_session_stream'])
     // The usage note names the tools, so the PM's first turn knows how to read, create and orchestrate.
     expect(prompts[0]!.text).toContain('Use control_project')
     expect(prompts[0]!.text).toContain('control_create_tickets')

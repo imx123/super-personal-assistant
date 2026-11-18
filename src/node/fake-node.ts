@@ -42,8 +42,10 @@ export interface FakeNodeOptions {
   capabilities?: readonly string[]
 }
 
-type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
-type PendingNodeEvent = DistributiveOmit<NodeEvent, 'seq' | 'at'>
+/** The omission of the keys of every member of a union, one member at a time. */
+export type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
+/** The event of the node, without the counters the fake itself writes. */
+export type PendingNodeEvent = DistributiveOmit<NodeEvent, 'seq' | 'at'>
 type EventEnvelopeFields = Omit<NodeEventBase, 'seq' | 'at'>
 
 /** An in-process NodePort for the standalone kernel and tests; it records commands and emits ordered events. */
@@ -407,6 +409,48 @@ export class FakeNode implements NodePort {
       data: { toolName, reasonCode, ...(turn === undefined ? {} : { turnId: String(turn) }),
         callId, backend: options.backend ?? 'dsh' },
     })
+  }
+
+  /**
+   * Report the facts of one tool call, as the node reports them.
+   *
+   * The fake has no backend that makes tool calls, so a test that needs one writes the fact here: the tool's name, how
+   * the call ended, the identity of the call and — for a call that changed a file — the relative path it changed. The
+   * turn is the one the Session really runs, so a fact is always about the work that runs now.
+   */
+  simulateToolFact(sessionId: string, toolName: string, outcome: 'succeeded' | 'failed', options: {
+    /** The turn the call was made in; the Session's own running turn when it is not named. */
+    turnId?: string
+    /** The identity of the call; a fresh one when it is not named. */
+    callId?: string
+    /** The relative paths the call changed, when it changed files. */
+    changedPaths?: readonly string[]
+  } = {}): void {
+    const session = this.requireSession(sessionId)
+    const turn = options.turnId ?? this.turns.get(sessionId)?.current
+    const callId = options.callId ?? `fake-tool-fact-${this.seq + 1}`
+    this.emit({
+      ...this.sessionEnvelope(session),
+      type: 'tool.fact',
+      fact: {
+        toolName,
+        outcome,
+        callId,
+        ...(turn === undefined ? {} : { turnId: String(turn) }),
+        backend: 'dsh',
+        ...(options.changedPaths === undefined ? {} : { changedPaths: [...options.changedPaths] }),
+      },
+    })
+  }
+
+  /**
+   * Report one event exactly as the test writes it.
+   *
+   * The control plane has to refuse an event of another node, of another role or of another Assignment, and a test needs
+   * to be able to say so: this reports the envelope the test wrote, without the fake's own.
+   */
+  simulateEvent(event: PendingNodeEvent): void {
+    this.emit(event)
   }
 
   /**

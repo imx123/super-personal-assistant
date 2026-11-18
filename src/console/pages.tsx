@@ -13,6 +13,7 @@ import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket,
   type CoordinationDelivery, type DenialAuthorization, type DenialReview, type FastRouteReceipt, type NodeView, type Overview,
+  type StreamSubscription,
   type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord,
   type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
   type SessionView, type StopNotice,
@@ -544,6 +545,21 @@ function denialTone(status: string): string {
   return 'muted'
 }
 
+/** How the console shows a stream subscription's state. */
+const STREAM_STATUS: Record<string, string> = {
+  active: '订阅中',
+  unsubscribed: '已退订',
+  terminal: '已终止',
+}
+
+/** How the console shows how a digest ended. */
+const STREAM_DIGEST_STATUS: Record<string, string> = {
+  dispatching: '发送中',
+  delivered_inbox: '已送达',
+  unconfirmed: '未确认',
+  failed: '未送达',
+}
+
 /** What a delivery is about, in one line: the Ticket, the Assignment and the kind of the report. */
 function coordinationSubject(delivery: CoordinationDelivery): string {
   const parts: string[] = []
@@ -581,6 +597,50 @@ function CoordinationDeliveries(props: { deliveries: CoordinationDelivery[] }): 
               </span>
               {delivery.attemptCount > 0 ? <span className="quiet"> · 尝试 {delivery.attemptCount} 次</span> : null}
               {delivery.error ? <span className="quiet"> · {delivery.error}</span> : null}
+            </li>
+          ))}
+        </ul>}
+    </div>
+  )
+}
+
+/**
+ * The stream subscriptions a superior asked for, as the console shows them.
+ *
+ * It shows the scope of each subscription — who watches whom, at which rhythm — and the state it reached. Each row
+ * opens the very session it is about, so the child of a subscription is one click away instead of a path an operator has
+ * to copy. The digest itself is never shown here: it quotes the child's own words, and the console shows the control
+ * plane's facts rather than the lower-trust text of a Session.
+ */
+function StreamSubscriptions(props: { subscriptions: StreamSubscription[]
+  navigate: (page: string, where?: string) => void }): ReactElement {
+  return (
+    <div className="router-queue" aria-label="信息流订阅记录">
+      <p className="quiet">上级订阅下级信息流的范围与状态。摘要正文不在这里展示。</p>
+      {props.subscriptions.length === 0
+        ? <p className="empty">还没有信息流订阅。</p>
+        : <ul className="router-queue-list">
+          {props.subscriptions.map(subscription => (
+            <li key={subscription.subscriptionId} className={subscription.status === 'terminal' ? 'failure' : ''}>
+              <span className="router-queue-text">
+                {subscription.subscriberRole} {subscription.subscriberSessionId} → {subscription.targetRole}{' '}
+                {subscription.targetSessionId}
+              </span>
+              <span className={`chip ${subscription.status === 'active' ? 'success' : 'muted'}`}>
+                {STREAM_STATUS[subscription.status] ?? subscription.status}
+              </span>
+              <span className="quiet"> · 间隔 {subscription.intervalSeconds}s</span>
+              {subscription.targetTicketId ? <span className="quiet"> · 工单 {subscription.targetTicketId}</span> : null}
+              {subscription.targetAssignmentId
+                ? <span className="quiet"> · 执行 {subscription.targetAssignmentId}</span> : null}
+              {subscription.digestStatus
+                ? <span className="quiet"> · 摘要 {STREAM_DIGEST_STATUS[subscription.digestStatus] ?? subscription.digestStatus}</span>
+                : null}
+              {subscription.reason ? <span className="quiet"> · {subscription.reason}</span> : null}
+              <button type="button" className="action"
+                onClick={() => props.navigate('sessions', subscription.targetSessionId)}>
+                打开会话详情
+              </button>
             </li>
           ))}
         </ul>}
@@ -786,6 +846,8 @@ export function HomePage(props: PageProps): ReactElement {
     '/v1/console/coordination/deliveries?limit=24'), props.revision)
   const denials = useLoaded(() => read<{ reviews: DenialReview[]; applications: DenialAuthorization[] }>(
     '/v1/console/denials?limit=24'), props.revision)
+  const streams = useLoaded(() => read<{ subscriptions: StreamSubscription[] }>(
+    '/v1/console/stream-subscriptions?limit=24'), props.revision)
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<(RouterTextAttachment & { bytes: number })[]>([])
   const [attachmentError, setAttachmentError] = useState('')
@@ -804,6 +866,7 @@ export function HomePage(props: PageProps): ReactElement {
   const deliveries: CoordinationDelivery[] = coordination.data?.deliveries ?? []
   const denialReviews: DenialReview[] = denials.data?.reviews ?? []
   const denialApplications: DenialAuthorization[] = denials.data?.applications ?? []
+  const streamSubscriptions: StreamSubscription[] = streams.data?.subscriptions ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -1123,6 +1186,14 @@ export function HomePage(props: PageProps): ReactElement {
         </div>
         <DenialReviews reviews={denialReviews} />
         <DenialAuthorizations applications={denialApplications} refresh={props.refresh} />
+      </section>
+
+      <section className="section" aria-labelledby="streams-title">
+        <div className="section-heading">
+          <h2 id="streams-title">信息流订阅</h2>
+          <span className="quiet">上级订阅下级周期摘要的范围与状态</span>
+        </div>
+        <StreamSubscriptions subscriptions={streamSubscriptions} navigate={props.navigate} />
       </section>
     </>
   )
@@ -1488,6 +1559,15 @@ export function SessionsPage(props: PageProps): ReactElement {
   useEffect(() => {
     if (current && !selected) setSelected(current.sessionId)
   }, [current, selected])
+  // A cell of another page points at one Session: the console opens that Session and shows its detail. The filter is
+  // widened, because a filter that hides the Session the operator was sent to would show them another one.
+  useEffect(() => {
+    if (!props.focus) return
+    setRole('all')
+    setSelected(props.focus)
+    setCreating(false)
+    setShowDetail(true)
+  }, [props.focus])
   const standaloneTicket = (id: string): ConsoleTicket | undefined =>
     projects.data?.standaloneTickets?.find(ticket => ticket.id === id)
   const projectTitle = (id: string): string =>

@@ -466,6 +466,16 @@ export type NodeEvent =
   | (EventEnvelope & { type: 'review.diff'; requestId: string; result: ReviewDiffResult })
   | (EventEnvelope & { type: 'tool.call'; tool: string; args: unknown; toolCallId: string })
   | (EventEnvelope & {
+    /**
+     * The facts of one tool call the backend made, as the node reports them.
+     *
+     * The node pairs the call with its own result before it reports anything, so the fact says whether the call
+     * succeeded and never carries the arguments of the call or the output of the tool.
+     */
+    type: 'tool.fact'
+    fact: ToolFact
+  })
+  | (EventEnvelope & {
     type: 'schedule.run'
     /** The plan the run belongs to. */
     scheduleId: string
@@ -579,4 +589,46 @@ export interface GuardDenialFacts {
   readonly callId?: string
   /** The backend that decided the refusal. */
   readonly backend?: string
+}
+
+// === COORDINATION & MEMORY V1 ===
+
+/**
+ * How one tool call ended.
+ *
+ * `succeeded` is a call the backend carried out; `failed` is one it refused or that errored. It is the only thing about
+ * a call that may be counted, and it is the backend's own answer rather than a guess: the node pairs the call with its
+ * result before it reports the fact.
+ */
+export type ToolFactOutcome = 'succeeded' | 'failed'
+
+/**
+ * The facts of one tool call the backend made.
+ *
+ * They are the smallest set that says what happened without saying anything the model wrote: the tool's name, how the
+ * call ended, the identity of the call itself and — for a call that changed a file inside the Session's own workspace —
+ * the relative path it changed.
+ *
+ * The arguments of the call and the output of the tool are never part of a fact. A path is a *relative* path inside the
+ * workspace the Session really works in, so it names a place in the work and not a place on the machine; a call whose
+ * path cannot be attributed to that workspace carries no path at all.
+ */
+export interface ToolFact {
+  /** The tool the call was made for. */
+  readonly toolName: string
+  /** How the call ended. */
+  readonly outcome: ToolFactOutcome
+  /** The stable identity of the call the backend gave it. */
+  readonly callId: string
+  /** The turn the call was made in, when the node knows one. */
+  readonly turnId?: string
+  /**
+   * The backend that made the call, when the node names one.
+   *
+   * The control plane knows which backend it talks to, and a fact of another backend is not a fact about this work. The
+   * field is optional, so a fact of an older node still reads.
+   */
+  readonly backend?: string
+  /** The relative paths the call changed, when it changed files inside the workspace. */
+  readonly changedPaths?: readonly string[]
 }

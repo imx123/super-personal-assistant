@@ -7,7 +7,7 @@
  */
 import { mkdirSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { resolve } from 'node:path'
+import { isAbsolute, relative as relativePath, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
@@ -202,6 +202,20 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
    * turn come from the call, and the result alone never decides anything.
    */
   const nativeCalls = new Map<string, { toolName: string; turn?: number }>()
+  /**
+   * The tool calls the backend made and may still answer, by the id it gave them.
+   *
+   * The name of the tool, the turn it was made in and — for a call that changes a file — the path it names, normalized
+   * against the Session's own workspace. The arguments of the call are never kept: only the one path a file-changing
+   * tool names is read, and only when it stays inside the workspace.
+   */
+  const pendingToolCalls = new Map<string, { toolName: string; turn?: number; changedPaths?: string[] }>()
+  /**
+   * The workspace each Session really works in.
+   *
+   * A path is only ever reported relative to it, so the machine's own layout never leaves the node.
+   */
+  const sessionWorkspaces = new Map<string, string>()
   /**
    * The identity this host gives a refusal the backend gave no id for.
    *
@@ -566,11 +580,107 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
     reportGuardDenial(sessionId, call.toolName, 'WORKSPACE_OUT_OF_BOUNDS', toolCallId)
   }
 
+  /**
+   * Remember one tool call the backend made, for the fact it will produce.
+   *
+   * The tool's name, the id of the call and the turn it was made in are read. For a call that changes a file, the one
+   * path it names is read as well and normalized against the Session's own workspace; every other argument is left
+   * alone, because the arguments of a call are the model's input and never become a fact.
+   */
+  const noteToolCall = (sessionId: string, event: SessionEvent): void => {
+    if (eventType(event) !== 'tool/call') return
+    const data = eventData(event)
+    if (data === undefined) return
+    const callId = firstText(data, ['callId', 'call_id', 'toolCallId', 'id'])
+    const toolName = firstText(data, ['name', 'tool', 'toolName'])
+    if (callId === '' || toolName === '') return
+    const turn = numberOf(data.turn)
+    const current = turnState.get(sessionId)?.current
+    const changedPaths = FILE_MUTATION_TOOLS.has(toolName) ? changedPathsOf(data, sessionId) : undefined
+    pendingToolCalls.set(nativeCallKey(sessionId, callId), {
+      toolName,
+      turn: turn ?? current,
+      ...(changedPaths === undefined || changedPaths.length === 0 ? {} : { changedPaths }),
+    })
+    // Only the calls that may still be answered are kept: a Session that runs many calls must not grow this forever.
+    if (pendingToolCalls.size > NATIVE_CALL_LIMIT) {
+      const oldest = pendingToolCalls.keys().next()
+      if (!oldest.done) pendingToolCalls.delete(oldest.value)
+    }
+  }
+
+  /**
+   * The relative path a file-changing call names, when it names one inside the Session's own workspace.
+   *
+   * The path is resolved against the workspace the Session really works in and is reported relative to it. A path that
+   * leaves the workspace, that names no path at all or that cannot be resolved is left out: a digest may name a place
+   * in the work, never a place on the machine.
+   */
+  const changedPathsOf = (data: Record<string, unknown>, sessionId: string): string[] | undefined => {
+    const workspace = sessionWorkspaces.get(sessionId)
+    if (workspace === undefined) return undefined
+    const args = callArgumentsOf(data)
+    if (args === undefined) return undefined
+    for (const name of PATH_ARGUMENTS) {
+      const value = args[name]
+      if (typeof value !== 'string' || value.trim() === '') continue
+      const relative = relativePathIn(workspace, value.trim())
+      if (relative !== undefined) return [relative]
+    }
+    return undefined
+  }
+
+  /**
+   * Report the facts of one finished tool call.
+   *
+   * The result is paired with its call by the id both carry, and the call is what names the tool and the turn. A result
+   * without its call is not a fact about any call, and the output of the tool is never read: only the backend's own
+   * `isError` field says how the call ended.
+   */
+  const noteToolResult = (sessionId: string, event: SessionEvent): void => {
+    if (eventType(event) !== 'tool/result') return
+    const data = eventData(event)
+    if (data === undefined) return
+    const message = recordOf(data.message)
+    if (message === undefined) return
+    const toolCallId = firstText(message, ['toolCallId', 'callId', 'call_id'])
+    if (toolCallId === '') return
+    const key = nativeCallKey(sessionId, toolCallId)
+    const call = pendingToolCalls.get(key)
+    if (call === undefined) return
+    pendingToolCalls.delete(key)
+    const failed = message.isError === true
+    // A path is only ever named for the call, the Session and the turn it belongs to. A result that names another turn
+    // does not answer this call: the fact is still a fact about the work, but it names no file.
+    const answerTurn = turnOfResult(data, message)
+    const anotherTurn = call.turn !== undefined && answerTurn !== undefined && call.turn !== answerTurn
+    const guard = sessionGuards.get(sessionId)
+    publishHostEvent({
+      type: 'tool.fact',
+      sessionId,
+      role: guard?.role ?? 'worker',
+      ...(guard?.assignmentId === undefined ? {} : { assignmentId: guard.assignmentId }),
+      fact: {
+        toolName: call.toolName,
+        outcome: failed ? 'failed' : 'succeeded',
+        callId: toolCallId,
+        ...(call.turn === undefined ? {} : { turnId: String(call.turn) }),
+        // The backend that made the call: the control plane knows which backend it talks to.
+        backend: DSH_BACKEND,
+        // Only a call that succeeded may name a file it changed.
+        ...(failed || anotherTurn || call.changedPaths === undefined || call.changedPaths.length === 0
+          ? {} : { changedPaths: call.changedPaths }),
+      },
+    })
+  }
+
   return {
     async ensureSession({ sessionId, workspace, title, role, prompt, profile, sessionToken, ticketId, assignmentId }) {
       const directory = nodeWorkspace(root, workspace)
       try {
         mkdirSync(directory, { recursive: true, mode: 0o700 })
+        // The Session's own workspace is remembered: a path a tool names is only ever reported relative to it.
+        sessionWorkspaces.set(sessionId, directory)
         const agent = await input.nodeRuntime.sessions.ensure(sessionId, directory, title, role, profile)
         // The role's permission comes before its tools and its first turn: a turn that started wider cannot be narrowed
         // retroactively, and the prompt below may start one.
@@ -805,6 +915,10 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
           // its result are read here, where the Session events are already watched.
           noteNativeCall(sessionId, event)
           noteNativeResult(sessionId, event)
+          // The facts of the tool calls the backend made: the call and its own result are read here, where the Session
+          // events are already watched, so a digest of a Session's activity is a fact and never a guess.
+          noteToolCall(sessionId, event)
+          noteToolResult(sessionId, event)
           const mapped = portEvent(sessionId, event, takeReadyInputs)
           if (mapped) listener(mapped)
         }),
@@ -1034,6 +1148,22 @@ function toolBoundaryReason(role: 'pm' | 'worker' | 'router', allowed: readonly 
 const PATH_ARGUMENTS = ['path', 'file_path', 'filePath', 'absolute_path', 'absolutePath'] as const
 
 /**
+ * The field names a tool call may carry its arguments under.
+ *
+ * The real DSH hands the arguments as a serialized JSON object in a string; other versions hand them as an object. Both
+ * are read under these names, and nothing else of a call is.
+ */
+const ARGUMENT_FIELDS = ['arguments', 'args', 'input', 'parameters'] as const
+
+/**
+ * How long a serialized argument object may be before it is left alone.
+ *
+ * A call that writes a big file names a big argument, and parsing it costs the whole text. The bound keeps the reading
+ * of a call cheap and bounded: a longer text is not read at all, and the call then simply names no path.
+ */
+const SERIALIZED_ARGUMENTS_LIMIT = 64 * 1024
+
+/**
  * The refusal a call that changes a file gets when it names the Git metadata of the workspace.
  *
  * The decision is lexical: the path the call names is split into its segments and one of them has to be `.git`. Nothing
@@ -1063,6 +1193,20 @@ function isGitMetadata(path: string): boolean {
   return parts.some(part => part === '.git')
 }
 
+/**
+ * The path a call names, relative to the workspace, when it stays inside it.
+ *
+ * An absolute path is taken as it is and a relative one is resolved against the workspace the Session works in. A path
+ * that leaves the workspace, that is the workspace itself or that cannot be resolved is refused: a digest may name a
+ * place in the work, never a place on the machine.
+ */
+function relativePathIn(workspace: string, path: string): string | undefined {
+  const resolved = isAbsolute(path) ? resolve(path) : resolve(workspace, path)
+  const relative = relativePath(workspace, resolved)
+  if (relative === '' || relative === '..' || relative.startsWith(`..${sep}`) || isAbsolute(relative)) return undefined
+  return relative.split(sep).join('/')
+}
+
 /** The kind of one Session event, read without narrowing it to the backend's own union. */
 function eventType(event: unknown): string {
   const record = recordOf(event)
@@ -1080,6 +1224,53 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined
+}
+
+/**
+ * The arguments of one tool call, as a record of their fields.
+ *
+ * The backend hands the arguments in two shapes: as an object, and — the shape the real DSH uses — as a serialized JSON
+ * object in a string. Both are read, and nothing else is: a serialized text is parsed only when it is a bounded JSON
+ * object, so a huge or malformed argument never costs anything but the refusal to read it.
+ */
+function callArgumentsOf(data: Record<string, unknown>): Record<string, unknown> | undefined {
+  for (const name of ARGUMENT_FIELDS) {
+    const value = data[name]
+    const record = recordOf(value)
+    if (record !== undefined) return record
+    if (typeof value !== 'string') continue
+    const parsed = serializedObject(value)
+    if (parsed !== undefined) return parsed
+  }
+  return undefined
+}
+
+/**
+ * The serialized JSON object a text holds, when it holds one.
+ *
+ * The text is bounded before it is parsed, and only an object is accepted: an array, a bare word and a malformed text
+ * are not arguments of a tool call, and none of them is guessed at.
+ */
+function serializedObject(text: string): Record<string, unknown> | undefined {
+  const trimmed = text.trim()
+  if (trimmed.length === 0 || trimmed.length > SERIALIZED_ARGUMENTS_LIMIT) return undefined
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
+  try {
+    return recordOf(JSON.parse(trimmed))
+  } catch {
+    // A text that is not JSON is not a set of arguments: nothing is read out of it.
+    return undefined
+  }
+}
+
+/**
+ * The turn a tool result answers, when it names one.
+ *
+ * A result that names no turn belongs to the call it answers: the turn of the call is the turn of its answer. A result
+ * that names another turn answers another call, and the path of this one is not read.
+ */
+function turnOfResult(data: Record<string, unknown>, message: Record<string, unknown>): number | undefined {
+  return numberOf(data.turn) ?? numberOf(message.turn)
 }
 
 /**
@@ -1174,12 +1365,12 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
   if (options.role === 'pm') {
     return [projectTool(options), createTicketsTool(options), messageWorkerTool(options), cancelWorkerTool(options),
       requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options),
-      requestAuthorizationTool(options)]
+      requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options)]
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
     routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
-    requestAuthorizationTool(options),
+    requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
   ]
   return [reportTool(options)]
 }
@@ -1307,6 +1498,71 @@ function requestAuthorizationTool(options: ControlToolOptions): ToolDefinition {
       const input = argumentsOf(args)
       const reviewId = requiredString(input.reviewId, 'reviewId')
       return requestControl(options, 'POST', '/v1/tools/denial/authorization', { reviewId }, exec)
+    },
+  }
+}
+
+/**
+ * `control_subscribe_session_stream`: the PM's or the Router's own subscription to the stream of a Session it supervises.
+ *
+ * It names the target Session and, if it wants another rhythm, an interval in seconds. The control plane decides whether
+ * the caller may watch that Session at all: the token names the subscriber, and the target must be a lawful subordinate
+ * of it. The answer says what the subscription became, so a repeated call is harmless.
+ */
+function subscribeSessionStreamTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_subscribe_session_stream',
+    description: 'Follow the work of one Session you supervise. Name its session id and, if you want another rhythm than '
+      + 'the default, an interval in seconds. You then receive a short periodic summary of what that Session did: the '
+      + 'tools it called, the files it changed inside its own workspace and the tail of its last message. It is a '
+      + 'summary, not the conversation, and it grants nothing. A Session you do not supervise is refused, and the '
+      + 'refusal does not say whether it exists.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['sessionId'],
+      properties: {
+        sessionId: { type: 'string', description: 'The session id of the Session to follow.' },
+        intervalSeconds: { type: 'integer', minimum: 30, maximum: 3600,
+          description: 'How often the summary should arrive, in seconds. The default is 120.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const sessionId = requiredString(input.sessionId, 'sessionId')
+      const intervalSeconds = input.intervalSeconds === undefined
+        ? undefined
+        : requiredInteger(input.intervalSeconds, 'intervalSeconds')
+      return requestControl(options, 'POST', '/v1/tools/stream/subscribe',
+        { sessionId, ...(intervalSeconds === undefined ? {} : { intervalSeconds }) }, exec)
+    },
+  }
+}
+
+/**
+ * `control_unsubscribe_session_stream`: the end of one subscription.
+ *
+ * It takes effect at once: the next summary does not go out, and one that is on its way does not go out either.
+ */
+function unsubscribeSessionStreamTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_unsubscribe_session_stream',
+    description: 'Stop following the work of one Session you supervise. Name its session id. The subscription ends at once: '
+      + 'no further summary arrives, and one that is on its way does not go out either.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['sessionId'],
+      properties: {
+        sessionId: { type: 'string', description: 'The session id of the Session to stop following.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const sessionId = requiredString(input.sessionId, 'sessionId')
+      return requestControl(options, 'POST', '/v1/tools/stream/unsubscribe', { sessionId }, exec)
     },
   }
 }
@@ -1918,6 +2174,12 @@ function argumentsOf(value: unknown): Record<string, unknown> {
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== 'string' || value.trim() === '') throw new Error(`${name} must be a non-empty string`)
   return value.trim()
+}
+
+/** A whole number, when the value is one. */
+function requiredInteger(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) throw new Error(`${name} must be a whole number`)
+  return value
 }
 
 function requiredState(value: unknown): WorkerReportState {

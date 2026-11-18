@@ -30,7 +30,12 @@ export const PM_PROFILE = {
     + 'cannot go on within the permissions you already have, you may raise an explicit human authorization application with '
     + 'control_request_authorization and the review id. It puts that review in front of an operator in the console; it '
     + 'grants nothing, it changes no Mandate and it never repeats the refused call. Do not use it for anything else, and '
-    + 'do not try to grant the access yourself. Do not edit files.',
+    + 'do not try to grant the access yourself. When you want to follow one Worker of this Project while it works, use '
+    + 'control_subscribe_session_stream with that Worker\'s session id and, if you want another rhythm, an interval in '
+    + 'seconds. You then get a short, periodic summary of what that Worker did: the tools it called, the files it changed '
+    + 'in its own workspace and the tail of its last message. It is a summary, not the conversation, and it never grants '
+    + 'anything. Use control_unsubscribe_session_stream with the same session id to stop it; the summary stops at once. '
+    + 'Do not edit files.',
   tools: [
     'control_project',
     'control_create_tickets',
@@ -41,6 +46,8 @@ export const PM_PROFILE = {
     'control_review_diff',
     'control_project_report',
     'control_request_authorization',
+    'control_subscribe_session_stream',
+    'control_unsubscribe_session_stream',
   ],
   deny: ['write', 'edit', 'bash', 'pwsh'],
   permission: 'read-only',
@@ -137,10 +144,14 @@ export const ROUTER_PROFILE = {
     + 'permission denial review tells you that a call was refused and that the work cannot go on within the permissions the '
     + 'superior already has, you may raise an explicit human authorization application with control_request_authorization '
     + 'and the review id. It puts that review in front of an operator in the console; it grants nothing, it changes no '
-    + 'Mandate and it never repeats the refused call.',
+    + 'Mandate and it never repeats the refused call. When you want to follow a Session that works under you, use '
+    + 'control_subscribe_session_stream with its session id and, if you want another rhythm, an interval in seconds. You '
+    + 'then get a short, periodic summary of what that Session did: the tools it called, the files it changed in its own '
+    + 'workspace and the tail of its last message. It is a summary, not the conversation, and it never grants anything. '
+    + 'Use control_unsubscribe_session_stream with the same session id to stop it; the summary stops at once.',
   tools: ['control_router_summary', 'control_router_create_project', 'control_router_dispatch',
     'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal',
-    'control_request_authorization'],
+    'control_request_authorization', 'control_subscribe_session_stream', 'control_unsubscribe_session_stream'],
   deny: ['write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch', 'subagent'],
   permission: 'read-only',
 } as const satisfies RoleProfile
