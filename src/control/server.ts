@@ -12,6 +12,10 @@ import { CONSOLE_BUNDLE, CONSOLE_CSP, ConsoleAssets } from './console-assets.ts'
 import { ControlPlane, EVENT_REPLAY_LIMIT, OperatorError, SessionEnsureError, ToolCallError,
   type ToolCallErrorCode } from './control-plane.ts'
 import { ScheduleError, describeScheduleRule, parseScheduleRule, type SchedulePlan } from './scheduler.ts'
+import { type PmProjectReportKind } from './report-coordinator.ts'
+
+/** The kinds a PM's own report about its Project may name. */
+const PROJECT_REPORT_KINDS: readonly string[] = ['progress', 'blocked', 'completed', 'failed']
 
 export interface ControlPlaneServerOptions {
   /** Bearer token required by every `/v1` route; `/health` stays public. */
@@ -565,6 +569,14 @@ export class ControlPlaneServer {
       return json(res, 200, { result })
     }
 
+    // The coordination of the reports: what each delivery of a Worker or a PM report did. The record is durable, so the
+    // console shows it after a restart of the control plane as well. The body of the report is not part of it: the console
+    // shows what happened to a delivery, never the lower-trust text the report carried.
+    if (method === 'GET' && path === '/v1/console/coordination/deliveries') {
+      const limit = this.limit(url.searchParams.get('limit'))
+      return json(res, 200, { deliveries: this.control.coordinationDeliveries(limit ?? 50) })
+    }
+
     // The scheduled plans: the plans themselves, and what every run of them did.
     //
     // A plan is a clock and a sentence. It never runs a command, never starts a Session and never dispatches a Worker: at
@@ -987,7 +999,13 @@ export class ControlPlaneServer {
       const body = await readJson(req)
       const summary = stringValue(body.summary, 'summary', true)!
       if (summary.length > 4000) throw new ToolCallError('invalid', 'A Project report may contain at most 4000 characters')
-      return json(res, 200, this.control.pmReportProject(claims.sid, summary))
+      // The kind says what the report is. A report that names none is an ordinary progress report: it is throttled like
+      // any other, and it is never a blocker by accident.
+      const kind = body.kind === undefined ? undefined : stringValue(body.kind, 'kind', true)!
+      if (kind !== undefined && !PROJECT_REPORT_KINDS.includes(kind)) {
+        throw new ToolCallError('invalid', `kind must be one of ${PROJECT_REPORT_KINDS.join(', ')}`)
+      }
+      return json(res, 200, this.control.pmReportProject(claims.sid, summary, kind as PmProjectReportKind | undefined))
     }
 
     // The PM's coordination message to the Worker of one of its own Tickets. The Ticket is checked against the

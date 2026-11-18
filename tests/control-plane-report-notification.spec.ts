@@ -67,13 +67,18 @@ interface Opened {
   address: { url: string }
 }
 
-/** A Project whose PM and first Worker Session exist on the FakeNode, plus the tool API listening on a random port. */
+/**
+ * A Project whose PM and first Worker Session exist on the FakeNode, plus the tool API listening on a random port.
+ *
+ * The ordinary progress reports go out at once here: this file is about the wake-up a report causes and about the call
+ * ledger behind it, and a throttle would hide what the wake-up does.
+ */
 async function open(): Promise<Opened> {
   directory = mkdtempSync(join(tmpdir(), 'superagent-report-'))
   const root = join(directory, 'workspaces')
   node = new ControllableNode({ nodeId: NODE_ID, root, now: () => START })
   control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: NODE_ID, node, secret: SECRET,
-    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50 })
+    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50, reportProgressIntervalMs: 0 })
   await control.registerNode()
   control.store.triggers.save(trigger('trigger-1'))
   const project = control.createProject('trigger-1', 'Project', 'Goal')

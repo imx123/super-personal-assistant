@@ -853,13 +853,18 @@ function projectTool(options: ControlToolOptions): ToolDefinition {
 function projectReportTool(options: ControlToolOptions): ToolDefinition {
   return {
     name: 'control_project_report',
-    description: 'Record and relay a milestone, blocker, or question for a person about the Project you manage.',
+    description: 'Record and relay a milestone, blocker, or question for a person about the Project you manage. '
+      + 'Say what the report is: "blocked" and "completed" reach the Router at once, while an ordinary "progress" is '
+      + 'merged with the ones that follow.',
     parameters: { type: 'object', additionalProperties: false, required: ['summary'],
-      properties: { summary: { type: 'string', maxLength: 4000 } } },
+      properties: { summary: { type: 'string', maxLength: 4000 },
+        kind: { type: 'string', enum: ['progress', 'blocked', 'completed', 'failed'] } } },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
     execute(args, exec) {
+      const arguments_ = argumentsOf(args)
+      const kind = arguments_.kind === undefined ? undefined : requiredString(arguments_.kind, 'kind')
       return requestControl(options, 'POST', '/v1/tools/pm/project-report',
-        { summary: requiredString(argumentsOf(args).summary, 'summary') }, exec.signal)
+        { summary: requiredString(arguments_.summary, 'summary'), ...(kind === undefined ? {} : { kind }) }, exec.signal)
     },
   }
 }

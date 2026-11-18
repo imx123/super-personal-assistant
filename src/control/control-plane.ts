@@ -25,6 +25,9 @@ import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { asksForAuthority, asksForIrreversible, FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
   type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
+import { SingleNodeResolver, assignmentEpochOf } from './node-resolver.ts'
+import { ReportCoordinator, CoordinationTargetUnavailableError, notificationStateOf, projectReportKindOf,
+  type CoordinationDeliveryRow, type CoordinationDeliveryView, type PmProjectReportKind } from './report-coordinator.ts'
 import { evaluateProjectGate, explicitProjectRequest, namedProject,
   ProjectGateError, readProjectGateDecision, type ProjectGateDecision, type ProjectGateFinding,
   type ProjectGateModule, type ProjectGateProject, type ProjectGateVerdict } from './project-gate.ts'
@@ -132,14 +135,6 @@ const DELIVERY_CONFIRM_TIMEOUT_MS = 30_000
  * expired bearer credential into a second class of long-lived credential: ordinary tool and message routes never use it.
  */
 export const DEFAULT_TOKEN_REFRESH_GRACE_SECONDS = 300
-
-/**
- * How many distinct report contents one Assignment keeps as "the PM already knows this".
- *
- * The memory is the kernel's own and stays small: an Assignment that reports many different Progress summaries keeps
- * the newest ones, so a very old report may wake the PM once more.
- */
-const NOTIFIED_REPORTS_PER_ASSIGNMENT = 32
 
 /**
  * How many events the kernel keeps in memory.
@@ -540,6 +535,15 @@ export interface ControlPlaneOptions {
    * It is the scheduler's own timer; the control plane starts it and stops it with the rest of the kernel.
    */
   schedulerTickMs?: number
+  /**
+   * The smallest interval between two ordinary progress reports to the same superior, in milliseconds.
+   *
+   * The default is a minute: a Worker that reports after every step does not wake its superior for every step, and a
+   * superior learns of a long silence within a minute of it ending. `0` delivers every progress report at once, which is
+   * what a deployment that wants to see every turn of a busy Worker asks for. A final report, a blocker, a failure and a
+   * dropped work are never held back: they are state changes the superior has to see at once.
+   */
+  reportProgressIntervalMs?: number
 }
 
 export interface ControlPlaneState {
@@ -1138,6 +1142,25 @@ export interface PmNotification {
 }
 
 /**
+ * What one report asks the coordination to do, and what the control plane decided about it.
+ *
+ * The plan is made inside the report's own transaction, so a report that was written always has its delivery work and a
+ * delivery work always names a report that exists.
+ */
+interface ReportPlan {
+  /** The delivery to carry out; absent when the report is not to be delivered now. */
+  delivery?: CoordinationDeliveryRow
+  /** The state the caller shows when there is no delivery. */
+  state?: 'skipped' | 'deferred'
+  /** Why it went that way. */
+  reason?: string
+  /** The facts of the report; they are kept for a wake-up that waits for the resume. */
+  facts?: PmReportFacts
+  /** The ledger entry of the report call, when the call had one. */
+  ledgerKey?: Key<ReportCallRecord>
+}
+
+/**
  * One Session as the console reads it: the record itself, and what may still be done with it.
  *
  * A Worker Session that a newer Assignment replaced cannot receive a message any more, and the console says so instead of
@@ -1456,6 +1479,21 @@ export class ControlPlane {
   private readonly audit: AuditRecorder
   /** The Engine's Executor over the node; it knows which delivery of a message is still in flight. */
   private readonly executor: NodeExecutor
+  /**
+   * The resolver of the one node: every path that reaches a node asks it for the target and its generations.
+   *
+   * It is the only place that answers whether a target still exists, still belongs to the work it is asked about, and is
+   * still allowed to run, so a path that skipped it could not invent an answer of its own.
+   */
+  private readonly resolver: SingleNodeResolver
+  /**
+   * The durable coordination of the reports a Worker and a PM make.
+   *
+   * It owns the routing of a report to the Session that has to act on it, the stable key that keeps an identical report
+   * from being delivered twice, the throttle that merges ordinary progress reports, and the record of what every
+   * delivery really did.
+   */
+  private readonly reports: ReportCoordinator
   readonly sessions = new Map<string, SessionRecord>()
   readonly nodes = new Map<string, NodeStatus>()
   readonly events: NodeEvent[] = []
@@ -1555,13 +1593,6 @@ export class ControlPlane {
    * One timer serves the whole queue: a hundred waiting messages do not mean a hundred lookups.
    */
   private routerQueueRetry: ReturnType<typeof setTimeout> | undefined
-  /**
-   * The report contents a PM was already woken for, by Assignment.
-   *
-   * A replayed report is one fact, not two, so the same content wakes a PM once. A wake-up that failed gives its key
-   * back, so a later report with the same content may try again once the node is reachable.
-   */
-  private readonly notifiedReports = new Map<string, Set<string>>()
   /** Callbacks waiting for the next node status of one Session, so an async event can settle an ensure. */
   private readonly statusWaiters = new Map<string, Set<() => void>>()
   /** Answers expected for an explicit `session.inspect`, keyed by its request id. */
@@ -1581,6 +1612,16 @@ export class ControlPlane {
    * offline, so a Session confirmed under another generation is re-ensured once rather than reported as current.
    */
   private nodeGeneration = randomUUID()
+  /**
+   * The trust generation of the node.
+   *
+   * It advances whenever the node's registration or its continuity changed — a control plane that restarted, or a node
+   * that came back from offline. It is durable, so a command that was made under an older trust is recognisable as such
+   * after a restart instead of quietly matching a node that is not the same one.
+   */
+  private trustEpoch = 0
+  /** Whether the deliveries a previous run left open have already been looked at. */
+  private reportRecoveryDone = false
   /** The periodic heartbeat timer, owned by this kernel so `close` can stop it. */
   private heartbeatTimer: ReturnType<typeof setTimeout> | undefined
   /** Whether the loop is running; also true while a beat is in flight, when no timer exists yet. */
@@ -1627,6 +1668,9 @@ export class ControlPlane {
     let consoleDb: ConsoleStore | undefined
     try {
       this.store = new Store(options.dbPath)
+      // The trust of the node starts a new generation: this control plane cannot prove that the connection it had before
+      // is still there, so it never claims to trust a node it did not register itself.
+      this.trustEpoch = this.advanceTrustEpoch(this.nodeGeneration)
       consoleDb = new ConsoleStore(options.consoleDbPath ?? join(dirname(options.dbPath), 'console.sqlite'), {
         ...(options.consoleEventRows === undefined ? {} : { eventRows: options.consoleEventRows }),
         ...(options.consoleEventDays === undefined ? {} : { eventDays: options.consoleEventDays }),
@@ -1676,6 +1720,51 @@ export class ControlPlane {
       })
       this.executor = executor
       this.domain = createKernelDomain(this.store, options.now, executor)
+      // The resolver of the one node: it reads this control plane's own records, so a target is never guessed and a
+      // failed resolution never falls back to a default.
+      this.resolver = new SingleNodeResolver({
+        nodeId: options.nodeId,
+        backendId: 'dsh',
+        session: sessionId => this.sessions.get(sessionId),
+        nodeStatus: () => this.nodes.get(options.nodeId),
+        ticket: ticketId => this.store.tickets.get(ticketId),
+        ticketOfAssignment: assignmentId => this.ticketOfAssignment(assignmentId),
+        project: projectId => this.store.projects.get(projectId),
+        routerSessionId: () => ROUTER_SESSION_ID,
+        nodeTrustEpoch: () => this.trustEpoch,
+        sessionLifecycleEpoch: sessionId => this.sessionLifecycleEpoch(sessionId),
+      })
+      // The coordination of the reports: its records live in this control plane's own file, in the same transaction as
+      // the reports they are about.
+      this.reports = new ReportCoordinator(this.store, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => 'dsh',
+        session: sessionId => this.sessions.get(sessionId),
+        project: projectId => this.store.projects.get(projectId),
+        routerSessionId: () => ROUTER_SESSION_ID,
+        resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
+        resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
+        deliver: (sessionId, text, idempotencyKey, validateForSend) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend),
+        reportOf: (ticketId, assignmentId) => {
+          // Only the Assignment that is still the Ticket's current one answers: a report of a replaced Worker is no
+          // longer a fact about the work that runs now.
+          const ticket = this.store.tickets.get(ticketId)
+          const current = ticket === undefined ? undefined : latestAssignment(ticket)
+          if (!ticket || !current || current.id !== assignmentId) return undefined
+          const report = current.report
+          if (report === undefined) return undefined
+          return { ...report, projectId: ticket.projectId ?? '', assignmentEpoch: assignmentEpochOf(ticket, assignmentId) }
+        },
+        reviewOf: (ticketId, assignmentId) => {
+          const ticket = this.store.tickets.get(ticketId)
+          const review = ticket === undefined ? undefined : pendingReview(ticket)
+          return review?.assignmentId === assignmentId ? review.id : undefined
+        },
+        targetEpochs: sessionId => this.targetEpochs(sessionId),
+        nodeTrustEpoch: () => this.trustEpoch,
+      }, { progressIntervalMs: options.reportProgressIntervalMs })
       // The scheduler keeps its plans in the console's own file, in tables of its own: the domain's schema is untouched, and
       // an old plugin binary never opens this file. The kernel owns the delivery — it is the only one that knows a Project's
       // PM Session and whether the node really holds it.
@@ -1712,6 +1801,101 @@ export class ControlPlane {
   get generation(): string { return this.nodeGeneration }
 
   /**
+   * The trust generation of the node.
+   *
+   * It is the number the resolver hands out with every target: a command that was made under an older trust belongs to
+   * an older node, and the difference is visible instead of silent.
+   */
+  private nodeTrustEpoch(): number { return this.trustEpoch }
+
+  /**
+   * Start a new trust generation for the node.
+   *
+   * The node came back, or this control plane just started: neither can prove that the connection it had before still
+   * holds the Sessions it confirmed, so the trust moves on and every Session is confirmed again under it.
+   */
+  private rotateNodeGeneration(): void {
+    this.nodeGeneration = randomUUID()
+    this.trustEpoch = this.advanceTrustEpoch(this.nodeGeneration)
+  }
+
+  /** Write the trust generation of the node down and return it; it never goes back. */
+  private advanceTrustEpoch(generation: string): number {
+    const known = this.store.get(KV.control.nodeTrust)
+    const epoch = (known?.epoch ?? 0) + (known?.generation === generation ? 0 : 1)
+    this.store.set(KV.control.nodeTrust, { generation, epoch })
+    return epoch
+  }
+
+  /**
+   * The lifecycle generation of a managed Session: a PM or the Router.
+   *
+   * It advances when the Session's life was ended and a person started it again. A refresh of the credential does not
+   * advance it, and neither does an ensure that found the Session missing after the node came back: a new token is a new
+   * credential, not a new life.
+   */
+  private sessionLifecycleEpoch(sessionId: string): number {
+    return this.store.get(KV.control.sessionEpoch(sessionId)) ?? 0
+  }
+
+  /** Start a new lifecycle generation for a managed Session. */
+  private advanceSessionLifecycle(sessionId: string): number {
+    const epoch = this.sessionLifecycleEpoch(sessionId) + 1
+    this.store.set(KV.control.sessionEpoch(sessionId), epoch)
+    return epoch
+  }
+
+  /**
+   * The generations of a target Session, read without waiting for the node.
+   *
+   * A managed Session (a PM or the Router) has a lifecycle of its own; a Worker has the lifecycle of the Assignment it
+   * runs. A delivery writes these down when it is enqueued, so a delivery that waits knows which life it was meant for
+   * and a target that was replaced in the meantime is refused instead of reached.
+   */
+  private targetEpochs(sessionId: string): { assignmentEpoch: number; toolTokenVersion: number } {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) return { assignmentEpoch: 0, toolTokenVersion: 0 }
+    const toolTokenVersion = record.tokenVersion ?? 0
+    if (record.role !== 'worker' || record.assignmentId === undefined) {
+      return { assignmentEpoch: this.sessionLifecycleEpoch(sessionId), toolTokenVersion }
+    }
+    const ticket = this.ticketOfAssignment(record.assignmentId)
+    return { assignmentEpoch: ticket === undefined ? 0 : assignmentEpochOf(ticket, record.assignmentId),
+      toolTokenVersion }
+  }
+
+  /**
+   * Deliver one coordination message to a Session.
+   *
+   * The target has to be ready before the message goes out: a Session the node has forgotten is re-ensured first, and
+   * an ensure that fails is a failure *before* the send — the message never left this control plane — which the
+   * coordination records as such rather than as a refusal by the node.
+   *
+   * The ensure takes time, and the life of the target may end while it is on its way. The check the coordination brings
+   * along is therefore carried through the ensure and run again immediately before the transport: a target that was
+   * revoked, replaced or stopped in the meantime does not receive the message.
+   */
+  private async deliverCoordinationMessage(sessionId: string, text: string, idempotencyKey: string,
+    validateForSend?: () => void): Promise<void> {
+    const record = this.requireSession(sessionId)
+    if (!this.isCurrentGeneration(record)) {
+      try {
+        await this.ensureForMessage(record)
+      } catch (error) {
+        // The check the coordination brings along runs here as well: the ensure failed because the life the delivery was
+        // planned for ended while it was on its way, and that more precise fact — stale, stopped or revoked — wins over
+        // the generic failure of the ensure. The check throws on its own, and its error leaves this control plane.
+        validateForSend?.()
+        throw new CoordinationTargetUnavailableError(redact(messageOf(error)).slice(0, 300))
+      }
+    }
+    // The check the coordination brings along runs here as well: the ensure took time, and the authority of the target
+    // may have ended while it was on its way. It runs again right before the transport.
+    validateForSend?.()
+    await this.sendMessage(sessionId, text, undefined, 'system', { idempotencyKey, validateForSend })
+  }
+
+  /**
    * Register this control plane with the node.
    *
    * Every call uses a fresh key: a node acknowledges a completed key without executing the command again, so a control
@@ -1723,6 +1907,29 @@ export class ControlPlane {
       version: registration.version ?? this.version, ...(registration.capabilities ? { capabilities: registration.capabilities } : {}) }
     await this.options.node.send({ ...this.base(this.uniqueKey('node-register', this.options.nodeId)), type: 'node.register',
       registration: value })
+    // The node is there: the deliveries a previous run left open can be looked at now, and only now.
+    await this.recoverReportDeliveries()
+  }
+
+  /**
+   * Look at the deliveries a previous run of this control plane left open.
+   *
+   * A delivery that was never sent is carried out again under its own key, after the report it is about and the target it
+   * names are read again. A delivery that was on its way when the process stopped has an unknown outcome: it is marked as
+   * unconfirmed and never sent again, because a blind resend would repeat a delivery that may have landed.
+   */
+  private async recoverReportDeliveries(): Promise<void> {
+    // The recovery belongs to the start of this control plane: a registration that happens later must not call a
+    // delivery that is on its way right now unconfirmed.
+    if (this.reportRecoveryDone) return
+    this.reportRecoveryDone = true
+    try {
+      await this.reports.recover()
+    } catch (error) {
+      // A recovery that fails is a diagnostic: the records stay as they are and the work continues.
+      process.stderr.write(`superagent control-plane report recovery failed: ${
+        error instanceof Error ? error.message : String(error)}\n`)
+    }
   }
 
   /**
@@ -2015,7 +2222,7 @@ export class ControlPlane {
    */
   nodeReconnected(): void {
     if (this.closed) return
-    this.nodeGeneration = randomUUID()
+    this.rotateNodeGeneration()
   }
 
   /**
@@ -2201,6 +2408,11 @@ export class ControlPlane {
       targetId: projectId, outcome: report.workers.failures.length === 0 ? 'ok' : 'failed',
       detail: `${project.title} · ${mode}` })
     if (!paused) await this.resumeDeferredPmNotifications(projectId)
+    // A hard pause ended the work of the Project: the wake-ups it held back are not to be woken behind a person's back,
+    // and they do not wait for a resume either.
+    if (paused && mode === 'hard') {
+      this.reports.settleHeldFor(projectId, 'blocked_target_inactive', `the Project ${projectId} is hard paused`)
+    }
     return { project: report.project, workers: report.workers }
   }
 
@@ -2219,6 +2431,8 @@ export class ControlPlane {
     // The domain ends the Project first, so no Assignment can start over a Worker that is on its way out.
     const ended = this.engine.stopProject(projectId, reason, { cleanups })
     const { stopped, failures } = await this.awaitCleanups(cleanups, workers)
+    // The Project is over: the wake-ups it held back will never be woken, and they do not wait for a resume either.
+    this.reports.settleHeldFor(projectId, 'rejected_stale_or_revoked', `the Project ${projectId} is ended`)
     this.audit.record({ actor: 'operator', kind: 'project', action: 'stopped', targetKind: 'project', targetId: projectId,
       outcome: failures.length === 0 ? 'ok' : 'failed', detail: project.title })
     return { project: ended, stopped, failures }
@@ -2254,6 +2468,8 @@ export class ControlPlane {
     }
     this.audit.record({ actor: 'operator', kind: 'project', action: 'archived', targetKind: 'project', targetId: projectId,
       outcome: failures.length === 0 ? 'ok' : 'failed', detail: project.title })
+    // The Project is over: the wake-ups it held back will never be woken, and they do not wait for a resume either.
+    this.reports.settleHeldFor(projectId, 'rejected_stale_or_revoked', `the Project ${projectId} is archived`)
     return { project: archived, stopped, failures }
   }
 
@@ -2399,6 +2615,14 @@ export class ControlPlane {
       throw new OperatorError(409, 'The Router Session was stopped by an operator and has to be resumed explicitly')
     }
     this.requireNodeOnline()
+    // The target is resolved before the node is asked: a Session that belongs to another node is not this control plane's
+    // Session. Whether it may be started again is decided by the gates above, not by the resolver.
+    if (known !== undefined) {
+      const resolved = this.resolver.resolveSessionNow(ROUTER_SESSION_ID, options.resume === true ? 'resume' : 'ensure')
+      if (!resolved.ok && resolved.code === 'OWNERSHIP_MISMATCH') {
+        throw new OperatorError(409, `The Router Session cannot be started again: ${resolved.reason}`)
+      }
+    }
     const pending = this.pendingEnsures.get(ROUTER_SESSION_ID)
     if (pending) {
       // A creation that is still in flight belongs to the stop that came before the resume: joining it would answer with
@@ -3971,23 +4195,57 @@ export class ControlPlane {
       ...(worker === undefined ? {} : { worker: { sessionId: worker.sessionId, status: worker.status } }) }
   }
 
-  pmReportProject(sessionId: string, summary: string): { projectId: string; report: ProjectReport } {
+  /**
+   * Record a PM's report about its own Project and deliver it to the Router.
+   *
+   * `kind` says what the report is: an ordinary `progress`, a `blocked` a person has to hear about, a `completed`
+   * milestone or a `failed` one. A report that names no kind is an ordinary progress report — it is throttled like any
+   * other — and never a blocker by accident. A blocker and a final go out at once: the Router has to see them without
+   * waiting for the interval.
+   *
+   * The report and the work of delivering it are written in one transaction: a report that was written always has its
+   * delivery work, and a delivery work always names a report that exists.
+   */
+  pmReportProject(sessionId: string, summary: string, kind: PmProjectReportKind = 'progress'):
+    { projectId: string; report: ProjectReport } {
     const { project } = this.requireProject(sessionId)
     if (project.status === 'archived' || project.status === 'ended') {
       throw new ToolCallError('invalid', `This Project is ${project.status}`)
     }
     const duplicate = project.latestReport?.summary === summary
-    const updated = duplicate ? project : this.engine.projectReport(project.id, summary)
+    const planned = this.store.atomic(() => {
+      const next = duplicate ? project : this.engine.projectReport(project.id, summary)
+      // The delivery is planned even when the Project already carries this summary: the kind says what the report is, and
+      // a blocker that repeats an earlier progress is still a blocker. The coordination's own key keeps a report that is
+      // already known from being delivered twice.
+      const result = this.reports.planProjectReport({
+        projectId: next.id,
+        sourceSessionId: sessionId,
+        summary: next.latestReport!.summary,
+        reportKind: projectReportKindOf(kind),
+        message: routerProjectReportMessage(next, next.latestReport!, kind),
+      })
+      return { project: next, delivery: result?.delivery }
+    })
+    const updated = planned.project
     const report = updated.latestReport!
     if (!duplicate) {
       this.audit.record({ actor: 'pm', kind: 'project', action: 'reported', targetKind: 'project',
         targetId: project.id, detail: project.title })
     }
-    const idempotencyKey = `project-report:${key(project.id, report.at, report.summary)}`
-    void this.ensureRouter().then(() =>
-      this.sendMessage(ROUTER_SESSION_ID, routerProjectReportMessage(updated, report), undefined, 'system',
-        { idempotencyKey })
-    ).catch(() => { /* The report remains available from the Project and Router summary. */ })
+    const delivery = planned.delivery
+    if (delivery !== undefined) {
+      // The Router is ensured first: a PM that reports on its Project reaches the Router, and the Router is the one
+      // Session of this control plane that may be created on demand. A Router an operator stopped or a person revoked
+      // stays as it is: the ensure refuses, and the delivery is recorded with that reason instead of waiting for a send
+      // that will never happen.
+      void this.ensureRouter()
+        .then(() => this.reports.deliver(delivery))
+        .catch((error: unknown) => {
+          const reason = redact(messageOf(error)).slice(0, 300)
+          this.reports.fail(delivery.deliveryId, 'blocked_target_inactive', reason)
+        })
+    }
     return { projectId: project.id, report }
   }
 
@@ -4182,6 +4440,14 @@ export class ControlPlane {
     if (record.projectId !== claims.pid || record.role !== claims.role || record.assignmentId !== claims.aid) {
       throw new ToolCallError('unauthenticated', 'The Session token does not match its Session record')
     }
+    // The token names the node and the backend it was minted for: a token of another node or another backend opens
+    // nothing here, so a callback that arrives with the wrong binding never reaches the work it names.
+    if (claims.nodeId !== record.nodeId) {
+      throw new ToolCallError('unauthenticated', 'The Session token names another node')
+    }
+    if (claims.backend !== 'dsh') {
+      throw new ToolCallError('unauthenticated', 'The Session token names another backend')
+    }
     // A revoked Session has no authority left, whatever its token says: the revocation is a fact about the Session, not
     // about one credential, so neither a fresh token nor an old one may open a route.
     if (record.revokedAt) {
@@ -4311,9 +4577,25 @@ export class ControlPlane {
     if (ticket.manualStop !== undefined) {
       card.manualStop = { scope: ticket.manualStop.scope, at: ticket.manualStop.at, by: ticket.manualStop.by }
     }
-    const notification = this.pmNotificationsByTicket.get(ticket.id)
+    const notification = this.pmNotificationOf(ticket.id)
     if (notification !== undefined) card.pmNotification = notification
     return card
+  }
+
+  /**
+   * The wake-up the PM of a Ticket's Project reads.
+   *
+   * The wake-up of this run is in memory; the one of a previous run is in the coordination's own durable record, so a PM
+   * that comes back after a restart of the control plane still sees what its Worker reported.
+   */
+  private pmNotificationOf(ticketId: string): PmNotification | undefined {
+    const known = this.pmNotificationsByTicket.get(ticketId)
+    if (known !== undefined) return known
+    const durable = this.reports.notificationOf(ticketId)
+    if (durable === undefined) return undefined
+    return { ticketId, projectId: durable.projectId, assignmentId: durable.assignmentId,
+      reportState: durable.reportState, at: durable.at, state: durable.state,
+      ...(durable.reason === '' ? {} : { reason: durable.reason }) }
   }
 
   /**
@@ -4863,6 +5145,12 @@ export class ControlPlane {
    * Project and its latest Assignment must still be this Worker's, so a replaced Worker cannot report on work a newer
    * Assignment owns. `engine.report` applies the report's own rules (an ended Ticket, a question beside a ready result).
    *
+   * The call is checked against the resolver before anything is written: the Session must still be the Worker of that
+   * Assignment, it must still be bound to this node, and the Assignment must still be the Ticket's current one. A call
+   * that arrives for a Worker of another node, or for an Assignment that was replaced, is refused here rather than
+   * written. A replay of a call that was already recorded is recognised before that check, so a report that ended its
+   * own Ticket is still answered as the call it was.
+   *
    * A call that names its own id is recorded with it: the report and the ledger entry are written in one transaction, so
    * a report that was written is always recorded, and a recorded call is never forgotten by a restart. The same call with
    * the same payload is a replay — it changes nothing and answers with the Ticket as it stands — and the same call with a
@@ -4895,7 +5183,25 @@ export class ControlPlane {
     const key = callKey !== undefined && callKey.trim() !== ''
       ? reportCallKey(sessionId, own, callKey.trim())
       : undefined
-    // One transaction: the report and its ledger entry are written together, or neither is.
+    // A call that was already recorded is a replay, and it is recognised before the work is checked again: a report that
+    // ended its own Ticket leaves nothing to check, and the call still has to be answered as the call it was.
+    if (key !== undefined) {
+      const prior = this.store.get(key)
+      if (prior !== undefined) return this.answerReportReplay(ticket, own, report, prior.payloadHash, payloadHash)
+    }
+    // The work is checked against the resolver right before it is written: the Session must still be the Worker of this
+    // Assignment, it must still be bound to this node, and the Assignment must still be the Ticket's current one.
+    const resolved = this.resolver.resolveAssignmentNow(ticketId, own, 'verify_callback')
+    if (!resolved.ok) {
+      // A binding that does not hold is a refusal; work that is over is an invalid call, as it always was.
+      const code: ToolCallErrorCode = resolved.code === 'OWNERSHIP_MISMATCH' || resolved.code === 'PERMISSION_REVOKED'
+        || resolved.code === 'MANUALLY_STOPPED' ? 'forbidden' : 'invalid'
+      throw new ToolCallError(code, `This Worker Session may not report for ${own}: ${resolved.reason}`)
+    }
+    if (resolved.handle.binding.nodeId !== this.options.nodeId || resolved.handle.binding.backendId !== 'dsh') {
+      throw new ToolCallError('forbidden', 'This Worker Session is not bound to this node and backend')
+    }
+    // One transaction: the report, its ledger entry and the work of delivering it are written together, or none of them is.
     const outcome = this.store.atomic(() => {
       if (key !== undefined) {
         const prior = this.store.get(key)
@@ -4904,7 +5210,8 @@ export class ControlPlane {
             throw new ToolCallError('invalid',
               'This report call was already recorded with a different payload; it cannot be reused')
           }
-          return { ticket: this.store.tickets.get(ticketId) ?? ticket, replay: true as const, prior }
+          return { ticket: this.store.tickets.get(ticketId) ?? ticket, replay: true as const, prior,
+            plan: undefined as ReportPlan | undefined }
         }
       }
       const written = this.engine.report(ticketId, report)
@@ -4913,7 +5220,10 @@ export class ControlPlane {
           notified: false, at: this.now() })
         this.pruneReportCalls(sessionId)
       }
-      return { ticket: written, replay: false as const, prior: undefined }
+      // The delivery of the report is planned in the same transaction as the report itself: a report that was written
+      // always has its delivery work, and a delivery work always names a report that exists.
+      return { ticket: written, replay: false as const, prior: undefined,
+        plan: this.planReportDelivery(written, own, key) }
     })
     if (outcome.replay) {
       // The call was already recorded: the work is not done twice, and the PM is not woken twice.
@@ -4928,8 +5238,29 @@ export class ControlPlane {
     // throws into this call: a PM that cannot be reached is a diagnostic, not a failed report.
     this.audit.record({ actor: 'worker', kind: 'report', action: report.state, targetKind: 'assignment',
       targetId: own, detail: `${ticket.title} · ${report.summary}` })
-    this.notifyOwnerOfReport(outcome.ticket, own, key)
+    this.carryOutReportDelivery(outcome.ticket, own, outcome.plan, key)
     return outcome.ticket
+  }
+
+  /**
+   * Answer a report call that was already recorded.
+   *
+   * The same call with the same payload is a replay: it changes nothing and answers with the Ticket as it stands. The
+   * same call with a different payload is a conflict, which is refused rather than written over the first one.
+   */
+  private answerReportReplay(ticket: Ticket, assignmentId: string, report: WorkerReport,
+    recordedHash: string, payloadHash: string): Ticket {
+    if (recordedHash !== payloadHash) {
+      throw new ToolCallError('invalid',
+        'This report call was already recorded with a different payload; it cannot be reused')
+    }
+    this.audit.record({ actor: 'worker', kind: 'report', action: 'duplicate', targetKind: 'assignment',
+      targetId: assignmentId, outcome: 'skipped', detail: `${ticket.title} · 这个调用已经记录过` })
+    const notification: PmNotification = { ticketId: ticket.id, projectId: ticket.projectId ?? '',
+      assignmentId, reportState: report.state, at: this.now(), state: 'skipped',
+      reason: 'this report call was already recorded' }
+    this.pmNotificationsByTicket.set(ticket.id, notification)
+    return this.store.tickets.get(ticket.id) ?? ticket
   }
 
   /**
@@ -4976,32 +5307,44 @@ export class ControlPlane {
   }
 
   /**
-   * Wake the Project's PM with one Worker report.
+   * Plan the delivery of one Worker report.
    *
-   * The message names the Project, the Ticket, the Assignment and the report itself, and it carries the Worker's own
-   * text as data. It goes to the PM Session of the report's own Project and to no other, so one Project's work never
-   * wakes another's PM.
+   * The coordination owns the routing and the record; this method owns the facts of the report and the one case the
+   * coordination cannot hold by itself — a Project that is paused, whose wake-up waits in the domain's own records for the
+   * resume.
    *
-   * A report that must not wake the PM is skipped and recorded: a Project that is not active (archived or ended), a PM
-   * that does not exist (the control plane never creates one on its own), and a report the PM already knows. A message the
-   * node refuses or cannot receive is recorded as failed with a redacted diagnostic; the report stays written either way.
-   *
-   * A paused Project is the one case that waits instead of being given up: it has no PM to wake now, so the wake-up is
-   * held back and sent when the Project is resumed — if the result still waits for the PM's decision by then.
-   *
-   * The wake-up is not awaited: the PM's Session may be busy with a turn of its own, and a Worker must never wait for
-   * the PM. The message is queued by the node, which starts the PM's turn when it can.
+   * The plan is written inside the report's own transaction, so a report that was written always has its delivery work.
    */
-  private notifyOwnerOfReport(ticket: Ticket, assignmentId: string, ledgerKey?: Key<ReportCallRecord>): void {
+  private planReportDelivery(ticket: Ticket, assignmentId: string,
+    ledgerKey?: Key<ReportCallRecord>): ReportPlan {
     const report = latestAssignment(ticket)?.report
-    if (!report) return
-    const projectId = ticket.projectId ?? ''
-    // A ready result waits for the PM's decision, and the decision names the review: the wake-up carries that id, so the
-    // PM decides the round it was told about and a new round with the same text is a new fact, not a replayed one.
+    if (report === undefined) {
+      return { state: 'skipped', reason: 'the report is no longer the current one of its Assignment',
+        ...(ledgerKey === undefined ? {} : { ledgerKey }) }
+    }
+    const facts = this.reportFacts(ticket, assignmentId, report)
+    const result = this.reports.planReport(facts, pmReportMessage(facts))
+    if (result.state === 'deferred') {
+      // A paused Project has no PM to wake. The report stays written, and the wake-up waits for the resume: the PM decides
+      // on the result when the Project is active again, and only then.
+      this.store.set(KV.control.deferredPmReport(ticket.id), { facts, ...(ledgerKey === undefined ? {} : { ledgerKey }) })
+    }
+    const withKey = { facts, ...(ledgerKey === undefined ? {} : { ledgerKey }) }
+    if (result.state === 'deliver' && result.delivery !== undefined) return { ...withKey, delivery: result.delivery }
+    return { ...withKey, state: result.state === 'deliver' ? 'skipped' : result.state, reason: result.reason }
+  }
+
+  /**
+   * The facts one report gives its superior.
+   *
+   * A ready result waits for the PM's decision, and the decision names the review: the wake-up carries that id, so the PM
+   * decides the round it was told about and a new round with the same text is a new fact, not a replayed one.
+   */
+  private reportFacts(ticket: Ticket, assignmentId: string, report: NonNullable<Assignment['report']>): PmReportFacts {
     const review = report.state === 'ready' ? pendingReview(ticket) : undefined
     const reviewId = review?.assignmentId === assignmentId ? review.id : undefined
-    const facts: PmReportFacts = {
-      projectId,
+    return {
+      projectId: ticket.projectId ?? '',
       ticketId: ticket.id,
       ticketTitle: ticket.title,
       assignmentId,
@@ -5010,84 +5353,70 @@ export class ControlPlane {
       ...(reviewId === undefined ? {} : { reviewId }),
       ...(ticket.attention === undefined ? {} : { question: ticket.attention.question }),
       at: report.at,
+      nodeId: this.options.nodeId,
+      backendId: 'dsh',
     }
-    const record: PmNotification = { ticketId: ticket.id, projectId, assignmentId, reportState: report.state,
-      at: this.now(), state: 'pending' }
-    this.pmNotificationsByTicket.set(ticket.id, record)
-    const finish = (state: PmNotification['state'], reason?: string): void => {
-      record.state = state
-      if (reason !== undefined) record.reason = reason
-    }
-    const project = projectId === '' ? undefined : this.store.projects.get(projectId)
-    // Every outcome that will not wake the PM settles the call: the PM will not learn this report from here, so the call
-    // is recorded as notified and a replay of it asks nothing of the PM again.
-    if (projectId !== '' && !project) {
-      finish('skipped', 'the Project of the Ticket does not exist')
-      this.markReportNotified(ledgerKey)
-      return
-    }
-    if (project && project.status === 'paused') {
-      // A paused Project has no PM to wake. The report stays written, and the wake-up waits for the resume: the PM decides
-      // on the result when the Project is active again, and only then.
-      this.store.set(KV.control.deferredPmReport(ticket.id), { facts, ...(ledgerKey === undefined ? {} : { ledgerKey }) })
-      finish('deferred', 'the Project is paused; the wake-up waits for the resume')
-      return
-    }
-    if (project && project.status !== 'active') {
-      finish('skipped', `the Project is ${project.status}`)
-      this.markReportNotified(ledgerKey)
-      return
-    }
-    const manager = this.sessions.get(project?.pmSessionId ?? ROUTER_SESSION_ID)
-    if (!manager) {
-      finish('skipped', project ? 'the Project has no PM Session' : 'the Router has no Session')
-      this.markReportNotified(ledgerKey)
-      return
-    }
-    if (project && (manager.role !== 'pm' || manager.projectId !== project.id)) {
-      finish('skipped', 'the PM Session does not belong to the Project')
-      this.markReportNotified(ledgerKey)
-      return
-    }
-    // The wake-up runs in the background: the PM's Session may be busy, and the Worker's report must not wait for it.
-    void this.sendPmWakeUp(manager.sessionId, facts, ledgerKey).then(
-      (outcome) => { finish(outcome.state, outcome.error) },
-      (error: unknown) => { finish('failed', redact(messageOf(error)).slice(0, 300)) })
   }
 
   /**
-   * Send one PM wake-up, and record what the PM learned.
+   * Carry out the delivery of one Worker report, and record what the superior learned.
    *
-   * The report's own content is the key: the same Assignment reporting the same content is one fact, so the PM is woken
-   * once for it. A wake-up that failed gives its key back, so a later report with the same content may try again once the
-   * node is reachable, and the report's own ledger entry stays unnotified for the same reason.
+   * The wake-up is not awaited: the PM's Session may be busy with a turn of its own, and a Worker must never wait for
+   * the PM. The message is queued by the node, which starts the PM's turn when it can.
    */
-  private async sendPmWakeUp(managerSessionId: string, facts: PmReportFacts, ledgerKey?: Key<ReportCallRecord>):
-    Promise<{ state: 'sent' | 'skipped' | 'failed'; error?: string }> {
-    const reportKey = pmReportKey(facts)
-    const known = this.notifiedReports.get(facts.assignmentId) ?? new Set<string>()
-    if (known.has(reportKey)) {
-      // The PM already knows this report: the call is recorded as notified and a replay asks nothing of the PM again.
+  private carryOutReportDelivery(ticket: Ticket, assignmentId: string, plan: ReportPlan | undefined,
+    ledgerKey?: Key<ReportCallRecord>): void {
+    const record: PmNotification = { ticketId: ticket.id, projectId: ticket.projectId ?? '', assignmentId,
+      reportState: plan?.facts?.reportState ?? '', at: this.now(), state: 'pending' }
+    this.pmNotificationsByTicket.set(ticket.id, record)
+    if (plan === undefined) return
+    if (plan.state === 'skipped') {
+      record.state = 'skipped'
+      if (plan.reason !== undefined) record.reason = plan.reason
       this.markReportNotified(ledgerKey)
-      return { state: 'skipped', error: 'the PM already knows this report' }
+      return
     }
-    known.add(reportKey)
-    // The oldest key goes first, so one Assignment that reports many different texts keeps a bounded memory.
-    while (known.size > NOTIFIED_REPORTS_PER_ASSIGNMENT) {
-      const oldest = known.values().next().value
-      if (oldest === undefined) break
-      known.delete(oldest)
+    if (plan.state === 'deferred') {
+      record.state = 'deferred'
+      if (plan.reason !== undefined) record.reason = plan.reason
+      return
     }
-    this.notifiedReports.set(facts.assignmentId, known)
-    try {
-      await this.sendMessage(managerSessionId, pmReportMessage(facts), undefined, 'system',
-        facts.reviewId === undefined ? {} : { idempotencyKey: key('pm-report', reportKey) })
+    if (plan.delivery === undefined) {
+      record.state = 'skipped'
+      record.reason = plan.reason ?? 'the PM already knows this report'
       this.markReportNotified(ledgerKey)
-      return { state: 'sent' }
-    } catch (error) {
-      known.delete(reportKey)
-      return { state: 'failed', error: redact(messageOf(error)).slice(0, 300) }
+      return
     }
+    void this.deliverPlannedReport(plan).then(
+      (outcome) => {
+        record.state = outcome.state
+        if (outcome.reason !== undefined) record.reason = outcome.reason
+        // A delivery that settled settles the call: the PM will not learn this report from anywhere else, so a replay of
+        // it asks nothing of the PM again. A delivery that failed does not: the report may be tried once more.
+        if (outcome.state === 'sent' || outcome.state === 'skipped') this.markReportNotified(ledgerKey)
+      },
+      (error: unknown) => {
+        record.state = 'failed'
+        record.reason = redact(messageOf(error)).slice(0, 300)
+      })
+  }
+
+  /**
+   * Deliver one planned report and say what really happened.
+   *
+   * The delivery is the coordination's own: the target is resolved again right before the message goes out, so a target
+   * that was stopped, replaced or taken away in the meantime is refused instead of being reached.
+   */
+  private async deliverPlannedReport(plan: ReportPlan): Promise<{ state: PmNotification['state']; reason?: string }> {
+    if (plan.delivery === undefined) return { state: 'skipped', reason: plan.reason }
+    const outcome = await this.reports.deliver(plan.delivery)
+    // The durable record is the authority: it knows the state the delivery really reached, including the ones the
+    // outcome alone cannot name.
+    const state: PmNotification['state'] = outcome.delivery === undefined
+      ? outcome.state === 'sent' ? 'sent'
+        : outcome.state === 'pending' ? 'pending' : outcome.state === 'skipped' ? 'skipped' : 'failed'
+      : notificationStateOf(outcome.delivery.status)
+    return { state, ...(outcome.reason === undefined ? {} : { reason: outcome.reason }) }
   }
 
   /**
@@ -5100,6 +5429,10 @@ export class ControlPlane {
    *
    * The wake-up is sent once. The entry is dropped as soon as it is sent, so a second resume asks nothing of the PM again,
    * and the report's own ledger entry is marked, so a replay of the same report asks nothing either.
+   *
+   * The wake-ups the coordination itself held back are carried out again as well: a report that was made while the
+   * Project was active, but whose delivery could not go out before the pause, keeps its place in the coordination's own
+   * record and goes out under the same key once the Project is active again.
    */
   private async resumeDeferredPmNotifications(projectId: string): Promise<void> {
     const project = this.store.projects.get(projectId)
@@ -5121,9 +5454,10 @@ export class ControlPlane {
         reportState: entry.facts.reportState, at: this.now(), state: 'pending' }
       this.pmNotificationsByTicket.set(ticket.id, record)
       try {
-        const outcome = await this.sendPmWakeUp(manager.sessionId, entry.facts, entry.ledgerKey)
+        const plan = this.planDeferredReport(entry.facts)
+        const outcome = await this.deliverPlannedReport(plan)
         record.state = outcome.state
-        if (outcome.error !== undefined) record.reason = outcome.error
+        if (outcome.reason !== undefined) record.reason = outcome.reason
         const current = this.store.get(entryKey as ReturnType<typeof KV.control.deferredPmReport>)
         if (outcome.state !== 'failed' && current && pmReportKey(current.facts) === pmReportKey(entry.facts)) {
           this.store.delete(entryKey)
@@ -5132,6 +5466,38 @@ export class ControlPlane {
         this.resumingPmNotifications.delete(entryKey)
       }
     }
+    await this.resumeHeldReportDeliveries(projectId)
+  }
+
+  /**
+   * Carry out the deliveries a paused Project held back, and only the ones that still wait.
+   *
+   * The delivery is the very same one: it keeps its own key, so the report is one delivery and not two. The report, the
+   * Worker that made it and the review round it waits for are read again before it goes out, and a delivery that is on
+   * its way or whose receipt is missing is never carried out again — the message may already have landed.
+   */
+  private async resumeHeldReportDeliveries(projectId: string): Promise<void> {
+    for (const row of this.reports.heldFor(projectId)) {
+      if (this.store.projects.get(projectId)?.status !== 'active') return
+      const record: PmNotification = { ticketId: row.ticketId, projectId, assignmentId: row.assignmentId,
+        reportState: row.reportKind, at: row.at, state: 'pending' }
+      this.pmNotificationsByTicket.set(row.ticketId, record)
+      const outcome = await this.deliverPlannedReport({ delivery: row })
+      record.state = outcome.state
+      if (outcome.reason !== undefined) record.reason = outcome.reason
+    }
+  }
+
+  /**
+   * Plan the delivery of a wake-up that a paused Project held back.
+   *
+   * The facts are the ones the report carried, so the delivery says exactly what the superior is told: the same Ticket,
+   * the same Assignment, the same review round and the same text.
+   */
+  private planDeferredReport(facts: PmReportFacts): ReportPlan {
+    const result = this.store.atomic(() => this.reports.planReport(facts, pmReportMessage(facts)))
+    if (result.state === 'deliver' && result.delivery !== undefined) return { facts, delivery: result.delivery }
+    return { facts, state: result.state === 'deliver' ? 'skipped' : result.state, reason: result.reason }
   }
 
   /**
@@ -5150,8 +5516,51 @@ export class ControlPlane {
     return pendingReview(ticket)?.id === facts.reviewId
   }
 
-  /** The PM wake-ups this control plane made for Worker reports, newest last. */
-  pmNotifications(): PmNotification[] { return [...this.pmNotificationsByTicket.values()] }
+  /**
+   * The PM wake-ups this control plane made for Worker reports, newest last.
+   *
+   * The wake-ups of this run are in memory, and the ones of a previous run are in the coordination's own durable record:
+   * a control plane that starts again still tells the PM of its Project what its Workers reported and what happened to
+   * the report, instead of showing an empty page.
+   */
+  pmNotifications(): PmNotification[] {
+    const known = new Map(this.pmNotificationsByTicket)
+    for (const ticket of this.tickets()) {
+      if (known.has(ticket.id)) continue
+      const durable = this.reports.notificationOf(ticket.id)
+      if (durable === undefined) continue
+      known.set(ticket.id, { ticketId: ticket.id, projectId: durable.projectId, assignmentId: durable.assignmentId,
+        reportState: durable.reportState, at: durable.at, state: durable.state,
+        ...(durable.reason === '' ? {} : { reason: durable.reason }) })
+    }
+    // A wake-up a paused Project holds back is durable as well: it waits in the domain's own records for the resume.
+    for (const entryKey of this.store.keys(KV.control.deferredPmReport)) {
+      const entry = this.store.get(entryKey as ReturnType<typeof KV.control.deferredPmReport>)
+      if (!entry || known.has(entry.facts.ticketId)) continue
+      known.set(entry.facts.ticketId, { ticketId: entry.facts.ticketId, projectId: entry.facts.projectId,
+        assignmentId: entry.facts.assignmentId, reportState: entry.facts.reportState, at: entry.facts.at,
+        state: 'deferred', reason: 'the Project is paused; the wake-up waits for the resume' })
+    }
+    return [...known.values()]
+  }
+
+  /**
+   * The deliveries the coordination recorded, newest last.
+   *
+   * Every report delivery leaves a row: the target and the source, the node and the backend it came from, how many times
+   * it was attempted and the state it reached. A delivery that failed is visible here with its reason. The body of the
+   * report is not part of the view: it is the lower-trust text of the Worker or the PM, and a console shows what happened
+   * to a delivery rather than what it said.
+   */
+  coordinationDeliveries(limit = 50): CoordinationDeliveryView[] { return this.reports.views(limit) }
+
+  /**
+   * The smallest interval between two ordinary progress reports, in milliseconds.
+   *
+   * It is the setting the deployment made: `0` delivers every ordinary progress report at once, and the default holds a
+   * report back for a minute so that a Worker which reports after every step does not wake its superior for every step.
+   */
+  get reportProgressIntervalMs(): number { return this.reports.progressInterval }
 
   /** The Session a tool call acts as; a token of the wrong role is refused before any domain check runs. */
   private requireToolSession(sessionId: string, role: 'pm' | 'worker' | 'router'): SessionRecord {
@@ -5265,6 +5674,16 @@ export class ControlPlane {
     if (known && this.operatorStopRefusal(known)) {
       throw new SessionEnsureError(`The Worker Session ${sessionId} was stopped by an operator and cannot be created again`)
     }
+    // The execution target is resolved through the one resolver: the Assignment must still be the Ticket's current one
+    // and the Worker Session that runs it must still be bound to it. An Assignment no Ticket owns is left alone: the
+    // nominal entry point and the older protocol tests name Assignments the domain never had.
+    const owned = this.ticketOfAssignment(assignmentId)
+    if (owned !== undefined) {
+      const resolved = await this.resolver.resolveForAssignment(owned.id, assignmentId, 'dispatch')
+      if (!resolved.ok) {
+        throw new SessionEnsureError(`The Worker Session ${sessionId} cannot be created: ${resolved.reason}`)
+      }
+    }
     const pending = this.pendingEnsures.get(sessionId)
     if (pending) return pending
     const existing = this.sessions.get(sessionId)
@@ -5360,6 +5779,14 @@ export class ControlPlane {
 
   private async ensurePm(project: ProjectProfile, workspace?: string, options: { resume?: boolean } = {}): Promise<SessionRecord> {
     const existing = this.sessions.get(project.pmSessionId)
+    // The target is resolved before the node is asked: a Session that belongs to another node is not this control plane's
+    // Session. Whether it may be started again is decided by the gates below, not by the resolver.
+    if (existing !== undefined) {
+      const resolved = this.resolver.resolveSessionNow(project.pmSessionId, options.resume === true ? 'resume' : 'ensure')
+      if (!resolved.ok && resolved.code === 'OWNERSHIP_MISMATCH') {
+        throw new SessionEnsureError(`The PM Session ${project.pmSessionId} cannot be ensured: ${resolved.reason}`)
+      }
+    }
     // A confirmed record from an older generation is re-ensured rather than inspected: the node's answer would be the
     // same stale fact the generation already told us not to trust.
     const stale = existing !== undefined && this.needsReensure(existing)
@@ -5478,11 +5905,14 @@ export class ControlPlane {
    * `options.idempotencyKey` names the node's own key, so a delivery that is repeated under the same key is executed by the
    * node at most once — that is how a scheduled run keeps its own identity across a retry. `options.allowEnsure: false`
    * forbids the re-ensure below: a scheduled task never starts a Session on its own, so a Session the node may have
-   * forgotten is a failure and not something to bring back.
+   * forgotten is a failure and not something to bring back. `options.validateForSend` is the check that runs immediately
+   * before the message goes on the wire: the caller knows which life the message was meant for, and the message leaves
+   * this control plane only while that life still holds.
    */
   async sendMessage(sessionId: string, text: string, inputIds?: readonly string[],
     origin: 'operator' | 'system' = 'operator',
-    options: { idempotencyKey?: string; allowEnsure?: boolean; routerModel?: RouterModel } = {}): Promise<void> {
+    options: { idempotencyKey?: string; allowEnsure?: boolean; routerModel?: RouterModel;
+      validateForSend?: () => void } = {}): Promise<void> {
     let record = this.requireSession(sessionId)
     // A revoked Session is not a running Session: a message must not bring it back, and it must not re-ensure it either.
     if (record.revokedAt) throw new Error(`Session ${sessionId} was revoked`)
@@ -5501,6 +5931,10 @@ export class ControlPlane {
       || this.stoppingSessions.has(sessionId)) {
       throw new Error(`Session ${sessionId} is not running`)
     }
+    // The target is resolved before the message goes out: the ownership of the work, the state of the Project the Session
+    // belongs to and the lifecycle of its Assignment are read at that moment, not when the message was written.
+    const before = await this.resolver.resolveForSession(sessionId, 'message')
+    if (!before.ok) throw new Error(`Session ${sessionId} is not running: ${before.reason}`)
     this.requireNodeOnline()
     // A node restart leaves the record confirmed under an older generation while its Agent is gone; the node would refuse
     // the message as "session not loaded" and fail the Assignment. Ensure the Session first, then re-read the record: the
@@ -5518,10 +5952,20 @@ export class ControlPlane {
       // The Session may have been stopped by an operator while it was re-ensured; a message must not revive it either.
       const stoppedAfterEnsure = this.operatorStopRefusal(record)
       if (stoppedAfterEnsure !== undefined) throw new Error(`Session ${sessionId} is not running: ${stoppedAfterEnsure}`)
+      // The target is resolved again: the ensure may have taken long enough for the work to move on, and a message meant
+      // for the previous Worker must not reach the one that replaced it.
+      const after = await this.resolver.resolveForSession(sessionId, 'message')
+      if (!after.ok) throw new Error(`Session ${sessionId} is not running: ${after.reason}`)
+      if (after.generation.assignmentEpoch !== before.generation.assignmentEpoch) {
+        throw new Error(`Session ${sessionId} is not running: its Assignment was replaced while it was re-ensured`)
+      }
     }
     const token = this.tokens.get(sessionId) ?? this.issueToken(record)
     this.tokens.set(sessionId, token)
     const key = options.idempotencyKey ?? this.uniqueKey('message', sessionId)
+    // The last check before the transport. It runs here and not earlier: everything before this line may await, and a
+    // check that waits is a check that may already be outdated when the message goes out.
+    options.validateForSend?.()
     await this.options.node.send({ ...this.base(key), type: 'session.message', sessionId, text,
       sessionToken: token, ...(inputIds && inputIds.length ? { inputIds } : {}),
       ...(options.routerModel ? { routerModel: options.routerModel } : {}) })
@@ -5584,6 +6028,13 @@ export class ControlPlane {
     const record = this.sessions.get(sessionId)
     // A Session that was never created has no Worker behind it, so there is nothing to stop.
     if (!record) return
+    // The target is resolved before the node is asked: the Session must still be the one this control plane holds, and it
+    // must still be bound to this node. A stop reaches a Session whose work is over — that is how the cleanup after an
+    // ended or a revoked Worker happens — so the resolver does not refuse it on that account.
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'stop')
+    if (!resolved.ok && resolved.code !== 'TARGET_NOT_FOUND') {
+      throw new OperatorError(409, `The Session ${sessionId} cannot be stopped: ${resolved.reason}`)
+    }
     // A Session whose lifecycle is over needs no mark: it will not be brought back by anything.
     const marked = !SESSION_TERMINAL.has(record.status)
     if (marked) this.stoppingSessions.add(sessionId)
@@ -5815,6 +6266,13 @@ export class ControlPlane {
   async stopSessionByOperator(sessionId: string, reason?: string):
     Promise<{ stopped: boolean; scope: 'session' | 'assignment'; confirmed: boolean; error?: string }> {
     const record = this.requireSession(sessionId)
+    // The target is resolved before the node is asked: the Session must still be the one this control plane holds and must
+    // still be bound to this node. A stop reaches a Session whose work is over — that is how the cleanup after an ended
+    // or a revoked Session happens — so the resolver does not refuse it on that account.
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'stop')
+    if (!resolved.ok && resolved.code !== 'TARGET_NOT_FOUND') {
+      throw new OperatorError(409, `The Session ${sessionId} cannot be stopped: ${resolved.reason}`)
+    }
     if (record.role === 'worker') {
       return this.withSessionOperation(sessionId, async () => {
         const current = this.requireSession(sessionId)
@@ -5917,6 +6375,24 @@ export class ControlPlane {
     const stopped = this.operatorStopRefusal(record)
     if (stopped !== undefined) {
       return { interrupted: false, confirmed: false, refusal: 'stopped', error: stopped }
+    }
+    // The target is resolved through the one resolver: the ownership of the work and the lifecycle of its Assignment are
+    // read there, so an interrupt cannot reach a Worker whose Assignment is no longer the Ticket's current one.
+    const resolution = await this.resolver.resolveForSession(sessionId, 'interrupt')
+    if (!resolution.ok) {
+      if (resolution.code === 'PERMISSION_REVOKED') {
+        return { interrupted: false, confirmed: false, refusal: 'revoked', error: resolution.reason }
+      }
+      if (resolution.code === 'MANUALLY_STOPPED') {
+        return { interrupted: false, confirmed: false, refusal: 'stopped', error: resolution.reason }
+      }
+      if (resolution.code === 'STALE_GENERATION') {
+        return { interrupted: false, confirmed: false, refusal: 'replaced', error: resolution.reason }
+      }
+      if (resolution.code === 'TARGET_NOT_FOUND') {
+        return { interrupted: false, confirmed: false, refusal: 'no-running-turn', error: resolution.reason }
+      }
+      return { interrupted: false, confirmed: false, error: resolution.reason }
     }
     if (!this.nodeSupportsTurnInterrupt()) {
       return { interrupted: false, confirmed: false, refusal: 'unsupported',
@@ -6084,6 +6560,10 @@ export class ControlPlane {
    */
   private async stopManagerSession(record: SessionRecord, reason: string):
     Promise<{ stopped: boolean; error?: string }> {
+    // The Session's life ends here: a delivery that was enqueued for it before the stop belongs to the life that is
+    // over, and it is refused when it goes out. An ordinary re-ensure and a credential refresh never move this
+    // generation, so a routine refresh does not invalidate a delivery.
+    this.advanceSessionLifecycle(record.sessionId)
     this.markOperatorStop(record, reason)
     const pending = this.pendingEnsures.get(record.sessionId)
     let unconfirmed = false
@@ -6326,6 +6806,12 @@ export class ControlPlane {
     if (selected.revokedAt) {
       throw new OperatorError(409, `The Session ${sessionId} was revoked; a revoked Session cannot be resumed`)
     }
+    // The target is resolved before the node is asked: the Session must still be the one this control plane holds. The
+    // resume is the operator's own path, so it reaches a Session a person stopped — nothing else does.
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'resume')
+    if (!resolved.ok && resolved.code !== 'TARGET_NOT_FOUND') {
+      throw new OperatorError(409, `The Session ${sessionId} cannot be resumed: ${resolved.reason}`)
+    }
     if (selected.role === 'worker') {
       throw new OperatorError(409, `A Worker Session is not resumed on its own: resume its Ticket, `
         + 'which lets the Project PM start a new Assignment')
@@ -6360,6 +6846,8 @@ export class ControlPlane {
       const at = this.now()
       // The cancels of the stops before this one are stale from now on: a late cancel must not stop the Session again.
       this.advanceSessionEpoch(sessionId)
+      // The Session comes back with a new lifecycle: a command that was meant for the stopped Session is stale now.
+      this.advanceSessionLifecycle(sessionId)
       // A report of the stop that came before this resume is about the old lifecycle and must not stop the Session again.
       this.resumedSessions.add(sessionId)
       delete record.operatorStop
@@ -6906,6 +7394,9 @@ export class ControlPlane {
       clearTimeout(this.routerQueueRetry)
       this.routerQueueRetry = undefined
     }
+    // The coordination's own timer stops with it, and a flush that is running is waited for: a held-back report waits
+    // for a control plane that is still there, and a delivery that is on its way is written down before the file closes.
+    await this.reports.close()
     // The scheduler writes to the console's own file, so it is stopped before that file is closed: a delivery still in
     // flight gets its record written instead of finding a closed database.
     await this.stopScheduler()
@@ -7073,6 +7564,11 @@ export class ControlPlane {
 
   /** Ask the node for one Session's status; undefined when it cannot answer. */
   private async tryInspect(sessionId: string): Promise<SessionInspection | undefined> {
+    // The target is resolved before the node is asked: the Session must still be the one this control plane holds and must
+    // still be bound to this node. An inspection is a read of the operator's own picture, so it reaches a Session whose
+    // work is over — a stopped or a revoked one is exactly what an operator wants to look at.
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'reconcile')
+    if (!resolved.ok && resolved.code !== 'TARGET_NOT_FOUND') return undefined
     const inspect = this.options.node.inspect
     if (inspect) {
       try {
@@ -7201,8 +7697,15 @@ export class ControlPlane {
     try {
       if (assignment.state === 'running') this.engine.deliveryFailed(ticketId, assignmentId, error)
       else if (ticket.assignments.at(-1)?.id === assignmentId) {
-        const written = this.engine.report(ticketId, { state: 'failed', summary: error })
-        if (ticket.projectId === undefined) this.notifyOwnerOfReport(written, assignmentId)
+        // The report and the work of delivering it are written together, so a report that was written always has its
+        // delivery work. Only a standalone Ticket has a superior here: the Router, which owns the Tickets no Project
+        // owns. A failure inside a Project stays on the Ticket and in the Project's own view.
+        const plan = this.store.atomic(() => {
+          const written = this.engine.report(ticketId, { state: 'failed', summary: error })
+          if (written.projectId !== undefined) return undefined
+          return this.planReportDelivery(written, assignmentId)
+        })
+        if (plan !== undefined) this.carryOutReportDelivery(ticket, assignmentId, plan)
       }
     } catch {
       // The Ticket ended or changed meanwhile: the failure no longer has a live record to update.
@@ -7261,7 +7764,7 @@ export class ControlPlane {
     const previous = this.nodes.get(status.nodeId)
     this.nodes.set(status.nodeId, status)
     if (status.nodeId === this.options.nodeId && status.online && previous !== undefined && previous.online === false) {
-      this.nodeGeneration = randomUUID()
+      this.rotateNodeGeneration()
     }
     // Only a change of liveness is a fact worth keeping: a heartbeat that repeats what is already known is not an event.
     if (previous?.online !== status.online) {
@@ -7390,6 +7893,11 @@ export class ControlPlane {
     }
     const record = this.sessions.get(event.sessionId)
     if (!record) return
+    // A state change is only applied when it comes from the node the Session is bound to. The event carries the node it
+    // came from, and the Session record names the node it belongs to: an event of another node is not this Session's
+    // business. An event that names no node is left alone: an older node does not send one, and its Sessions are still
+    // the ones this control plane holds.
+    if (event.nodeId !== '' && event.nodeId !== record.nodeId) return
     if (event.type === 'session.status') {
       // A report of the stop that came before a resume is about the old lifecycle: it must not stop the resumed Session.
       const stale = this.resumedSessions.has(event.sessionId)

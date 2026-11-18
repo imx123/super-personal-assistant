@@ -55,6 +55,7 @@ node lib/control.js                      dsh --profile superagent-node
 | `SUPERAGENT_CONSOLE_EVENT_DAYS` | 控制面 | 否 | 事件保留天数，默认 7；0 关闭按天数清理 |
 | `SUPERAGENT_CONSOLE_AUDIT_DAYS` | 控制面 | 否 | 审计保留天数，默认 0，表示长期保留 |
 | `SUPERAGENT_RECONCILE_INTERVAL_MS` | 控制面 | 否 | 自动清理残留会话的间隔（毫秒）。默认 `0`，可在节点部署页手动检查。 |
+| `SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS` | 控制面 | 否 | 同一上级收到两条**普通进展**报告的最小间隔（毫秒）。默认 `60000`（一分钟）：Worker 每一步都汇报时，上级不会每一步都被叫醒。`0` = 每条普通进展立刻送达。终态、阻塞、失败、丢弃、就绪**不**受此节流影响。非法值启动失败 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 控制面 | 否 | 定时任务的**固定**时基偏移（分钟，东为正），默认 `0` = UTC。取值范围 −720…840，非法值启动失败。用命名时区会带上夏令时规则，所以这里只给固定偏移；控制台会把这个偏移显示出来 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 控制面 | 否 | 调度器查看「到点计划」的周期（毫秒），不设置时用模块自己的默认（5 秒）。`0` = 计划仍然存在，但**不自己**到点运行，只能手动跑 |
 | `SUPERAGENT_WORKSPACE_ROOT` | 控制面 | 否 | 默认 `<node root>/workspaces`；**必须**在 `SUPERAGENT_NODE_ROOT` 之内，否则节点报 `Workspace escapes the node root` |

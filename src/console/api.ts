@@ -431,9 +431,61 @@ export interface StopNotice {
   error?: string
 }
 
-/** One node as the control plane knows it. */
-export interface NodeView {
+/**
+ * One delivery of a report, as the console reads it.
+ *
+ * It carries the facts of the delivery and never the body of the report: the stored message is the lower-trust text of
+ * the Worker or the PM, and a console shows what happened to a delivery rather than what it said.
+ */
+export interface CoordinationDelivery {
+  /** The delivery's own id. */
+  deliveryId: string
+  /** `worker_report` or `pm_report`. */
+  kind: string
+  /** When the delivery was accepted. */
+  at: string
+  /** The state the delivery reached. */
+  status: string
+  /** The kind of the report. */
+  reportKind: string
+  /** The Project the report belongs to. */
+  projectId: string
+  /** The Ticket the report is about. */
+  ticketId: string
+  /** The Assignment the report is about. */
+  assignmentId: string
+  /** The review round the report waits for. */
+  reviewId: string
+  /** The Session that made the report. */
+  sourceSessionId: string
+  /** The Session the report is delivered to. */
+  targetSessionId: string
+  /** What the target Session is for. */
+  targetRole: string
+  /** The node the report came from. */
   nodeId: string
+  /** The backend the report came from. */
+  backendId: string
+  /** How many times the delivery was attempted. */
+  attemptCount: number
+  /** The lifecycle generation of the target when the delivery was enqueued. */
+  expectedAssignmentEpoch: number
+  /** The credential version of the target when the delivery was enqueued. */
+  expectedToolTokenVersion: number
+  /** The node trust the delivery was made under. */
+  expectedNodeTrustEpoch: number
+  /** The lifecycle generation of the Assignment the report is about. */
+  sourceAssignmentEpoch: number
+  /** When a held-back delivery may go out. */
+  dueAt: string
+  /** When the delivery was claimed and went on its way. */
+  dispatchedAt: string
+  /** Why the delivery failed, when it did. */
+  error: string
+}
+
+/** One node as the control plane knows it. */
+export interface NodeView {  nodeId: string
   backend: string
   version: string
   online: boolean

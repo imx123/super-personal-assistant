@@ -49,6 +49,8 @@ Worker 报告沿用当前业务流程。`ready` 是节点工具现有协议里�
 
 `coordination_deliveries` 独立于控制台事件日志，保存目标与来源、幂等键、代际、尝试次数、授权条件和消息到期时间。确认过的节点入箱为 `delivered_inbox`，有后端消费证据才标记 `consumed_turn`。重启时先重验当前授权及代际，再按发送阶段处理。确证尚未发送且仍有效的记录可用同一键补交。发送尝试中断后需按键查原节点的接收证据；查不到则标记 `unconfirmed`，仅在节点明确证明未接收、授权仍有效时受控补发一次。旧 Relay Proposal 在未确认、已过期或目标失效时不产生可重试记录。
 
+投递状态本身也是一套受限词汇：`accepted_pending`、`dispatching`、`delivered_inbox`、`consumed_turn`、`unconfirmed`、`blocked_target_inactive`、`blocked_node_unavailable`、`rejected_stale_or_revoked`、`failed_permanent`、`superseded`、`deferred_for_resume`。其中 `superseded` 记录“这条进展已被更新的报告取代”——终态报告到达时，尚未发出的旧进展就地作废，绝不晚于终态送达。`deferred_for_resume` 记录“这条唤醒在等待项目恢复”：报告作出时项目仍在运行，但 Project 在投递送出前被软暂停，唤醒随记录保留，恢复后以同一幂等键补送；硬暂停、结束与撤权仍是 `blocked_target_inactive` 或 `rejected_stale_or_revoked`，不等待恢复。相同语义身份（工单、Assignment、验收轮次、报告类别、内容摘要）只允许存在一条仍然打开的投递记录，这一唯一性由表自身保证，重启后依然成立；`unconfirmed` 属于“仍然打开”，所以一条“已尝试但无回执”的报告不会被同内容的新调用再发一次。控制台通过 `GET /v1/console/coordination/deliveries` 读取这些状态，只看投递事实（目标、状态、节点、原因），不返回报告正文。
+
 ## 5. 外部事件投递模式
 
 | 模式 | 创建权限与目标 |

@@ -11,10 +11,11 @@
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
-  messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket, type FastRouteReceipt,
-  type NodeView, type Overview, type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun,
-  type RouterHandoffRecord, type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan,
-  type ScheduleRun, type SessionMessage, type SessionView, type StopNotice,
+  messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket,
+  type CoordinationDelivery, type FastRouteReceipt, type NodeView, type Overview, type ProjectGateRecord,
+  type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord, type RouterQueueEntry,
+  type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView,
+  type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -489,6 +490,73 @@ const QUEUE_STATE: Record<string, string> = {
   routed: '快路由已自行处理',
 }
 
+/** What became of the delivery of a report, in the console's own words. */
+const COORDINATION_STATUS: Record<string, string> = {
+  accepted_pending: '已接受，待发送',
+  dispatching: '投递中',
+  delivered_inbox: '已送达收件箱',
+  consumed_turn: '已被回合读取',
+  unconfirmed: '节点未确认是否送达',
+  blocked_target_inactive: '目标已停用',
+  blocked_node_unavailable: '节点不可用',
+  rejected_stale_or_revoked: '权限或代际已失效',
+  failed_permanent: '永久失败',
+  superseded: '已被更新的报告取代',
+  deferred_for_resume: '等待项目恢复',
+}
+
+/** How the console shows a delivery's state: done, broken, or still on its way. */
+function coordinationTone(status: string): string {
+  if (status === 'delivered_inbox' || status === 'consumed_turn') return 'success'
+  if (status === 'unconfirmed' || status === 'failed_permanent' || status === 'blocked_node_unavailable') return 'failure'
+  if (status === 'blocked_target_inactive' || status === 'rejected_stale_or_revoked') return 'failure'
+  return 'muted'
+}
+
+/** What a delivery is about, in one line: the Ticket, the Assignment and the kind of the report. */
+function coordinationSubject(delivery: CoordinationDelivery): string {
+  const parts: string[] = []
+  if (delivery.ticketId !== '') parts.push(`工单 ${delivery.ticketId}`)
+  if (delivery.assignmentId !== '') parts.push(`执行 ${delivery.assignmentId}`)
+  parts.push(delivery.reportKind)
+  return parts.join(' · ')
+}
+
+/**
+ * The deliveries of the reports a Worker and a PM made, as the console shows them.
+ *
+ * It shows what happened to each delivery — the target, the state, the reason when there is one — and never the body of
+ * the report: the stored message is the lower-trust text of the Worker or the PM, and a console that showed it would show
+ * untrusted text as if it were the control plane's own.
+ */
+function CoordinationDeliveries(props: { deliveries: CoordinationDelivery[] }): ReactElement {
+  return (
+    <div className="router-queue" aria-label="报告投递记录">
+      <p className="quiet">Worker 与 PM 的报告投递给谁、投递到哪一步。报告正文不在这里展示。</p>
+      {props.deliveries.length === 0
+        ? <p className="empty">还没有报告投递记录。</p>
+        : <ul className="router-queue-list">
+          {props.deliveries.map(delivery => (
+            <li key={delivery.deliveryId} className={coordinationTone(delivery.status) === 'failure' ? 'failure' : ''}>
+              <span className="router-queue-text">{coordinationSubject(delivery)}</span>
+              <span className={`chip ${coordinationTone(delivery.status)}`}>
+                {COORDINATION_STATUS[delivery.status] ?? delivery.status}
+              </span>
+              <span className="quiet">
+                {' '}· 目标 {delivery.targetSessionId}（{delivery.targetRole}）
+              </span>
+              <span className="quiet">
+                {' '}· 节点 {delivery.nodeId} / {delivery.backendId}
+              </span>
+              {delivery.attemptCount > 0 ? <span className="quiet"> · 尝试 {delivery.attemptCount} 次</span> : null}
+              {delivery.error ? <span className="quiet"> · {delivery.error}</span> : null}
+            </li>
+          ))}
+        </ul>}
+    </div>
+  )
+}
+
 /**
  * The messages a person sent to the Router, as the console shows them.
  *
@@ -683,6 +751,8 @@ export function HomePage(props: PageProps): ReactElement {
   const overview = useLoaded(() => read<Overview>('/v1/overview'), props.revision)
   const activity = useLoaded(() => read<{ entries: AuditEntry[] }>('/v1/audit?limit=24'), props.revision)
   const router = useLoaded(() => read<RouterState>('/v1/console/router'), props.revision)
+  const coordination = useLoaded(() => read<{ deliveries: CoordinationDelivery[] }>(
+    '/v1/console/coordination/deliveries?limit=24'), props.revision)
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<(RouterTextAttachment & { bytes: number })[]>([])
   const [attachmentError, setAttachmentError] = useState('')
@@ -698,6 +768,7 @@ export function HomePage(props: PageProps): ReactElement {
   const routes: FastRouteReceipt[] = router.data?.routes ?? []
   const gates: ProjectGateRecord[] = router.data?.gates ?? []
   const handoffs: RouterHandoffRecord[] = router.data?.handoffs ?? []
+  const deliveries: CoordinationDelivery[] = coordination.data?.deliveries ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -1000,6 +1071,14 @@ export function HomePage(props: PageProps): ReactElement {
               })}
             </ol>}
         </div>
+      </section>
+
+      <section className="section" aria-labelledby="coordination-title">
+        <div className="section-heading">
+          <h2 id="coordination-title">报告投递</h2>
+          <span className="quiet">来自控制面的持久投递记录</span>
+        </div>
+        <CoordinationDeliveries deliveries={deliveries} />
       </section>
     </>
   )

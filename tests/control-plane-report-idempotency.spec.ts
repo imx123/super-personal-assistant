@@ -38,13 +38,18 @@ async function until(predicate: () => boolean, message: string, timeoutMs = 3000
   }
 }
 
-/** A control plane with a node, listening on a random port. */
+/**
+ * A control plane with a node, listening on a random port.
+ *
+ * The ordinary progress reports go out at once here: this file is about the call ledger — how often a fact reaches the
+ * PM — and a throttle would hide what the ledger does.
+ */
 async function open(): Promise<void> {
   directory = mkdtempSync(join(tmpdir(), 'superagent-report-'))
   const root = join(directory, 'workspaces')
   node = new FakeNode({ nodeId: 'local', root, now: () => START })
   control = new ControlPlane({ dbPath: join(directory, 'control.sqlite'), nodeId: 'local', node, secret: SECRET,
-    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50 })
+    workspaceRoot: root, now: () => START, confirmationTimeoutMs: 50, reportProgressIntervalMs: 0 })
   await control.registerNode()
   server = new ControlPlaneServer(control, { token: API_TOKEN })
   address = await server.listen(0)
@@ -128,7 +133,7 @@ describe('the call-level idempotency of a Worker report', () => {
     expect(node.messages.get(pmSessionId)).toHaveLength(1)
   })
 
-  it('keeps the report contents it remembers bounded, and forgets the oldest ones', async () => {
+  it('remembers every report content it has seen, however many there are', async () => {
     await open()
     const { pmSessionId, ticketId, workerToken } = await projectWithWorker()
 
@@ -138,9 +143,13 @@ describe('the call-level idempotency of a Worker report', () => {
     }
     await until(() => (node.messages.get(pmSessionId)?.length ?? 0) >= 40, 'the PM was not woken for every content')
 
-    // The oldest content is no longer remembered, so it may wake the PM once more. The memory is bounded, never endless.
+    // The oldest content is still remembered: the record of what the superior knows is durable and is not bounded by a
+    // number of reports, so the same fact never wakes the PM a second time.
     expect((await report(workerToken, ticketId, 'call-old', 'progress', '第 0 步')).status).toBe(200)
-    await until(() => (node.messages.get(pmSessionId)?.length ?? 0) > 40, 'the forgotten content did not wake the PM again')
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(node.messages.get(pmSessionId)).toHaveLength(40)
+    expect(control!.pmNotifications()[0]).toMatchObject({ state: 'skipped' })
+    expect(control!.pmNotifications()[0]!.reason).toContain('already knows')
   })
 
   it('does not wake the PM a second time after a restart of the control plane', async () => {

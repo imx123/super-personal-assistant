@@ -48,7 +48,22 @@ export const KV = {
      */
     reportCall: family<ReportCallRecord, [scope: string, callId: string]>('control/report-call:'),
     /** The latest PM notification held back by a pause, one per Ticket. */
-    deferredPmReport: family<{ facts: PmReportFacts; ledgerKey?: Key<ReportCallRecord> }, [ticketId: string]>('control/deferred-pm-report:') },
+    deferredPmReport: family<{ facts: PmReportFacts; ledgerKey?: Key<ReportCallRecord> }, [ticketId: string]>('control/deferred-pm-report:'),
+    /**
+     * The trust generation of the node, with the node generation it belongs to.
+     *
+     * It advances whenever the node's registration or its continuity changed: a control plane that restarted cannot prove
+     * that the old connection is still there, so it starts a new trust generation rather than trusting the old one.
+     */
+    nodeTrust: record<{ generation: string; epoch: number }>('control/node-trust'),
+    /**
+     * The lifecycle generation of a managed Session, by Session id.
+     *
+     * It advances when the Session's life was ended and a person started it again. A refresh of the Session's credential
+     * does not advance it, and neither does an ensure that found the Session missing after the node came back: a new
+     * token is a new credential, not a new life.
+     */
+    sessionEpoch: family<number, [sessionId: string]>('control/session-epoch:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */
   queues: { relays: record<{ id: string; text: string }[]>('relay-queue'), unsubscribed: record<string[]>('subscription-results'),
     prompts: record<number | null>('prompt-notification'), settings: record<number | null>('settings-notification') },

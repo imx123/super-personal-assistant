@@ -134,6 +134,25 @@ function schedulerTickMs(env: Record<string, string | undefined>): number | unde
   return milliseconds
 }
 
+/**
+ * The smallest interval between two ordinary progress reports, in milliseconds.
+ *
+ * Unset keeps the kernel's own default of a minute. `0` delivers every ordinary progress report at once, which is what a
+ * deployment that wants to see every turn of a busy Worker asks for. A configured value must be a whole number of
+ * milliseconds; anything else fails startup before the kernel takes the database lock, because a typo must not silently
+ * turn the throttle off or into an unbounded one.
+ */
+function reportProgressIntervalMs(env: Record<string, string | undefined>): number | undefined {
+  const value = env.SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS
+  if (value === undefined || value === '') return undefined
+  if (!/^\d+$/.test(value)) throw new Error('SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS is invalid')
+  const milliseconds = Number(value)
+  if (!Number.isSafeInteger(milliseconds) || milliseconds > 2_147_483_647) {
+    throw new Error('SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS is invalid')
+  }
+  return milliseconds
+}
+
 function retentionNumber(env: Record<string, string | undefined>, name: string, minimum: number): number | undefined {
   const raw = env[name]
   if (!raw) return undefined
@@ -243,6 +262,7 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
   const eventRows = retentionNumber(env, 'SUPERAGENT_CONSOLE_EVENT_ROWS', 1)
   const eventDays = retentionNumber(env, 'SUPERAGENT_CONSOLE_EVENT_DAYS', 0)
   const auditDays = retentionNumber(env, 'SUPERAGENT_CONSOLE_AUDIT_DAYS', 0)
+  const progressInterval = reportProgressIntervalMs(env)
 
   const nodeUrl = env.SUPERAGENT_NODE_URL
   const node: NodePort = options.node ?? (nodeUrl
@@ -255,7 +275,8 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
     ...(auditDays === undefined ? {} : { consoleAuditDays: auditDays }),
     ...(refreshGraceSeconds === undefined ? {} : { sessionTokenRefreshGraceSeconds: refreshGraceSeconds }),
     ...(schedulerOffset === undefined ? {} : { schedulerTimeZoneOffsetMinutes: schedulerOffset }),
-    ...(schedulerTick === undefined ? {} : { schedulerTickMs: schedulerTick }) }
+    ...(schedulerTick === undefined ? {} : { schedulerTickMs: schedulerTick }),
+    ...(progressInterval === undefined ? {} : { reportProgressIntervalMs: progressInterval }) }
   const control = new ControlPlane(controlOptions)
   hasSessions = () => control.sessions.size !== 0
   // The viewer token is optional: unset (or empty), the API keeps exactly the single-token behaviour it always had.
