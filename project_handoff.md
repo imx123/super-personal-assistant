@@ -14,12 +14,12 @@
 | P3-Gate | 验收通过。已在同一版核对两条真实闭环、停止与重启、项目门禁和兼容回归。 | 受测代码 `b2ff528` |
 | P4-0 协作事件与节点解析 | 设计与共享类型已签收。 | `154c313` |
 | P4-1 单节点报告协调 | 已通过真实 DSH 双报告、停止与重启验收，已合入本地 `next`。 | `b9e68ba` |
-| P4-3 权限拒绝审查 | Claude Code 实施，Codex 独立验收。 | `phase4/p4-3` |
+| P4-3 权限拒绝审查 | 已通过双端守卫、一次上报、人工申请与重启验收，已合入本地 `next`。 | `5111373` |
 | P4-2、P4-4 至 P4-Gate、Phase 5 记忆 | 尚未开始实施。 | — |
 
 P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定向回归通过。真实 DSH 核对了两条闭环、会话干预和 Worker 停止后的重启恢复。全量测试的遗留问题和真实证据见 [P3-Gate 记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p3-gate)。
 
-`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-1 已签收，当前实施 P4-3 权限拒绝审查，其后是摘要、外部事件订阅与投递恢复。Phase 4 验收通过后进入三域记忆。 [P4-1 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-1) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
+`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-1 和 P4-3 已签收。下一项是 P4-2 上级按需订阅直属下级会话的增量摘要，随后是外部事件订阅与投递恢复。Phase 4 验收通过后进入三域记忆。 [P4-1 与 P4-3 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-1) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
 
 `feat/multi-node` 由跨设备负责人实施和验收。两条线共用 `NodeResolver` 接口。双 Windows 通过 Tailscale 验收后，在临时集成工作树复跑双机用例、单节点回滚和届时的主线用例。Android 是后续扩展。 [跨设备计划](docs/roadmap/MULTI_NODE_PLAN_v1.1.md)
 
@@ -39,6 +39,7 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 
 - 从 Router 或 Worker 会话可向独立工单追加指令。旧 Worker 会话会拒绝发送，避免把消息交给接替它的 Worker。会话页分别显示已送达、已排队和发送失败，两次主动发送相同文字各算一条消息。
 - 硬暂停会列出节点未确认停止的工单。软暂停期间待验收的报告会记录到数据库，项目恢复后，控制面核对当前派工和验收轮次，再把仍待验收的报告通知 PM。
+- 权限守卫拒绝会进入独立审查记录。窗口内达到阈值后通知直属上级，Router 自身的审查进入操作员控制台。上级可按审查编号提交人工授权申请，操作员可在首页记录决定。实际权限变更须由操作员另行处理。 [权限拒绝审查](docs/022-phase4-coordination-architecture.zh-CN.md#6-p4-3-权限拒绝审查实现口径)
 - 更改任务时区并重启控制面后，重新保存日或周计划即可按新偏移计算下次运行。按间隔运行的计划保留原节奏。调度器开始执行每条计划时读取当时有效的正文和目标项目。
 
 ## 3. 两套入口与数据归属
