@@ -1,7 +1,7 @@
 /** The node-only entry: Sessions driven by DSH services alone, the RoleProfile's permission, and the environment fail-fast. */
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { listenFetchLoopback } from './fixtures/fetch-port.ts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -530,8 +530,7 @@ describe('plugin apply', () => {
 
   it('fails when another process already holds the port', async () => {
     external = createServer()
-    await new Promise<void>(resolve => external!.listen(0, '127.0.0.1', resolve))
-    const port = (external.address() as AddressInfo).port
+    const { port } = await listenFetchLoopback(external)
     process.env.SUPERAGENT_NODE_TOKEN = 'node-token'
     process.env.SUPERAGENT_NODE_PORT = String(port)
     process.env.SUPERAGENT_NODE_ROOT = root

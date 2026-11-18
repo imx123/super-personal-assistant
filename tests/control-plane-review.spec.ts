@@ -18,7 +18,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Assignment, ProjectProfile, Ticket, TicketReview, Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import type { NodeCommand, SessionRecord } from '../src/shared/protocol.ts'
 

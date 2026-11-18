@@ -5,13 +5,13 @@
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { createServer, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { listenFetchLoopback } from './fixtures/fetch-port.ts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ControlPlane, type ControlPlaneState } from '../src/control/control-plane.ts'
 import { DEFAULT_COMMAND_TIMEOUT_MS, HttpNodePort } from '../src/control/http-node.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeStatus } from '../src/shared/protocol.ts'
 
 const SECRET = 'command-timeout-secret'
@@ -90,19 +90,14 @@ function listenHalfReachableNode(): Promise<HalfReachableNode> {
       hung.push(res)
     })
   })
-  return new Promise((resolve, reject) => {
-    node.once('error', reject)
-    node.listen(0, '127.0.0.1', () => {
-      node.off('error', reject)
-      const address = node.address() as AddressInfo
-      closeNode = () => new Promise<void>((done, fail) => {
-        for (const res of hung.splice(0)) res.destroy()
-        // A held command answer and the open event stream must not keep the server from closing.
-        node.closeAllConnections()
-        node.close(error => error ? fail(error) : done())
-      })
-      resolve({ url: `http://127.0.0.1:${address.port}`, state })
+  return listenFetchLoopback(node).then(({ url }) => {
+    closeNode = () => new Promise<void>((done, fail) => {
+      for (const res of hung.splice(0)) res.destroy()
+      // A held command answer and the open event stream must not keep the server from closing.
+      node.closeAllConnections()
+      node.close(error => error ? fail(error) : done())
     })
+    return { url, state }
   })
 }
 

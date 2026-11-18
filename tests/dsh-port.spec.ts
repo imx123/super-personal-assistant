@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { createDshPortHost } from '../src/node/dsh-port-host.ts'
 import { DshNodePort, type DshPortEvent, type DshPortHost } from '../src/node/dsh-port.ts'
-import { startNodeHttpServer } from '../src/node/http-server.ts'
+import { startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodeStatus, type RoleProfile, type SessionInspection }
   from '../src/shared/protocol.ts'
 

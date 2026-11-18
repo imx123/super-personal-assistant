@@ -11,8 +11,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Assignment, ProjectProfile, Ticket, Trigger } from '../src/core/index.ts'
 import { ControlPlane, DEFAULT_TOKEN_REFRESH_GRACE_SECONDS } from '../src/control/control-plane.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
-import { startControlPlane } from '../src/control/start.ts'
+import { FetchControlPlaneServer, startFetchControlPlane } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { issueSessionToken, SessionTokenError, verifySessionToken } from '../src/shared/session-token.ts'
 
@@ -24,7 +23,7 @@ const TTL = 120
 
 let directory = ''
 let control: ControlPlane | undefined
-let server: ControlPlaneServer | undefined
+let server: FetchControlPlaneServer | undefined
 let node: FakeNode
 
 function trigger(id: string): Trigger {
@@ -82,31 +81,9 @@ async function open(ttl: number | null = TTL, grace?: number): Promise<Opened> {
   const assignment = created!.assignments[0]!
   await until(() => control!.store.tickets.get(created!.id)?.assignments.at(-1)?.state === 'running',
     'the Assignment did not start')
-  const url = await listenToolServer()
+  server = new FetchControlPlaneServer(control, { token: API_TOKEN })
+  const { url } = await server.listen()
   return { project, pm, ticket: control.store.tickets.get(created!.id)!, assignment, url }
-}
-
-/**
- * Listen on a port the fetch implementation accepts.
- *
- * The runtime's fetch refuses a small set of ports; an ephemeral port can land on one, which would make every request in a
- * test fail with `bad port`. A public health request over the new listener detects that and picks another port.
- */
-async function listenToolServer(): Promise<string> {
-  for (let attempt = 0; attempt < 10; attempt++) {
-    server = new ControlPlaneServer(control!, { token: API_TOKEN })
-    const address = await server.listen(0)
-    try {
-      const health = await fetch(`${address.url}/health`)
-      await health.text()
-      if (health.ok) return address.url
-    } catch {
-      // The port was refused before any request reached the server: close and try another one.
-    }
-    await server.close()
-    server = undefined
-  }
-  throw new Error('Could not listen on a port the fetch implementation accepts')
 }
 
 function tokenOf(sessionId: string): string {
@@ -374,11 +351,11 @@ describe('Session token refresh', () => {
 
     for (const value of ['soon', '-1', '1.5']) {
       const node = new FakeNode({ nodeId: NODE_ID, root, now: () => START })
-      await expect(startControlPlane({ env: { ...env, SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS: value }, node }))
+      await expect(startFetchControlPlane({ env: { ...env, SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS: value }, node }))
         .rejects.toThrow('SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS is invalid')
     }
 
-    const started = await startControlPlane({ env: { ...env, SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS: '0' },
+    const started = await startFetchControlPlane({ env: { ...env, SUPERAGENT_TOKEN_REFRESH_GRACE_SECONDS: '0' },
       node: new FakeNode({ nodeId: NODE_ID, root, now: () => START }), heartbeatMs: 0 })
     try {
       expect(started.control.tokenRefreshGraceSeconds).toBe(0)

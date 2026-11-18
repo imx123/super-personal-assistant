@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createDshPortHost } from '../src/node/dsh-port-host.ts'
 import { DshNodePort, type DshPortEvent, type DshPortHost } from '../src/node/dsh-port.ts'
-import { startNodeHttpServer } from '../src/node/http-server.ts'
+import { startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
 import {
   NODE_PROTOCOL_VERSION,
   type NodeCommand,

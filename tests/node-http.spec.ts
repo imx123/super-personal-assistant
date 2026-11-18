@@ -6,7 +6,7 @@ import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
-import { startNodeHttpServer } from '../src/node/http-server.ts'
+import { startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent } from '../src/shared/protocol.ts'
 
 const NODE_TOKEN = 'node-http-test-token'

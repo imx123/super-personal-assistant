@@ -1,6 +1,6 @@
 /** HttpNodePort.inspect bounds the whole inspect: opening the SSE stream, POSTing the command, and waiting for the answer. */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { listenFetchLoopback } from './fixtures/fetch-port.ts'
 import { afterEach, describe, expect, it } from 'vitest'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent } from '../src/shared/protocol.ts'
@@ -14,18 +14,13 @@ let closeServer: (() => Promise<void>) | undefined
 /** Start a loopback HTTP server whose every answer is controlled by the test. */
 function listen(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<{ url: string }> {
   const server = createServer(handler)
-  return new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      server.off('error', reject)
-      const address = server.address() as AddressInfo
-      closeServer = () => new Promise<void>((done, fail) => {
-        // Open SSE connections and a never-answered command must not keep the server from closing.
-        server.closeAllConnections()
-        server.close(error => error ? fail(error) : done())
-      })
-      resolve({ url: `http://127.0.0.1:${address.port}` })
+  return listenFetchLoopback(server).then(address => {
+    closeServer = () => new Promise<void>((done, fail) => {
+      // An open SSE stream or held response must not keep the server from closing.
+      server.closeAllConnections()
+      server.close(error => error ? fail(error) : done())
     })
+    return address
   })
 }
 

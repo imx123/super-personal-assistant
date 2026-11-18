@@ -3,7 +3,7 @@
  * stops on unsubscribe, and never turns `inspect` into an endless retry loop.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { listenFetchLoopback } from './fixtures/fetch-port.ts'
 import { afterEach, describe, expect, it } from 'vitest'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { NODE_PROTOCOL_VERSION, type NodeEvent } from '../src/shared/protocol.ts'
@@ -26,18 +26,13 @@ async function until(predicate: () => boolean, message: string, timeoutMs = 4000
 /** Start a loopback HTTP server whose every answer is controlled by the test. */
 function listen(handler: (req: IncomingMessage, res: ServerResponse) => void): Promise<{ url: string }> {
   const server = createServer(handler)
-  return new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      server.off('error', reject)
-      const address = server.address() as AddressInfo
-      closeServer = () => new Promise<void>((done, fail) => {
-        // An open SSE connection must not keep the server from closing.
-        server.closeAllConnections()
-        server.close(error => error ? fail(error) : done())
-      })
-      resolve({ url: `http://127.0.0.1:${address.port}` })
+  return listenFetchLoopback(server).then(address => {
+    closeServer = () => new Promise<void>((done, fail) => {
+      // An open SSE stream or held response must not keep the server from closing.
+      server.closeAllConnections()
+      server.close(error => error ? fail(error) : done())
     })
+    return address
   })
 }
 

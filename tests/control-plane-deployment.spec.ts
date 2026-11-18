@@ -2,7 +2,8 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { startControlPlane, type StartedControlPlane } from '../src/control/start.ts'
+import type { StartedControlPlane } from '../src/control/start.ts'
+import { startFetchControlPlane } from './fixtures/fetch-servers.ts'
 import { readNodeEnvironment } from '../src/node/plugin.ts'
 import type { DeploymentScope, DeploymentView } from '../src/shared/deployment.ts'
 
@@ -15,7 +16,7 @@ let env: Record<string, string>
 let running: StartedControlPlane | undefined
 
 async function start(): Promise<void> {
-  running = await startControlPlane({ env, heartbeatMs: 0 })
+  running = await startFetchControlPlane({ env, heartbeatMs: 0 })
 }
 
 function request(path: string, token = initialKey, body?: unknown): Promise<Response> {

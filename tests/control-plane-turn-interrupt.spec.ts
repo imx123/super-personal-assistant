@@ -19,7 +19,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { ConsoleStore } from '../src/control/console-store.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { FakeNode, type FakeNodeOptions } from '../src/node/fake-node.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent } from '../src/shared/protocol.ts'
 

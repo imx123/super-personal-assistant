@@ -22,7 +22,7 @@ import { ControlPlane } from '../src/control/control-plane.ts'
 import { ConsoleStore } from '../src/control/console-store.ts'
 import { evaluateProjectGate, explicitProjectRequest, ProjectGateError, readProjectGateDecision, workAuthorization,
   type ProjectGateDecision } from '../src/control/project-gate.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 
 const SECRET = 'project-gate-secret'

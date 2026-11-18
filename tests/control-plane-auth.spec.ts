@@ -9,8 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
-import { startControlPlane } from '../src/control/start.ts'
+import { FetchControlPlaneServer as ControlPlaneServer, startFetchControlPlane } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 
 const OPERATOR_TOKEN = 'control-operator-token'
@@ -254,10 +253,10 @@ describe('control-plane read-only viewer', () => {
       SUPERAGENT_CONTROL_PORT: '0',
     }
     const startNode = new FakeNode({ nodeId: 'local', root: join(directory, 'equal', 'workspaces') })
-    await expect(startControlPlane({ env, node: startNode, heartbeatMs: 0 })).rejects.toThrow(/must differ/)
+    await expect(startFetchControlPlane({ env, node: startNode, heartbeatMs: 0 })).rejects.toThrow(/must differ/)
 
     // The refused startup closed the kernel it had already opened: the same database starts immediately, with no lock.
-    const recovered = await startControlPlane({ env: { ...env, SUPERAGENT_CONTROL_VIEWER_TOKEN: VIEWER_TOKEN },
+    const recovered = await startFetchControlPlane({ env: { ...env, SUPERAGENT_CONTROL_VIEWER_TOKEN: VIEWER_TOKEN },
       node: startNode, heartbeatMs: 0 })
     try {
       expect((await read(recovered.address.url, '/v1/state', VIEWER)).status).toBe(200)
@@ -276,7 +275,7 @@ describe('control-plane read-only viewer', () => {
       SUPERAGENT_CONTROL_PORT: '0',
     }
     const startNode = new FakeNode({ nodeId: 'local', root: join(directory, 'started', 'workspaces') })
-    const running = await startControlPlane({ env, node: startNode, heartbeatMs: 0 })
+    const running = await startFetchControlPlane({ env, node: startNode, heartbeatMs: 0 })
     try {
       expect((await read(running.address.url, '/v1/state', VIEWER)).status).toBe(200)
       const refused = await fetch(`${running.address.url}/v1/nodes/local/heartbeat`, { method: 'POST', headers: VIEWER })

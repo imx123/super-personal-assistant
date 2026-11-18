@@ -4,8 +4,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane, SessionEnsureError } from '../src/control/control-plane.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
-import { startControlPlane } from '../src/control/start.ts'
+import { ControlPlaneServer as ProductionControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer, startFetchControlPlane } from './fixtures/fetch-servers.ts'
 import { KV } from '../src/kv.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type SessionInspection }
@@ -450,7 +450,7 @@ describe('control-plane cross-layer outcomes', () => {
       async inspect(sessionId) { return { sessionId, found: false } },
     }
     const closeControl = vi.spyOn(ControlPlane.prototype, 'close')
-    const closeServer = vi.spyOn(ControlPlaneServer.prototype, 'close')
+    const closeServer = vi.spyOn(ProductionControlPlaneServer.prototype, 'close')
     const env = {
       SUPERAGENT_CONTROL_TOKEN: API_TOKEN,
       SUPERAGENT_CONTROL_DB: join(directory, 'startup', 'control.sqlite'),
@@ -459,7 +459,7 @@ describe('control-plane cross-layer outcomes', () => {
       SUPERAGENT_CONTROL_PORT: '0',
     }
 
-    await expect(startControlPlane({ env, node })).rejects.toThrow(/registration refused/)
+    await expect(startFetchControlPlane({ env, node })).rejects.toThrow(/registration refused/)
     expect(closeControl).toHaveBeenCalled()
     expect(closeServer).toHaveBeenCalled()
   })
@@ -474,7 +474,7 @@ describe('control-plane cross-layer outcomes', () => {
       SUPERAGENT_NODE_ID: 'local',
       SUPERAGENT_CONTROL_PORT: '0',
     }
-    const started = await startControlPlane({ env, node })
+    const started = await startFetchControlPlane({ env, node })
     try {
       expect(started.address.port).toBeGreaterThan(0)
       const health = await fetch(`${started.address.url}/health`)

@@ -9,11 +9,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { HttpNodePort } from '../src/control/http-node.ts'
-import { startControlPlane } from '../src/control/start.ts'
+import { startFetchControlPlane, startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
 import { KV } from '../src/kv.ts'
 import { DshNodePort, type DshPortEvent, type DshPortHost } from '../src/node/dsh-port.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
-import { startNodeHttpServer } from '../src/node/http-server.ts'
 import { type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type SessionInspection }
   from '../src/shared/protocol.ts'
 
@@ -216,7 +215,7 @@ describe('node registration and liveness recovery', () => {
     const node = new ToggleHeartbeatNode(inner)
     const env = { SUPERAGENT_CONTROL_TOKEN: API_TOKEN, SUPERAGENT_CONTROL_DB: join(directory, 'startup', 'control.sqlite'),
       SUPERAGENT_WORKSPACE_ROOT: nodeRoot(), SUPERAGENT_NODE_ID: 'local', SUPERAGENT_CONTROL_PORT: '0' }
-    const started = await startControlPlane({ env, node, heartbeatMs: 10 })
+    const started = await startFetchControlPlane({ env, node, heartbeatMs: 10 })
     const auth = { authorization: `Bearer ${API_TOKEN}` }
     try {
       const project = saveProject(started.control)
@@ -484,10 +483,10 @@ describe('node generation on event-stream reconnect', () => {
       maxReconnectDelayMs: 20 })
     const env = { SUPERAGENT_CONTROL_TOKEN: API_TOKEN, SUPERAGENT_CONTROL_DB: join(directory, 'reconnect', 'control.sqlite'),
       SUPERAGENT_WORKSPACE_ROOT: nodeRoot(), SUPERAGENT_NODE_ID: 'local', SUPERAGENT_CONTROL_PORT: '0' }
-    let started: Awaited<ReturnType<typeof startControlPlane>> | undefined
+    let started: Awaited<ReturnType<typeof startFetchControlPlane>> | undefined
     let secondServer: Awaited<ReturnType<typeof startNodeHttpServer>> | undefined
     try {
-      const running = await startControlPlane({ env, node: transport, heartbeatMs: 0 })
+      const running = await startFetchControlPlane({ env, node: transport, heartbeatMs: 0 })
       started = running
       const project = saveProject(running.control)
       const pm = await running.control.openProject(project.id)

@@ -18,7 +18,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { evaluateRouterHandoff, handoffWorkIntent, mentionedProjects, readRouterHandoffDecision,
   RouterHandoffError, tracedFromRequest, type RouterHandoffDecision } from '../src/control/router-handoff.ts'
-import { ControlPlaneServer } from '../src/control/server.ts'
+import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { NodeUnconfirmedError, type NodeCommand } from '../src/shared/protocol.ts'
 
