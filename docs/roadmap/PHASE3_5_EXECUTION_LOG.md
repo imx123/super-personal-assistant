@@ -22,8 +22,8 @@
 | P5-0 | P4-Gate | 三域数据契约与设计 | DONE |
 | P5-1 | P5-0 | Live State | DONE |
 | P5-2 | P5-0 | 持久 Event History | DONE |
-| P5-3 | P5-0 | Memory Service 与候选队列 | IN_PROGRESS |
-| P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | NOT_STARTED |
+| P5-3 | P5-0 | Memory Service 与候选队列 | DONE |
+| P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | IN_PROGRESS |
 | P5-5 | P5-1、P5-2、P5-3 | 按需检索与排序，验证检索进入模型 | NOT_STARTED |
 | P5-6 | P3、P4、P5 主功能 | 三域与路由协作闭环，真实模型 | NOT_STARTED |
 | P5-Gate | P5-0–P5-6 | 三域、权限、恢复与全链路回归 | NOT_STARTED |
@@ -270,3 +270,13 @@ P5-2 开始实现持久事件历史和控制台精确查询。
 - 类型检查、构建、21 个定向文件共 387 项通过。Windows 全量 2,179 项通过、45 项失败，失败断言集合与 P5-1 逐项一致。报告见 `.artifacts/phase5-p5-2-20261119/`。
 
 P5-3 先实现候选与长期记忆事实的存储、作用域和人工审核。遗忘语义仍待确定，继续推进独立的交付内容。
+
+## P5-3
+
+2026-11-19 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 实施，Codex 独立验收。候选 `f49dba5` 与本地 `next` 的 `297d31e` 在受测文件上一致。
+
+- 无生成模型的 Memory Service 将候选和生效记忆分别落到业务库。来源校验、隔离、去重、版本链和决定校验在服务端执行。候选在审核前不进入生效列表。外部污染来源不能写入或改变全局可信记录，跨 Session 去重不返回对方候选正文或来源。
+- 控制台「长期记忆」提供项目范围候选表单、审核与列表。隔离的 DSH Desktop 0.2.2.0 使用 `phase3-live` profile、`dsh-superagent/node`。Edge 验证提交、审批前隔离、重复键只落一条、旧审核版本 409、人工通过与控制面重启。390px 无横向溢出。证据见 `.artifacts/phase3-5-20261117/live-DXN6tl/evidence.json` 和同目录截图。
+- 类型检查和构建通过。22 个定向文件共 425 项通过。Windows 全量 2,217 项通过、45 项失败，失败集合与 P5-2 基线一致。报告见 `.artifacts/phase5-p5-3-20261119/`。
+
+遗忘策略的设计选择待确认。P5-4 开始实施受限审核与维护。
