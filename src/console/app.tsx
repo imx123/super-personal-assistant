@@ -7,6 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEve
 import { clearConsoleKey, connectConsole, consoleKey, CONSOLE_KEY_REJECTED, followEvents, messageOf, read,
   type Overview, type StreamStatus } from './api.ts'
 import { Icon } from './icons.tsx'
+import { MemoryPage } from './memory.tsx'
 import { HomePage, NodesPage, ProjectsPage, SchedulesPage, SessionsPage, type PageProps } from './pages.tsx'
 import { readPreferences, readSidebarCollapsed, saveSidebarCollapsed } from './preferences.ts'
 import { SettingsPage } from './settings.tsx'
@@ -17,6 +18,7 @@ const PAGES = [
   { key: 'projects', label: '项目', icon: 'project', crumb: '项目', title: '项目' },
   { key: 'sessions', label: 'PM / Worker 会话', icon: 'chat', crumb: 'PM / Worker 会话', title: '执行会话' },
   { key: 'schedules', label: '定时任务', icon: 'clock', crumb: '定时任务', title: '定时任务' },
+  { key: 'memory', label: '记忆', icon: 'memory', crumb: '记忆', title: '记忆' },
   { key: 'nodes', label: '节点部署', icon: 'node', crumb: '节点部署', title: '节点部署' },
   { key: 'settings', label: '设置', icon: 'settings', crumb: '设置', title: '设置' },
 ] as const
@@ -148,7 +150,7 @@ export function App(): ReactElement {
   // An action the console carried out reads the page's facts again by itself: not every action leaves an event behind,
   // and a page that waited for the next one would show a state that is already out of date.
   const refresh = (): void => setRevision(value => value + 1)
-  const pageProps: PageProps = { revision, refresh, navigate, signOut, focus }
+  const pageProps: PageProps = { revision, refresh, navigate, signOut, focus, overview, stream }
 
   return (
     <div className="app" data-sidebar-collapsed={collapsed} onKeyDown={event => {
@@ -197,8 +199,9 @@ export function App(): ReactElement {
           : page === 'projects' ? <ProjectsPage {...pageProps} />
             : page === 'sessions' ? <SessionsPage {...pageProps} />
               : page === 'schedules' ? <SchedulesPage {...pageProps} />
-                : page === 'nodes' ? <NodesPage {...pageProps} />
-                  : <SettingsPage {...pageProps} />}
+                : page === 'memory' ? <MemoryPage {...pageProps} />
+                  : page === 'nodes' ? <NodesPage {...pageProps} />
+                    : <SettingsPage {...pageProps} />}
       </main>
     </div>
   )

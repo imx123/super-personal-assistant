@@ -18,7 +18,7 @@ import {
   type StreamSubscription,
   type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord,
   type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
-  type SessionView, type StopNotice,
+  type SessionView, type StopNotice, type StreamStatus,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -53,6 +53,20 @@ export interface PageProps {
   focus?: string
   /** Forget the control-plane key and go back to the sign-in. */
   signOut: () => void
+  /**
+   * The control plane's own facts, as the shell already read them.
+   *
+   * A page that shows what the control plane can see right now reads these instead of asking again: the shell keeps them
+   * current, and a second request would only repeat what it already knows.
+   */
+  overview?: Overview
+  /**
+   * Whether the event stream is connected right now.
+   *
+   * A page that shows live facts says so when the stream is not connected, because the numbers it holds are then as old as
+   * the last event it received.
+   */
+  stream?: StreamStatus
 }
 
 /**
@@ -334,7 +348,7 @@ function timeOf(at: string): string {
 }
 
 /** The time of a fact, with its day. */
-function stampOf(at: string): string {
+export function stampOf(at: string): string {
   const moment = new Date(at)
   if (Number.isNaN(moment.getTime())) return at
   return moment.toLocaleString('zh-CN', { hour12: false })
@@ -1769,6 +1783,13 @@ export function ProjectsPage(props: PageProps): ReactElement {
   const action = useAction(props.refresh)
   const list = projects.data?.projects ?? []
   const current = list.find(project => project.id === selected) ?? list[0]
+
+  // A page that names a Project leads to that Project: the memory page points at the notes of one.
+  useEffect(() => {
+    if (!props.focus) return
+    setSelected(props.focus)
+    setShowDetail(true)
+  }, [props.focus])
 
   const create = (): void => {
     if (action.state.busy) return

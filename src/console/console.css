@@ -31,7 +31,7 @@ svg{width:18px;height:18px;flex:none}
 .nav button{display:flex;gap:10px;align-items:center;text-align:left;border-radius:9px;min-height:42px;padding:8px 11px;color:var(--muted)}
 .nav button[aria-current=page]{background:var(--lav);font-weight:700;color:var(--purple)}
 .nav button:hover:not([aria-current=page]){background:var(--bg);color:var(--ink)}
-.nav button:nth-child(5){margin-top:9px}
+.nav button:nth-child(6){margin-top:9px}
 .side-status{margin-top:auto;border-top:1px solid var(--edge);padding:13px 8px 0;color:var(--green);font-size:12px;display:flex;align-items:center;gap:7px}
 .side-status.offline{color:var(--red)}
 .side-status.unknown{color:var(--muted)}
@@ -296,6 +296,25 @@ svg{width:18px;height:18px;flex:none}
 .external-optin b{display:block;font-size:13px}
 .external-actions{margin-top:0}
 .external-actions select{border:1px solid var(--edge);border-radius:8px;padding:6px 8px;background:var(--white);max-width:100%}
+/* The memory page: one compact work surface with three sibling domains, switched by a small labelled group. */
+.memory-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 14px}
+/* The status may shrink and wrap; the action never shrinks and never breaks its words in two. */
+.memory-status{flex:1 1 210px;min-width:0;overflow-wrap:anywhere}
+.memory-head .action{flex:none;white-space:nowrap}
+.memory-tabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px}
+.memory-tabs button{min-height:36px;padding:6px 12px;border:1px solid var(--edge);border-radius:9px;background:var(--white);color:var(--muted);font-weight:650}
+.memory-tabs button[aria-pressed=true]{background:var(--lav);border-color:#ded5f0;color:var(--purple)}
+.memory-tabs button:hover:not([aria-pressed=true]){border-color:var(--purple);color:var(--ink)}
+.memory-tabs button:focus-visible{outline-offset:-3px}
+/* The two kinds of record are told apart by their surface: the current records of the business store, and the log that is trimmed. */
+.memory-block{border:1px solid var(--edge);border-radius:10px;padding:12px 14px;margin:0 0 14px;background:var(--white)}
+.memory-block.is-log{border-style:dashed;background:var(--bg)}
+.memory-block-head{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin:0 0 4px}
+.memory-block-head h3{font-size:14px;margin:0}
+.memory-domain>h3{font-size:14px;margin:18px 0 6px}
+.memory-tag{font-size:11px;color:var(--muted);border:1px solid var(--edge);border-radius:5px;padding:1px 6px;white-space:nowrap}
+.memory-rows .setting>span:first-child{min-width:0}
+.memory-rows .setting b,.memory-rows .setting .quiet{display:block;overflow-wrap:anywhere}
 @media(max-width:1050px){.app{grid-template-columns:194px minmax(0,1fr)}.brand{font-size:16px}}
 @media(width > 800px){
   .app[data-sidebar-collapsed=true]{grid-template-columns:64px minmax(0,1fr)}

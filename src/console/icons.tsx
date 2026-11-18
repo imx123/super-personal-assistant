@@ -14,6 +14,7 @@ const ICONS: Record<string, () => ReactElement> = {
   chat: () => <><path d="M5 5h14v11h-8l-4 3v-3H5z" /><path d="M9 9h6m-6 3h4" /></>,
   clock: () => <><circle cx="12" cy="12" r="8" /><path d="M12 8v5l3 2" /></>,
   node: () => <><rect x="4" y="5" width="16" height="6" rx="2" /><rect x="4" y="13" width="16" height="6" rx="2" /><path d="M8 8h1m-1 8h1" /></>,
+  memory: () => <><ellipse cx="12" cy="5.5" rx="7" ry="2.5" /><path d="M5 5.5v13c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5v-13" /><path d="M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5" /></>,
   settings: () => <><path d="M5 7h14M5 12h14M5 17h14" /><circle cx="9" cy="7" r="1.5" fill="white" /><circle cx="15" cy="12" r="1.5" fill="white" /><circle cx="11" cy="17" r="1.5" fill="white" /></>,
   arrowUp: () => <path d="M12 19V6m-6 6 6-6 6 6" />,
   plus: () => <path d="M12 5v14M5 12h14" />,

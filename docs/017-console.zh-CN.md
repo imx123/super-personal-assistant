@@ -55,9 +55,12 @@ node lib/control.js
 | 会话 | 真实 PM/Worker Session（状态、Project、Assignment、工作区、DSH 会话 ID、会话令牌版本、权限状态）与节点上报的真实消息事件 | `GET /v1/sessions`、`GET /v1/console/sessions/:id/messages` |
 | 定时任务 | 查看定时任务的运行规则、任务时区、下次运行时间和历史记录。发送失败时可查看原因 | `GET /v1/console/schedules`、`POST /v1/console/schedules`、`PUT/DELETE /v1/console/schedules/:id`、`POST /v1/console/schedules/:id/pause|resume|run`、`GET /v1/console/schedules/:id/runs` |
 | 节点部署 | 查看节点连接信息，检查并清理残留会话 | `GET /v1/overview`、`GET /v1/console/reconcile/latest` |
+| 记忆 | 三个只读面板：**实时状态**（控制面此刻的快照：节点在线状态、执行中的工单与 Worker、待 PM 验收数）、**事件历史**（业务库里项目与工单的当前状态、控制台自己的短期事件日志——它按保留规则会被裁掉，不是可以回读的历史）、**长期记忆**（服务与候选队列尚未建立；现在能手工留下的只有「项目 › 项目备忘」） | `GET /v1/overview`、`GET /v1/console/projects`、`GET /v1/events?after=…` |
 | 设置 | 保存起始页、Enter 发送和 Router 首选模型。在线调整定时任务检查间隔、自动清理残留会话的间隔和会话令牌过期宽限。编辑下次启动的控制面和节点配置 | `GET /v1/overview`、`GET/PUT/DELETE /v1/console/settings`、`GET/PUT /v1/console/deployment/{control,node}` |
 
 桌面主导航固定在左侧，右侧页面独立滚动。导航可收成图标栏，浏览器记住选择。窄屏通过顶部菜单打开抽屉。
+
+「记忆」页显示控制面的实时概况。打开「事件历史」后，页面才加载项目当前记录和短期事件日志，并显示加载、失败或空列表状态。持久事件索引与长期记忆服务尚未开放。项目备忘沿用「项目」页。
 
 ### 部署与凭据
 
@@ -255,7 +258,7 @@ P3-1A 在后端补齐了控制台停止所需的动作，P3-1B 把它们接到�
 
 ## 8. 当前边界
 
-- 快速派工与复杂请求共用同一个首页 Router 会话。**P3-2 起，点名了目标的明显指令由控制面自己执行**（规则见 3.0.2 节的锚定要求），复杂请求仍走模型回合；独立的快路由小模型、外部来源接入、订阅直唤醒和三域记忆尚未接入独立控制面。
+- 快速派工与复杂请求共用同一个首页 Router 会话。**P3-2 起，点名了目标的明显指令由控制面自己执行**（规则见 3.0.2 节的锚定要求），复杂请求仍走模型回合；独立的快路由小模型、外部来源接入、订阅直唤醒和三域记忆尚未接入独立控制面。「记忆」页已经接进控制台，但**只有实时状态、事件历史与长期记忆这三个只读视图**：持久事件历史索引与长期记忆服务都还没有建立，页面上写的就是这个事实。
 - 定时任务只到「给已有 PM 发一条消息」这一步：它不建单、不派工、不跑命令，**不会**替 PM 决定项目要做什么，停机期间积压的时刻只计数不补发。
 - 验收：浏览器不代替 PM 接受或拒绝 Worker 的结果。
 - 手工派工：没有「按 Assignment id 手工创建 Worker」的入口，Worker 只能因为一个 Assignment 而存在（底层路由 `POST /v1/projects/:id/workers` 仍在，但控制台不暴露它）。

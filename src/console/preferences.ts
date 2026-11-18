@@ -5,6 +5,7 @@ export const CONSOLE_PAGES = {
   projects: '项目',
   sessions: 'PM / Worker 会话',
   schedules: '定时任务',
+  memory: '记忆',
   nodes: '节点部署',
   settings: '设置',
 } as const
