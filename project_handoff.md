@@ -12,12 +12,13 @@
 | P3-3 高层路由与项目交接 | 完成，真实 DSH 验证既有项目接单，以及自动创建项目后从派工到报告回 Router。 | `1b38219`、`b66ca88` |
 | P3-4 工作区隔离 | Git 实验和项目页提示完成，生产继续使用共享目录。 | `3364630` |
 | P3-Gate | 验收通过。已在同一版核对两条真实闭环、停止与重启、项目门禁和兼容回归。 | 受测代码 `b2ff528` |
-| P4-0 协作事件与节点解析 | 评审稿与共享类型已就位。 | [P4-0 评审稿](docs/022-phase4-coordination-architecture.zh-CN.md) |
-| P4-1 至 P4-Gate、Phase 5 记忆 | 尚未开始实施。 | — |
+| P4-0 协作事件与节点解析 | 设计与共享类型已签收。 | `154c313` |
+| P4-1 单节点报告协调 | Claude Code 实施，Codex 独立验收。 | `phase4/p4-1` |
+| P4-3 至 P4-Gate、Phase 5 记忆 | 尚未开始实施。 | — |
 
 P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定向回归通过。真实 DSH 核对了两条闭环、会话干预和 Worker 停止后的重启恢复。全量测试的遗留问题和真实证据见 [P3-Gate 记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p3-gate)。
 
-Codex 负责 `next` 的 Phase 4 和 Phase 5。按专项补充规范实施，先评审 P4-0，再做单节点报告协调和权限拒绝审查，再实施摘要、外部事件订阅与投递恢复。Phase 4 验收通过后进入三域记忆。 [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
+`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-0 已评审，当前做单节点报告协调；随后做权限拒绝审查、摘要、外部事件订阅与投递恢复。Phase 4 验收通过后进入三域记忆。 [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
 
 `feat/multi-node` 由跨设备负责人实施和验收。两条线共用 `NodeResolver` 接口。双 Windows 通过 Tailscale 验收后，在临时集成工作树复跑双机用例、单节点回滚和届时的主线用例。Android 是后续扩展。 [跨设备计划](docs/roadmap/MULTI_NODE_PLAN_v1.1.md)
 

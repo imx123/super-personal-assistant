@@ -12,8 +12,8 @@
 | P3-3 | P3-2 | 高层路由、四条件门禁及 PM 自动交接，真实 DSH | DONE |
 | P3-4 | P3-0 | 工作区隔离实验与 ADR | DONE |
 | P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | DONE |
-| P4-0 | P3-Gate | 协作事件评审稿、共享 `NodeResolver` 类型及回传契约 | REVIEW_READY |
-| P4-1 | P4-0 | 统一业务目标校验与报告投递，先在现有单节点上验收 | NOT_STARTED |
+| P4-0 | P3-Gate | 协作事件评审稿、共享 `NodeResolver` 类型及回传契约 | DONE |
+| P4-1 | P4-0 | 统一业务目标校验与报告投递，先在现有单节点上验收 | IN_PROGRESS |
 | P4-3 | P4-1 | 真实权限守卫与拒绝上报，优先于订阅扩展 | NOT_STARTED |
 | P4-2 | P4-1 | 零 LLM 下级增量摘要，真实后端验证 | NOT_STARTED |
 | P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | NOT_STARTED |
@@ -44,6 +44,8 @@
 ### P4-0 先评审节点解析与投递契约
 
 [P4-0 评审稿](../022-phase4-coordination-architecture.zh-CN.md)记录四类通信机制、五条路径的四时点核验、失败与回执口径，以及外部事件默认直达和仅操作员手动显式开启双层路由的规则。P4-0 交付共享类型与设计，P4-1 接入运行时。
+
+2026-11-18，用户确认按新版计划推进。P4-0 以 `154c313` 的设计和共享类型签收。P4-1 由 Claude Code 按 `max` effort 在 `phase4/p4-1` 实施，由 Codex 独立审阅、复测和验收。
 
 当前 `ControlPlane` 已持有单一 `nodeId`、`NodePort`、Session 确认代际与现有停止/撤权检查。Session 消息、派工、定时交付和回执仍各有校验与调用路径。P4-0 先核对旧插件 Source / Trigger / Thread Subscription、独立控制面的 Session event / Report / Scheduler，以及 Router 的自动交接与手动 Relay Proposal。复用已有领域关系，保持旧插件与独立运行时的数据边界。Thread 的 Ticket 关联、下级会话摘要订阅和外部事件订阅各自保留生命周期。
 
