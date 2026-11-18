@@ -1,7 +1,7 @@
 /** A `NodePort` over the node's HTTP + SSE transport; no DSH imports. */
 import { randomUUID } from 'node:crypto'
-import { NODE_PROTOCOL_VERSION, NodeUnconfirmedError, type NodeCommand, type NodeEvent, type NodePort, type SessionInspection }
-  from '../shared/protocol.ts'
+import { NODE_PROTOCOL_VERSION, NodeUnconfirmedError, type DeliveryEvidence, type DeliveryEvidenceState, type NodeCommand,
+  type NodeEvent, type NodePort, type SessionInspection } from '../shared/protocol.ts'
 
 export interface HttpNodePortOptions {
   /** Base URL of the node server, such as `http://127.0.0.1:4310`. */
@@ -60,6 +60,28 @@ function describe(error: unknown): string {
 function isEvent(value: unknown): value is NodeEvent {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     && typeof (value as { type?: unknown }).type === 'string'
+}
+
+/** The states a node may answer a question about a delivery with. */
+const EVIDENCE_STATES: ReadonlySet<string> = new Set(['inbox', 'consumed_turn', 'absent', 'unknown'])
+
+/**
+ * The answer as this transport accepts it.
+ *
+ * The answer arrives from the wire, so it is read as data and not trusted as a fact: a state this transport does not know
+ * proves nothing, and neither does an answer that is not an answer at all. Both become `unknown`, the one answer that
+ * never repeats a delivery on a guess.
+ */
+function validatedEvidence(value: unknown): DeliveryEvidence {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { state: 'unknown', reason: 'the node answered with something that is not an answer' }
+  }
+  const answer = value as { state?: unknown; reason?: unknown }
+  if (typeof answer.state !== 'string' || !EVIDENCE_STATES.has(answer.state)) {
+    return { state: 'unknown', reason: 'the node answered with a state this transport does not know' }
+  }
+  const reason = typeof answer.reason === 'string' ? answer.reason.slice(0, 300) : ''
+  return { state: answer.state as DeliveryEvidenceState, ...(reason === '' ? {} : { reason }) }
 }
 
 /**
@@ -190,6 +212,61 @@ export class HttpNodePort implements NodePort {
   subscribe(listener: (event: NodeEvent) => void): () => void {
     const subscription = this.attach(listener, new AbortController(), true)
     return () => { this.detach(subscription) }
+  }
+
+  /**
+   * Ask the node what it can prove about one delivery.
+   *
+   * The question names the Session and the exact key, and it travels over the existing command/event protocol: the
+   * `delivery.evidence` command goes out and the node's answer comes back on the event stream. The whole operation shares
+   * one deadline, so a node that stalls at any step answers `unknown` instead of hanging the recovery.
+   *
+   * The answer is read only when it comes from the node this transport asked, names the Session the question was about and
+   * echoes the exact key the question was about. An answer that matches none of those is not an answer to this question,
+   * so it proves nothing: it is ignored, the deadline runs out, and the outcome stays `unknown`. A node that does not know
+   * the command refuses it, and a node that does not answer at all leaves the outcome unknown: neither is a proof that the
+   * message never arrived, and the control plane may not repeat a delivery on one.
+   */
+  async evidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+    const requestId = `delivery-evidence:${sessionId}:${deliveryKey}:${randomUUID()}`
+    const controller = new AbortController()
+    let resolveAnswer!: (evidence: DeliveryEvidence) => void
+    const answered = new Promise<DeliveryEvidence>(resolve => { resolveAnswer = resolve })
+    const subscription = this.attach(event => {
+      if (event.type !== 'delivery.evidence') return
+      // The question, the node, the Session and the exact key: an answer that names another one of them is about
+      // another delivery, and it is never read as this one's answer.
+      if (event.requestId !== requestId) return
+      if (event.nodeId !== this.nodeId) return
+      if (event.sessionId !== sessionId) return
+      if (event.deliveryKey !== deliveryKey) return
+      resolveAnswer(validatedEvidence(event.evidence))
+    }, controller)
+    const timeoutError = new Error(
+      `The node did not answer delivery.evidence for ${sessionId} within ${this.inspectionTimeoutMs} ms`)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(timeoutError)
+        reject(timeoutError)
+      }, this.inspectionTimeoutMs)
+    })
+    const work = (async () => {
+      await subscription.ready
+      await this.send({ protocolVersion: NODE_PROTOCOL_VERSION, nodeId: this.nodeId, idempotencyKey: requestId,
+        at: this.now(), type: 'delivery.evidence', sessionId, deliveryKey }, controller.signal)
+      return await answered
+    })()
+    work.catch(() => {})
+    try {
+      return await Promise.race([work, deadline])
+    } catch {
+      // A node that refused the command, or never answered it, proves nothing: the outcome stays unknown.
+      return { state: 'unknown', reason: 'the node did not answer the question about this delivery' }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      this.detach(subscription)
+    }
   }
 
   /**

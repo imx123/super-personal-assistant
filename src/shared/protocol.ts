@@ -412,6 +412,16 @@ export type NodeCommand =
   | (CommandEnvelope & { type: 'permission.set'; sessionId: string; permission: string })
   | (CommandEnvelope & { type: 'workspace.ensure'; projectId: string; workspace: string })
   | (CommandEnvelope & { type: 'review.diff'; projectId: string })
+  /**
+   * Ask the node whether it received one delivery.
+   *
+   * The command names the Session the delivery was for and the exact key the delivery was made under. The node answers
+   * with {@link DeliveryEvidence}: what it can *prove* about that one key in that one Session.
+   *
+   * It is additive: a node that does not know it refuses the command, and an older control plane never sends it, so the
+   * protocol version does not move.
+   */
+  | (CommandEnvelope & { type: 'delivery.evidence'; sessionId: string; deliveryKey: string })
 
 /**
  * The envelope every event carries.
@@ -464,6 +474,16 @@ export type NodeEvent =
   })
   | (EventEnvelope & { type: 'session.inspected'; requestId: string; inspection: SessionInspection })
   | (EventEnvelope & { type: 'review.diff'; requestId: string; result: ReviewDiffResult })
+  /**
+   * The node's answer about one delivery.
+   *
+   * It answers the question that was asked — the exact key in the exact Session — and it answers with what the node can
+   * prove, never with what it happens to remember. The request id echoes the key of the question, so the asking side can
+   * match the answer to its own question and to nobody else's. The answer also names the Session and the exact key the
+   * question was about: an answer that does not echo both is not an answer to this question, and the asking side treats it
+   * as no answer at all rather than as a proof.
+   */
+  | (EventEnvelope & { type: 'delivery.evidence'; requestId: string; deliveryKey: string; evidence: DeliveryEvidence })
   | (EventEnvelope & { type: 'tool.call'; tool: string; args: unknown; toolCallId: string })
   | (EventEnvelope & {
     /**
@@ -538,6 +558,17 @@ export interface NodePort {
    * gives the control plane the only loss-proof confirmation of a `starting` record.
    */
   inspect?(sessionId: string, routerDetails?: true): Promise<SessionInspection>
+  /**
+   * Ask the node what it can prove about one delivery.
+   *
+   * The question names the Session and the exact idempotency key. The answer is what the node can *prove* about that key
+   * in that Session: a message it can show it holds, a turn it can show read it, a proof that it never got it, or
+   * `unknown` when it cannot tell.
+   *
+   * Optional, so an older transport still satisfies the port. A transport that does not implement it answers `unknown`:
+   * the absence of a way to ask is never a proof that the message was not received.
+   */
+  evidence?(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence>
 }
 
 /**
@@ -631,4 +662,39 @@ export interface ToolFact {
   readonly backend?: string
   /** The relative paths the call changed, when it changed files inside the workspace. */
   readonly changedPaths?: readonly string[]
+}
+
+/**
+ * The capability a node advertises when it can answer a question about a delivery it was asked about.
+ *
+ * The capability is what keeps the change backward compatible: a node that does not advertise it is never asked, and the
+ * control plane says plainly that the answer is unknown instead of pretending the message was not received.
+ */
+export const NODE_CAPABILITY_DELIVERY_EVIDENCE = 'delivery-evidence'
+
+/**
+ * What a node can prove about one delivery.
+ *
+ * `inbox` is a proof that the message is in the target's inbox: the node can show the message itself. `consumed_turn` is
+ * a proof that a turn of the target read it — the stronger fact, and the only one that may ever be reported as a
+ * consumption. `absent` is a proof that the message never arrived: the node looked in a place that holds the whole
+ * history and found nothing there. `unknown` is everything else: the node cannot tell, the query is not supported, the
+ * node is not there, or the answer would rest on a cache that a restart empties.
+ *
+ * `unknown` is the safe answer, and a node that cannot prove anything must say it: a missing cache entry is not a proof
+ * that the message was never received.
+ */
+export type DeliveryEvidenceState = 'inbox' | 'consumed_turn' | 'absent' | 'unknown'
+
+/**
+ * One answer about one delivery.
+ *
+ * The state is the fact; the reason is the node's own bounded words about how it knows. There is no body of the message
+ * here, no path and no credential: the answer says whether the delivery happened, never what it said.
+ */
+export interface DeliveryEvidence {
+  /** What the node can prove. */
+  readonly state: DeliveryEvidenceState
+  /** Why the node answers this way, in its own bounded words. */
+  readonly reason?: string
 }

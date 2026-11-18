@@ -1,7 +1,9 @@
 import { mkdirSync } from 'node:fs'
 import {
+  NODE_CAPABILITY_DELIVERY_EVIDENCE,
   NODE_CAPABILITY_TURN_INTERRUPT,
   NODE_PROTOCOL_VERSION,
+  type DeliveryEvidence,
   type NodeCommand,
   type NodeEvent,
   type NodePort,
@@ -36,10 +38,20 @@ export interface FakeNodeOptions {
   /**
    * The capabilities this node advertises.
    *
-   * The default is what the fake really offers: it can interrupt one running turn of one Session. A test that needs an
-   * older node passes `[]`, and the control plane then says plainly that the node cannot interrupt a turn.
+   * The default is what the fake really offers: it can interrupt one running turn of one Session, and it can say what it
+   * holds of one delivery. A test that needs an older node passes `[]`, and the control plane then says plainly that the
+   * node cannot interrupt a turn.
    */
   capabilities?: readonly string[]
+  /**
+   * How the fake answers a question about one delivery.
+   *
+   * `authoritative` is the default: the fake is the whole node in a test, so what it holds is the truth, and a key it
+   * never received is a message that never arrived. `unknown` models a node that cannot prove anything — an older node, or
+   * one whose own record was emptied by a restart — and it is the safe answer: the control plane then never repeats a
+   * message on a guess.
+   */
+  evidence?: 'authoritative' | 'unknown'
 }
 
 /** The omission of the keys of every member of a union, one member at a time. */
@@ -65,7 +77,15 @@ export class FakeNode implements NodePort {
    * act on a Session that is running, interrupt the turn it runs, and watch the message that waits behind it.
    */
   private readonly turns = new Map<string, { current?: number; counter: number }>()
-  private readonly pending = new Map<string, { text: string; inputIds: string[] }[]>()
+  private readonly pending = new Map<string, { text: string; inputIds: string[]; key?: string }[]>()
+  /**
+   * The deliveries this node holds, by Session and by the key they were made under.
+   *
+   * The value is what the node can prove about the delivery: `inbox` for a message that waits in the Session's inbox,
+   * `consumed_turn` for one a turn of the Session already read. A key the node holds no record of is a message that
+   * never arrived — the fake is the whole node in a test, so its record is the truth.
+   */
+  private readonly deliveries = new Map<string, Map<string, 'inbox' | 'consumed_turn'>>()
 
   private readonly options: FakeNodeOptions
   private readonly idempotencyKeys = new Map<string, true>()
@@ -83,7 +103,7 @@ export class FakeNode implements NodePort {
    * them would make the control plane refuse an action the node would have carried out.
    */
   private capabilitiesOf(reported: readonly string[] | undefined): string[] {
-    const own = this.options.capabilities ?? [NODE_CAPABILITY_TURN_INTERRUPT]
+    const own = this.options.capabilities ?? [NODE_CAPABILITY_TURN_INTERRUPT, NODE_CAPABILITY_DELIVERY_EVIDENCE]
     return [...new Set([...own, ...(reported ?? [])])]
   }
 
@@ -213,7 +233,9 @@ export class FakeNode implements NodePort {
         // A Session that runs a turn takes the message for the next one: the message waits in the inbox and the turn
         // that follows reads it. This is what a real backend's next-turn queue does.
         if (this.turnOf(command.sessionId).current !== undefined) {
-          this.pendingOf(command.sessionId).push({ text: command.text, inputIds: [...(command.inputIds ?? [])] })
+          this.pendingOf(command.sessionId).push({ text: command.text, inputIds: [...(command.inputIds ?? [])],
+            key: command.idempotencyKey })
+          this.rememberDelivery(command.sessionId, command.idempotencyKey, 'inbox')
           break
         }
 
@@ -225,6 +247,25 @@ export class FakeNode implements NodePort {
           data: { text: command.text },
         })
         this.transitionSession(session, 'idle')
+        // The message was read right away: the fake has no model, so the turn that took it is over.
+        this.rememberDelivery(command.sessionId, command.idempotencyKey, 'consumed_turn')
+        break
+      }
+
+      // The question about one delivery: the node answers with what it holds of that exact key in that exact Session,
+      // and the answer names the Session and the exact key again, so the asking side can match it to its own question.
+      case 'delivery.evidence': {
+        this.emit({
+          protocolVersion: NODE_PROTOCOL_VERSION,
+          nodeId: this.options.nodeId,
+          sessionId: command.sessionId,
+          projectId: this.sessions.get(command.sessionId)?.projectId ?? '',
+          role: this.sessions.get(command.sessionId)?.role ?? 'worker',
+          type: 'delivery.evidence',
+          requestId: command.idempotencyKey,
+          deliveryKey: command.deliveryKey,
+          evidence: this.evidenceOf(command.sessionId, command.deliveryKey),
+        })
         break
       }
 
@@ -346,6 +387,44 @@ export class FakeNode implements NodePort {
   /** Answer an explicit status query from the Sessions this node actually holds. */
   async inspect(sessionId: string): Promise<SessionInspection> {
     return this.inspectOf(sessionId)
+  }
+
+  /**
+   * What this node can prove about one delivery.
+   *
+   * The question names the Session and the exact key, and the answer is what the node holds: a message it read, a message
+   * that waits in its inbox, or — when the node is authoritative and holds no record of that key — a message that never
+   * arrived. A node that is told to answer `unknown` says so for every question, which is what a node that cannot prove
+   * anything says.
+   */
+  async evidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+    return this.evidenceOf(sessionId, deliveryKey)
+  }
+
+  /** The answer this node gives about one delivery. */
+  private evidenceOf(sessionId: string, deliveryKey: string): DeliveryEvidence {
+    if (this.options.evidence === 'unknown') {
+      return { state: 'unknown', reason: 'this node cannot prove what happened to a delivery' }
+    }
+    if (!this.sessions.has(sessionId)) {
+      return { state: 'unknown', reason: 'this node holds no Session with that id' }
+    }
+    const held = this.deliveries.get(sessionId)?.get(deliveryKey)
+    if (held !== undefined) {
+      return { state: held, reason: held === 'inbox'
+        ? 'the message waits in the Session inbox'
+        : 'a turn of the Session read the message' }
+    }
+    return { state: 'absent', reason: 'this node holds no record of that delivery' }
+  }
+
+  /** Remember one delivery of one Session, and what the node can prove about it. */
+  private rememberDelivery(sessionId: string, deliveryKey: string, state: 'inbox' | 'consumed_turn'): void {
+    let held = this.deliveries.get(sessionId)
+    if (!held) { held = new Map(); this.deliveries.set(sessionId, held) }
+    // A message that waits in the inbox and is read later is the stronger fact: the turn that read it is the proof.
+    if (held.get(deliveryKey) === 'consumed_turn') return
+    held.set(deliveryKey, state)
   }
 
   /** The shape both `inspect` and the `session.inspect` command answer with. */
@@ -498,7 +577,7 @@ export class FakeNode implements NodePort {
   }
 
   /** The messages that wait for the Session's next turn, created on demand. */
-  private pendingOf(sessionId: string): { text: string; inputIds: string[] }[] {
+  private pendingOf(sessionId: string): { text: string; inputIds: string[]; key?: string }[] {
     let waiting = this.pending.get(sessionId)
     if (!waiting) { waiting = []; this.pending.set(sessionId, waiting) }
     return waiting
@@ -520,6 +599,8 @@ export class FakeNode implements NodePort {
       data: { turn: number, inputIds: waiting.flatMap(message => message.inputIds) },
     })
     for (const message of waiting) {
+      // The turn reads the message now: the node can prove more about it than before.
+      if (message.key !== undefined) this.rememberDelivery(session.sessionId, message.key, 'consumed_turn')
       this.emit({
         ...this.sessionEnvelope(session),
         type: 'session.event',

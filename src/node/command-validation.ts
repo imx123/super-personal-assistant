@@ -158,6 +158,13 @@ export function validateNodeCommand(value: unknown): NodeCommand {
       identifier(command, 'permission', type)
       break
 
+    // The question about one delivery: the Session the delivery was for, and the exact key it was made under. Both are
+    // named, because an answer about another Session or another key is an answer about nothing.
+    case 'delivery.evidence':
+      identifier(command, 'sessionId', type)
+      identifier(command, 'deliveryKey', type)
+      break
+
     default:
       // No TypeScript member covers this value, so a node that trusted the annotation would silently accept it.
       throw new NodeCommandError('unknown-command', `Unknown command type: ${type.slice(0, 64)}`)

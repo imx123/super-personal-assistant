@@ -17,7 +17,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import { resolveRoleModel } from '../app/role-models.ts'
 import type { RoleModel } from '../policy.ts'
 import { loadDeployment } from '../shared/deployment.ts'
-import { NODE_CAPABILITY_TURN_INTERRUPT } from '../shared/protocol.ts'
+import { NODE_CAPABILITY_DELIVERY_EVIDENCE, NODE_CAPABILITY_TURN_INTERRUPT } from '../shared/protocol.ts'
 import { DshNodePort } from './dsh-port.ts'
 import { createDshPortHost } from './dsh-port-host.ts'
 import { startNodeHttpServer } from './http-server.ts'
@@ -110,8 +110,9 @@ export async function apply(ctx: Context): Promise<void> {
       ...(environment.defaultModel ? { defaultModel: environment.defaultModel } : {}) }) },
       nodeId: environment.nodeId, root: environment.root,
       // The node can end one running turn of one Session and keep the rest of it, so it says so: the control plane
-      // asks a node that cannot do it instead of pretending the turn ended.
-      capabilities: [NODE_CAPABILITY_TURN_INTERRUPT],
+      // asks a node that cannot do it instead of pretending the turn ended. It can also say what it proves about one
+      // delivery, read from the Session's own persisted history.
+      capabilities: [NODE_CAPABILITY_TURN_INTERRUPT, NODE_CAPABILITY_DELIVERY_EVIDENCE],
       ...(environment.controlUrl === undefined ? {} : { controlUrl: environment.controlUrl }) }) })
   const server = await startNodeHttpServer({ node, token: environment.token, host: environment.host,
     port: environment.port })

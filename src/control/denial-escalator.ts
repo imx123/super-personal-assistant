@@ -38,6 +38,7 @@ import { redact } from '../infra/redact.ts'
 import { NodeUnconfirmedError, GUARD_DENIAL_REASON_CODES, type GuardDenialReasonCode, type SessionRecord,
   type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
+import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
 
 /**
@@ -688,7 +689,7 @@ export class DenialEscalator {
   /** Whether another revisit was asked for while one was running. */
   private revisitQueued = false
 
-  constructor(private readonly store: Store, private readonly host: DenialEscalatorHost,
+  constructor(private readonly store: Store, private readonly outbox: DeliveryOutbox, private readonly host: DenialEscalatorHost,
     options: DenialEscalatorOptions = {}) {
     this.windowMs = positive(options.windowMs, DEFAULT_DENIAL_WINDOW_MS)
     this.threshold = positive(options.threshold, DEFAULT_DENIAL_THRESHOLD)
@@ -1194,9 +1195,36 @@ export class DenialEscalator {
       this.settleReview(review.noticeId, 'pending_manager_online', 'pending_manager_online', REASONS.targetNotTheManager)
       return
     }
-    // The claim: from here on the review is on its way. Only the caller whose write changed the row may send it, so a
-    // retry and a recovery never both deliver it.
-    if (!this.claimForWire(review.noticeId)) return
+    // The claim and the record of the review are one write: a control plane that stopped between them would leave a
+    // review that is on its way and a delivery that does not exist, and the review would never be delivered again.
+    const delivery = this.store.atomic(() => {
+      // The claim: from here on the review is on its way. Only the caller whose write changed the row may send it, so a
+      // retry and a recovery never both deliver it.
+      if (!this.claimForWire(review.noticeId)) return undefined
+      // The review is written down before it goes out: the outbox holds the record of what happened to it, so a restart
+      // knows whether the review was ever delivered and may ask the node about it.
+      return this.outbox.accept({
+        kind: 'denial_review',
+        idempotencyKey: review.noticeId,
+        dedupKey: `denial_review:${review.noticeId}`,
+        scope: `denial:${review.scopeKey}`,
+        projectId: review.projectId,
+        ticketId: review.ticketId,
+        assignmentId: review.assignmentId,
+        sourceSessionId: review.controlSessionId,
+        targetSessionId: review.targetSessionId,
+        targetRole: review.targetRole as SessionRole,
+        nodeId: review.nodeId,
+        backendId: review.backendId,
+        expectedAssignmentEpoch: this.host.targetEpochs(review.targetSessionId).assignmentEpoch,
+        expectedToolTokenVersion: this.host.targetEpochs(review.targetSessionId).toolTokenVersion,
+        expectedNodeTrustEpoch: 0,
+        payload: review.payload,
+        context: { kind: 'denial_review', noticeId: review.noticeId, scopeKey: review.scopeKey },
+      })
+    })
+    if (delivery === undefined) return
+    if (!this.outbox.claim(delivery.deliveryId, ['accepted_pending'])) return
     try {
       await this.host.deliver(review.targetSessionId, review.payload, review.noticeId, () => {
         this.assertSendable(review)
@@ -1204,19 +1232,68 @@ export class DenialEscalator {
     } catch (error) {
       // A missing receipt is not a refusal: the message may have arrived, so it is neither a failure nor to be repeated.
       if (error instanceof NodeUnconfirmedError) {
+        this.outbox.settle(delivery.deliveryId, 'dispatching', 'unconfirmed', REASONS.deliveryUnconfirmed)
         this.settleReview(review.noticeId, 'dispatching', 'unconfirmed', REASONS.deliveryUnconfirmed)
         return
       }
       // A review that was stopped before the wire never went out: it waits for the evidence that it may go out again.
       if (error instanceof DenialReviewStaleError) {
+        this.outbox.settle(delivery.deliveryId, 'dispatching', 'blocked_target_inactive', error.reason)
         this.settleReview(review.noticeId, 'dispatching', 'pending_manager_online', error.reason)
         return
       }
+      this.outbox.settle(delivery.deliveryId, 'dispatching', 'failed_permanent', REASONS.deliveryFailed)
       this.settleReview(review.noticeId, 'dispatching', 'pending_manager_online', REASONS.deliveryFailed)
       return
     }
+    this.outbox.settle(delivery.deliveryId, 'dispatching', 'delivered_inbox', '')
     // The review reached its superior: the settle is conditional, so only one of two callers writes the audit line.
     if (this.settleReview(review.noticeId, 'dispatching', 'notified', '')) this.auditReview(review)
+  }
+
+  /**
+   * Whether the review of one delivery may still go out.
+   *
+   * The Session that was refused must still live the life it lived when it was refused, and the superior must still be
+   * the manager of that work. A review that was already notified is not on its way any more, and a review that waits for
+   * a superior is not sent on a guess.
+   */
+  revalidateReview(row: CoordinationDeliveryRow): DeliveryRevalidation {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'denial_review') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'this delivery names no review' }
+    }
+    const review = this.reviewById(context.noticeId)
+    if (review === undefined) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the review this delivery was about is gone' }
+    }
+    if (review.status === 'notified') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the review this delivery was about was notified' }
+    }
+    const source = this.validateSource(review)
+    if (!source.ok) return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: source.reason }
+    const target = this.validateTarget(review)
+    if (!target.ok) return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: target.reason }
+    // The lifecycle the review was planned under must still hold: a superior that was replaced is not this one.
+    if (this.host.targetEpochs(review.targetSessionId).assignmentEpoch !== row.expectedAssignmentEpoch) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the superior was replaced before the review went out' }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * The message of a review that is sent again.
+   *
+   * It is the review's own message: the bounded, redacted facts of the refusal that caused it. A review whose record is
+   * gone has no message, and it is not sent with another one.
+   */
+  reviewPayload(row: CoordinationDeliveryRow): string | undefined {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'denial_review') return undefined
+    const review = this.reviewById(context.noticeId)
+    if (review === undefined) return undefined
+    return review.payload === '' ? undefined : review.payload
   }
 
   /**
@@ -1355,16 +1432,26 @@ export class DenialEscalator {
   /**
    * The reviews a previous run of this control plane left open.
    *
-   * A review that was on its way when the control plane stopped has an unknown outcome: it is marked as unconfirmed and
-   * never sent again, because a blind resend would repeat a review that may have landed. A review that waits for a
-   * superior is carried out again only when there is evidence that the superior can be reached now — it was resumed, or
-   * the node came back. A review that was notified or whose outcome is unknown is left alone.
+   * A review that was on its way when the control plane stopped has an unknown outcome, and the outbox is the one that
+   * learned it: it asked the node what it can prove about that exact key. This method reads that answer: a review the node
+   * can show was notified, and a review whose outcome stays unknown is never sent again, because a blind resend would
+   * repeat a review that may have landed.
+   *
+   * A review that waits for a superior is carried out again only when there is evidence that the superior can be reached
+   * now — it was resumed, or the node came back. A review that was notified or whose outcome is unknown is left alone.
    */
   async recover(): Promise<void> {
     const dispatching = this.store.db.prepare(
       "SELECT notice_id FROM permission_denial_reviews WHERE status = 'dispatching'").all() as Record<string, unknown>[]
     for (const row of dispatching) {
-      this.settleReview(String(row.notice_id ?? ''), 'dispatching', 'unconfirmed', REASONS.dispatchUnknown)
+      const noticeId = String(row.notice_id ?? '')
+      const delivery = this.outbox.byIdempotencyKey(noticeId)
+      const arrived = delivery?.status === 'delivered_inbox' || delivery?.status === 'consumed_turn'
+      if (arrived) {
+        this.settleReview(noticeId, 'dispatching', 'notified', '')
+        continue
+      }
+      this.settleReview(noticeId, 'dispatching', 'unconfirmed', REASONS.dispatchUnknown)
     }
     await this.revisit()
   }

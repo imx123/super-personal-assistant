@@ -11,8 +11,8 @@ import { assignmentStopped, canRetry, currentReview, latestAssignment, pendingRe
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { redact } from '../infra/redact.ts'
-import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
-  GUARD_DENIAL_REASON_CODES, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
+import { NODE_CAPABILITY_DELIVERY_EVIDENCE, NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
+  GUARD_DENIAL_REASON_CODES, type DeliveryEvidence, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
 import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
   SessionInspection, SessionRecord, SessionStatus, GuardDenialFacts, ToolFact } from '../shared/protocol.ts'
@@ -22,6 +22,8 @@ import { AuditRecorder, type AuditActor } from './console-audit.ts'
 import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectGateRow,
   type ProjectMemoryRow, type RouterHandoffRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
+import { DeliveryOutbox, readContext as readDeliveryContext, type CoordinationDeliveryKind,
+  type DeliveryContext, type DeliveryKindHandler, type DeliveryRevalidation } from './delivery-outbox.ts'
 import { DenialEscalator, denialCallId, DenialAuthorizationError, type DenialAuthorizationView, type DenialCounterView,
   type DenialFact, type DenialReviewView } from './denial-escalator.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
@@ -1719,6 +1721,15 @@ export class ControlPlane {
    */
   private readonly resolver: SingleNodeResolver
   /**
+   * The durable outbox of the coordination deliveries.
+   *
+   * It owns the table every coordination writes into, the vocabulary of the states a delivery reaches and the recovery
+   * that looks at what a restart left open. The six kinds — the Router's handoff, the Worker's report, the PM's report,
+   * the stream digest, the denial review and the external wake-up — all share it, and all of them are recovered the same
+   * way: the authority is read again, and a delivery that was on its way is asked about.
+   */
+  private readonly outbox: DeliveryOutbox
+  /**
    * The durable coordination of the reports a Worker and a PM make.
    *
    * It owns the routing of a report to the Session that has to act on it, the stable key that keeps an identical report
@@ -1944,6 +1955,20 @@ export class ControlPlane {
       this.consoleStore = consoleDb
       const savedRuntime = consoleDb.meta(RUNTIME_SETTINGS_KEY)
       if (savedRuntime) this.runtime = parseRuntimeSettings(JSON.parse(savedRuntime))
+      // The durable outbox of the coordination deliveries: one table for the six kinds, one vocabulary of the states a
+      // delivery reaches and one recovery. It is created before the coordination that writes into it, and before the
+      // startup reconciliation that reads it.
+      this.outbox = new DeliveryOutbox(this.store, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        // The recovery sends through the same door as every other coordination, and it carries the same check twice: once
+        // before the target is ensured and once immediately before the transport.
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        evidence: (sessionId, deliveryKey) => this.askNodeForEvidence(sessionId, deliveryKey),
+        evidenceSupported: () => this.nodeAnswersDeliveries(),
+      })
       this.lastEventSeq = consoleDb.lastEventSeq()
       // The log is bounded; a restart is a good moment to drop what it may no longer keep.
       this.pruneConsoleLog()
@@ -2001,7 +2026,7 @@ export class ControlPlane {
       })
       // The coordination of the reports: its records live in this control plane's own file, in the same transaction as
       // the reports they are about.
-      this.reports = new ReportCoordinator(this.store, {
+      this.reports = new ReportCoordinator(this.store, this.outbox, {
         now: () => this.now(),
         nodeId: () => this.options.nodeId,
         backendId: () => 'dsh',
@@ -2033,7 +2058,7 @@ export class ControlPlane {
       // The escalation of the permission denials: its records live in this control plane's own file, next to the counters
       // they count and the reviews they made. The control plane owns the facts and the delivery; this module owns the
       // counting, the burst folding, the fuse and the routing.
-      this.denials = new DenialEscalator(this.store, {
+      this.denials = new DenialEscalator(this.store, this.outbox, {
         now: () => this.now(),
         nodeId: () => this.options.nodeId,
         backendId: () => CONTROL_BACKEND,
@@ -2057,7 +2082,7 @@ export class ControlPlane {
       })
       // The stream digests a superior asks for: the subscriptions live in this control plane's own file, next to the
       // other coordination tables, and the aggregation is a programmatic read of the event log — never a model call.
-      this.streams = new StreamSubscriptionService(this.store, {
+      this.streams = new StreamSubscriptionService(this.store, this.outbox, {
         now: () => this.now(),
         nodeId: () => this.options.nodeId,
         backendId: () => CONTROL_BACKEND,
@@ -2079,7 +2104,7 @@ export class ControlPlane {
       // The external observation events an operator watches for: the subscriptions and their dispositions live in this
       // control plane's own file, next to the other coordination tables, and the rules are deterministic — no model is
       // asked whether an event is interesting, and the event never goes through the Router.
-      this.externalEvents = new EventSubscriptionService(this.store, {
+      this.externalEvents = new EventSubscriptionService(this.store, this.outbox, {
         now: () => this.now(),
         nodeId: () => this.options.nodeId,
         backendId: () => CONTROL_BACKEND,
@@ -2090,6 +2115,7 @@ export class ControlPlane {
         routerSessionId: () => ROUTER_SESSION_ID,
         ensureRouterSession: async () => (await this.ensureRouter()).sessionId,
         fastRouteFacts: () => this.fastRouteFacts(),
+        targetEpochs: sessionId => this.targetEpochs(sessionId),
         resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
         resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
         deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
@@ -2124,6 +2150,10 @@ export class ControlPlane {
       })
       this.loadSessions()
       this.unsubscribe = options.node.subscribe(event => { this.receive(event) })
+      // The outbox knows the six kinds now: each of them re-reads its own authority before a delivery is sent again, and
+      // rebuilds its own message for that attempt. The registration comes last, because every handler needs the module
+      // that owns the work.
+      this.registerDeliveryKinds()
     } catch (error) {
       // The console's own file may already be open when a later step fails; it is closed with the rest.
       try { consoleDb?.close() } catch { /* a file that never opened needs no closing */ }
@@ -2239,6 +2269,140 @@ export class ControlPlane {
   }
 
   /**
+   * The kinds of coordination the outbox knows, and who owns each of them.
+   *
+   * Every kind re-reads its own authority before a delivery is sent again and rebuilds its own message for that attempt.
+   * The registration comes after every module exists, because the owner of a kind is the module that holds its facts.
+   */
+  private registerDeliveryKinds(): void {
+    const reports: DeliveryKindHandler = {
+      kind: 'worker_report',
+      revalidate: row => this.reports.revalidate(row),
+      payloadOf: row => this.reports.payloadOf(row),
+    }
+    this.outbox.register(reports)
+    this.outbox.register({ ...reports, kind: 'pm_report' })
+    this.outbox.register({
+      kind: 'auto_handoff',
+      revalidate: row => this.revalidateAutoHandoff(row),
+      payloadOf: row => this.autoHandoffPayload(row),
+    })
+    this.outbox.register({
+      kind: 'stream_digest',
+      revalidate: row => this.streams.revalidateDigest(row),
+      payloadOf: row => this.streams.digestPayload(row),
+    })
+    this.outbox.register({
+      kind: 'denial_review',
+      revalidate: row => this.denials.revalidateReview(row),
+      payloadOf: row => this.denials.reviewPayload(row),
+    })
+    this.outbox.register({
+      kind: 'external_wakeup',
+      revalidate: row => this.externalEvents.revalidateWakeup(row),
+      payloadOf: row => this.externalEvents.wakeupPayload(row),
+    })
+  }
+
+  /**
+   * Whether this node can be asked about a delivery at all.
+   *
+   * The node says so itself: a node that does not advertise the capability is never asked, and the answer is then the
+   * unknown one. The control plane never asks a node it does not know to be able to answer.
+   */
+  private nodeAnswersDeliveries(): boolean {
+    const status = this.nodes.get(this.options.nodeId)
+    const capabilities = status?.capabilities
+    return Array.isArray(capabilities) && capabilities.includes(NODE_CAPABILITY_DELIVERY_EVIDENCE)
+  }
+
+  /**
+   * Ask the node what it can prove about one delivery.
+   *
+   * The question names the Session and the exact key, and it goes to the node the delivery was made to. A transport that
+   * cannot ask answers `unknown`, and so does a node that refuses the question: neither is a proof that the message never
+   * arrived, and a delivery may not be repeated on one.
+   */
+  private async askNodeForEvidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+    const node = this.options.node
+    if (!node.evidence) {
+      return { state: 'unknown', reason: 'this transport cannot ask the node about a delivery' }
+    }
+    try {
+      return await node.evidence(sessionId, deliveryKey)
+    } catch {
+      return { state: 'unknown', reason: 'the node could not be asked about this delivery' }
+    }
+  }
+
+  /**
+   * Whether the handoff of the Router may still go out.
+   *
+   * The handoff is a fact about a Project and a PM: the Project must still be active, the PM must still be its manager,
+   * and that PM must still be a Session that may be messaged. A handoff that was already decided is not on its way any
+   * more, and a handoff whose record is gone is not sent again.
+   */
+  private revalidateAutoHandoff(row: CoordinationDeliveryRow): DeliveryRevalidation {
+    const context = readDeliveryContext(row.context)
+    if (context === undefined || context.kind !== 'auto_handoff') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'this delivery names no handoff' }
+    }
+    const handoff = this.consoleStore.routerHandoff(context.requestId)
+    if (handoff === undefined) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the handoff this delivery was about is gone' }
+    }
+    if (handoff.stage !== 'routing') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the handoff this delivery was about is no longer on its way' }
+    }
+    const project = this.store.projects.get(handoff.projectId)
+    if (!project) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the Project this handoff was about does not exist' }
+    }
+    if (project.status !== 'active') {
+      return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: `the Project ${project.id} is ${project.status}` }
+    }
+    if (project.pmSessionId !== handoff.pmSessionId) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the Project has another manager now' }
+    }
+    const manager = this.sessions.get(handoff.pmSessionId)
+    if (!manager) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the PM Session this handoff was about is gone' }
+    }
+    if (manager.revokedAt) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the PM Session was revoked' }
+    }
+    const stopped = this.operatorStopRefusal(manager)
+    if (stopped !== undefined) {
+      return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: stopped }
+    }
+    // The lifecycle the handoff was planned under must still hold: a PM that was replaced is not this one.
+    if (this.targetEpochs(handoff.pmSessionId).assignmentEpoch !== row.expectedAssignmentEpoch) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the PM Session was replaced before the handoff went out' }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * The message of a handoff that is sent again.
+   *
+   * It is rebuilt from the handoff's own record: the person's own words, the Project they belong to and the id of the
+   * request. A handoff whose record is gone has no message, and it is not sent with another one.
+   */
+  private autoHandoffPayload(row: CoordinationDeliveryRow): string | undefined {
+    const context = readDeliveryContext(row.context)
+    if (context === undefined || context.kind !== 'auto_handoff') return undefined
+    const handoff = this.consoleStore.routerHandoff(context.requestId)
+    if (handoff === undefined) return undefined
+    return context.handoffKind === 'brief'
+      ? routerProjectBriefMessage(handoff.requestId, handoff.instruction, handoff.projectTitle)
+      : routerAutoInstructionMessage(handoff.requestId, handoff.instruction, handoff.projectTitle, 'work')
+  }
+
+  /**
    * Register this control plane with the node.
    *
    * Every call uses a fresh key: a node acknowledges a completed key without executing the command again, so a control
@@ -2293,9 +2457,9 @@ export class ControlPlane {
   /**
    * Look at the deliveries a previous run of this control plane left open.
    *
-   * A delivery that was never sent is carried out again under its own key, after the report it is about and the target it
-   * names are read again. A delivery that was on its way when the process stopped has an unknown outcome: it is marked as
-   * unconfirmed and never sent again, because a blind resend would repeat a delivery that may have landed.
+   * The outbox owns the recovery of every kind: a delivery that was never sent is carried out again under its own key,
+   * after the authority it was planned under is read again, and a delivery that was on its way when the process stopped is
+   * asked about — the node is asked, because the node is the only one that knows whether the message arrived.
    */
   private async recoverReportDeliveries(): Promise<void> {
     // The recovery belongs to the start of this control plane: a registration that happens later must not call a
@@ -2303,7 +2467,8 @@ export class ControlPlane {
     if (this.reportRecoveryDone) return
     this.reportRecoveryDone = true
     try {
-      await this.reports.recover()
+      await this.outbox.recover()
+      this.settleHandoffsFromOutbox()
     } catch (error) {
       // A recovery that fails is a diagnostic: the records stay as they are and the work continues.
       process.stderr.write(`superagent control-plane report recovery failed: ${
@@ -3780,13 +3945,41 @@ export class ControlPlane {
    *
    * Work that was on its way when the process ended may or may not have reached the PM: the receipt is missing, not
    * negative. It says exactly that, and it is never sent again — the person's request is not repeated to find out.
+   *
+   * A handoff the outbox knows about is left alone here: the outbox's recovery asks the node what it can prove about
+   * that exact delivery, and the answer settles the handoff. A handoff the outbox does not know about is an older
+   * record, and nothing may be learned about it.
    */
   private reconcileRouterHandoffs(): void {
     for (const row of this.consoleStore.routerHandoffs({ limit: 200, newest: true })) {
       if (row.stage !== 'routing') continue
+      if (this.outbox.byIdempotencyKey(`router-${row.kind}:${row.requestId}`) !== undefined) continue
       this.consoleStore.updateRouterHandoff(row.requestId, { stage: 'unconfirmed', reason: 'delivery_unconfirmed',
         detail: '控制面在这份工作送达途中停了，无法确认它是否到达，不会再送一次。',
         error: 'The control plane stopped while this work was on its way; it is not sent again' })
+    }
+  }
+
+  /**
+   * Settle the handoffs the outbox's recovery learned about.
+   *
+   * The outbox asked the node about every handoff that was on its way, and it knows what the node could prove. A handoff
+   * the node can show reached its PM, and a handoff whose outcome stays unknown is never sent again.
+   */
+  private settleHandoffsFromOutbox(): void {
+    for (const row of this.consoleStore.routerHandoffs({ limit: 200, newest: true })) {
+      if (row.stage !== 'routing') continue
+      const delivery = this.outbox.byIdempotencyKey(`router-${row.kind}:${row.requestId}`)
+      if (delivery === undefined) continue
+      if (delivery.status === 'delivered_inbox' || delivery.status === 'consumed_turn') {
+        this.consoleStore.updateRouterHandoff(row.requestId, { stage: 'assigned', error: '' })
+        continue
+      }
+      if (delivery.status === 'unconfirmed') {
+        this.consoleStore.updateRouterHandoff(row.requestId, { stage: 'unconfirmed', reason: 'delivery_unconfirmed',
+          detail: '节点没有确认工作是否送达，不会再送一次。',
+          error: 'The control plane stopped while this work was on its way; it is not sent again' })
+      }
     }
   }
 
@@ -4084,14 +4277,43 @@ export class ControlPlane {
     const message = kind === 'brief'
       ? routerProjectBriefMessage(request.id, instruction, project.title)
       : routerAutoInstructionMessage(request.id, instruction, project.title, 'work')
+    // The handoff is written down before it goes out: the outbox holds the record of what happened to it, so a restart
+    // knows whether the work reached the PM and may ask the node about it.
+    const key = `router-${kind}:${request.id}`
+    const delivery = this.outbox.accept({
+      kind: 'auto_handoff',
+      idempotencyKey: key,
+      dedupKey: `auto_handoff:${request.id}`,
+      scope: `handoff:${project.id}`,
+      projectId: project.id,
+      ticketId: '',
+      assignmentId: '',
+      sourceSessionId: ROUTER_SESSION_ID,
+      targetSessionId: project.pmSessionId,
+      targetRole: 'pm',
+      nodeId: this.options.nodeId,
+      backendId: CONTROL_BACKEND,
+      expectedAssignmentEpoch: this.targetEpochs(project.pmSessionId).assignmentEpoch,
+      expectedToolTokenVersion: this.targetEpochs(project.pmSessionId).toolTokenVersion,
+      expectedNodeTrustEpoch: this.trustEpoch,
+      payload: message,
+      context: { kind: 'auto_handoff', requestId: request.id, projectId: project.id, handoffKind: kind },
+    })
     try {
+      // The delivery is claimed before it goes out: the record says it is on its way, so a restart knows that the outcome
+      // has to be asked about rather than guessed.
+      if (!this.outbox.claim(delivery.deliveryId, ['accepted_pending'])) {
+        return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
+      }
       // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once.
       await this.sendMessage(project.pmSessionId, message, undefined, 'system',
-        { idempotencyKey: `router-${kind}:${request.id}` })
+        { idempotencyKey: key })
     } catch (error) {
       const reason = redact(messageOf(error)).slice(0, 300)
       // A missing receipt is not a refusal: the work may have arrived, so it is neither "failed" nor to be repeated.
       const stage: RouterHandoffStage = error instanceof NodeUnconfirmedError ? 'unconfirmed' : 'failed'
+      this.outbox.settle(delivery.deliveryId, 'dispatching', stage === 'unconfirmed' ? 'unconfirmed' : 'failed_permanent',
+        reason)
       this.consoleStore.updateRouterHandoff(request.id, { stage, reason: stage === 'unconfirmed' ? 'delivery_unconfirmed'
         : 'delivery_failed', detail: stage === 'unconfirmed' ? '节点没有确认工作是否送达，不会再送一次。'
         : '工作没有送到这个项目的 PM。', error: reason })
@@ -4099,6 +4321,7 @@ export class ControlPlane {
         targetId: project.id, outcome: 'failed', detail: `${project.title} · ${reason}` })
       return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
     }
+    this.outbox.settle(delivery.deliveryId, 'dispatching', 'delivered_inbox', '')
     this.consoleStore.updateRouterHandoff(request.id, { stage: 'assigned', reason: verdict.reason, detail: verdict.detail,
       error: '' })
     this.audit.record({ actor: 'router', kind: 'session', action: 'routed', targetKind: 'project',
@@ -5882,6 +6105,10 @@ export class ControlPlane {
    * The delivery is the very same one: it keeps its own key, so the report is one delivery and not two. The report, the
    * Worker that made it and the review round it waits for are read again before it goes out, and a delivery that is on
    * its way or whose receipt is missing is never carried out again — the message may already have landed.
+   *
+   * A delivery that was on the wire when the Project was paused is not a report that waits for a resume: the node is the
+   * only one that knows whether it arrived, and its answer is what the record says. Those deliveries are recovered here,
+   * and the one re-send a proof of absence permits goes out under the delivery's own key.
    */
   private async resumeHeldReportDeliveries(projectId: string): Promise<void> {
     for (const row of this.reports.heldFor(projectId)) {
@@ -5893,6 +6120,8 @@ export class ControlPlane {
       record.state = outcome.state
       if (outcome.reason !== undefined) record.reason = outcome.reason
     }
+    if (this.store.projects.get(projectId)?.status !== 'active') return
+    await this.reports.recoverProject(projectId)
   }
 
   /**
@@ -8253,6 +8482,9 @@ export class ControlPlane {
     // The stream digests stop with it too: the timer is cleared and a digest that is on its way is waited for, so the
     // record of what it did is written before the file closes.
     await this.streams.close()
+    // The outbox stops writing with the last of them: a record that belongs to a delivery in flight is written before the
+    // file closes, and nothing is written to a file that is about to close.
+    this.outbox.close()
     // The scheduler writes to the console's own file, so it is stopped before that file is closed: a delivery still in
     // flight gets its record written instead of finding a closed database.
     await this.stopScheduler()
@@ -8655,6 +8887,9 @@ export class ControlPlane {
       this.applyEvent(event)
       return
     }
+    // The answer to a question about one delivery is not a fact about the work: it belongs to the question, and the log
+    // of the work keeps no trace of it.
+    if (event.type === 'delivery.evidence') return
     // The event belongs to the node that sent it: an event of another machine is not this Session's business. The check
     // runs before the recording, because a row the log holds is a row a digest may quote later on.
     if (origin === 'node' && !this.ownsEvent(event)) return

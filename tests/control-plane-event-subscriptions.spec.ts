@@ -19,10 +19,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Assignment, ProjectProfile, Ticket, Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import type { SyntheticEvent } from '../src/control/event-subscriptions.ts'
+import type { DeliveryOutbox } from '../src/control/delivery-outbox.ts'
 import type { SingleNodeResolver } from '../src/control/node-resolver.ts'
 import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
-import { NodeUnconfirmedError, type NodeCommand } from '../src/shared/protocol.ts'
+import { NodeUnconfirmedError, type DeliveryEvidence, type NodeCommand } from '../src/shared/protocol.ts'
+import { KV } from '../src/kv.ts'
 
 const SECRET = 'external-secret'
 const API_TOKEN = 'external-api-token'
@@ -64,6 +66,8 @@ async function until(predicate: () => boolean, message: string, timeoutMs = 3000
 class ControllableNode extends FakeNode {
   /** When set, a `session.message` to that Session fails with it. */
   readonly failures = new Map<string, Error>()
+  /** The keys the node proves it never received. */
+  readonly absent = new Set<string>()
 
   override async send(command: NodeCommand): Promise<void> {
     if (command.type === 'session.message') {
@@ -71,6 +75,19 @@ class ControllableNode extends FakeNode {
       if (failure) throw failure
     }
     return super.send(command)
+  }
+
+  /**
+   * What the node proves about one delivery.
+   *
+   * A key the node is told it never received is answered with the one proof that permits a re-send: the message never
+   * arrived. Every other key is answered with what the node really holds.
+   */
+  override async evidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+    if (this.absent.has(deliveryKey)) {
+      return { state: 'absent', reason: 'this node holds no record of that delivery' }
+    }
+    return super.evidence(sessionId, deliveryKey)
   }
 }
 
@@ -306,6 +323,28 @@ function claimed(subscriptionId: string, eventId: string): boolean {
     "SELECT COUNT(*) AS total FROM external_event_dispositions WHERE subscription_id = ? AND event_id = ? "
     + "AND status = 'dispatching'").get(subscriptionId, eventId) as Record<string, unknown> | undefined
   return Number(row?.['total'] ?? 0) > 0
+}
+
+/**
+ * The state a control plane leaves behind when it stops while an event is on its way.
+ *
+ * The ledger says the event is in flight and the outbox says the same: the message was on its way and nobody knows
+ * whether it arrived. The caller tells the node that it never received the message, which is the one answer that would
+ * permit a re-send.
+ */
+function inFlight(subscriptionId: string, eventId: string): void {
+  control!.store.db.prepare(
+    "UPDATE external_event_dispositions SET status = 'dispatching' WHERE subscription_id = ? AND event_id = ?")
+    .run(subscriptionId, eventId)
+  const delivery = control!.coordinationDeliveries().find(row => row.kind === 'external_wakeup')
+  if (delivery === undefined) throw new Error('There is no wake-up delivery')
+  control!.store.db.prepare("UPDATE coordination_deliveries SET status = 'dispatching' WHERE delivery_id = ?")
+    .run(delivery.deliveryId)
+}
+
+/** The key the node knows one wake-up by. */
+function wakeupKey(subscriptionId: string, eventId: string): string {
+  return `external-event:${subscriptionId}:synthetic-group-chat:${eventId}`
 }
 
 afterEach(async () => {
@@ -1010,6 +1049,83 @@ describe('the change that comes while the event is on its way', () => {
     const outcome = await emitting
 
     expect(outcome.blocked).toHaveLength(1)
+    expect(wakesOf(worker)).toHaveLength(0)
+  })
+})
+
+describe('the wake-up that was on its way when the rules changed', () => {
+  it('does not deliver a wake-up whose rules changed, even when the target did not', async () => {
+    const { address, worker } = await open()
+    const created = await post(address, '/v1/console/external-subscriptions', groupSubscription(worker))
+    const subscriptionId = ((await created.json()) as { subscription: { subscriptionId: string } }).subscription.subscriptionId
+    await emit(address, groupMessage('evt-old-rules', GROUP, '请回滚'))
+
+    // The control plane stopped while the event was on its way, and the node proves that it never received it.
+    inFlight(subscriptionId, 'evt-old-rules')
+    node.absent.add(wakeupKey(subscriptionId, 'evt-old-rules'))
+
+    // The rules of the subscription change while the event is on its way: the revision moves, the target stays.
+    const changed = await put(address, `/v1/console/external-subscriptions/${subscriptionId}`,
+      { fields: [{ path: 'text', op: 'contains', value: '别的' }] })
+    expect(changed.status).toBe(200)
+
+    const ensures = node.commands.filter(command => command.type === 'worker.create').length
+    await restart()
+    node.messages.clear()
+
+    // The wake-up is not delivered under rules that are not its own: it is closed, and the target it was planned for is
+    // neither woken nor ensured.
+    const delivery = control!.coordinationDeliveries().find(row => row.kind === 'external_wakeup')
+    expect(delivery?.status).toBe('rejected_stale_or_revoked')
+    expect(wakesOf(worker)).toHaveLength(0)
+    expect(node.commands.filter(command => command.type === 'worker.create')).toHaveLength(ensures)
+  })
+
+  it('does not deliver a two-layer wake-up whose target was started again', async () => {
+    const { address, pm } = await open()
+    const created = await post(address, '/v1/console/external-subscriptions', {
+      sourceId: 'synthetic-group-chat', eventTypes: ['group.message'],
+      fields: [{ path: 'text', op: 'contains', value: '回滚' }],
+      deliveryMode: 'dual_layer_router', routeHint: '告诉项目「Project」请处理这条外部事件' })
+    const subscriptionId = ((await created.json()) as { subscription: { subscriptionId: string } }).subscription.subscriptionId
+    await emit(address, groupMessage('evt-two-layer', GROUP, '请回滚'))
+    // The fast route named the Project's PM, and the event went there.
+    expect(wakesOf(pm.sessionId)).toHaveLength(1)
+
+    // The control plane stopped while the event was on its way, and the node proves that it never received it.
+    inFlight(subscriptionId, 'evt-two-layer')
+    node.absent.add(wakeupKey(subscriptionId, 'evt-two-layer'))
+
+    // The PM was started again: its lifecycle is a new one, and the wake-up was planned under the old one.
+    control!.store.set(KV.control.sessionEpoch(pm.sessionId), 1)
+
+    const ensures = node.commands.filter(command => command.type === 'pm.ensure').length
+    await restart()
+    node.messages.clear()
+
+    // The wake-up is closed: the Session it was planned for is not this one any more, and it is neither woken nor
+    // ensured.
+    const delivery = control!.coordinationDeliveries().find(row => row.kind === 'external_wakeup')
+    expect(delivery?.status).toBe('rejected_stale_or_revoked')
+    expect(wakesOf(pm.sessionId)).toHaveLength(0)
+    expect(node.commands.filter(command => command.type === 'pm.ensure')).toHaveLength(ensures)
+  })
+})
+
+describe('the write that reserves an event', () => {
+  it('does not leave the event on its way when its delivery cannot be written down', async () => {
+    const { address, worker } = await open()
+    await post(address, '/v1/console/external-subscriptions', groupSubscription(worker))
+    // The outbox cannot take the delivery: the claim of the event and the record of the delivery are one write, so
+    // neither of them is written down.
+    const outbox = (control as unknown as { outbox: DeliveryOutbox }).outbox
+    vi.spyOn(outbox, 'accept').mockImplementation(() => { throw new Error('the table of the outbox is gone') })
+
+    const result = await emit(address, groupMessage('evt-atomic', GROUP, '请回滚'))
+
+    // The event is not left on its way: the ledger says that it failed, and nobody was woken by it.
+    expect(result.result.failed).toHaveLength(1)
+    expect(ledger().map(row => row.status)).toEqual(['failed'])
     expect(wakesOf(worker)).toHaveLength(0)
   })
 })

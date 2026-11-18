@@ -10,6 +10,10 @@
  * work that exists always names a report. A crash between the two leaves a record whose report was never written, and
  * the recovery says exactly that instead of delivering a fact that does not exist.
  *
+ * The table itself belongs to the shared outbox (`delivery-outbox.ts`), which owns its shape, its migration and the
+ * recovery of every kind of coordination. This module owns the routing of a report, its stable key, its throttle and the
+ * message the superior reads; it reads its own rows back for the throttle and for the PM's own view of a wake-up.
+ *
  * The three generations are kept apart on purpose. The node's trust answers "is this the node I registered", the
  * Assignment's lifecycle answers "is this still the Worker that owns this work", and the credential's version answers
  * "is this token the current one". Only the middle one says that a target was replaced, so a routine refresh of a
@@ -26,6 +30,11 @@ import { redact } from '../infra/redact.ts'
 import { NodeUnconfirmedError, type SessionRecord, type SessionRole } from '../shared/protocol.ts'
 import type { NodeResolutionErrorCode, NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
 import type { PmReportFacts } from './pm-report.ts'
+import { DEFAULT_DELIVERY_TTL_MS, CoordinationDeliveryStaleError, type CoordinationDeliveryKind,
+  type CoordinationDeliveryRow, type CoordinationDeliveryStatus, type CoordinationDeliveryView, type DeliveryContext,
+  type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
+
+export type { CoordinationDeliveryKind, CoordinationDeliveryRow, CoordinationDeliveryStatus, CoordinationDeliveryView }
 
 /**
  * The kinds of report the coordination knows.
@@ -34,33 +43,6 @@ import type { PmReportFacts } from './pm-report.ts'
  * its own Project as a whole is a `completed`, a `blocked`, a `failed` or an ordinary `progress`.
  */
 export type CoordinationReportKind = 'progress' | 'waiting' | 'ready' | 'blocked' | 'failed' | 'dropped' | 'completed'
-
-/**
- * The states of one coordination delivery.
- *
- * They are facts about different moments, and the record keeps them apart: `accepted_pending` is a delivery that was
- * accepted and not sent yet, `dispatching` one that is on its way to the node, `delivered_inbox` one the node confirmed
- * in the target's inbox, `consumed_turn` one a turn of the target read, `unconfirmed` one whose receipt is missing,
- * `blocked_target_inactive` one whose target is stopped, paused or gone, `blocked_node_unavailable` one the node could
- * not be reached on, `rejected_stale_or_revoked` one whose authority or generation no longer holds, `failed_permanent`
- * one the node refused, `superseded` one a newer report replaced before it could go out, and `deferred_for_resume` one
- * that waits for the Project to be resumed.
- */
-export type CoordinationDeliveryStatus =
-  | 'accepted_pending'
-  | 'dispatching'
-  | 'delivered_inbox'
-  | 'consumed_turn'
-  | 'unconfirmed'
-  | 'blocked_target_inactive'
-  | 'blocked_node_unavailable'
-  | 'rejected_stale_or_revoked'
-  | 'failed_permanent'
-  | 'superseded'
-  | 'deferred_for_resume'
-
-/** The kinds of delivery the coordination records. */
-export type CoordinationDeliveryKind = 'worker_report' | 'pm_report'
 
 /**
  * What a PM's own report about its Project is.
@@ -83,109 +65,14 @@ export function projectReportKindOf(kind: PmProjectReportKind): CoordinationRepo
 }
 
 /**
- * The statuses that hold a delivery's identity open.
- *
- * While a delivery is in one of them, the same report may not be planned again: the superior either knows it, is about
- * to know it, or may already have it without a receipt. The durable uniqueness of the table enforces the same rule, so a
- * restart cannot lose it.
- *
- * The statuses that *may* be planned again are the complement of this set — `failed_permanent`,
- * `blocked_target_inactive`, `blocked_node_unavailable`, `superseded` and `deferred_for_resume`: a delivery that never
- * reached its superior may be tried once more, while one that reached it, or whose outcome is unknown, may not. The
- * unique index of the table is written over exactly that complement.
- */
-const LIVE_STATUSES: ReadonlySet<string> = new Set([
-  'accepted_pending', 'dispatching', 'delivered_inbox', 'consumed_turn', 'unconfirmed', 'rejected_stale_or_revoked',
-])
-
-/**
- * The statuses a delivery may be planned again from.
- *
- * They are the ones a delivery never left its superior in: it failed for good, its target was resting, the node could
- * not be reached on, a newer report took its place, or it waits for the Project to be resumed. The unique index of the
- * table is written over the complement of this set, so two open deliveries of one report cannot exist.
- */
-const REOPENABLE_STATUSES: readonly string[] = ['failed_permanent', 'blocked_target_inactive', 'blocked_node_unavailable',
-  'superseded', 'deferred_for_resume']
-
-/** The statuses a delivery may be planned again from, as the table's own SQL spells them. */
-function reopenableStatuses(): string {
-  return REOPENABLE_STATUSES.map(status => `'${status}'`).join(',')
-}
-
-/**
- * One delivery of one report, as the durable record holds it.
- *
- * The record names the target and the source, the key that makes the delivery idempotent, the generations it was made
- * under, how many times it was attempted and the state it reached. The body of the report is kept as an isolated
- * reference: it is the lower-trust text of a report, never an instruction.
- */
-export interface CoordinationDeliveryRow {
-  /** The delivery's own id; it names the delivery on the node as well. */
-  deliveryId: string
-  /** What kind of coordination the delivery is. */
-  kind: CoordinationDeliveryKind
-  /** When the delivery was accepted. */
-  at: string
-  /** The state the delivery reached. */
-  status: CoordinationDeliveryStatus
-  /** The key the node knows this delivery by; a repeated key is executed at most once. */
-  idempotencyKey: string
-  /** The stable key that makes an identical report one delivery. */
-  dedupKey: string
-  /** The scope the throttle of this delivery counts in: the target and the owner of the report. */
-  scope: string
-  /** The Project the report belongs to; empty for a standalone Ticket. */
-  projectId: string
-  /** The Ticket the report is about. */
-  ticketId: string
-  /** The Assignment the report is about; empty for a PM's Project report. */
-  assignmentId: string
-  /** The review round the report waits for, when it waits for one. */
-  reviewId: string
-  /** The kind of the report. */
-  reportKind: CoordinationReportKind
-  /** The digest of the report's own content. */
-  contentDigest: string
-  /** The Session that made the report. */
-  sourceSessionId: string
-  /** The Session the report is delivered to. */
-  targetSessionId: string
-  /** What the target Session is for. */
-  targetRole: SessionRole
-  /** The node the report came from. */
-  nodeId: string
-  /** The backend the report came from. */
-  backendId: string
-  /** The lifecycle generation of the target when the delivery was enqueued. */
-  expectedAssignmentEpoch: number
-  /** The credential version of the target when the delivery was enqueued. */
-  expectedToolTokenVersion: number
-  /** The node trust the delivery was made under. */
-  expectedNodeTrustEpoch: number
-  /** The lifecycle generation of the Assignment the report is about. */
-  sourceAssignmentEpoch: number
-  /** How many times the delivery was attempted. */
-  attemptCount: number
-  /** When the delivery was claimed and went on its way. */
-  dispatchedAt: string
-  /** When a held-back delivery may go out; empty when it may go out at once. */
-  dueAt: string
-  /** The body of the report, as an isolated reference. */
-  payload: string
-  /** Why the delivery failed, when it did. */
-  error: string
-}
-
-/**
  * What one report asks the coordination to deliver.
  *
  * The plan is written by the control plane, which owns the business facts; the coordination owns the routing rules, the
  * durable record and the delivery itself.
  */
 export interface ReportDeliveryPlan {
-  /** What kind of coordination the delivery is. */
-  kind: CoordinationDeliveryKind
+  /** What kind of coordination the delivery is; a report is a Worker's or a PM's. */
+  kind: 'worker_report' | 'pm_report'
   /** The Project the report belongs to; empty for a standalone Ticket. */
   projectId: string
   /** The Ticket the report is about. */
@@ -227,20 +114,6 @@ export class CoordinationTargetUnavailableError extends Error {
   }
 }
 
-/**
- * A delivery that may not go on the wire any more.
- *
- * The check that runs immediately before the transport found that the life the delivery was planned for is over: the
- * report was replaced, the source moved on, or the target was replaced. The message never left this control plane, so it
- * is neither a lost receipt nor a refusal by the node: the record says which of the two it is.
- */
-export class CoordinationDeliveryStaleError extends Error {
-  constructor(message: string, readonly status: CoordinationDeliveryStatus) {
-    super(message)
-    this.name = 'CoordinationDeliveryStaleError'
-  }
-}
-
 /** What one delivery really did. */
 export interface ReportDeliveryOutcome {
   /** The state the caller shows. */
@@ -249,60 +122,6 @@ export interface ReportDeliveryOutcome {
   reason?: string
   /** The durable record of the delivery. */
   delivery?: CoordinationDeliveryRow
-}
-
-/**
- * One delivery as the console reads it.
- *
- * The body of the report is not part of it: the stored message is the lower-trust text of a Worker or a PM, and the
- * console shows what happened to a delivery, not what the report said. The idempotency key is not part of it either: it
- * is the node's own name for the delivery, and nothing outside the node has a use for it.
- */
-export interface CoordinationDeliveryView {
-  /** The delivery's own id. */
-  deliveryId: string
-  /** What kind of coordination the delivery is. */
-  kind: CoordinationDeliveryKind
-  /** When the delivery was accepted. */
-  at: string
-  /** The state the delivery reached. */
-  status: CoordinationDeliveryStatus
-  /** The kind of the report. */
-  reportKind: CoordinationReportKind
-  /** The Project the report belongs to; empty for a standalone Ticket. */
-  projectId: string
-  /** The Ticket the report is about. */
-  ticketId: string
-  /** The Assignment the report is about. */
-  assignmentId: string
-  /** The review round the report waits for, when it waits for one. */
-  reviewId: string
-  /** The Session that made the report. */
-  sourceSessionId: string
-  /** The Session the report is delivered to. */
-  targetSessionId: string
-  /** What the target Session is for. */
-  targetRole: SessionRole
-  /** The node the report came from. */
-  nodeId: string
-  /** The backend the report came from. */
-  backendId: string
-  /** How many times the delivery was attempted. */
-  attemptCount: number
-  /** The lifecycle generation of the target when the delivery was enqueued. */
-  expectedAssignmentEpoch: number
-  /** The credential version of the target when the delivery was enqueued. */
-  expectedToolTokenVersion: number
-  /** The node trust the delivery was made under. */
-  expectedNodeTrustEpoch: number
-  /** The lifecycle generation of the Assignment the report is about. */
-  sourceAssignmentEpoch: number
-  /** When a held-back delivery may go out; empty when it may go out at once. */
-  dueAt: string
-  /** When the delivery was claimed and went on its way. */
-  dispatchedAt: string
-  /** Why the delivery failed, when it did. */
-  error: string
 }
 
 /**
@@ -418,6 +237,14 @@ export interface ReportCoordinatorOptions {
    * a dropped work are never held back: they are state changes the superior has to see at once.
    */
   progressIntervalMs?: number
+  /**
+   * How long the message of a report stays worth delivering, in milliseconds.
+   *
+   * The message life is its own: it does not follow the authorization of the Session the report is about, and the
+   * authorization does not follow it. A report that is still the current one after this time is still a fact; one that
+   * ran out is not delivered any more. `0` turns the message life off, and a report then waits for as long as it takes.
+   */
+  deliveryTtlMs?: number
 }
 
 /**
@@ -427,53 +254,6 @@ export interface ReportCoordinatorOptions {
  * short enough that a superior learns of a long silence within a minute of it ending.
  */
 export const DEFAULT_PROGRESS_INTERVAL_MS = 60_000
-
-/** The table of the coordination's own records. */
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS coordination_deliveries (
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  delivery_id TEXT NOT NULL UNIQUE,
-  kind TEXT NOT NULL,
-  at TEXT NOT NULL,
-  status TEXT NOT NULL,
-  idempotency_key TEXT NOT NULL,
-  dedup_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  project_id TEXT NOT NULL,
-  ticket_id TEXT NOT NULL,
-  assignment_id TEXT NOT NULL,
-  review_id TEXT NOT NULL,
-  report_kind TEXT NOT NULL,
-  content_digest TEXT NOT NULL,
-  source_session_id TEXT NOT NULL,
-  target_session_id TEXT NOT NULL,
-  target_role TEXT NOT NULL,
-  node_id TEXT NOT NULL,
-  backend_id TEXT NOT NULL,
-  expected_assignment_epoch INTEGER NOT NULL,
-  expected_tool_token_version INTEGER NOT NULL,
-  expected_node_trust_epoch INTEGER NOT NULL,
-  source_assignment_epoch INTEGER NOT NULL,
-  attempt_count INTEGER NOT NULL,
-  dispatched_at TEXT NOT NULL,
-  due_at TEXT NOT NULL,
-  payload TEXT NOT NULL,
-  error TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS coordination_deliveries_status ON coordination_deliveries(status, seq);
-CREATE INDEX IF NOT EXISTS coordination_deliveries_target ON coordination_deliveries(target_session_id, assignment_id, seq);
-`
-
-/**
- * The index that holds one delivery per report.
- *
- * It covers the rows that are still open — the ones the superior knows, is about to know, or may already have without a
- * receipt — so an identical report cannot be delivered twice. It is written after the table has been brought to its
- * current shape, because a file that predates it may still hold rows the index would refuse.
- */
-const DEDUP_INDEX = `
-CREATE UNIQUE INDEX IF NOT EXISTS coordination_deliveries_dedup_live
-  ON coordination_deliveries(dedup_key) WHERE status NOT IN (${reopenableStatuses()});
-`
 
 /**
  * The digest of one report's own content.
@@ -507,6 +287,21 @@ export function stableDedupKey(plan: ReportDeliveryPlan): string {
  */
 function throttleScope(targetSessionId: string, assignmentId: string, projectId: string): string {
   return JSON.stringify([targetSessionId, assignmentId === '' ? `project:${projectId}` : assignmentId])
+}
+
+/**
+ * The owning record of one delivery of a report.
+ *
+ * It names the Ticket and the Assignment a Worker's report is about, or the Project a PM's report is about. A recovery
+ * reads it and knows which record it has to read again; it never has to guess, and it never has to run anything the
+ * writer left behind.
+ */
+function reportContextOf(plan: ReportDeliveryPlan): DeliveryContext {
+  if (plan.kind === 'pm_report') {
+    return { kind: 'pm_report', projectId: plan.projectId }
+  }
+  return { kind: 'worker_report', ticketId: plan.ticketId, assignmentId: plan.assignmentId,
+    reportKind: plan.reportKind, reviewId: plan.reviewId }
 }
 
 /**
@@ -546,13 +341,9 @@ export class ReportCoordinator {
   /** Whether the coordination was closed; nothing is written after that. */
   private closed = false
 
-  constructor(private readonly store: Store, private readonly host: ReportCoordinatorHost,
-    private readonly options: ReportCoordinatorOptions = {}) {
+  constructor(private readonly store: Store, private readonly outbox: DeliveryOutbox,
+    private readonly host: ReportCoordinatorHost, private readonly options: ReportCoordinatorOptions = {}) {
     this.progressIntervalMs = Math.max(0, options.progressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS)
-    // The coordination's own table lives in the control plane's own file. It is created here, idempotently, so the
-    // domain's own schema stays what it always was and an older plugin binary never opens this table.
-    this.store.db.exec(SCHEMA)
-    this.migrate()
   }
 
   /**
@@ -565,9 +356,7 @@ export class ReportCoordinator {
 
   /** The deliveries the coordination holds, newest last. */
   deliveries(limit = 50): CoordinationDeliveryRow[] {
-    const rows = this.store.db.prepare(
-      'SELECT * FROM coordination_deliveries ORDER BY seq DESC LIMIT ?').all(Math.max(1, Math.min(limit, 500)))
-    return rows.map(row => this.rowOf(row as Record<string, unknown>))
+    return this.outbox.rows(limit)
   }
 
   /**
@@ -578,30 +367,7 @@ export class ReportCoordinator {
    * own.
    */
   views(limit = 50): CoordinationDeliveryView[] {
-    return this.deliveries(limit).map(row => ({
-      deliveryId: row.deliveryId,
-      kind: row.kind,
-      at: row.at,
-      status: row.status,
-      reportKind: row.reportKind,
-      projectId: row.projectId,
-      ticketId: row.ticketId,
-      assignmentId: row.assignmentId,
-      reviewId: row.reviewId,
-      sourceSessionId: row.sourceSessionId,
-      targetSessionId: row.targetSessionId,
-      targetRole: row.targetRole,
-      nodeId: row.nodeId,
-      backendId: row.backendId,
-      attemptCount: row.attemptCount,
-      expectedAssignmentEpoch: row.expectedAssignmentEpoch,
-      expectedToolTokenVersion: row.expectedToolTokenVersion,
-      expectedNodeTrustEpoch: row.expectedNodeTrustEpoch,
-      sourceAssignmentEpoch: row.sourceAssignmentEpoch,
-      dueAt: row.dueAt,
-      dispatchedAt: row.dispatchedAt,
-      error: row.error,
-    }))
+    return this.outbox.views(limit)
   }
 
   /**
@@ -615,7 +381,7 @@ export class ReportCoordinator {
     const row = this.store.db.prepare(
       'SELECT * FROM coordination_deliveries WHERE ticket_id = ? ORDER BY seq DESC LIMIT 1').get(ticketId)
     if (row === undefined) return undefined
-    const delivery = this.rowOf(row as Record<string, unknown>)
+    const delivery = this.outbox.readRow(row as Record<string, unknown>)
     return { reportState: delivery.reportKind, assignmentId: delivery.assignmentId, projectId: delivery.projectId,
       at: delivery.at, state: notificationStateOf(delivery.status), reason: delivery.error }
   }
@@ -719,8 +485,7 @@ export class ReportCoordinator {
 
   /** The delivery of one report, by its own id. */
   delivery(deliveryId: string): CoordinationDeliveryRow | undefined {
-    const row = this.store.db.prepare('SELECT * FROM coordination_deliveries WHERE delivery_id = ?').get(deliveryId)
-    return row === undefined ? undefined : this.rowOf(row as Record<string, unknown>)
+    return this.outbox.row(deliveryId)
   }
 
   /**
@@ -734,7 +499,7 @@ export class ReportCoordinator {
     const rows = this.store.db.prepare(
       "SELECT * FROM coordination_deliveries WHERE status = 'deferred_for_resume' AND project_id = ? ORDER BY seq")
       .all(projectId) as Record<string, unknown>[]
-    return rows.map(row => this.rowOf(row))
+    return rows.map(row => this.outbox.readRow(row))
   }
 
   /**
@@ -805,9 +570,13 @@ export class ReportCoordinator {
       dueAt: dueAt ?? '',
       payload: plan.message,
       error: '',
+      context: JSON.stringify(reportContextOf(plan)),
+      expiresAt: this.expiryOf(),
+      resendCount: 0,
+      evidence: '',
     }
     try {
-      this.insert(row)
+      this.outbox.insert(row)
     } catch (error) {
       // The unique index of the table refused the row: another delivery of the same report is open right now, so this
       // report is one fact and is not delivered twice.
@@ -816,6 +585,20 @@ export class ReportCoordinator {
     }
     if (dueAt !== undefined) this.scheduleFlush(dueAt)
     return row
+  }
+
+  /**
+   * The moment the message of a delivery runs out.
+   *
+   * The message life is its own: it does not follow the authorization, and the authorization does not follow it. A report
+   * that is still the current one after a week is still a fact; one that ran out is not delivered any more.
+   */
+  private expiryOf(): string {
+    const ttl = this.options.deliveryTtlMs ?? DEFAULT_DELIVERY_TTL_MS
+    if (!Number.isFinite(ttl) || ttl <= 0) return ''
+    const now = Date.parse(this.host.now())
+    if (!Number.isFinite(now)) return ''
+    return new Date(now + ttl).toISOString()
   }
 
   /**
@@ -887,7 +670,7 @@ export class ReportCoordinator {
       return { state: 'skipped', reason, delivery: this.delivery(current.deliveryId) }
     }
     // One claim, one send: the row is claimed with a conditional write, so two callers cannot both take it.
-    if (!this.claim(current.deliveryId)) {
+    if (!this.outbox.claim(current.deliveryId, ['accepted_pending', 'deferred_for_resume'])) {
       return { state: 'skipped', reason: 'the delivery was already claimed', delivery: this.delivery(current.deliveryId) }
     }
     try {
@@ -929,27 +712,25 @@ export class ReportCoordinator {
   /**
    * The deliveries a restart left open.
    *
-   * A delivery that was never sent is carried out again under its own key, after the report it is about and the target
-   * it names are read again. A delivery that waits for a Project's resume is carried out again as well: the resume may
-   * have happened while this control plane was not running. A delivery that was on its way when the control plane
-   * stopped has an unknown outcome: it is marked as unconfirmed and never sent again, because a blind resend would
-   * repeat a delivery that may have landed.
+   * The recovery belongs to the outbox: it owns the table, it asks the node what it can prove about a delivery that was
+   * on its way, and it settles every kind of coordination the same way. A delivery that was never sent is carried out
+   * again under its own key, after the report it is about and the target it names are read again. A delivery that was on
+   * its way when the control plane stopped is asked about: the node is the only one that knows whether it arrived.
    */
   async recover(): Promise<void> {
-    const rows = this.store.db.prepare(
-      "SELECT * FROM coordination_deliveries WHERE status IN "
-      + "('accepted_pending','dispatching','deferred_for_resume') ORDER BY seq")
-      .all() as Record<string, unknown>[]
-    for (const raw of rows) {
-      const row = this.rowOf(raw)
-      if (row.status === 'dispatching') {
-        // The request may have gone out: the outcome is unknown, and it is never sent again on a guess.
-        this.settle(row.deliveryId, 'dispatching', 'unconfirmed',
-          'the control plane stopped while the delivery was on its way; its outcome is unknown')
-        continue
-      }
-      await this.deliver(row)
-    }
+    await this.outbox.recover()
+  }
+
+  /**
+   * Recover the deliveries of one Project that a pause left on the wire.
+   *
+   * A delivery that was on its way when the Project was paused is not a report that waits for a resume: the node is the
+   * only one that knows whether the message arrived, and its answer is what the record says. The recovery belongs to the
+   * outbox: it asks the node about the exact key of the exact Session, and it carries out the one re-send a proof of
+   * absence permits — under the delivery's own key, and only when that re-send was not made yet.
+   */
+  async recoverProject(projectId: string): Promise<void> {
+    await this.outbox.recoverProject(projectId)
   }
 
   /**
@@ -1143,6 +924,13 @@ export class ReportCoordinator {
       return { ok: false, status: 'rejected_stale_or_revoked',
         reason: 'the PM Session does not belong to the Project' }
     }
+    // A PM that lost its authority may not be woken, and a PM a person put to rest is never brought back by a report.
+    if (manager.revokedAt) {
+      return { ok: false, status: 'rejected_stale_or_revoked', reason: 'the PM Session was revoked' }
+    }
+    if (manager.operatorStop !== undefined) {
+      return { ok: false, status: 'blocked_target_inactive', reason: 'the PM Session was stopped by an operator' }
+    }
     if (project.status === 'ended' || project.status === 'archived') {
       return { ok: false, status: 'rejected_stale_or_revoked', reason: `the Project ${project.id} is ${project.status}` }
     }
@@ -1275,7 +1063,7 @@ export class ReportCoordinator {
       .all() as Record<string, unknown>[]
     for (const raw of rows) {
       if (this.closed) return
-      const row = this.rowOf(raw)
+      const row = this.outbox.readRow(raw)
       if (row.dueAt !== '' && !this.dueNow(row.dueAt)) {
         this.scheduleFlush(row.dueAt)
         continue
@@ -1286,25 +1074,7 @@ export class ReportCoordinator {
 
   /** The open delivery of one report, when there is one. */
   private liveRowOf(dedupKey: string): CoordinationDeliveryRow | undefined {
-    const row = this.store.db.prepare(
-      'SELECT * FROM coordination_deliveries WHERE dedup_key = ? ORDER BY seq DESC LIMIT 1').get(dedupKey)
-    if (row === undefined) return undefined
-    const delivery = this.rowOf(row as Record<string, unknown>)
-    return LIVE_STATUSES.has(delivery.status) ? delivery : undefined
-  }
-
-  /**
-   * Claim one delivery for sending.
-   *
-   * The claim is a conditional write: only the caller whose write changes a row may send the message, so two callers
-   * that read the same row never both deliver it. A delivery that waits for a Project's resume is claimed from the state
-   * it waits in; a delivery that is on its way or whose outcome is unknown is never claimed again.
-   */
-  private claim(deliveryId: string): boolean {
-    const result = this.store.db.prepare(
-      "UPDATE coordination_deliveries SET status = 'dispatching', attempt_count = attempt_count + 1, dispatched_at = ? "
-      + "WHERE delivery_id = ? AND status IN ('accepted_pending','deferred_for_resume')").run(this.host.now(), deliveryId)
-    return Number(result.changes ?? 0) === 1
+    return this.outbox.liveRowOf(dedupKey)
   }
 
   /**
@@ -1315,13 +1085,7 @@ export class ReportCoordinator {
    */
   private settle(deliveryId: string, from: CoordinationDeliveryStatus, to: CoordinationDeliveryStatus, error: string): void {
     if (this.closed) return
-    try {
-      this.store.db.prepare(
-        'UPDATE coordination_deliveries SET status = ?, error = ? WHERE delivery_id = ? AND status = ?')
-        .run(to, error, deliveryId, from)
-    } catch {
-      // The database is gone: the control plane is closing, and the record it would have written no longer has a home.
-    }
+    this.outbox.settle(deliveryId, from, to, error)
   }
 
   /** Whether SQLite refused a write because of its unique index. */
@@ -1330,115 +1094,38 @@ export class ReportCoordinator {
   }
 
   /**
-   * Bring a table of an earlier shape to the shape this coordination expects.
+   * Re-read the authority of one delivery of a report.
    *
-   * The table is the control plane's own, and it only exists where this coordination has run before: a file that
-   * predates a column gets it, so an upgrade keeps its records instead of losing them. The index that holds one delivery
-   * per report is written last, because a file that predates it may hold rows the index would refuse: the older of two
-   * open deliveries of the same report is closed first, and the newest one stays.
+   * This is the answer the outbox asks before it sends a delivery again: the report the delivery is about must still be
+   * the report the superior is to hear, the Worker that made it must still be the one that may speak for it, and the
+   * Project and its PM must still hold.
+   *
+   * A report that is held back by the throttle is not refused: it keeps its place and waits for its moment.
    */
-  private migrate(): void {
-    const columns = this.store.db.prepare('PRAGMA table_info(coordination_deliveries)').all() as Record<string, unknown>[]
-    if (columns.length === 0) {
-      this.store.db.exec(DEDUP_INDEX)
-      return
+  revalidate(row: CoordinationDeliveryRow): DeliveryRevalidation {
+    if (row.dueAt !== '' && !this.dueNow(row.dueAt)) {
+      return { ok: false, outcome: 'held', reason: 'the report is held back until the progress interval passed' }
     }
-    const known = new Set(columns.map(column => String(column.name ?? '')))
-    const wanted: Record<string, string> = {
-      scope: "TEXT NOT NULL DEFAULT ''",
-      source_assignment_epoch: 'INTEGER NOT NULL DEFAULT 0',
-      dispatched_at: "TEXT NOT NULL DEFAULT ''",
+    const source = this.validateSource(row)
+    if (!source.ok) return { ok: false, outcome: 'closed', status: source.status, reason: source.reason }
+    const target = this.validateTarget(row)
+    if (!target.ok) return { ok: false, outcome: 'closed', status: target.status, reason: target.reason }
+    // The lifecycle the delivery was planned under must still hold: a target that was replaced since is not this one.
+    // The credential's own version is not compared: a refresh replaces the credential and nothing else.
+    if (this.host.targetEpochs(row.targetSessionId).assignmentEpoch !== row.expectedAssignmentEpoch) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the target was replaced before the delivery went out' }
     }
-    for (const [name, definition] of Object.entries(wanted)) {
-      if (known.has(name)) continue
-      this.store.db.exec(`ALTER TABLE coordination_deliveries ADD COLUMN ${name} ${definition}`)
-    }
-    // The old table kept an index over every row; the live one is unique over the rows that are still open.
-    this.store.db.exec('DROP INDEX IF EXISTS coordination_deliveries_dedup')
-    this.closeDuplicateDeliveries()
-    // The live index is written again: the set of rows that are still open grew, and an index that still knows the old
-    // one would refuse a report that waits for a resume.
-    this.store.db.exec('DROP INDEX IF EXISTS coordination_deliveries_dedup_live')
-    this.store.db.exec(DEDUP_INDEX)
+    return { ok: true }
   }
 
   /**
-   * Close the older of two deliveries that are open under the same report.
+   * The message of one delivery of a report, for a delivery that is sent again.
    *
-   * A file that predates the unique index may hold two such rows. The newest one keeps the report's identity; the older
-   * one is closed as superseded, so its record is still there and the index can be written.
+   * The message was assembled when the report was accepted: it is the isolated, bounded reference the PM reads, and it
+   * is the very message the first attempt carried. A delivery that has no message is not sent with another one.
    */
-  private closeDuplicateDeliveries(): void {
-    const rows = this.store.db.prepare(
-      "SELECT seq, dedup_key FROM coordination_deliveries WHERE status NOT IN "
-      + `(${reopenableStatuses()}) ORDER BY seq DESC`)
-      .all() as Record<string, unknown>[]
-    const seen = new Set<string>()
-    for (const row of rows) {
-      const key = String(row.dedup_key ?? '')
-      if (!seen.has(key)) {
-        seen.add(key)
-        continue
-      }
-      this.store.db.prepare(
-        "UPDATE coordination_deliveries SET status = 'superseded', error = ? WHERE seq = ?")
-        .run('a newer delivery of the same report took its place', Number(row.seq ?? 0))
-    }
-  }
-
-  /** Write one delivery record. */
-  private insert(row: CoordinationDeliveryRow): void {
-    this.store.db.prepare(
-      'INSERT INTO coordination_deliveries (delivery_id, kind, at, status, idempotency_key, dedup_key, scope, '
-      + 'project_id, ticket_id, assignment_id, review_id, report_kind, content_digest, source_session_id, '
-      + 'target_session_id, target_role, node_id, backend_id, expected_assignment_epoch, expected_tool_token_version, '
-      + 'expected_node_trust_epoch, source_assignment_epoch, attempt_count, dispatched_at, due_at, payload, error) '
-      + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(row.deliveryId, row.kind, row.at, row.status, row.idempotencyKey, row.dedupKey, row.scope,
-        row.projectId, row.ticketId, row.assignmentId, row.reviewId, row.reportKind, row.contentDigest,
-        row.sourceSessionId, row.targetSessionId, row.targetRole, row.nodeId, row.backendId, row.expectedAssignmentEpoch,
-        row.expectedToolTokenVersion, row.expectedNodeTrustEpoch, row.sourceAssignmentEpoch, row.attemptCount,
-        row.dispatchedAt, row.dueAt, row.payload, row.error)
-  }
-
-  /** One row of the table, as the coordination reads it. */
-  private rowOf(row: Record<string, unknown>): CoordinationDeliveryRow {
-    const text = (name: string): string => {
-      const value = row[name]
-      return value === null || value === undefined ? '' : String(value)
-    }
-    const number = (name: string): number => {
-      const value = row[name]
-      return typeof value === 'number' ? value : Number(value ?? 0)
-    }
-    return {
-      deliveryId: text('delivery_id'),
-      kind: text('kind') as CoordinationDeliveryKind,
-      at: text('at'),
-      status: text('status') as CoordinationDeliveryStatus,
-      idempotencyKey: text('idempotency_key'),
-      dedupKey: text('dedup_key'),
-      scope: text('scope'),
-      projectId: text('project_id'),
-      ticketId: text('ticket_id'),
-      assignmentId: text('assignment_id'),
-      reviewId: text('review_id'),
-      reportKind: text('report_kind') as CoordinationReportKind,
-      contentDigest: text('content_digest'),
-      sourceSessionId: text('source_session_id'),
-      targetSessionId: text('target_session_id'),
-      targetRole: text('target_role') as SessionRole,
-      nodeId: text('node_id'),
-      backendId: text('backend_id'),
-      expectedAssignmentEpoch: number('expected_assignment_epoch'),
-      expectedToolTokenVersion: number('expected_tool_token_version'),
-      expectedNodeTrustEpoch: number('expected_node_trust_epoch'),
-      sourceAssignmentEpoch: number('source_assignment_epoch'),
-      attemptCount: number('attempt_count'),
-      dispatchedAt: text('dispatched_at'),
-      dueAt: text('due_at'),
-      payload: text('payload'),
-      error: text('error'),
-    }
+  payloadOf(row: CoordinationDeliveryRow): string | undefined {
+    return row.payload === '' ? undefined : row.payload
   }
 }

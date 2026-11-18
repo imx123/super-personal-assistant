@@ -18,7 +18,7 @@ import type {} from '@deepseek-ai/dsh-permission-presets'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { cancelled, stopBackground } from '../executor/background.ts'
-import { WORKER_REPORT_STATES, PROJECT_GATE_CONDITIONS, type GuardDenialReasonCode, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
+import { WORKER_REPORT_STATES, PROJECT_GATE_CONDITIONS, type DeliveryEvidence, type GuardDenialReasonCode, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
   type RouterModel, type RouterOptions, type WorkerReportState } from '../shared/protocol.ts'
 import { nodeWorkspace, type DshPortEvent, type DshPortHost, type NodeSessionRole } from './dsh-port.ts'
 
@@ -101,6 +101,13 @@ export interface DshPortSessions {
    * inserted; one only present in the persisted history does not.
    */
   prompt(sessionId: string, idempotencyKey: string, text: string, mode: 'queue', onDelivered?: () => void): Promise<void>
+  /**
+   * What this node can prove about one delivery.
+   *
+   * The answer comes from the Session's own persisted history, never from a cache a restart empties. A backend that cannot
+   * read that history answers `unknown`: it may not claim that a message never arrived.
+   */
+  evidence?(sessionId: string, idempotencyKey: string): Promise<DeliveryEvidence>
 }
 
 /**
@@ -756,6 +763,18 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
           if (!inserted) forgetDelivery(sessionId, message, delivery)
           throw error
         })
+    },
+    /**
+     * What this node can prove about one delivery.
+     *
+     * The proof comes from the Session's own persisted history, read by the node runtime that wrote it. A Session this
+     * process does not run cannot be read at all, and the answer is then `unknown`: the node that may have received the
+     * message is not this one, so this one may not claim that it never arrived.
+     */
+    async evidenceSession(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+      const answer = input.nodeRuntime.sessions.evidence
+      if (!answer) return { state: 'unknown', reason: 'this node cannot answer a question about a delivery' }
+      return answer.call(input.nodeRuntime.sessions, sessionId, deliveryKey)
     },
     async cancelSession(sessionId: string, reason?: string) {
       const agent = context.agents.get(sessionId as SessionId)

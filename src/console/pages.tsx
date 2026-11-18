@@ -540,6 +540,16 @@ function coordinationTone(status: string): string {
   return 'muted'
 }
 
+/** How the console names the kind of a coordination delivery. */
+const COORDINATION_KIND: Record<string, string> = {
+  auto_handoff: '自动交接',
+  worker_report: 'Worker 报告',
+  pm_report: 'PM 报告',
+  stream_digest: '信息流摘要',
+  denial_review: '拒绝审查',
+  external_wakeup: '外部事件唤醒',
+}
+
 /** How the console shows a denial review's state. */
 function denialTone(status: string): string {
   if (status === 'notified') return 'success'
@@ -562,12 +572,12 @@ const STREAM_DIGEST_STATUS: Record<string, string> = {
   failed: '未送达',
 }
 
-/** What a delivery is about, in one line: the Ticket, the Assignment and the kind of the report. */
+/** What a delivery is about, in one line: the kind, the Ticket, the Assignment and the kind of the report. */
 function coordinationSubject(delivery: CoordinationDelivery): string {
-  const parts: string[] = []
+  const parts: string[] = [COORDINATION_KIND[delivery.kind] ?? delivery.kind]
   if (delivery.ticketId !== '') parts.push(`工单 ${delivery.ticketId}`)
   if (delivery.assignmentId !== '') parts.push(`执行 ${delivery.assignmentId}`)
-  parts.push(delivery.reportKind)
+  if (delivery.reportKind !== '') parts.push(delivery.reportKind)
   return parts.join(' · ')
 }
 
@@ -581,7 +591,7 @@ function coordinationSubject(delivery: CoordinationDelivery): string {
 function CoordinationDeliveries(props: { deliveries: CoordinationDelivery[] }): ReactElement {
   return (
     <div className="router-queue" aria-label="报告投递记录">
-      <p className="quiet">Worker 与 PM 的报告投递给谁、投递到哪一步。报告正文不在这里展示。</p>
+      <p className="quiet">协调投递（自动交接、报告、信息流摘要、拒绝审查、外部事件唤醒）投递给谁、投递到哪一步。投递正文不在这里展示。</p>
       {props.deliveries.length === 0
         ? <p className="empty">还没有报告投递记录。</p>
         : <ul className="router-queue-list">

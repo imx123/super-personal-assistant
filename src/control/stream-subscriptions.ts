@@ -36,6 +36,7 @@ import { randomUUID } from 'node:crypto'
 import type { ProjectProfile, Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { redact } from '../infra/redact.ts'
+import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
 import { NodeUnconfirmedError, type SessionRecord, type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
@@ -441,7 +442,7 @@ export class StreamSubscriptionService {
   /** Whether the service was closed; nothing is written after that. */
   private closed = false
 
-  constructor(private readonly store: Store, private readonly host: StreamSubscriptionHost,
+  constructor(private readonly store: Store, private readonly outbox: DeliveryOutbox, private readonly host: StreamSubscriptionHost,
     options: StreamSubscriptionOptions = {}) {
     // The bound comes first: the default interval is kept inside it.
     this.maxIntervalSeconds = Math.max(MIN_STREAM_INTERVAL_SECONDS,
@@ -597,9 +598,13 @@ export class StreamSubscriptionService {
   /**
    * Look at the subscriptions a previous run of this control plane left open.
    *
-   * A digest that was on its way when the control plane stopped has an unknown outcome: it is marked as unconfirmed
-   * and never sent again, because a blind resend would repeat a digest that may have landed. Its watermark moves to
-   * the end of the range it covered, so the next digest is an increment of what came after it and never a replay.
+   * A digest that was on its way when the control plane stopped has an unknown outcome, and the outbox is the one that
+   * learned it: it asked the node what it can prove about that exact key, and the answer is written down. This method
+   * reads that answer and settles the subscription's own column with it: a digest the node can show is a digest that
+   * arrived, and a digest whose outcome stays unknown is never sent again.
+   *
+   * Its watermark moves to the end of the range it covered, so the next digest is an increment of what came after it and
+   * never a replay.
    */
   recover(): void {
     const rows = this.store.db.prepare(
@@ -608,10 +613,12 @@ export class StreamSubscriptionService {
     for (const raw of rows) {
       const row = this.rowOf(raw)
       const end = row.digestEndSeq > row.lastPushedSeq ? row.digestEndSeq : row.lastPushedSeq
+      const delivery = row.digestKey === '' ? undefined : this.outbox.byIdempotencyKey(row.digestKey)
+      const arrived = delivery?.status === 'delivered_inbox' || delivery?.status === 'consumed_turn'
       this.update(row.subscriptionId, {
         lastPushedSeq: end,
-        digestStatus: 'unconfirmed',
-        digestReason: 'the control plane stopped while the digest was on its way; its outcome is unknown',
+        digestStatus: arrived ? 'delivered_inbox' : 'unconfirmed',
+        digestReason: arrived ? '' : 'the control plane stopped while the digest was on its way; its outcome is unknown',
         updatedAt: this.host.now(),
       })
     }
@@ -705,8 +712,35 @@ export class StreamSubscriptionService {
     }
     const message = this.digestMessage(current, facts, end)
     const key = `stream-digest:${current.subscriptionId}:${current.lastPushedSeq}-${end}`
-    // The claim: one digest at a time, so two ticks never deliver the same range.
-    if (!this.claim(current.subscriptionId, key, end)) return
+    // The claim and the record of the digest are one write: a control plane that stopped between them would leave a
+    // range that is consumed and a delivery that does not exist, and the range would never be delivered again.
+    const delivery = this.store.atomic(() => {
+      // The claim: one digest at a time, so two ticks never deliver the same range. It comes first, so a digest that this
+      // tick does not own never leaves a record behind.
+      if (!this.claim(current.subscriptionId, key, end)) return undefined
+      // The digest is written down before it goes out: the outbox holds the record of what happened to it, so a restart
+      // knows whether the range was ever delivered.
+      return this.outbox.accept({
+        kind: 'stream_digest',
+        idempotencyKey: key,
+        dedupKey: `stream_digest:${current.subscriptionId}:${current.lastPushedSeq}-${end}`,
+        scope: `stream:${current.subscriberSessionId}:${current.targetSessionId}`,
+        projectId: current.targetProjectId,
+        ticketId: '',
+        assignmentId: current.targetRole === 'worker' ? current.targetAssignmentId : '',
+        sourceSessionId: current.targetSessionId,
+        targetSessionId: current.subscriberSessionId,
+        targetRole: current.subscriberRole,
+        nodeId: this.host.nodeId(),
+        backendId: this.host.backendId(),
+        expectedAssignmentEpoch: this.host.targetEpochs(current.subscriberSessionId).assignmentEpoch,
+        expectedToolTokenVersion: this.host.targetEpochs(current.subscriberSessionId).toolTokenVersion,
+        expectedNodeTrustEpoch: 0,
+        payload: message,
+        context: { kind: 'stream_digest', subscriptionId: current.subscriptionId, fromSeq: current.lastPushedSeq, toSeq: end },
+      })
+    })
+    if (delivery === undefined) return
     let resolution: NodeResolutionResult<ResolvedTarget>
     try {
       resolution = await this.host.resolveTarget(current.subscriberSessionId, 'message')
@@ -730,6 +764,13 @@ export class StreamSubscriptionService {
       return
     }
     try {
+      // The delivery is claimed before it goes out: the record says it is on its way, so a restart knows that the outcome
+      // has to be asked about rather than guessed.
+      if (!this.outbox.claim(delivery.deliveryId, ['accepted_pending'])) {
+        this.settleDigest(current.subscriptionId, 'failed', 'the delivery was already claimed')
+        this.scheduleNext(current)
+        return
+      }
       await this.host.deliver(current.subscriberSessionId, message, key, () => {
         this.assertSendable(current)
       }, () => {
@@ -739,21 +780,78 @@ export class StreamSubscriptionService {
       // A missing receipt is not a refusal: the digest may have arrived, so it is neither a failure nor to be repeated.
       if (error instanceof NodeUnconfirmedError) {
         this.advance(current, end)
+        this.outbox.settle(delivery.deliveryId, 'dispatching', 'unconfirmed',
+          'the node did not confirm the delivery; the digest may have arrived and is not sent again')
         this.settleDigest(current.subscriptionId, 'unconfirmed',
           'the node did not confirm the delivery; the digest may have arrived and is not sent again')
         this.scheduleNext(current)
         return
       }
-      this.settleDigest(current.subscriptionId, 'failed',
-        redact(error instanceof Error ? error.message : String(error)).slice(0, 300))
+      const reason = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+      this.outbox.settle(delivery.deliveryId, 'dispatching', 'failed_permanent', reason)
+      this.settleDigest(current.subscriptionId, 'failed', reason)
       this.scheduleNext(current)
       return
     }
     this.advance(current, end)
+    this.outbox.settle(delivery.deliveryId, 'dispatching', 'delivered_inbox', '')
     this.settleDigest(current.subscriptionId, 'delivered_inbox', '')
     this.audit({ actor: current.subscriberRole === 'router' ? 'router' : 'pm', kind: 'session', action: 'digested',
       targetKind: 'session', targetId: current.targetSessionId, detail: `events ${current.lastPushedSeq}-${end}` })
     this.scheduleNext(current)
+  }
+
+  /**
+   * Whether the digest of one delivery may still go out.
+   *
+   * The subscription must still be running, the child must still be the one it was made for, the superior must still
+   * govern that child, and the range the digest covers must still be the one the watermark waits for: a digest whose
+   * range was already delivered is closed, not repeated.
+   */
+  revalidateDigest(row: CoordinationDeliveryRow): DeliveryRevalidation {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'stream_digest') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'this delivery names no digest' }
+    }
+    const current = this.subscriptionOf(context.subscriptionId)
+    if (current === undefined || current.status !== 'active') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the subscription this digest was about is over' }
+    }
+    if (current.lastPushedSeq >= context.toSeq) {
+      return { ok: false, outcome: 'closed', status: 'superseded', reason: 'the range this digest was about was already delivered' }
+    }
+    const target = this.validateTarget(current)
+    if (!target.ok) return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: target.reason }
+    const governing = this.governsTarget(current)
+    if (!governing.ok) return { ok: false, outcome: 'closed', status: 'blocked_target_inactive', reason: governing.reason }
+    const resolved = this.host.resolveTargetNow(current.subscriberSessionId, 'message')
+    if (!resolved.ok) return { ok: false, outcome: 'closed', status: 'blocked_node_unavailable', reason: resolved.reason }
+    if (resolved.handle.sessionId !== current.subscriberSessionId) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the resolution named another Session' }
+    }
+    // The lifecycle the digest was planned under must still hold: a superior that was replaced is not this one.
+    if (resolved.generation.assignmentEpoch !== row.expectedAssignmentEpoch) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the superior was replaced before the digest went out' }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * The message of a digest that is sent again.
+   *
+   * It is rebuilt from the very range the first attempt covered: the aggregation is a programmatic read of the control
+   * plane's own event log, so the same range yields the same digest. A range that was already consumed yields no digest,
+   * and the delivery is closed rather than sent with another one.
+   */
+  digestPayload(row: CoordinationDeliveryRow): string | undefined {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'stream_digest') return undefined
+    const current = this.subscriptionOf(context.subscriptionId)
+    if (current === undefined) return undefined
+    const facts = this.aggregate(current, context.toSeq)
+    if (!facts.useful) return undefined
+    return this.digestMessage(current, facts, context.toSeq)
   }
 
   /**

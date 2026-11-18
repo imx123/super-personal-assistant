@@ -36,6 +36,7 @@ import type { Store } from '../app/store.ts'
 import { redact } from '../infra/redact.ts'
 import { NodeUnconfirmedError, type SessionRecord, type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
+import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
 import { fastRoute, type FastRouteDecision, type FastRouteFacts } from './fast-router.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
 import { compilePattern, safeMatches, PatternError } from './safe-regex.ts'
@@ -474,6 +475,14 @@ export interface EventSubscriptionHost {
   ensureRouterSession(): Promise<string>
   /** The facts the fast route reads, for the two-layer mode. */
   fastRouteFacts(): FastRouteFacts
+  /**
+   * The generations of a target Session, read without waiting for the node.
+   *
+   * A delivery writes them down when it is enqueued, so a delivery that waits knows which life it was meant for and a
+   * target that was replaced in the meantime is refused instead of reached. The read is the control plane's own: the
+   * numbers are never a default and never a guess.
+   */
+  targetEpochs(sessionId: string): { assignmentEpoch: number; toolTokenVersion: number }
   /** Resolve a target Session and the generations it was read under. */
   resolveTarget(sessionId: string, op: 'message'): Promise<NodeResolutionResult<ResolvedTarget>>
   /**
@@ -672,9 +681,24 @@ interface DeliveryPlan {
   rateWindowSeconds: number
 }
 
+/**
+ * The wake-up that was written down, and the very message it was written with.
+ *
+ * The record of the delivery and the message are one thing: a delivery that is sent again carries the very words its
+ * first attempt carried, and the key the node knows it by is the key it was written under.
+ */
+interface AcceptedWakeup {
+  /** The durable record of the delivery. */
+  readonly delivery: CoordinationDeliveryRow
+  /** The message the target reads. */
+  readonly text: string
+  /** The key the node knows the delivery by. */
+  readonly key: string
+}
+
 /** What the claim of one event decided. */
 type Claim =
-  | { kind: 'claimed' }
+  | { kind: 'claimed'; accepted: AcceptedWakeup }
   | { kind: 'duplicate' }
   | { kind: 'throttled'; reason: string }
   | { kind: 'blocked'; reason: string; scopeLoss: boolean }
@@ -715,7 +739,7 @@ export class EventSubscriptionService {
   /** How long a subscription's lease lasts, in seconds. */
   private readonly leaseSeconds: number
 
-  constructor(private readonly store: Store, private readonly host: EventSubscriptionHost,
+  constructor(private readonly store: Store, private readonly outbox: DeliveryOutbox, private readonly host: EventSubscriptionHost,
     options: EventSubscriptionOptions = {}) {
     this.maxSubscriptions = Math.max(1, options.maxSubscriptions ?? DEFAULT_MAX_EXTERNAL_SUBSCRIPTIONS)
     this.workerQuota = Math.max(1, options.workerQuota ?? DEFAULT_EXTERNAL_WORKER_QUOTA)
@@ -928,13 +952,24 @@ export class EventSubscriptionService {
   /**
    * Look at what a previous run of this control plane left open.
    *
-   * An event that was on its way when the control plane stopped has an unknown outcome: it is marked as unconfirmed and
-   * never sent again, because a blind resend would repeat an event that may have landed.
+   * An event that was on its way when the control plane stopped has an unknown outcome, and the outbox is the one that
+   * learned it: it asked the node what it can prove about that exact key. This method reads that answer: an event the node
+   * can show was sent, and an event whose outcome stays unknown is never sent again, because a blind resend would repeat
+   * an observation that may have landed.
    */
   recover(): void {
-    this.store.db.prepare(
-      "UPDATE external_event_dispositions SET status = 'unconfirmed', reason = ? WHERE status = 'dispatching'")
-      .run('the control plane stopped while the event was on its way; its outcome is unknown')
+    const rows = this.store.db.prepare(
+      "SELECT subscription_id, source_id, event_id FROM external_event_dispositions WHERE status = 'dispatching'")
+      .all() as Record<string, unknown>[]
+    for (const row of rows) {
+      const subscriptionId = String(row.subscription_id ?? '')
+      const sourceId = String(row.source_id ?? '')
+      const eventId = String(row.event_id ?? '')
+      const delivery = this.outbox.byIdempotencyKey(`external-event:${subscriptionId}:${sourceId}:${eventId}`)
+      const arrived = delivery?.status === 'delivered_inbox' || delivery?.status === 'consumed_turn'
+      this.settle(subscriptionId, sourceId, eventId, arrived ? 'sent' : 'unconfirmed',
+        arrived ? '' : 'the control plane stopped while the event was on its way; its outcome is unknown')
+    }
   }
 
   /**
@@ -1205,7 +1240,10 @@ export class EventSubscriptionService {
     // The asynchronous resolution comes first: the target is read before anything is claimed, so a target that is
     // already gone is refused before the ledger grows.
     await this.host.resolveTarget(plan.targetSessionId, 'message')
-    const claim = this.store.atomic(() => this.claim(plan, event, plan.targetSessionId))
+    // The claim of the event and the record of the delivery are one write: the transaction holds both of them, or
+    // neither of them.
+    const claim = this.store.atomic(() => this.claim(plan, event, plan.targetSessionId,
+      () => this.acceptWakeup(row, event, plan.targetSessionId)))
     return this.settleClaim(row, event, claim, plan.targetSessionId)
   }
 
@@ -1229,7 +1267,10 @@ export class EventSubscriptionService {
       // The fast route named a Session that exists: the event goes there. A target that may not be woken is a refusal
       // of that target, never a reason to fall back to the Router.
       await this.host.resolveTarget(chosen, 'message')
-      const claim = this.store.atomic(() => this.claim(plan, event, chosen))
+      // The claim of the event and the record of the delivery are one write: the transaction holds both of them, or
+      // neither of them.
+      const claim = this.store.atomic(() => this.claim(plan, event, chosen,
+        () => this.acceptWakeup(row, event, chosen)))
       return this.settleClaim(row, event, claim, chosen)
     }
     // The authority of the subscription comes first, and it needs no target: an observation that is over, that was
@@ -1271,7 +1312,10 @@ export class EventSubscriptionService {
       return { status: 'blocked', reason }
     }
     await this.host.resolveTarget(targetSessionId, 'message')
-    const claim = this.store.atomic(() => this.claim(plan, event, targetSessionId))
+    // The claim of the event and the record of the delivery are one write: the transaction holds both of them, or
+    // neither of them.
+    const claim = this.store.atomic(() => this.claim(plan, event, targetSessionId,
+      () => this.acceptWakeup(row, event, targetSessionId)))
     return this.settleClaim(row, event, claim, targetSessionId)
   }
 
@@ -1390,7 +1434,8 @@ export class EventSubscriptionService {
    * The target is read after the authority, and a target that was stopped, ended or revoked outranks the rate limit: an
    * event that may not be delivered is not a storm. The rate limit is the last thing before the claim.
    */
-  private claim(plan: DeliveryPlan, event: SyntheticEvent, targetSessionId: string): Claim {
+  private claim(plan: DeliveryPlan, event: SyntheticEvent, targetSessionId: string,
+    accept: () => AcceptedWakeup): Claim {
     const authority = this.authority(plan, event)
     if (authority.kind !== 'proceed') return authority
     const current = authority.row
@@ -1425,7 +1470,10 @@ export class EventSubscriptionService {
       this.bumpDuplicate(current.subscriptionId)
       return { kind: 'duplicate' }
     }
-    return { kind: 'claimed' }
+    // The claim and the record of the delivery are one write: a control plane that stopped between them would leave an
+    // event that is consumed and a delivery that does not exist, and the event would never be delivered again. The
+    // record is written inside the claim's own transaction, so either both of them are there or neither of them is.
+    return { kind: 'claimed', accepted: accept() }
   }
 
   /**
@@ -1450,7 +1498,7 @@ export class EventSubscriptionService {
         targetId: row.subscriptionId, detail: claim.reason })
       return { status: 'blocked', reason: claim.reason }
     }
-    return this.send(row, event, targetSessionId)
+    return this.send(row, event, targetSessionId, claim.accepted)
   }
 
   /**
@@ -1486,39 +1534,87 @@ export class EventSubscriptionService {
   }
 
   /**
-   * Put one event on the wire.
+   * Write one wake-up down.
    *
-   * The envelope is built after the claim, and the transport is guarded twice: before the Session is re-ensured and
-   * again right before the message goes out. A subscription that was stopped or changed in between never reaches the
-   * wire.
+   * The record of the delivery is written in the same transaction as the claim of the event, so a control plane that
+   * stopped before the write was through leaves neither of them: the event is not consumed, and a replay of it may still
+   * be delivered.
+   *
+   * The record names the revision of the subscription the wake-up was planned under and the generation of the Session it
+   * really goes to, so a recovery reads the very same binding: the rules that are in force when the event is accepted are
+   * the rules it goes out under, and a record of an older shape may not carry the delivery out at all.
    */
-  private async send(row: ExternalSubscriptionRow, event: SyntheticEvent, targetSessionId: string): Promise<DeliveryOutcome> {
+  private acceptWakeup(row: ExternalSubscriptionRow, event: SyntheticEvent, targetSessionId: string): AcceptedWakeup {
     const envelope = this.envelope(row, event)
     const text = row.deliveryMode === 'dual_layer_router' && targetSessionId === this.host.routerSessionId()
       ? `${OBSERVATION_NOTE}\n${envelope}`
       : envelope
     const key = `external-event:${row.subscriptionId}:${event.sourceId}:${event.eventId}`
+    // The wake-up is written down before it goes out: the outbox holds the record of what happened to it, so a restart
+    // knows whether the event was ever delivered and may ask the node about it.
+    const delivery = this.outbox.accept({
+      kind: 'external_wakeup',
+      idempotencyKey: key,
+      dedupKey: `external_wakeup:${row.subscriptionId}:${event.sourceId}:${event.eventId}`,
+      scope: `external:${row.subscriptionId}`,
+      projectId: row.scopeProjectId,
+      ticketId: row.targetTicketId,
+      assignmentId: row.targetAssignmentId,
+      sourceSessionId: row.ownerSessionId,
+      targetSessionId,
+      targetRole: (row.targetRole || 'worker') as SessionRole,
+      nodeId: this.host.nodeId(),
+      backendId: this.host.backendId(),
+      expectedAssignmentEpoch: this.targetEpochOf(targetSessionId),
+      expectedToolTokenVersion: this.host.targetEpochs(targetSessionId).toolTokenVersion,
+      expectedNodeTrustEpoch: 0,
+      payload: text,
+      context: { kind: 'external_wakeup', subscriptionId: row.subscriptionId, sourceId: event.sourceId,
+        eventId: event.eventId, revision: row.revision },
+    })
+    return { delivery, text, key }
+  }
+
+  /**
+   * Put one event on the wire.
+   *
+   * The transport is guarded twice: before the Session is re-ensured and again right before the message goes out. A
+   * subscription that was stopped or changed in between never reaches the wire.
+   */
+  private async send(row: ExternalSubscriptionRow, event: SyntheticEvent, targetSessionId: string,
+    accepted: AcceptedWakeup): Promise<DeliveryOutcome> {
+    const { delivery, text, key } = accepted
     try {
-      await this.host.deliver(targetSessionId, text, key, () => { this.assertSendable(row, targetSessionId) },
-        () => { this.assertSendable(row, targetSessionId) })
+      // The delivery is claimed before it goes out: the record says it is on its way, so a restart knows that the outcome
+      // has to be asked about rather than guessed.
+      if (!this.outbox.claim(delivery.deliveryId, ['accepted_pending'])) {
+        this.settle(row.subscriptionId, event.sourceId, event.eventId, 'failed', 'the delivery was already claimed')
+        return { status: 'failed', reason: 'the delivery was already claimed' }
+      }
+      await this.host.deliver(targetSessionId, text, key, () => { this.assertSendable(row, targetSessionId, row.revision) },
+        () => { this.assertSendable(row, targetSessionId, row.revision) })
     } catch (error) {
       if (error instanceof NodeUnconfirmedError) {
         // The receipt is missing: the event may have arrived, and it is never sent again on a guess.
         const reason = 'the node did not confirm the delivery; the event may have arrived and is not sent again'
+        this.outbox.settle(delivery.deliveryId, 'dispatching', 'unconfirmed', reason)
         this.settle(row.subscriptionId, event.sourceId, event.eventId, 'unconfirmed', reason)
         return { status: 'unconfirmed', reason }
       }
       if (error instanceof ExternalDeliveryStaleError) {
         // The check that runs immediately before the transport refused the event: it never left this control plane.
+        this.outbox.settle(delivery.deliveryId, 'dispatching', 'blocked_target_inactive', error.reason)
         this.settle(row.subscriptionId, event.sourceId, event.eventId, 'blocked', error.reason)
         return { status: 'blocked', reason: error.reason }
       }
       const reason = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
+      this.outbox.settle(delivery.deliveryId, 'dispatching', 'failed_permanent', reason)
       this.settle(row.subscriptionId, event.sourceId, event.eventId, 'failed', reason)
       return { status: 'failed', reason }
     }
     // The receipt is the fact: the event is in the target's inbox. The audit follows it, and the bookkeeping of the
     // last delivery is a convenience — a failure of it never turns a delivery that really went out into a failure.
+    this.outbox.settle(delivery.deliveryId, 'dispatching', 'delivered_inbox', '')
     this.settle(row.subscriptionId, event.sourceId, event.eventId, 'sent', '')
     this.audit({ actor: 'system', kind: 'session', action: 'event_delivered', targetKind: 'external-subscription',
       targetId: row.subscriptionId, detail: `${event.sourceId} ${event.eventType}` })
@@ -1529,6 +1625,75 @@ export class EventSubscriptionService {
       // a failed delivery.
     }
     return { status: 'sent', reason: '' }
+  }
+
+  /**
+   * Whether the wake-up of one delivery may still go out.
+   *
+   * The subscription must still be running, its lease must still hold, its creator must still be there, and the target
+   * must still be the Session the subscription was made for. An event that the ledger already shows as delivered is not
+   * sent again: it is one observation, and one observation wakes its target once.
+   *
+   * The rules are the rules the wake-up was accepted under: the revision of the subscription is read from the record of
+   * the delivery and compared with the one that is in force now. A subscription whose rules, hints or lease changed while
+   * the event was on its way does not get this event, and the Session it was planned for is not woken either. A record
+   * that names no revision — one of an older shape, or one that was only partly written — is not a wake-up at all.
+   */
+  revalidateWakeup(row: CoordinationDeliveryRow): DeliveryRevalidation {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'external_wakeup') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'this delivery names no wake-up' }
+    }
+    const current = this.subscriptionOf(context.subscriptionId)
+    if (current === undefined || current.status !== 'active') {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the subscription this wake-up was about is over' }
+    }
+    // The rules the wake-up was accepted under are the rules it goes out under: a change that came while the event was
+    // on its way makes the wake-up stale, and the revision is what says that there was one.
+    if (current.revision !== context.revision) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the subscription was changed while the wake-up was on its way' }
+    }
+    const lease = Date.parse(current.leaseExpiresAt)
+    if (Number.isFinite(lease) && lease <= Date.parse(this.host.now())) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the lease of the subscription ran out' }
+    }
+    const lost = this.ownerLoss(current)
+    if (lost !== undefined) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: lost }
+    }
+    if (current.targetSessionId !== '' && current.targetSessionId !== row.targetSessionId) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the target changed while the event was on its way' }
+    }
+    const seen = this.dispositionStatusOf(context.subscriptionId, context.sourceId, context.eventId)
+    if (seen === 'sent' || seen === 'unconfirmed') {
+      return { ok: false, outcome: 'closed', status: 'superseded', reason: 'the event was already delivered' }
+    }
+    const resolved = this.host.resolveTargetNow(row.targetSessionId, 'message')
+    if (!resolved.ok) return { ok: false, outcome: 'closed', status: 'blocked_node_unavailable', reason: resolved.reason }
+    if (resolved.handle.sessionId !== row.targetSessionId) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked', reason: 'the resolution named another Session' }
+    }
+    // The lifecycle the wake-up was planned under must still hold: a target that was replaced is not this one. The
+    // generation that is compared is the one of the Session the event really goes to, so the two-layer mode — which
+    // chooses its target per event — is fenced by it as well.
+    if (resolved.generation.assignmentEpoch !== row.expectedAssignmentEpoch) {
+      return { ok: false, outcome: 'closed', status: 'rejected_stale_or_revoked',
+        reason: 'the target was replaced before the wake-up went out' }
+    }
+    return { ok: true }
+  }
+
+  /**
+   * The message of a wake-up that is sent again.
+   *
+   * It is the very envelope the first attempt carried: the observation, stripped of control characters, cut to its bound
+   * and fenced as untrusted data. A wake-up whose record is gone has no message, and it is not sent with another one.
+   */
+  wakeupPayload(row: CoordinationDeliveryRow): string | undefined {
+    const context = readContext(row.context)
+    if (context === undefined || context.kind !== 'external_wakeup') return undefined
+    return row.payload === '' ? undefined : row.payload
   }
 
   /**
@@ -1544,15 +1709,19 @@ export class EventSubscriptionService {
    * Session it was planned for is not woken either. The binding is what gives the check its meaning: a check that read
    * the target the subscription names *now* and compared it with itself would let the old target be woken by a
    * subscription that names another Session now.
+   *
+   * The revision the delivery is compared with is the one the wake-up was accepted under, and it is the very same
+   * revision the recovery reads from the record: a rule that changed after the acceptance makes the wake-up stale at
+   * both fences and at the recovery alike.
    */
-  private assertSendable(row: ExternalSubscriptionRow, targetSessionId: string): void {
+  private assertSendable(row: ExternalSubscriptionRow, targetSessionId: string, accepted: number): void {
     const current = this.subscriptionOf(row.subscriptionId)
     if (current === undefined || current.status !== 'active') {
       throw new ExternalDeliveryStaleError('the subscription is over')
     }
     // The plan is the plan: the revision and the mode have to be exactly what the delivery was planned under, and the
     // revision says that nothing changed while the event was on its way.
-    if (current.revision !== row.revision) {
+    if (current.revision !== accepted) {
       throw new ExternalDeliveryStaleError('the subscription was changed while the event was on its way')
     }
     if (current.deliveryMode !== row.deliveryMode) {
@@ -1592,6 +1761,19 @@ export class EventSubscriptionService {
     if (resolved.generation.assignmentEpoch !== row.targetAssignmentEpoch) {
       throw new ExternalDeliveryStaleError('the Assignment of the target was replaced')
     }
+  }
+
+  /**
+   * The lifecycle generation of the Session one wake-up really goes to.
+   *
+   * The two-layer mode chooses its target per event, so the generation that is written down is the one of the Session the
+   * event goes to — not the fixed epoch of a subscription that has no fixed target at all. The resolver is the authority:
+   * it knows the generation of the Session it just resolved, and it refuses a target that may not be messaged at all.
+   */
+  private targetEpochOf(targetSessionId: string): number {
+    const resolved = this.host.resolveTargetNow(targetSessionId, 'message')
+    if (resolved.ok) return resolved.generation.assignmentEpoch
+    return this.host.targetEpochs(targetSessionId).assignmentEpoch
   }
 
   /**
@@ -1669,6 +1851,20 @@ export class EventSubscriptionService {
       + 'AND event_id = ?').get(subscriptionId, sourceId, eventId) as Record<string, unknown> | undefined
     if (row === undefined) return undefined
     return { dispositionId: String(row['disposition_id'] ?? ''), attempt: Number(row['attempt'] ?? 0) }
+  }
+
+  /**
+   * The state the ledger holds for one event of one subscription.
+   *
+   * It is the fact about the event itself: a `sent` event reached its target and an `unconfirmed` one may have, so
+   * neither is ever delivered again.
+   */
+  private dispositionStatusOf(subscriptionId: string, sourceId: string, eventId: string): string | undefined {
+    const row = this.store.db.prepare(
+      'SELECT status FROM external_event_dispositions WHERE subscription_id = ? AND source_id = ? AND event_id = ?')
+      .get(subscriptionId, sourceId, eventId) as Record<string, unknown> | undefined
+    if (row === undefined) return undefined
+    return String(row['status'] ?? '')
   }
 
   /**

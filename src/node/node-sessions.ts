@@ -19,7 +19,7 @@ import type {} from '@deepseek-ai/dsh-session-persistence'
 import { AgentDelivery } from '../app/delivery.ts'
 import { initializeRoleModel, resolveRoleModel } from '../app/role-models.ts'
 import type { RoleModel } from '../policy.ts'
-import type { RoleProfile, RouterModel, RouterOptions } from '../shared/protocol.ts'
+import type { DeliveryEvidence, RoleProfile, RouterModel, RouterOptions } from '../shared/protocol.ts'
 import type { DshPortSessions } from './dsh-port-host.ts'
 
 /**
@@ -127,6 +127,18 @@ export class NodeSessions implements DshPortSessions {
     if (!agent) throw new Error(`Session ${sessionId} is not loaded on this node`)
     await this.delivery.send(agent, idempotencyKey, text, mode, this.signal,
       /* authorize */ undefined, /* accepted */ undefined, onDelivered)
+  }
+
+  /**
+   * What this node can prove about one delivery.
+   *
+   * The proof comes from the Session's own persisted history. A Session this process does not run cannot be read at all,
+   * and the answer is then `unknown`: the node that may have received the message is not this one.
+   */
+  async evidence(sessionId: string, idempotencyKey: string): Promise<DeliveryEvidence> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (!agent) return { state: 'unknown', reason: 'this node does not run that Session' }
+    return this.delivery.evidence(agent, idempotencyKey)
   }
 
   setRolePrompt(sessionId: string, text: string): void {

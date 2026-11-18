@@ -5,7 +5,7 @@
  */
 import { mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type RoleProfile,
+import { NODE_PROTOCOL_VERSION, type DeliveryEvidence, type NodeCommand, type NodeEvent, type NodePort, type NodeStatus, type RoleProfile,
   type RouterModel, type SessionInspection, type SessionRole } from '../shared/protocol.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { NodeCommandError, validateNodeCommand } from './command-validation.ts'
@@ -83,6 +83,14 @@ export interface DshPortHost {
   archiveSession(sessionId: string): Promise<void>
   /** Report what the host knows about one Session, without changing it. */
   inspectSession(sessionId: string, routerDetails?: true): Promise<SessionInspection>
+  /**
+   * What the host can prove about one delivery.
+   *
+   * The question names the Session and the exact key, and the answer is what the host can prove from the Session's own
+   * persisted history. The call is optional, because a host that cannot answer is an older node: the port then says
+   * plainly that the outcome is unknown instead of claiming the message never arrived.
+   */
+  evidenceSession?(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence>
   /** Set the Session's permission preset by name. */
   setPermission(sessionId: string, permission: string): void
   /** Report the Session events the host observes; returns the disposer that stops reporting. */
@@ -207,6 +215,18 @@ export class DshNodePort implements NodePort {
     return this.host.inspectSession(sessionId)
   }
 
+  /**
+   * What this node can prove about one delivery, for an in-process caller.
+   *
+   * The HTTP transport asks the same question through the `delivery.evidence` command instead. A host that cannot answer
+   * says that the outcome is unknown; it never says the message never arrived.
+   */
+  async evidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
+    const answer = this.host.evidenceSession
+    if (!answer) return { state: 'unknown', reason: 'this node cannot answer a question about a delivery' }
+    return answer.call(this.host, sessionId, deliveryKey)
+  }
+
   /** Runs one command's mapping against the host, once per key until a failed run is retried. */
   private async execute(command: NodeCommand): Promise<void> {
     switch (command.type) {
@@ -294,6 +314,16 @@ export class DshNodePort implements NodePort {
         // The request id echoes the key so the asking transport can match the answer to its request.
         this.publish({ type: 'session.inspected', sessionId: command.sessionId,
           requestId: command.idempotencyKey, inspection })
+        break
+      }
+
+      // The question about one delivery: the node answers with what it can prove about that exact key in that exact
+      // Session, and the answer names the Session and the exact key again, so the asking side can match the answer to
+      // its own question and to nobody else's.
+      case 'delivery.evidence': {
+        const evidence = await this.evidence(command.sessionId, command.deliveryKey)
+        this.publish({ type: 'delivery.evidence', sessionId: command.sessionId,
+          requestId: command.idempotencyKey, deliveryKey: command.deliveryKey, evidence })
         break
       }
 

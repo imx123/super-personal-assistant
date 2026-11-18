@@ -4,6 +4,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { freezeMessage, MessageId, type ContextFormed, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import type { DeliveryEvidence } from '../shared/protocol.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -102,6 +103,30 @@ export class AgentDelivery {
   async holds(agent: Agent, requestId: string): Promise<boolean> {
     const id = messageId(requestId)
     return (await this.history(agent)).ids.has(id) || [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
+  }
+  /**
+   * What this node can prove about one delivery.
+   *
+   * The proof is the message itself: the Session's own persisted history — the log the delivery wrote itself — or the
+   * live inbox it still waits in. What the proof never rests on is the *absence* of a record: the in-memory set of ids
+   * this class keeps is emptied by a restart, and a message that is missing from it may still have arrived and been read.
+   *
+   * `inbox` is therefore the message the history or the live inbox shows, and it is the strongest fact this adapter can
+   * prove. `consumed_turn` is *not* among them: the durable history records that a turn started or ended, never which
+   * input that turn took, so a turn after the insertion is no evidence that *this* message was read by it. A node that can
+   * prove a consumption reports it — the fake node knows exactly which turn took which message — but this adapter has no
+   * such signal and may not borrow one. Everything else is `unknown`: this node cannot tell a message that never arrived
+   * from one that arrived and was not yet flushed, and a delivery that may not be repeated may not be repeated on a
+   * guess. It never answers `absent` for the same reason.
+   */
+  async evidence(agent: Agent, requestId: string): Promise<DeliveryEvidence> {
+    const id = messageId(requestId)
+    const pending = [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => deliveryId(message) === id)
+    if (pending) return { state: 'inbox', reason: 'the message waits in the Session inbox' }
+    if (await this.holds(agent, requestId)) {
+      return { state: 'inbox', reason: 'the message is in the persisted history of the Session' }
+    }
+    return { state: 'unknown', reason: 'this node cannot prove that the message never arrived' }
   }
   /**
    * Delivers once to the selected inbox, or injects into history without waking the agent, and flushes Session persistence

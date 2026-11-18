@@ -37,6 +37,7 @@ function fixture(history: Recorded[] = []) {
     delivery.send(agent, id, '{"event_id":"event"}', mode, signal.signal, undefined, undefined, onDelivered)
   const inject = (id: string, summary: string) => delivery.send(agent, id, '{"settings_saved":"policy"}', { inject: summary }, signal.signal)
   const holds = (id: string) => delivery.holds(agent, id)
+  const evidence = (id: string) => delivery.evidence(agent, id)
   const consume = (message: UserMessage) => {
     inbox.nextStep.splice(0); inbox.nextTurn.splice(0)
     ctx.emit('session/event', agent.session, event(message))
@@ -45,8 +46,8 @@ function fixture(history: Recorded[] = []) {
     inbox.nextStep.splice(0); inbox.nextTurn.splice(0)
     ctx.emit('session/event', agent.session, splicedEvent(inserted))
   }
-  return { agent, agents, inbox, steer, followup, injected, open, read, close, flush, send, inject, holds, consume,
-    consumeSpliced, signal, ctx, session: agent.session }
+  return { agent, agents, inbox, steer, followup, injected, open, read, close, flush, send, inject, holds, evidence,
+    consume, consumeSpliced, signal, ctx, session: agent.session }
 }
 
 it.each(['queue', 'steer'] as const)('delivers %s as an orchestrator relay, deduplicating pending and consumed messages', async mode => {
@@ -296,4 +297,33 @@ it('does not report a delivery that failed before insertion', async () => {
 
   await expect(f.send('request', 'steer', delivered)).rejects.toThrow('read failed')
   expect(delivered).not.toHaveBeenCalled()
+})
+
+it('answers a question about a delivery with what the history proves: the inbox, or nothing', async () => {
+  const f = fixture()
+  // Nothing is known about this delivery: the node cannot tell a message that never arrived from one that arrived and
+  // was not flushed, so it says so instead of guessing.
+  expect(await f.evidence('request')).toMatchObject({ state: 'unknown' })
+
+  await f.send('request')
+  // The message waits in the inbox: the node can show the message itself.
+  expect(await f.evidence('request')).toMatchObject({ state: 'inbox' })
+
+  // The Session took the message: the history holds it, so the message is in the Session's history.
+  f.consume(f.steer.mock.calls[0]![0])
+  expect(await f.evidence('request')).toMatchObject({ state: 'inbox' })
+})
+
+it('never claims a consumption it cannot prove: a turn after the message says nothing about this message', async () => {
+  const sent = fixture()
+  await sent.send('request')
+  const message = sent.steer.mock.calls[0]![0]
+  // The durable log holds the message and a turn that came after it — but never which input that turn took, so the turn
+  // is not evidence that this message was read.
+  const turn = { type: 'turn/start', seq: SessionSeq(0), time: 0, data: { turn: 1 } } as unknown as SessionEvent
+  const f = fixture([message, turn])
+
+  const answer = await f.evidence('request')
+  expect(answer.state).toBe('inbox')
+  expect(answer.state).not.toBe('consumed_turn')
 })

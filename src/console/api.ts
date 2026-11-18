@@ -440,7 +440,8 @@ export interface StopNotice {
 export interface CoordinationDelivery {
   /** The delivery's own id. */
   deliveryId: string
-  /** `worker_report` or `pm_report`. */
+  /** The kind of coordination: `auto_handoff`, `worker_report`, `pm_report`, `stream_digest`, `denial_review` or
+   * `external_wakeup`. */
   kind: string
   /** When the delivery was accepted. */
   at: string
@@ -482,6 +483,12 @@ export interface CoordinationDelivery {
   dispatchedAt: string
   /** Why the delivery failed, when it did. */
   error: string
+  /** When the message itself runs out; empty when it never does. */
+  expiresAt: string
+  /** How many times the delivery was sent again after the node proved it never arrived. */
+  resendCount: number
+  /** What the node last said about this delivery. */
+  evidence: string
 }
 
 /**
