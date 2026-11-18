@@ -658,6 +658,225 @@ export interface DenialCounter {
   noticeId: string
 }
 
+/**
+ * One condition on a field of the payload of an external event.
+ *
+ * The path is dotted, and it is looked for in the payload first and in the whole event afterwards: a rule may name
+ * `text` or `payload.text`, and both mean the same thing.
+ */
+export interface ExternalFieldCondition {
+  /** The path of the field inside the payload, such as `groupId` or `text`. */
+  path: string
+  /** How the field is compared with the value: `exact`, `prefix`, `contains` or `regex`. */
+  op: string
+  /** The value the field is compared with. */
+  value: string
+}
+
+/**
+ * One external event subscription, as the console reads it.
+ *
+ * It names the source the events come from, the kinds of event it watches, the conditions the payload has to hold and
+ * the one Session the event wakes. The lease, the rate and the state are here too, so a person may see why a
+ * subscription woke nobody.
+ */
+export interface ExternalSubscription {
+  /** The subscription's own id: the handle the console cancels or changes. */
+  subscriptionId: string
+  /** The observation source the events come from. */
+  sourceId: string
+  /** The kinds of event the subscription watches. */
+  eventTypes: string[]
+  /** The conditions the payload has to hold; every one of them has to hold. */
+  fields: ExternalFieldCondition[]
+  /**
+   * The Session the event wakes.
+   *
+   * It is empty in the two-layer mode: that mode has no fixed target, and the fast route names one per event.
+   */
+  targetSessionId: string
+  /** What that Session is for; empty in the two-layer mode, which names no Session at all. */
+  targetRole: string
+  /** The Project the target belongs to. */
+  targetProjectId: string
+  /** The Ticket the target works on. */
+  targetTicketId: string
+  /** The Assignment the target runs. */
+  targetAssignmentId: string
+  /** The lifecycle generation of the target when the subscription was made. */
+  targetAssignmentEpoch: number
+  /**
+   * How the event reaches the target: `direct_initiator`, `direct_designated` or `dual_layer_router`.
+   *
+   * The first one wakes the Session that made the subscription, the second one the Session it names, and the third one
+   * lets the fast route name one per event with the high-level Router as the fallback.
+   */
+  deliveryMode: string
+  /** `active`, `cancelled` or `expired_by_scope`. */
+  status: string
+  /**
+   * How many events the subscription may wake with in its window.
+   *
+   * The direct mode allows three in a minute; the two-layer mode allows one in five minutes, because every event of the
+   * two-layer mode costs a Router turn as well.
+   */
+  ratePerMinute: number
+  /**
+   * The window of the rate limit, in seconds.
+   *
+   * It is sixty for the direct mode and three hundred for the two-layer one, so the count alone never says how often a
+   * subscription may really wake. A control plane that does not have the window yet is read as one minute.
+   */
+  rateWindowSeconds?: number
+  /**
+   * The operator's own routing hint, when there is one.
+   *
+   * It belongs to the two-layer mode: the fast route reads it when it names a target for one event.
+   */
+  routeHint?: string
+  /** When the lease runs out. */
+  leaseExpiresAt: string
+  /** When the last delivery really went out. */
+  lastDeliveredAt: string
+  /** When the subscription was made. */
+  createdAt: string
+  /** When the subscription was last changed. */
+  updatedAt: string
+  /** Why the subscription is in this state, when there is something to say. */
+  reason: string
+  /** The console path of the target's own session panel. */
+  contextRef: string
+  /**
+   * Who made the subscription: `operator`, `pm`, `worker` or `router`.
+   *
+   * A person's own subscription is the operator's; the other three belong to the Agents of this control plane, and each
+   * of them owns what it made.
+   */
+  ownerRole?: string
+  /**
+   * The Session that made the subscription.
+   *
+   * It is empty for a subscription a person made.
+   */
+  ownerSessionId?: string
+  /**
+   * How many events were merged into the throttle counter of this subscription.
+   *
+   * It grows once per throttled event and never for a replay of one.
+   */
+  throttledCount?: number
+  /**
+   * How many events were refused because the subscription had already seen them.
+   *
+   * It grows once per replay and says nothing about how many events really went out.
+   */
+  duplicateCount?: number
+}
+
+/**
+ * One disposition of an external event, as the console reads it.
+ *
+ * It carries the ids, the state and the reason, and never the payload of the event: a console that showed the payload
+ * would show the words of the outside world as if they were the control plane's own.
+ */
+export interface ExternalDisposition {
+  /** The disposition's own id. */
+  dispositionId: string
+  /** The subscription the event was about. */
+  subscriptionId: string
+  /** The observation source the event came from. */
+  sourceId: string
+  /** The event's own id. */
+  eventId: string
+  /** The kind of event it was. */
+  eventType: string
+  /**
+   * `dispatching`, `sent`, `duplicate`, `unconfirmed`, `blocked`, `throttled`, `failed` or `semantic_eval_degraded`.
+   *
+   * The last one is an event whose optional semantic condition could not be evaluated: the event fails closed and wakes
+   * nobody.
+   */
+  status: string
+  /** Why the event reached that state. */
+  reason: string
+  /** When it happened. */
+  at: string
+  /** Which try of that event it was. */
+  attempt: number
+}
+
+/**
+ * What one injected event did to the subscriptions that watched for it.
+ *
+ * The counts say how many subscriptions the event was offered to, how many stayed quiet because their rules did not
+ * hold, and what became of the rest. The lists name the subscriptions, never the events they carried.
+ */
+export interface ExternalEmitResult {
+  /** The observation source the event came from. */
+  sourceId: string
+  /** The event's own id. */
+  eventId: string
+  /** The kind of event it was. */
+  eventType: string
+  /** The subscriptions whose source and event kind matched. */
+  considered: number
+  /** Of those, the ones whose fields did not hold: they stayed quiet. */
+  quiet: number
+  /** The subscriptions the event really reached. */
+  delivered: string[]
+  /** The subscriptions the event may not wake. */
+  blocked: string[]
+  /** The subscriptions that were woken too often. */
+  throttled: string[]
+  /** The subscriptions that had already seen this event. */
+  duplicates: string[]
+  /** The subscriptions whose delivery failed. */
+  failed: string[]
+  /** The subscriptions whose delivery may have arrived and is never repeated. */
+  unconfirmed: string[]
+  /** The subscriptions whose semantic condition could not be evaluated, and which therefore failed closed. */
+  degraded: string[]
+}
+
+/** What an operator asks for when a subscription is made. */
+export interface ExternalSubscriptionInput {
+  /** The observation source the events come from. */
+  sourceId: string
+  /** The kinds of event the subscription watches. */
+  eventTypes: string[]
+  /** The conditions the payload has to hold; every one of them has to hold. */
+  fields: ExternalFieldCondition[]
+  /**
+   * The Session the event wakes.
+   *
+   * It is left out in the two-layer mode: that mode has no fixed target, and the control plane ignores the field anyway.
+   */
+  targetSessionId?: string
+  /** How the event reaches the target. */
+  deliveryMode?: string
+  /** How long the subscription's lease lasts, in seconds. */
+  leaseSeconds?: number
+  /**
+   * The operator's own routing hint, for the two-layer delivery.
+   *
+   * It is a hint and not an instruction: the control plane reads it when the two-layer mode exists, and a control plane
+   * that does not know it simply ignores it.
+   */
+  routeHint?: string
+}
+
+/** What an operator may change on a subscription that already exists. */
+export interface ExternalSubscriptionPatch {
+  /** The kinds of event the subscription watches. */
+  eventTypes?: string[]
+  /** The conditions the payload has to hold. */
+  fields?: ExternalFieldCondition[]
+  /** The Session the event wakes. */
+  targetSessionId?: string
+  /** How long the subscription's lease lasts, in seconds. */
+  leaseSeconds?: number
+}
+
 /** One node as the control plane knows it. */
 export interface NodeView {  nodeId: string
   backend: string
@@ -808,6 +1027,51 @@ export function put<T>(path: string, body: unknown = {}): Promise<T> {
 /** One delete. */
 export function remove<T>(path: string): Promise<T> {
   return request<T>(path, { method: 'DELETE' })
+}
+
+/**
+ * The external event subscriptions the operator made, and the dispositions of the events they saw.
+ *
+ * The dispositions are the second pass's own field: a control plane that does not have them yet answers without them,
+ * and the console shows the subscriptions all the same. Nothing here is filled in by the console: a gap stays a gap.
+ */
+export async function readExternalSubscriptions(limit = 24): Promise<{ subscriptions: ExternalSubscription[];
+  dispositions: ExternalDisposition[] }> {
+  const answer = await read<{ subscriptions?: ExternalSubscription[]; dispositions?: ExternalDisposition[] }>(
+    `/v1/console/external-subscriptions?limit=${limit}`)
+  return { subscriptions: answer.subscriptions ?? [], dispositions: answer.dispositions ?? [] }
+}
+
+/** Make one external event subscription. */
+export async function createExternalSubscription(input: ExternalSubscriptionInput): Promise<ExternalSubscription> {
+  const { subscription } = await write<{ subscription: ExternalSubscription }>('/v1/console/external-subscriptions', input)
+  return subscription
+}
+
+/** Change one external event subscription that already exists. */
+export async function updateExternalSubscription(subscriptionId: string,
+  patch: ExternalSubscriptionPatch): Promise<ExternalSubscription> {
+  const { subscription } = await put<{ subscription: ExternalSubscription }>(
+    `/v1/console/external-subscriptions/${encodeURIComponent(subscriptionId)}`, patch)
+  return subscription
+}
+
+/** Stop one external event subscription. */
+export async function cancelExternalSubscription(subscriptionId: string): Promise<ExternalSubscription> {
+  const { subscription } = await write<{ subscription: ExternalSubscription }>(
+    `/v1/console/external-subscriptions/${encodeURIComponent(subscriptionId)}/cancel`, {})
+  return subscription
+}
+
+/**
+ * Publish one synthetic event, and say what every subscription did with it.
+ *
+ * The source is one of the control plane's own observation sources: nothing outside this control plane is contacted.
+ */
+export async function emitSyntheticEvent(event: { sourceId: string; eventId: string; eventType: string;
+  payload: Record<string, unknown> }): Promise<ExternalEmitResult> {
+  const { result } = await write<{ result: ExternalEmitResult }>('/v1/console/events/synthetic-emit', event)
+  return result
 }
 
 /** How the stream is doing. */

@@ -25,6 +25,9 @@ import { createKernelDomain, type KernelDomain } from './domain.ts'
 import { DenialEscalator, denialCallId, DenialAuthorizationError, type DenialAuthorizationView, type DenialCounterView,
   type DenialFact, type DenialReviewView } from './denial-escalator.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
+import { ExternalSubscriptionError, EventSubscriptionService, type ExternalDispositionView, type ExternalEmitResult,
+  type ExternalSubscriptionInput, type ExternalSubscriptionPatch, type ExternalSubscriptionView,
+  type SyntheticEvent } from './event-subscriptions.ts'
 import { asksForAuthority, asksForIrreversible, FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
   type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
 import { pmReportKey, pmReportMessage, type PmReportFacts } from './pm-report.ts'
@@ -608,6 +611,47 @@ export interface ControlPlaneOptions {
    * short interval never turns into a stream of empty digests.
    */
   streamIntervalSeconds?: number
+  /**
+   * The most active external event subscriptions the control plane allows.
+   *
+   * The default is fifty. The cap is global: a deployment that allows more asks for it, and a request beyond it is
+   * refused with `QUOTA_EXCEEDED` rather than silently accepted.
+   */
+  externalSubscriptionCap?: number
+  /**
+   * How many external subscriptions one Worker may have about itself.
+   *
+   * The default is three: the subscriptions the Worker made itself, and the ones an Agent made about it, all count.
+   * A person is bounded by the global cap instead.
+   */
+  externalWorkerQuota?: number
+  /**
+   * How many external subscriptions one Project may have about itself.
+   *
+   * The default is ten: the Project's own PM, its Workers and everything a person made about them count together.
+   */
+  externalProjectQuota?: number
+  /**
+   * How many events one external subscription may wake with in a minute.
+   *
+   * The default is three. The window slides, so a burst of one minute never silences the next one.
+   */
+  externalRatePerMinute?: number
+  /**
+   * How long an external event subscription's lease lasts, in seconds.
+   *
+   * The default is three days. A lease is bounded on purpose: a subscription that outlives the work it watches is a
+   * subscription nobody looks after.
+   */
+  externalLeaseSeconds?: number
+  /**
+   * The optional semantic evaluator of the external subscriptions.
+   *
+   * There is none by default, and a subscription that carries a semantic condition therefore fails closed: the event is
+   * not delivered and the ledger says `semantic_eval_degraded`. A deployment that has one hands it over here; it is
+   * called with the operator's own hint and a bounded text of the event, and it says whether the event is of interest.
+   */
+  externalSemanticEvaluator?: (hint: string, text: string) => Promise<boolean>
 }
 
 export interface ControlPlaneState {
@@ -1699,6 +1743,14 @@ export class ControlPlane {
    */
   private readonly streams: StreamSubscriptionService
   /**
+   * The external observation events an operator watches for.
+   *
+   * It owns the durable subscriptions, the deterministic rules that decide what an event is, the ledger that remembers
+   * what every event did, and the direct delivery of the wake-up. Nothing here calls a model, and nothing here reaches
+   * the Router: the event goes to the Session the subscription named.
+   */
+  private readonly externalEvents: EventSubscriptionService
+  /**
    * The escalations a refusal started and that have not settled yet.
    *
    * A refused tool call is answered at once and the escalation follows in the background: the caller never waits for a
@@ -2024,6 +2076,35 @@ export class ControlPlane {
           this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
         audit: input => { this.audit.record(input) },
       }, { ...(options.streamIntervalSeconds === undefined ? {} : { intervalSeconds: options.streamIntervalSeconds }) })
+      // The external observation events an operator watches for: the subscriptions and their dispositions live in this
+      // control plane's own file, next to the other coordination tables, and the rules are deterministic — no model is
+      // asked whether an event is interesting, and the event never goes through the Router.
+      this.externalEvents = new EventSubscriptionService(this.store, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        session: sessionId => this.sessions.get(sessionId),
+        project: projectId => this.store.projects.get(projectId),
+        ticket: ticketId => this.store.tickets.get(ticketId),
+        ticketOfAssignment: assignmentId => this.ticketOfAssignment(assignmentId),
+        routerSessionId: () => ROUTER_SESSION_ID,
+        ensureRouterSession: async () => (await this.ensureRouter()).sessionId,
+        fastRouteFacts: () => this.fastRouteFacts(),
+        resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
+        resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        // There is no semantic evaluator in this build: a subscription that carries a semantic condition therefore
+        // fails closed. A deployment that has one hands it over here.
+        semanticEvaluator: options.externalSemanticEvaluator,
+        audit: input => { this.audit.record(input) },
+      }, {
+        ...(options.externalSubscriptionCap === undefined ? {} : { maxSubscriptions: options.externalSubscriptionCap }),
+        ...(options.externalWorkerQuota === undefined ? {} : { workerQuota: options.externalWorkerQuota }),
+        ...(options.externalProjectQuota === undefined ? {} : { projectQuota: options.externalProjectQuota }),
+        ...(options.externalRatePerMinute === undefined ? {} : { ratePerMinute: options.externalRatePerMinute }),
+        ...(options.externalLeaseSeconds === undefined ? {} : { leaseSeconds: options.externalLeaseSeconds }),
+      })
       // The scheduler keeps its plans in the console's own file, in tables of its own: the domain's schema is untouched, and
       // an old plugin binary never opens this file. The kernel owns the delivery — it is the only one that knows a Project's
       // PM Session and whether the node really holds it.
@@ -2179,6 +2260,14 @@ export class ControlPlane {
     } catch (error) {
       // A recovery that fails is a diagnostic: the records stay as they are and the work continues.
       process.stderr.write(`superagent control-plane stream subscription recovery failed: ${
+        error instanceof Error ? error.message : String(error)}\n`)
+    }
+    // The external events of a previous run: an event that was on its way when the control plane stopped has an unknown
+    // outcome, and it is never sent again on a guess.
+    try {
+      this.externalEvents.recover()
+    } catch (error) {
+      process.stderr.write(`superagent control-plane external event recovery failed: ${
         error instanceof Error ? error.message : String(error)}\n`)
     }
   }
@@ -6172,6 +6261,142 @@ export class ControlPlane {
 
   /** The stream subscriptions of one Session, as the console shows them. */
   streamSubscriptionsOf(sessionId: string): StreamSubscriptionView[] { return this.streams.viewsOf(sessionId) }
+
+  /**
+   * Make one external event subscription.
+   *
+   * The target is checked before the subscription exists: the resolver reads the Session, its Assignment and its
+   * generation, and a target that was revoked, stopped by a person, replaced or ended is refused. The mode is fixed at
+   * the creation: the event goes straight to the Session the subscription names, and never through the Router.
+   */
+  async createExternalSubscription(input: ExternalSubscriptionInput): Promise<ExternalSubscriptionView> {
+    try {
+      return await this.externalEvents.create(input)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw new OperatorError(error.status, error.reason)
+      throw error
+    }
+  }
+
+  /** The external event subscriptions the console shows, newest first. */
+  externalSubscriptions(limit = 50): ExternalSubscriptionView[] { return this.externalEvents.list(limit) }
+
+  /** The dispositions of the external events the console shows, newest first. */
+  externalEventDispositions(limit = 50): ExternalDispositionView[] { return this.externalEvents.dispositions(limit) }
+
+  /**
+   * Change one external event subscription.
+   *
+   * A new target is read as a new target is: the resolver sees whether it is still there, and a target that is not is
+   * refused.
+   */
+  async updateExternalSubscription(subscriptionId: string, patch: ExternalSubscriptionPatch): Promise<ExternalSubscriptionView> {
+    try {
+      return await this.externalEvents.update(subscriptionId, patch)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw new OperatorError(error.status, error.reason)
+      throw error
+    }
+  }
+
+  /**
+   * Stop one external event subscription.
+   *
+   * The subscription is over at once, and one that is on its way does not go out either: the check that runs immediately
+   * before the transport reads the subscription's own state.
+   */
+  cancelExternalSubscription(subscriptionId: string): ExternalSubscriptionView {
+    try {
+      return this.externalEvents.cancel(subscriptionId)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw new OperatorError(error.status, error.reason)
+      throw error
+    }
+  }
+
+  /**
+   * Publish one synthetic event and deliver it to the subscriptions that watch for it.
+   *
+   * Nothing outside this control plane is contacted: the synthetic sources are local, and the wake-up goes to the target
+   * Session itself.
+   */
+  async emitSyntheticEvent(event: SyntheticEvent): Promise<ExternalEmitResult> {
+    try {
+      return await this.externalEvents.emit(event)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw new OperatorError(error.status, error.reason)
+      throw error
+    }
+  }
+
+  /**
+   * Make one external event subscription, for the Session a tool token names.
+   *
+   * The owner is the Session the token proves and nothing else: the request never chooses it. The mode an Agent gets is
+   * the direct one to itself, a Worker may not name a target at all, and the two-layer mode is refused for every Agent.
+   */
+  async createExternalSubscriptionFor(sessionId: string,
+    input: ExternalSubscriptionInput): Promise<ExternalSubscriptionView> {
+    try {
+      return await this.externalEvents.createFor(sessionId, input)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw this.externalToolError(error)
+      throw error
+    }
+  }
+
+  /**
+   * The external event subscriptions one Session owns.
+   *
+   * The list is the owner's own: a Session sees what it made and nothing else.
+   */
+  externalSubscriptionsOf(sessionId: string, limit = 50): ExternalSubscriptionView[] {
+    return this.externalEvents.listFor(sessionId, limit)
+  }
+
+  /**
+   * Change one external event subscription a Session owns.
+   *
+   * The same rules as the creation: an Agent may change the rules and the lease of what it made, and may name another
+   * target only under the rules its role allows.
+   */
+  async updateExternalSubscriptionFor(sessionId: string, subscriptionId: string,
+    patch: ExternalSubscriptionPatch): Promise<ExternalSubscriptionView> {
+    try {
+      return await this.externalEvents.updateFor(sessionId, subscriptionId, patch)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw this.externalToolError(error)
+      throw error
+    }
+  }
+
+  /**
+   * Stop one external event subscription a Session owns.
+   *
+   * The subscription is over at once, and one that is on its way does not go out either.
+   */
+  cancelExternalSubscriptionFor(sessionId: string, subscriptionId: string): ExternalSubscriptionView {
+    try {
+      return this.externalEvents.cancelFor(sessionId, subscriptionId)
+    } catch (error) {
+      if (error instanceof ExternalSubscriptionError) throw this.externalToolError(error)
+      throw error
+    }
+  }
+
+  /**
+   * The refusal one external subscription call answers with.
+   *
+   * A refusal that reached outside the caller's own scope is a forbidden call; a request that cannot be understood is an
+   * invalid one; and a quota or a conflict keeps its own status, so the caller sees that it was refused rather than
+   * broken.
+   */
+  private externalToolError(error: ExternalSubscriptionError): Error {
+    if (error.status === 403) return new ToolCallError('forbidden', error.reason)
+    if (error.status === 404) return new OperatorError(404, error.reason)
+    if (error.status === 409) return new OperatorError(409, error.reason)
+    return new ToolCallError('invalid', error.reason)
+  }
 
   /**
    * Ensure the Project's PM Session. The workspace is created under `workspaceRoot`; the PM gets a short-lived token

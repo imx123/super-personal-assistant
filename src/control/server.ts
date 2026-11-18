@@ -13,6 +13,8 @@ import { ControlPlane, EVENT_REPLAY_LIMIT, OperatorError, ProjectScopeViolationE
   type ToolCallErrorCode } from './control-plane.ts'
 import { ScheduleError, describeScheduleRule, parseScheduleRule, type SchedulePlan } from './scheduler.ts'
 import { type PmProjectReportKind } from './report-coordinator.ts'
+import type { ExternalDeliveryMode, ExternalFieldCondition, ExternalFieldOp, ExternalSubscriptionInput,
+  ExternalSubscriptionPatch, SyntheticEvent } from './event-subscriptions.ts'
 
 /** The kinds a PM's own report about its Project may name. */
 const PROJECT_REPORT_KINDS: readonly string[] = ['progress', 'blocked', 'completed', 'failed']
@@ -188,6 +190,94 @@ function streamIntervalOf(value: unknown): number | undefined {
   if (typeof value === 'number') return value
   if (typeof value === 'string' && /^\d+$/.test(value.trim())) return Number(value.trim())
   return Number.NaN
+}
+
+/** The ways a field of an external event's payload may be compared with a value. */
+const EXTERNAL_FIELD_OPS = ['exact', 'prefix', 'contains', 'regex'] as const
+
+/** One field condition of an external event subscription, as the console sends it. */
+function externalField(value: unknown, name: string): ExternalFieldCondition {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new HttpError(400, `${name} must be an object`)
+  }
+  const field = value as Record<string, unknown>
+  const path = stringValue(field.path, `${name}.path`, true)!
+  const op = stringValue(field.op, `${name}.op`, true)!
+  if (!EXTERNAL_FIELD_OPS.includes(op as ExternalFieldOp)) {
+    throw new HttpError(400, `${name}.op must be "exact", "prefix", "contains" or "regex"`)
+  }
+  return { path, op: op as ExternalFieldOp, value: stringValue(field.value, `${name}.value`, true)! }
+}
+
+/** The list of field conditions of an external event subscription. */
+function externalFields(value: unknown, name: string): ExternalFieldCondition[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new HttpError(400, `${name} must be a non-empty array`)
+  }
+  return value.map((entry, index) => externalField(entry, `${name}[${index}]`))
+}
+
+/** The kinds of event an external event subscription watches. */
+function externalEventTypes(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new HttpError(400, `${name} must be a non-empty array`)
+  }
+  return value.map((entry, index) => stringValue(entry, `${name}[${index}]`, true)!)
+}
+
+/** A number a console sends: a whole number, never a guess. */
+function wholeNumber(value: unknown, name: string): number {
+  const parsed = typeof value === 'number' ? value
+    : typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value.trim()) : Number.NaN
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new HttpError(400, `${name} must be a whole number`)
+  return parsed
+}
+
+/** The external event subscription an operator asks for. */
+function externalSubscriptionInput(body: Record<string, unknown>): ExternalSubscriptionInput {
+  const deliveryMode = body.deliveryMode === undefined
+    ? undefined
+    : stringValue(body.deliveryMode, 'deliveryMode', true)! as ExternalDeliveryMode
+  // The two-layer mode has no fixed target: it names one per event, and the high-level Router is the fallback.
+  const targetSessionId = body.targetSessionId === undefined
+    ? undefined
+    : stringValue(body.targetSessionId, 'targetSessionId', true)!
+  return {
+    sourceId: stringValue(body.sourceId, 'sourceId', true)!,
+    eventTypes: externalEventTypes(body.eventTypes, 'eventTypes'),
+    fields: externalFields(body.fields, 'fields'),
+    ...(targetSessionId === undefined ? {} : { targetSessionId }),
+    ...(deliveryMode === undefined ? {} : { deliveryMode }),
+    ...(body.leaseSeconds === undefined ? {} : { leaseSeconds: wholeNumber(body.leaseSeconds, 'leaseSeconds') }),
+    ...(body.routeHint === undefined ? {} : { routeHint: stringValue(body.routeHint, 'routeHint', true)! }),
+    ...(body.semanticHint === undefined ? {} : { semanticHint: stringValue(body.semanticHint, 'semanticHint', true)! }),
+  }
+}
+
+/** What an operator may change on an external event subscription. */
+function externalSubscriptionPatch(body: Record<string, unknown>): ExternalSubscriptionPatch {
+  return {
+    ...(body.eventTypes === undefined ? {} : { eventTypes: externalEventTypes(body.eventTypes, 'eventTypes') }),
+    ...(body.fields === undefined ? {} : { fields: externalFields(body.fields, 'fields') }),
+    ...(body.targetSessionId === undefined
+      ? {} : { targetSessionId: stringValue(body.targetSessionId, 'targetSessionId', true)! }),
+    ...(body.leaseSeconds === undefined ? {} : { leaseSeconds: wholeNumber(body.leaseSeconds, 'leaseSeconds') }),
+    ...(body.routeHint === undefined ? {} : { routeHint: stringValue(body.routeHint, 'routeHint', true)! }),
+    ...(body.semanticHint === undefined ? {} : { semanticHint: stringValue(body.semanticHint, 'semanticHint', true)! }),
+  }
+}
+
+/** The synthetic event an operator injects. */
+function syntheticEvent(body: Record<string, unknown>): SyntheticEvent {
+  if (typeof body.payload !== 'object' || body.payload === null || Array.isArray(body.payload)) {
+    throw new HttpError(400, 'payload must be an object')
+  }
+  return {
+    sourceId: stringValue(body.sourceId, 'sourceId', true)!,
+    eventId: stringValue(body.eventId, 'eventId', true)!,
+    eventType: stringValue(body.eventType, 'eventType', true)!,
+    payload: body.payload as Record<string, unknown>,
+  }
 }
 
 /** One `threads` entry: a bare `source:id` key or its object form, as the Engine's task type accepts it. */
@@ -638,6 +728,45 @@ export class ControlPlaneServer {
     if (method === 'GET' && path === '/v1/console/stream-subscriptions') {
       const limit = this.limit(url.searchParams.get('limit'))
       return json(res, 200, { subscriptions: this.control.streamSubscriptions(limit ?? 50) })
+    }
+
+    // The external observation events an operator watches for: which source, which kinds of event, which fields of the
+    // payload and the one Session the event wakes. The rules are deterministic and the delivery is direct: the event
+    // reaches that Session and never the Router. The record is durable, so the console shows it after a restart as well.
+    if (method === 'GET' && path === '/v1/console/external-subscriptions') {
+      const limit = this.limit(url.searchParams.get('limit'))
+      // The subscriptions and the dispositions of the events they saw: the dispositions carry the ids, the state and the
+      // reason, never the payload of the event.
+      return json(res, 200, { subscriptions: this.control.externalSubscriptions(limit ?? 50),
+        dispositions: this.control.externalEventDispositions(limit ?? 50) })
+    }
+    if (method === 'POST' && path === '/v1/console/external-subscriptions') {
+      const body = await readJson(req)
+      const subscription = await this.control.createExternalSubscription(externalSubscriptionInput(body))
+      return json(res, 201, { subscription })
+    }
+    // The operator's own changes to one subscription: a new rule, a new target, and the end of the subscription.
+    const externalSubscription = /^\/v1\/console\/external-subscriptions\/([^/]+)(?:\/(cancel))?$/.exec(path)
+    if (externalSubscription) {
+      const subscriptionId = decodeURIComponent(externalSubscription[1]!)
+      if (method === 'PUT' && externalSubscription[2] === undefined) {
+        const body = await readJson(req)
+        const subscription = await this.control.updateExternalSubscription(subscriptionId,
+          externalSubscriptionPatch(body))
+        return json(res, 200, { subscription })
+      }
+      if ((method === 'POST' && externalSubscription[2] === 'cancel')
+        || (method === 'DELETE' && externalSubscription[2] === undefined)) {
+        return json(res, 200, { subscription: this.control.cancelExternalSubscription(subscriptionId) })
+      }
+    }
+
+    // The synthetic events: the observation sources of this build, injected by an operator. Nothing outside this control
+    // plane is contacted — the sources are local — and the answer says what every subscription did with the event.
+    if (method === 'POST' && path === '/v1/console/events/synthetic-emit') {
+      const body = await readJson(req)
+      const result = await this.control.emitSyntheticEvent(syntheticEvent(body))
+      return json(res, 200, { result })
     }
 
     // The permission denials the guards refused: what each refusal was, how many the window held and what became of the
@@ -1317,6 +1446,44 @@ export class ControlPlaneServer {
       const sessionId = text(body.sessionId)
       const subscription = this.control.unsubscribeSessionStream(claims.sid, sessionId, callId)
       return json(res, 200, { subscription })
+    }
+
+    // The external observation events an Agent may watch for.
+    //
+    // The owner is the Session the token names and never the request: a token decides who acts, so a request may only
+    // ever watch what the token already names. The target is checked against the caller's own scope — a Worker watches
+    // itself, a PM watches the Workers of its own Project, the Router watches the PMs and the standalone Workers — and
+    // a refusal says nothing about whether the target exists.
+    if (method === 'POST' && url.pathname === '/v1/tools/external/subscriptions') {
+      this.control.requireTool(claims.sid, 'control_create_external_subscription', ['pm', 'worker', 'router'], callId)
+      const body = await readJson(req)
+      // The owner of a subscription is the Session the token names: a request may never choose one.
+      if (body.ownerSessionId !== undefined || body.creatorSessionId !== undefined) {
+        throw new HttpError(403, 'The owner of an external subscription is the Session this token names')
+      }
+      const subscription = await this.control.createExternalSubscriptionFor(claims.sid,
+        externalSubscriptionInput(body))
+      return json(res, 200, { subscription })
+    }
+    if (method === 'GET' && url.pathname === '/v1/tools/external/subscriptions') {
+      this.control.requireTool(claims.sid, 'control_list_external_subscriptions', ['pm', 'worker', 'router'], callId)
+      return json(res, 200, { subscriptions: this.control.externalSubscriptionsOf(claims.sid) })
+    }
+    const externalToolSubscription = /^\/v1\/tools\/external\/subscriptions\/([^/]+)$/.exec(url.pathname)
+    if (externalToolSubscription) {
+      const subscriptionId = decodeURIComponent(externalToolSubscription[1]!)
+      if (method === 'PUT') {
+        this.control.requireTool(claims.sid, 'control_update_external_subscription', ['pm', 'worker', 'router'], callId)
+        const body = await readJson(req)
+        const subscription = await this.control.updateExternalSubscriptionFor(claims.sid, subscriptionId,
+          externalSubscriptionPatch(body))
+        return json(res, 200, { subscription })
+      }
+      if (method === 'DELETE') {
+        this.control.requireTool(claims.sid, 'control_delete_external_subscription', ['pm', 'worker', 'router'], callId)
+        const subscription = this.control.cancelExternalSubscriptionFor(claims.sid, subscriptionId)
+        return json(res, 200, { subscription })
+      }
     }
 
     throw new HttpError(404, 'Not found')

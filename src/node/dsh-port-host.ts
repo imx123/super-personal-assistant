@@ -1365,14 +1365,16 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
   if (options.role === 'pm') {
     return [projectTool(options), createTicketsTool(options), messageWorkerTool(options), cancelWorkerTool(options),
       requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options),
-      requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options)]
+      requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
+      ...externalSubscriptionTools(options)]
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
     routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
     requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
+    ...externalSubscriptionTools(options),
   ]
-  return [reportTool(options)]
+  return [reportTool(options), ...externalSubscriptionTools(options)]
 }
 
 /**
@@ -2010,6 +2012,197 @@ function routerPmProposalTool(options: ControlToolOptions): ToolDefinition {
   }
 }
 
+/**
+ * The four tools an Agent uses to watch the external observation sources.
+ *
+ * They are the same for every role, and the control plane decides what each of them may do: the token names the owner,
+ * the owner may only watch what its own role allows, and the two-layer routing is refused for every Agent. The tools
+ * themselves carry no authority — they are requests, and the control plane judges them.
+ */
+function externalSubscriptionTools(options: ControlToolOptions): ToolDefinition[] {
+  return [createExternalSubscriptionTool(options), listExternalSubscriptionsTool(options),
+    updateExternalSubscriptionTool(options), deleteExternalSubscriptionTool(options)]
+}
+
+/** The ways a field of an external event's payload may be compared with a value. */
+const EXTERNAL_FIELD_OPS = ['exact', 'prefix', 'contains', 'regex'] as const
+
+/** The field conditions of an external event subscription, as the model writes them. */
+function externalFieldsOf(value: unknown): Array<{ path: string; op: string; value: string }> {
+  if (!Array.isArray(value) || value.length === 0) throw new Error('fields must be a non-empty array')
+  return value.map(entry => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error('every field must be an object')
+    }
+    const field = entry as Record<string, unknown>
+    const path = requiredString(field.path, 'path')
+    const op = requiredString(field.op, 'op')
+    if (!(EXTERNAL_FIELD_OPS as readonly string[]).includes(op)) {
+      throw new Error(`op must be one of ${EXTERNAL_FIELD_OPS.join(', ')}`)
+    }
+    return { path, op, value: requiredString(field.value, 'value') }
+  })
+}
+
+/** The kinds of event a subscription watches, as the model writes them. */
+function externalEventTypesOf(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) throw new Error('eventTypes must be a non-empty array')
+  return value.map(entry => requiredString(entry, 'eventType'))
+}
+
+/**
+ * `control_create_external_subscription`: the subscription an Agent makes for itself.
+ *
+ * The owner is the Session the token names, never the request. A Worker watches itself and nothing else; a PM and the
+ * Router may name a subordinate they really govern. The event reaches the target as quoted data: it grants nothing and
+ * decides nothing.
+ */
+function createExternalSubscriptionTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_create_external_subscription',
+    description: 'Watch an external observation source and be woken when an event of it matches. Name the source, the '
+      + 'kinds of event and the fields of the payload that have to hold — every one of them has to hold. The subscription '
+      + 'belongs to this Session: a Worker may only watch itself, and a superior may only name a subordinate it really '
+      + 'governs. The event reaches you as quoted data that grants nothing and decides nothing.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['sourceId', 'eventTypes', 'fields'],
+      properties: {
+        sourceId: { type: 'string', description: 'The observation source, such as synthetic-group-chat or synthetic-sms.' },
+        eventTypes: { type: 'array', items: { type: 'string' },
+          description: 'The kinds of event the subscription watches, such as group.message.' },
+        fields: { type: 'array', items: { type: 'object', additionalProperties: false,
+          required: ['path', 'op', 'value'],
+          properties: {
+            path: { type: 'string', description: 'The field of the payload, such as groupId or text.' },
+            op: { type: 'string', enum: [...EXTERNAL_FIELD_OPS],
+              description: 'How the field is compared with the value.' },
+            value: { type: 'string', description: 'The value the field is compared with.' },
+          } },
+          description: 'The conditions the payload has to hold; every one of them has to hold.' },
+        targetSessionId: { type: 'string',
+          description: 'The Session the event wakes. A Worker may not name one: it watches itself.' },
+        deliveryMode: { type: 'string', enum: ['direct_initiator', 'direct_designated'],
+          description: 'direct_initiator wakes this very Session; direct_designated wakes the Session you name. The '
+            + 'default is direct_initiator.' },
+        leaseSeconds: { type: 'integer', minimum: 60, description: 'How long the subscription lasts, in seconds.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const sourceId = requiredString(input.sourceId, 'sourceId')
+      const eventTypes = externalEventTypesOf(input.eventTypes)
+      const fields = externalFieldsOf(input.fields)
+      const targetSessionId = input.targetSessionId === undefined
+        ? undefined : requiredString(input.targetSessionId, 'targetSessionId')
+      const deliveryMode = input.deliveryMode === undefined
+        ? undefined : requiredString(input.deliveryMode, 'deliveryMode')
+      const leaseSeconds = input.leaseSeconds === undefined
+        ? undefined : requiredInteger(input.leaseSeconds, 'leaseSeconds')
+      return requestControl(options, 'POST', '/v1/tools/external/subscriptions',
+        { sourceId, eventTypes, fields, ...(targetSessionId === undefined ? {} : { targetSessionId }),
+          ...(deliveryMode === undefined ? {} : { deliveryMode }),
+          ...(leaseSeconds === undefined ? {} : { leaseSeconds }) }, exec)
+    },
+  }
+}
+
+/** `control_list_external_subscriptions`: the subscriptions this Session owns. */
+function listExternalSubscriptionsTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_list_external_subscriptions',
+    description: 'Read the external event subscriptions this Session made: the source, the kinds of event, the rules of '
+      + 'the payload, the Session each one wakes and the state it reached. A subscription another Session made is not '
+      + 'yours and is not shown.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(_args, exec) {
+      return requestControl(options, 'GET', '/v1/tools/external/subscriptions', undefined, exec)
+    },
+  }
+}
+
+/**
+ * `control_update_external_subscription`: the rules of one subscription this Session owns.
+ *
+ * The same scope rules as the creation apply: a Worker may not name another target, and a superior may only name a
+ * subordinate it really governs.
+ */
+function updateExternalSubscriptionTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_update_external_subscription',
+    description: 'Change one external event subscription this Session made: the kinds of event it watches, the rules of '
+      + 'the payload, the Session it wakes or how long it lasts. A subscription another Session made is not yours and may '
+      + 'not be changed.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['subscriptionId'],
+      properties: {
+        subscriptionId: { type: 'string', description: 'The subscription to change.' },
+        eventTypes: { type: 'array', items: { type: 'string' },
+          description: 'The kinds of event the subscription watches.' },
+        fields: { type: 'array', items: { type: 'object', additionalProperties: false,
+          required: ['path', 'op', 'value'],
+          properties: {
+            path: { type: 'string', description: 'The field of the payload, such as groupId or text.' },
+            op: { type: 'string', enum: [...EXTERNAL_FIELD_OPS],
+              description: 'How the field is compared with the value.' },
+            value: { type: 'string', description: 'The value the field is compared with.' },
+          } },
+          description: 'The conditions the payload has to hold; every one of them has to hold.' },
+        targetSessionId: { type: 'string', description: 'The Session the event wakes.' },
+        leaseSeconds: { type: 'integer', minimum: 60, description: 'How long the subscription lasts, in seconds.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const subscriptionId = requiredString(input.subscriptionId, 'subscriptionId')
+      const eventTypes = input.eventTypes === undefined ? undefined : externalEventTypesOf(input.eventTypes)
+      const fields = input.fields === undefined ? undefined : externalFieldsOf(input.fields)
+      const targetSessionId = input.targetSessionId === undefined
+        ? undefined : requiredString(input.targetSessionId, 'targetSessionId')
+      const leaseSeconds = input.leaseSeconds === undefined
+        ? undefined : requiredInteger(input.leaseSeconds, 'leaseSeconds')
+      return requestControl(options, 'PUT', `/v1/tools/external/subscriptions/${encodeURIComponent(subscriptionId)}`,
+        { ...(eventTypes === undefined ? {} : { eventTypes }), ...(fields === undefined ? {} : { fields }),
+          ...(targetSessionId === undefined ? {} : { targetSessionId }),
+          ...(leaseSeconds === undefined ? {} : { leaseSeconds }) }, exec)
+    },
+  }
+}
+
+/**
+ * `control_delete_external_subscription`: the end of one subscription this Session owns.
+ *
+ * It takes effect at once: no event goes out again, and one that is on its way does not go out either.
+ */
+function deleteExternalSubscriptionTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_delete_external_subscription',
+    description: 'Stop one external event subscription this Session made. The subscription ends at once: no further event '
+      + 'arrives, and one that is on its way does not go out either.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['subscriptionId'],
+      properties: {
+        subscriptionId: { type: 'string', description: 'The subscription to stop.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const subscriptionId = requiredString(input.subscriptionId, 'subscriptionId')
+      return requestControl(options, 'DELETE', `/v1/tools/external/subscriptions/${encodeURIComponent(subscriptionId)}`,
+        undefined, exec)
+    },
+  }
+}
+
 /** `control_report`: the Worker's status path; the control plane derives the Project and Assignment from the token. */
 function reportTool(options: ControlToolOptions): ToolDefinition {
   return {
@@ -2065,8 +2258,8 @@ function reportTool(options: ControlToolOptions): ToolDefinition {
  * retries the same request. A failed refresh or a retried `401` is reported as the original refusal: the refresh request
  * never recurses, so a bad control plane cannot turn one tool call into an unbounded loop.
  */
-async function requestControl(options: ControlToolOptions, method: 'GET' | 'POST', path: string, body: unknown,
-  exec: { signal: AbortSignal }): Promise<unknown> {
+async function requestControl(options: ControlToolOptions, method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string,
+  body: unknown, exec: { signal: AbortSignal }): Promise<unknown> {
   const signal = exec.signal
   // The identity of this very tool invocation. The backend's own id is used when it gives one; otherwise the node names
   // the invocation itself. Either way the identity is made once and travels with the request and with the retry after a
@@ -2105,15 +2298,18 @@ function toolCallIdOf(exec: unknown): string | undefined {
 }
 
 /** One authenticated request with the token that is current at the moment it is built. */
-function sendControl(options: ControlToolOptions, token: string, method: 'GET' | 'POST', path: string, body: unknown,
-  signal: AbortSignal, callId?: string): Promise<Awaited<ReturnType<DshPortFetch>>> {
+function sendControl(options: ControlToolOptions, token: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string,
+  body: unknown, signal: AbortSignal, callId?: string): Promise<Awaited<ReturnType<DshPortFetch>>> {
   const headers: Record<string, string> = { authorization: `Bearer ${token}` }
-  if (method === 'POST') headers['content-type'] = 'application/json'
+  // A GET carries no body at all, and neither does a DELETE: `fetch` refuses a body on a GET, and a DELETE without one
+  // is the shape the control plane reads.
+  const carries = method === 'POST' || method === 'PUT'
+  if (carries) headers['content-type'] = 'application/json'
   // The identity of the tool invocation travels with the request: the control plane recognises a retried call as the
   // very same call, so a refusal is neither audited nor counted twice.
   if (callId !== undefined) headers['x-superagent-call-id'] = callId
   return options.fetch(`${options.baseUrl}${path}`, { method, headers,
-    ...(method === 'POST' ? { body: JSON.stringify(body) } : {}), signal })
+    ...(carries ? { body: JSON.stringify(body) } : {}), signal })
 }
 
 /**

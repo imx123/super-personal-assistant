@@ -268,6 +268,7 @@ svg{width:18px;height:18px;flex:none}
 .notice{border-radius:8px;padding:8px 11px;font-size:12px;margin-top:10px;background:var(--lav);color:var(--purple)}
 .notice.success{background:#e5f4ed;color:var(--green)}
 .notice.failure{background:#fae9ed;color:var(--red)}
+.notice.warning{background:#fdf3e2;color:#8a5a12}
 .action.danger{border-color:#e7c3cb;color:var(--red)}
 .action.danger:hover:not(:disabled){border-color:var(--red)}
 .empty{padding:22px 18px;color:var(--muted);text-align:center}
@@ -281,6 +282,20 @@ svg{width:18px;height:18px;flex:none}
 .signin label{display:grid;gap:5px;font-size:13px;margin-bottom:12px}
 .signin input{border:1px solid var(--edge);border-radius:8px;padding:9px 10px;width:100%}
 .signin .error{color:var(--red);font-size:12px;margin-bottom:12px}
+/* The external event subscriptions: the operator's own records, their rules and the forms that make them. */
+.external-list li{align-items:flex-start;flex-wrap:wrap;gap:6px}
+.external-main{flex:1;min-width:210px;display:grid;gap:3px}
+.external-main .quiet{display:block;margin:0;overflow-wrap:anywhere}
+.external-line{font-weight:620;font-size:12.5px;overflow-wrap:anywhere}
+.external-rules{display:flex;flex-wrap:wrap;gap:5px}
+.external-rule{border:1px solid var(--edge);border-radius:6px;padding:1px 6px;font-size:11px;background:var(--white);overflow-wrap:anywhere}
+.external-fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:0 12px}
+.external-fields .form-block{margin:8px 0}
+.external-optin{display:flex;gap:9px;align-items:flex-start;padding:9px 11px;border:1px solid var(--edge);border-radius:9px;background:var(--white);margin:4px 0}
+.external-optin input{width:18px;height:18px;accent-color:var(--purple);flex:none;margin-top:2px}
+.external-optin b{display:block;font-size:13px}
+.external-actions{margin-top:0}
+.external-actions select{border:1px solid var(--edge);border-radius:8px;padding:6px 8px;background:var(--white);max-width:100%}
 @media(max-width:1050px){.app{grid-template-columns:194px minmax(0,1fr)}.brand{font-size:16px}}
 @media(width > 800px){
   .app[data-sidebar-collapsed=true]{grid-template-columns:64px minmax(0,1fr)}

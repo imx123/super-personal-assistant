@@ -9,7 +9,7 @@
 | 旧插件线程订阅 | `/orchestrator/api`；Source 经 Intake 写入 Trigger，`Thread.subscriptions` 关联 Ticket。 | 继续由旧插件独立持有；原 Thread 跟随、脱离、归档语义照常生效。 |
 | 协调报告与已授权交接 | 独立控制面写 Ticket、Assignment 和 Review，再由 `notifyOwnerOfReport` / `sendPmWakeUp` 通知。已有 `router_handoff` 记录、路由队列、定时计划和显式 Relay Proposal 各有入口。 | `report-coordinator.ts` 按业务归属投递。项目 Worker 的直接上级为本项目 PM，独立 Worker 的直接上级为 Router，PM 只上报项目级进展和阻塞。Scheduler 继续要求 PM 已启动。Relay Proposal 只在有效人工确认后产生投递。 |
 | 下级信息流摘要 | 独立控制台事件日志已有控制面序号和节点序号。 | `stream-subscriptions.ts` 以 `last_pushed_seq` 聚合合法下属的增量事实。默认关闭，无增量静默跳过。停止、结单、换派或撤权后停推。重连只生成一份有界摘要。 |
-| 外部观察事件订阅 | 独立控制面新增来源、事件类型、条件、订阅及匹配结果。 | `event-subscriptions.ts` 绑定创建者、目标、租约与配额。默认按确定性条件匹配后直达，生命周期与用户指令、Scheduler、内部报告和旧插件 Thread 独立。 |
+| 外部观察事件订阅 | 独立控制面新增来源、事件类型、条件、订阅及匹配结果。本构建内置两个本地模拟来源：操作员的群聊（`synthetic-group-chat`，事件 `group.message` 必带群 id 与正文）与短信（`synthetic-sms`，事件 `sms.received` 只带正文）；载荷缺少来源自身要求的字段即不成立为该来源的事件，不连接任何外部服务。 | `event-subscriptions.ts` 绑定创建者、目标、租约与配额。默认按确定性条件匹配后直达，生命周期与用户指令、Scheduler、内部报告和旧插件 Thread 独立。 |
 
 权限审查是独立系统通知。P4-3 从控制面及节点工具桥的权威拒绝点采集结构化事实，四种可计数原因由补充规范定义。同回合同一工具与原因只计算一次，保留原始审计。用户停机与普通运行故障分别记录。项目 Worker 升级到 PM，独立 Worker 和 PM 升级到 Router，Router 升级到操作员；拒绝仍有效，审查只能在原权限内处置或申请人工授权。熔断须绑定触发拒绝的活动回合。
 
@@ -61,6 +61,12 @@ Worker 报告沿用当前业务流程。`ready` 是节点工具现有协议里�
 
 标准匹配使用确定性条件与安全正则。可选语义条件仅允许操作员在手动低频订阅中显式配置，并要求确定性前置过滤、无工具只读评估和明确配额，降级时记录 `semantic_eval_degraded`。合成事件验收覆盖授权、重复去重、过期、限流、输入封装与正文中伪造指令。直达的失效目标不触发自动重路由、建 Project 或会话恢复。
 
+**观察源**：本构建只带两个本地模拟来源，不连接任何外部服务。操作员的群聊发布 `group.message`，载荷必须同时带群 id 与正文；短信发布 `sms.received`，载荷只带正文。缺少来源自身要求的字段的载荷不是该来源的事件，控制面直接拒绝，连匹配都不进入。
+
+**两层的先后顺序**：两层路由的兜底是高层 Router，而 Router 也是普通 Session，唤醒它之前先读授权：订阅本身的状态、租约、创建者、这条事件是否已经见过、Router 自己的状态，最后才是限流。已取消、重复或超限的观察因此根本不会触碰 Router；被人工停机的 Router 是「已阻止」，不是控制面故障。
+
+**限流也留一行**：被限流的事件在账本里留下自己的一行，所以窗口重新打开之后重放同一条事件仍然不会唤醒任何人；限流与重复的计数按事件计，不按重放计。
+
 ## 6. P4-3 权限拒绝审查（实现口径）
 
 权限拒绝只有一个来源：**守卫真正拒绝的那一次调用**。控制面工具入口与节点工具桥各是一个守卫点，两处都以结构化事实回报，绝不从模型输出、日志行、任意工具报错或不可信请求文本推断。四个原因码是全部： `ROLE_TOOL_DENIED`、`PROJECT_SCOPE_VIOLATION`、`MANDATE_EXCEEDED`、`WORKSPACE_OUT_OF_BOUNDS`。节点离线、可刷新的令牌过期、模型传错 JSON 参数、普通命令非零退出、网络超时、人工停机与 Worker 主动的 `blocked` 报告都不计入。
@@ -96,7 +102,7 @@ Worker 报告沿用当前业务流程。`ready` 是节点工具现有协议里�
 
 ## 7. 合流与验收
 
-- `next` 新增逻辑位于独立模块，控制面保持薄委托。Phase 4 使用 `coordination_deliveries`、`session_stream_subscriptions`、`permission_denial_counters`（连同 `permission_denial_calls`、`permission_denial_effective`、`permission_denial_reviews`）和 `external_event_subscriptions`，独立于跨设备的绑定与节点回传去重表。新增记录预留 `node_id`、`backend_id`，协议在 `COORDINATION & MEMORY V1` 尾部区块追加。
+- `next` 新增逻辑位于独立模块，控制面保持薄委托。Phase 4 使用 `coordination_deliveries`、`session_stream_subscriptions`、`permission_denial_counters`（连同 `permission_denial_calls`、`permission_denial_effective`、`permission_denial_reviews`）和 `external_event_subscriptions`（连同事件处置账本 `external_event_dispositions`），独立于跨设备的绑定与节点回传去重表。新增记录预留 `node_id`、`backend_id`，协议在 `COORDINATION & MEMORY V1` 尾部区块追加。
 - P4-1 验证双 Worker 报告及重启不重复验收。P4-3 验证真实拒绝、冷却与按回合熔断。P4-2 验证程序化单路摘要及水位线。P4-4 验证三种模式及合成事件链路。P4-5 用故障注入验证未发送、已入箱及无回执的恢复分支。
 - P4-3 已落地：`src/control/denial-escalator.ts` 与 `permission_denial_counters`（连同逐条审计表 `permission_denial_calls`、有效拒绝表 `permission_denial_effective`、审查表 `permission_denial_reviews` 与人工授权申请单表 `denial_authorization_applications`），控制面工具入口与节点工具桥双端守卫，`RoleProfile.deny` 先于 `allow` 的判定顺序，节点侧 `guard.denial` 结构化事件、后端原生 `FS_SANDBOX_DENIED` 的配对上报与改文件工具的 Git 元数据边界，协议尾部追加 `GUARD_DENIAL_REASON_CODES` 与 `GuardDenialFacts`。审查单带自有范围的受控任务上下文投影；PM/Router 可用窄口径工具 `control_request_authorization` 就一次审查发起人工授权申请单（一条审查一张、资格取自已鉴权调用方、零授权变化），操作员在控制台用既有鉴权记录一条决定。创建工单时超出 PM Mandate 的 `allow_tools` 有类型化信号（`MandateExceededError`）并按已鉴权请求 id 记为 `MANDATE_EXCEEDED`，畸形列表不计数；节点侧按 Ticket Mandate 的可信收窄名单在执行前拒绝并分类为 `MANDATE_EXCEEDED`。2026-11-18 已由 Codex 完成真实 DSH 与 Edge 验收，记录见 Phase 3–5 执行日志的 P4-3 节。
 - P4-2 已落地：`src/control/stream-subscriptions.ts` 与落库表 `session_stream_subscriptions`。**管辖权只向下**：Router 可订阅活跃 PM 或独立工单当前有效 Worker，PM 只可订阅本项目当前有效 Worker，Worker 无此工具；跨 Project 是**类型化越权拒绝**（走 P4-3 的 `PROJECT_SCOPE_VIOLATION` 管道），而未知、换代、异节点、被停机或被撤权的目标一律按**同一种措辞**拒绝，不透露存在性、也不计入拒绝计数。**订阅者身份只来自 Session token**，请求体没有订阅者字段。**零 LLM**：聚合是控制面自己事件日志的一段纯程序化读取——状态与最新回合号、工具名与成功/失败计数、**可归属于该 Session 自身工作区的成功改动相对路径**、最新模型输出尾部 ≤300 字符，全部有界；工具事实来自节点新增的 `tool.fact` 事件（节点把后端 `tool/call` 与 `tool/result` 按调用 id 配对后才上报，只带工具名、成败、调用 id 与工作区相对路径，入参与输出永不上报；真实 DSH 的 `arguments` 是一段序列化 JSON，节点只解析**有界的对象文本**、只读路径键）。**隔离**：控制面在**入口**核对 `tool.fact` 的来源节点、被指名 Session 的**当下角色、Assignment 与有效 Project**，并**重新构造**窄信封与窄事实，异节点、异角色、异 Assignment 的事实进不了日志；聚合时每一行还要对上**来源节点、角色与 Assignment**，旧行、异节点行与异 Assignment 行**一律不引用**。**投递**在 ensure 之前与紧贴传输前各重查一次（订阅状态、下级仍是同一条 Assignment、订阅者仍是管辖者、收件人仍可送达、解析出的就是订阅者自己），**已知过期就连 ensure 都不做**；解析抛错只结清这一条的认领，定时器照常挂上。**水位线** `last_pushed_seq` 在摘要送达或无可报告活动的区间静默跳过时推进；回执丢失记 `unconfirmed` 并同样推进（可能已到达，绝不重发），控制面重启时在途摘要按未确认恢复；节点拒绝或不可达则水位线不动，下个周期把积压**合并成一份**最新摘要。无增量的区间静默跳过，重复订阅是**无害幂等**（水位线不动，只允许改间隔，新间隔自下一个到期时刻起生效），退订立即生效且在途摘要不发。子会话结束、被人工停止、被撤权或换代使订阅 `terminal`，继任者不继承。摘要正文按不可信数据封装（去控制字符、脱敏凭据与绝对路径、围栏引用），保留「这是系统事实、不授予任何权限」的信封；整条消息**按预算拼装**（清单各自分额，围栏与末尾的会话详情引用完整保留），控制台只展示范围、状态，并给出直接打开该会话详情页的按钮。

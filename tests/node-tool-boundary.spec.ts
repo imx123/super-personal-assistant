@@ -150,12 +150,16 @@ describe('node role tool boundary', () => {
     expect(registry.registered).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
-      'control_unsubscribe_session_stream'])
+      'control_unsubscribe_session_stream', 'control_create_external_subscription',
+      'control_list_external_subscriptions', 'control_update_external_subscription',
+      'control_delete_external_subscription'])
     expect(registry.log).toEqual(['schemas', 'restrict', 'guard', 'register:control_project',
       'register:control_create_tickets', 'register:control_message_worker', 'register:control_cancel_worker',
       'register:control_request_assignment', 'register:control_review_result', 'register:control_review_diff',
       'register:control_project_report', 'register:control_request_authorization',
-      'register:control_subscribe_session_stream', 'register:control_unsubscribe_session_stream'])
+      'register:control_subscribe_session_stream', 'register:control_unsubscribe_session_stream',
+      'register:control_create_external_subscription', 'register:control_list_external_subscriptions',
+      'register:control_update_external_subscription', 'register:control_delete_external_subscription'])
   })
 
   it('keeps only the worker profile\'s inherited tools and guards the rest', async () => {
@@ -170,7 +174,9 @@ describe('node role tool boundary', () => {
     expect(registry.denial('read')).toBeUndefined()
     // `control_report` is registered into the own layer, not inherited, and the profile grants it.
     expect(registry.denial('control_report')).toBeUndefined()
-    expect(registry.registered).toEqual(['control_report'])
+    expect(registry.registered).toEqual(['control_report', 'control_create_external_subscription',
+      'control_list_external_subscriptions', 'control_update_external_subscription',
+      'control_delete_external_subscription'])
   })
 
   it('applies the boundary once per Agent across repeated ensures', async () => {
@@ -187,7 +193,9 @@ describe('node role tool boundary', () => {
     expect(registry.registered).toEqual(['control_project', 'control_create_tickets', 'control_message_worker',
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
-      'control_unsubscribe_session_stream'])
+      'control_unsubscribe_session_stream', 'control_create_external_subscription',
+      'control_list_external_subscriptions', 'control_update_external_subscription',
+      'control_delete_external_subscription'])
   })
 
   it('applies the boundary again to a resumed Agent', async () => {

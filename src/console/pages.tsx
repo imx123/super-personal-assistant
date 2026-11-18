@@ -11,8 +11,10 @@
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
-  messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket,
-  type CoordinationDelivery, type DenialAuthorization, type DenialReview, type FastRouteReceipt, type NodeView, type Overview,
+  cancelExternalSubscription, createExternalSubscription, emitSyntheticEvent, messageOf, put, read, readExternalSubscriptions,
+  remove, updateExternalSubscription, write, type AuditEntry, type ConsoleProject, type ConsoleTicket,
+  type CoordinationDelivery, type DenialAuthorization, type DenialReview, type ExternalDisposition, type ExternalEmitResult,
+  type ExternalSubscription, type FastRouteReceipt, type NodeView, type Overview,
   type StreamSubscription,
   type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord,
   type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
@@ -649,6 +651,431 @@ function StreamSubscriptions(props: { subscriptions: StreamSubscription[]
 }
 
 /**
+ * The observation sources an operator may watch, as the presets the panel offers.
+ *
+ * They are the control plane's own simulated sources: a chat group and a short message. Nothing outside this control
+ * plane is contacted, and the sample values of the panel carry nothing of a person's own.
+ */
+interface ExternalSourcePreset {
+  /** The source's own id. */
+  id: string
+  /** The name the console shows. */
+  label: string
+  /** The one kind of event the source publishes. */
+  eventType: string
+  /** Whether the payload of that event carries a group id. */
+  groupId: boolean
+}
+
+const EXTERNAL_SOURCES: ExternalSourcePreset[] = [
+  { id: 'synthetic-group-chat', label: '模拟群聊', eventType: 'group.message', groupId: true },
+  { id: 'synthetic-sms', label: '模拟短信', eventType: 'sms.received', groupId: false },
+]
+
+/** The states a subscription reaches. */
+const EXTERNAL_STATUS: Record<string, string> = {
+  active: '生效中',
+  cancelled: '已取消',
+  expired_by_scope: '已失效',
+}
+
+/** The states one event reaches for one subscription. */
+const EXTERNAL_DISPOSITION_STATUS: Record<string, string> = {
+  dispatching: '投递中',
+  sent: '已送达',
+  duplicate: '重复事件',
+  unconfirmed: '未确认',
+  blocked: '已阻止',
+  throttled: '已限流',
+  failed: '失败',
+  semantic_eval_degraded: '语义评估未完成（未投递）',
+}
+
+/** How the event reaches the target it wakes. */
+const EXTERNAL_DELIVERY_MODE: Record<string, string> = {
+  direct_initiator: '直送创建者会话',
+  direct_designated: '直送指定会话',
+  dual_layer_router: '两层路由',
+}
+
+/**
+ * Who made a subscription.
+ *
+ * A person at the console is the operator; the other three are the Agents of this control plane, and each of them owns
+ * what it made. A control plane that does not say who owns a subscription is read as the operator's own.
+ */
+const EXTERNAL_OWNER_ROLE: Record<string, string> = {
+  operator: '操作员',
+  pm: 'PM',
+  worker: 'Worker',
+  router: 'Router',
+}
+
+/** The owner of a subscription, in words, with the Session that made it when there is one. */
+function externalOwnerWording(subscription: ExternalSubscription): string {
+  const role = subscription.ownerRole ?? 'operator'
+  const name = EXTERNAL_OWNER_ROLE[role] ?? role
+  return subscription.ownerSessionId ? `${name} ${subscription.ownerSessionId}` : name
+}
+
+/**
+ * Whether a subscription is delivered by the two-layer router.
+ *
+ * The two-layer mode has no fixed target: the fast route names one per event and the high-level Router is the fallback,
+ * so there is no session to show and no target to change.
+ */
+function isDualLayer(subscription: ExternalSubscription): boolean {
+  return subscription.deliveryMode === 'dual_layer_router'
+}
+
+/**
+ * How often a subscription may really wake, in words.
+ *
+ * The count alone never says the window: the direct mode allows three in a minute and the two-layer mode one in five
+ * minutes, so the window is read from the control plane and shown with the count. A control plane that does not have the
+ * window yet is read as one minute, which is the direct mode's own window.
+ */
+function externalRateWording(subscription: ExternalSubscription): string {
+  const seconds = subscription.rateWindowSeconds ?? 60
+  const count = subscription.ratePerMinute
+  if (seconds % 60 === 0) return `每 ${seconds / 60} 分钟最多 ${count} 次`
+  return `每 ${seconds} 秒最多 ${count} 次`
+}
+
+/** How a field of the payload is compared with the value the subscription names. */
+const EXTERNAL_FIELD_OP: Record<string, string> = {
+  exact: '精确等于',
+  prefix: '前缀',
+  contains: '包含',
+  regex: '正则',
+}
+
+/** What one injected event did, in one sentence. */
+function externalEmitWording(result: unknown): string {
+  const value = result as Partial<ExternalEmitResult>
+  const count = (list: string[] | undefined): number => (Array.isArray(list) ? list.length : 0)
+  return `事件已注入：匹配 ${value.considered ?? 0} 个订阅，未命中 ${value.quiet ?? 0} 个，`
+    + `送达 ${count(value.delivered)} 个，已阻止 ${count(value.blocked)} 个，已限流 ${count(value.throttled)} 个，`
+    + `重复 ${count(value.duplicates)} 个，未确认 ${count(value.unconfirmed)} 个，`
+    + `降级未投递 ${count(value.degraded)} 个，失败 ${count(value.failed)} 个。`
+}
+
+/**
+ * The external event subscriptions an operator made, as the console shows them.
+ *
+ * It shows what each subscription watches — the source, the kinds of event, the rules the payload has to hold and the
+ * one Session the event wakes — and the state it reached, with the last disposition of the events it saw. The payload
+ * of an event is never shown: the disposition carries the ids and the reason, never the words of the outside world.
+ *
+ * The panel creates a subscription and injects a synthetic event as well, so the whole flow can be tried on the control
+ * plane's own simulated sources. The two-layer delivery is an explicit opt-in: the checkbox says what it turns on, the
+ * rate warning says what it costs, and the direct delivery stays what a subscription gets when the box is not ticked.
+ */
+function ExternalSubscriptions(props: { subscriptions: ExternalSubscription[]; dispositions: ExternalDisposition[];
+  sessions: SessionView[]; refresh: () => void }): ReactElement {
+  const createAction = useAction(props.refresh)
+  const injectAction = useAction(props.refresh)
+  const rowAction = useAction(props.refresh)
+  const [sourceId, setSourceId] = useState('synthetic-group-chat')
+  const [groupId, setGroupId] = useState('demo-group-1')
+  const [keyword, setKeyword] = useState('示例')
+  const [target, setTarget] = useState('')
+  const [dualLayer, setDualLayer] = useState(false)
+  const [routeHint, setRouteHint] = useState('')
+  const [retarget, setRetarget] = useState<Record<string, string>>({})
+  const [emitSourceId, setEmitSourceId] = useState('synthetic-group-chat')
+  const [emitGroupId, setEmitGroupId] = useState('demo-group-1')
+  const [emitText, setEmitText] = useState('示例消息：这是一条模拟事件')
+  const [emitEventId, setEmitEventId] = useState('demo-event-1')
+
+  const source = EXTERNAL_SOURCES.find(item => item.id === sourceId) ?? EXTERNAL_SOURCES[0]!
+  const emitSource = EXTERNAL_SOURCES.find(item => item.id === emitSourceId) ?? EXTERNAL_SOURCES[0]!
+  // A Session that cannot be messaged is not a target: the control plane would refuse it, so the console says so
+  // instead of offering it.
+  const deliverable = props.sessions.filter(session => session.deliverable !== false)
+  const busy = createAction.state.busy || injectAction.state.busy || rowAction.state.busy
+
+  // The target of a new subscription is the first Session that may still be messaged; the operator may pick another.
+  useEffect(() => {
+    if (target !== '' || deliverable.length === 0) return
+    setTarget(deliverable[0]!.sessionId)
+  }, [target, deliverable])
+
+  // The last disposition of each subscription: what the events it saw really did. A control plane that does not have
+  // the dispositions yet shows none, and the panel says so rather than inventing one.
+  const recent = new Map<string, ExternalDisposition>()
+  for (const disposition of props.dispositions) {
+    const known = recent.get(disposition.subscriptionId)
+    if (!known || disposition.at > known.at) recent.set(disposition.subscriptionId, disposition)
+  }
+
+  const create = (): void => {
+    if (createAction.state.busy) return
+    const text = keyword.trim()
+    if (text === '') {
+      createAction.run(() => Promise.reject(new Error('请填写文本关键词：订阅至少要有一个字段条件。')))
+      return
+    }
+    if (!dualLayer && target === '') {
+      createAction.run(() => Promise.reject(new Error('请选择被唤醒的目标会话。')))
+      return
+    }
+    const fields = [
+      ...(source.groupId && groupId.trim() !== '' ? [{ path: 'groupId', op: 'exact', value: groupId.trim() }] : []),
+      { path: 'text', op: 'contains', value: text },
+    ]
+    createAction.run(async () => {
+      await createExternalSubscription({
+        sourceId: source.id,
+        eventTypes: [source.eventType],
+        fields,
+        // The two-layer mode has no fixed target: the fast route names one per event, so no target is sent at all.
+        ...(dualLayer ? {} : { targetSessionId: target }),
+        // The direct delivery is what a subscription gets; the two-layer one only when the operator ticked the box.
+        deliveryMode: dualLayer ? 'dual_layer_router' : 'direct_designated',
+        ...(dualLayer && routeHint.trim() !== '' ? { routeHint: routeHint.trim() } : {}),
+      })
+      setKeyword('')
+      setRouteHint('')
+    }, '外部事件订阅已创建')
+  }
+
+  const inject = (): void => {
+    if (injectAction.state.busy) return
+    const text = emitText.trim()
+    const eventId = emitEventId.trim()
+    if (text === '' || eventId === '') {
+      injectAction.run(() => Promise.reject(new Error('请填写事件 id 和事件文本。')))
+      return
+    }
+    // The payload carries the fields the source publishes: a group message holds a group and a text, a short message
+    // only a text.
+    const payload: Record<string, unknown> = emitSource.groupId
+      ? { groupId: emitGroupId.trim(), text }
+      : { text }
+    injectAction.run(async () => emitSyntheticEvent({
+      sourceId: emitSource.id, eventId, eventType: emitSource.eventType, payload,
+    }), externalEmitWording)
+  }
+
+  const cancel = (subscriptionId: string): void => {
+    if (rowAction.state.busy) return
+    rowAction.run(async () => { await cancelExternalSubscription(subscriptionId) }, '外部事件订阅已取消')
+  }
+
+  const changeTarget = (subscriptionId: string): void => {
+    const sessionId = retarget[subscriptionId] ?? ''
+    if (rowAction.state.busy || sessionId === '') return
+    rowAction.run(async () => { await updateExternalSubscription(subscriptionId, { targetSessionId: sessionId }) },
+      '目标会话已更新')
+  }
+
+  return (
+    <>
+      <div className="router-queue" aria-label="外部事件订阅记录">
+        <p className="quiet">
+          外部观察源的事件与它们唤醒的会话：源、事件类型、载荷必须满足的字段条件、目标会话与状态。两层路由没有固定目标，由 Router 分流。事件的载荷不在这里展示，只看最近一次处置的结果。
+        </p>
+        {props.subscriptions.length === 0
+          ? <p className="empty">还没有外部事件订阅。</p>
+          : <ul className="router-queue-list external-list">
+            {props.subscriptions.map(subscription => {
+              const disposition = recent.get(subscription.subscriptionId)
+              const label = EXTERNAL_SOURCES.find(item => item.id === subscription.sourceId)?.label ?? subscription.sourceId
+              const dual = isDualLayer(subscription)
+              return (
+                <li key={subscription.subscriptionId}>
+                  <span className="external-main">
+                    <span className="external-line">{label} · {subscription.eventTypes.join('、')}</span>
+                    <span className="external-rules">
+                      {subscription.fields.map(field => (
+                        <span className="external-rule" key={`${field.path}:${field.op}:${field.value}`}>
+                          {field.path} {EXTERNAL_FIELD_OP[field.op] ?? field.op} 「{field.value}」
+                        </span>
+                      ))}
+                    </span>
+                    <span className="quiet">
+                      {dual
+                        ? '目标：没有固定目标（由 Router 分流）'
+                        : `目标：${subscription.targetRole} ${subscription.targetSessionId}`}
+                      {' · '}投递：{EXTERNAL_DELIVERY_MODE[subscription.deliveryMode] ?? subscription.deliveryMode}
+                      {' · '}{externalRateWording(subscription)}
+                    </span>
+                    <span className="quiet">
+                      归属：{externalOwnerWording(subscription)}
+                      {' · '}已限流 {subscription.throttledCount ?? 0} 次
+                      {' · '}重复 {subscription.duplicateCount ?? 0} 次
+                    </span>
+                    {subscription.routeHint
+                      ? <span className="quiet"> · 路由提示：{subscription.routeHint}</span>
+                      : null}
+                    <span className="quiet">
+                      最近处置：{disposition
+                        ? `${EXTERNAL_DISPOSITION_STATUS[disposition.status] ?? disposition.status}`
+                          + `${disposition.reason ? `（${disposition.reason}）` : ''} · ${stampOf(disposition.at)}`
+                        : '暂无记录'}
+                      {subscription.reason ? ` · ${subscription.reason}` : ''}
+                    </span>
+                  </span>
+                  <span className={`chip ${subscription.status === 'active' ? 'success' : 'muted'}`}>
+                    {EXTERNAL_STATUS[subscription.status] ?? subscription.status}
+                  </span>
+                  {subscription.status === 'active' ? (
+                    <div className="detail-actions external-actions">
+                      {dual ? null : (
+                        <>
+                          <select aria-label={`订阅 ${subscription.subscriptionId} 的目标会话`}
+                            value={retarget[subscription.subscriptionId] ?? subscription.targetSessionId}
+                            disabled={busy}
+                            onChange={event => setRetarget(current =>
+                              ({ ...current, [subscription.subscriptionId]: event.target.value }))}>
+                            {props.sessions.map(session => (
+                              <option key={session.sessionId} value={session.sessionId} disabled={session.deliverable === false}>
+                                {SESSION_ROLE[session.role] ?? session.role} {session.sessionId}
+                                {session.deliverable === false ? '（不可投递）' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <button type="button" className="action" disabled={busy}
+                            onClick={() => changeTarget(subscription.subscriptionId)}>更新目标</button>
+                        </>
+                      )}
+                      <button type="button" className="action danger" disabled={busy}
+                        onClick={() => cancel(subscription.subscriptionId)}>取消订阅</button>
+                    </div>
+                  ) : null}
+                </li>
+              )
+            })}
+          </ul>}
+        <ActionLine state={rowAction.state} />
+      </div>
+
+      <div className="panel padded">
+        <h3>新建外部事件订阅</h3>
+        <p className="quiet">
+          订阅说清楚哪些外部事件值得注意：源、事件类型、载荷必须满足的字段条件，以及被唤醒的那一个会话；两层路由例外：它没有固定目标，由 Router 分流。
+        </p>
+        <form className="form-block" onSubmit={event => { event.preventDefault(); create() }}>
+          <div className="external-fields">
+            <div className="form-block">
+              <label htmlFor="external-source">观察源</label>
+              <select id="external-source" value={sourceId} disabled={createAction.state.busy}
+                onChange={event => setSourceId(event.target.value)}>
+                {EXTERNAL_SOURCES.map(item => <option key={item.id} value={item.id}>{item.label}（{item.eventType}）</option>)}
+              </select>
+            </div>
+            {source.groupId ? (
+              <div className="form-block">
+                <label htmlFor="external-group">群 id（可选，精确匹配）</label>
+                <input id="external-group" value={groupId} maxLength={128} disabled={createAction.state.busy}
+                  onChange={event => setGroupId(event.target.value)} placeholder="demo-group-1" />
+              </div>
+            ) : null}
+            <div className="form-block">
+              <label htmlFor="external-keyword">文本关键词（必填，包含匹配）</label>
+              <input id="external-keyword" value={keyword} maxLength={256} required disabled={createAction.state.busy}
+                onChange={event => setKeyword(event.target.value)} placeholder="示例" />
+            </div>
+            {dualLayer ? (
+              <div className="form-block">
+                <span className="quiet">目标会话</span>
+                <p className="quiet">
+                  两层路由没有固定目标：事件交给 Router 分流，由它为每一条事件挑一个会话，高层 Router 兜底。所以这里不用选会话，控制面也不会收下固定目标。
+                </p>
+              </div>
+            ) : (
+              <div className="form-block">
+                <label htmlFor="external-target">目标会话（被唤醒的那一个）</label>
+                <select id="external-target" value={target} disabled={createAction.state.busy || deliverable.length === 0}
+                  onChange={event => setTarget(event.target.value)}>
+                  {deliverable.length === 0 ? <option value="">没有可投递的会话</option> : null}
+                  {props.sessions.map(session => (
+                    <option key={session.sessionId} value={session.sessionId} disabled={session.deliverable === false}>
+                      {SESSION_ROLE[session.role] ?? session.role} {session.sessionId}
+                      {session.deliverable === false ? '（不可投递）' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+          <label className="external-optin" htmlFor="external-dual-layer">
+            <input type="checkbox" id="external-dual-layer" checked={dualLayer} disabled={createAction.state.busy}
+              onChange={event => setDualLayer(event.target.checked)} />
+            <span>
+              <b>我明确启用两层路由（dual_layer_router）</b>
+              <span className="quiet">
+                默认关闭：不勾选时事件直送上面那个会话，绕过 Router。勾选后事件先交给 Router 分流（每 5 分钟最多唤醒 1 次），没有固定目标，也可以另填一条路由提示。
+              </span>
+            </span>
+          </label>
+          {dualLayer ? (
+            <>
+              <p className="notice warning" role="status">
+                两层路由的限流更严格：控制面每个订阅 5 分钟最多唤醒 1 次（直送是每分钟 3 次），超出的事件只记为「已限流」，不会送达任何会话；而且事件要多走一跳，投递更慢。
+              </p>
+              <div className="form-block">
+                <label htmlFor="external-route-hint">路由提示 routeHint（可选）</label>
+                <input id="external-route-hint" value={routeHint} maxLength={256} disabled={createAction.state.busy}
+                  onChange={event => setRouteHint(event.target.value)} placeholder="例如：交给处理日报的 PM" />
+                <p className="quiet">
+                  这是操作员自己写的提示，只在两层路由下有意义；它不会成为指令，也不会改写事件内容。
+                </p>
+              </div>
+            </>
+          ) : null}
+          <div className="detail-actions">
+            <button type="submit" className="action primary" disabled={createAction.state.busy}>创建订阅</button>
+          </div>
+          <ActionLine state={createAction.state} />
+        </form>
+      </div>
+
+      <div className="panel padded">
+        <h3>注入一条模拟事件</h3>
+        <p className="quiet">
+          这是本构建自带的模拟观察源，不会连接任何外部服务。事件 id 可以改成同一个值再注入一次，用来观察去重与限流；下面的示例值不含任何真实个人信息。
+        </p>
+        <form className="form-block" onSubmit={event => { event.preventDefault(); inject() }}>
+          <div className="external-fields">
+            <div className="form-block">
+              <label htmlFor="external-emit-source">观察源</label>
+              <select id="external-emit-source" value={emitSourceId} disabled={injectAction.state.busy}
+                onChange={event => setEmitSourceId(event.target.value)}>
+                {EXTERNAL_SOURCES.map(item => <option key={item.id} value={item.id}>{item.label}（{item.eventType}）</option>)}
+              </select>
+            </div>
+            {emitSource.groupId ? (
+              <div className="form-block">
+                <label htmlFor="external-emit-group">群 id</label>
+                <input id="external-emit-group" value={emitGroupId} maxLength={128} disabled={injectAction.state.busy}
+                  onChange={event => setEmitGroupId(event.target.value)} placeholder="demo-group-1" />
+              </div>
+            ) : null}
+            <div className="form-block">
+              <label htmlFor="external-emit-text">文本</label>
+              <input id="external-emit-text" value={emitText} maxLength={256} required disabled={injectAction.state.busy}
+                onChange={event => setEmitText(event.target.value)} />
+            </div>
+            <div className="form-block">
+              <label htmlFor="external-emit-event-id">事件 id（改成同一个值即可重放）</label>
+              <input id="external-emit-event-id" value={emitEventId} maxLength={128} required spellCheck={false}
+                disabled={injectAction.state.busy}
+                onChange={event => setEmitEventId(event.target.value)} />
+            </div>
+          </div>
+          <div className="detail-actions">
+            <button type="submit" className="action primary" disabled={injectAction.state.busy}>注入事件</button>
+          </div>
+          <ActionLine state={injectAction.state} />
+        </form>
+      </div>
+    </>
+  )
+}
+
+/**
  * The messages a person sent to the Router, as the console shows them.
  *
  * The home page and the Router's own Session show the same list, because they are the same queue: what one page shows
@@ -848,6 +1275,10 @@ export function HomePage(props: PageProps): ReactElement {
     '/v1/console/denials?limit=24'), props.revision)
   const streams = useLoaded(() => read<{ subscriptions: StreamSubscription[] }>(
     '/v1/console/stream-subscriptions?limit=24'), props.revision)
+  // The external event subscriptions and the Sessions they may wake: the targets of a new subscription are picked from
+  // the Sessions the control plane still allows a message to reach.
+  const externals = useLoaded(() => readExternalSubscriptions(), props.revision)
+  const sessionList = useLoaded(() => read<{ sessions: SessionView[] }>('/v1/sessions'), props.revision)
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<(RouterTextAttachment & { bytes: number })[]>([])
   const [attachmentError, setAttachmentError] = useState('')
@@ -1194,6 +1625,17 @@ export function HomePage(props: PageProps): ReactElement {
           <span className="quiet">上级订阅下级周期摘要的范围与状态</span>
         </div>
         <StreamSubscriptions subscriptions={streamSubscriptions} navigate={props.navigate} />
+      </section>
+
+      <section className="section" aria-labelledby="external-events-title">
+        <div className="section-heading">
+          <h2 id="external-events-title">外部事件订阅</h2>
+          <span className="quiet">外部观察源的事件与它们唤醒的会话</span>
+        </div>
+        <ExternalSubscriptions subscriptions={externals.data?.subscriptions ?? []}
+          dispositions={externals.data?.dispositions ?? []}
+          sessions={sessionList.data?.sessions ?? []}
+          refresh={props.refresh} />
       </section>
     </>
   )
