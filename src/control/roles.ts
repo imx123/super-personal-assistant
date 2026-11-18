@@ -58,6 +58,7 @@ export const PM_PROFILE = {
     'control_list_external_subscriptions',
     'control_update_external_subscription',
     'control_delete_external_subscription',
+    'control_live_state',
   ],
   deny: ['write', 'edit', 'bash', 'pwsh'],
   permission: 'read-only',
@@ -80,7 +81,7 @@ export const WORKER_PROFILE = {
     'interrupt_agent', 'orchestrator_read', 'orchestrator_ack', 'orchestrator_thread_unrelated', 'orchestrator_thread_follow',
     'orchestrator_trigger_handback', 'orchestrator_report', 'control_report',
     'control_create_external_subscription', 'control_list_external_subscriptions', 'control_update_external_subscription',
-    'control_delete_external_subscription',
+    'control_delete_external_subscription', 'control_live_state',
   ],
   deny: [
     'orchestrator_project_report',
@@ -177,7 +178,7 @@ export const ROUTER_PROFILE = {
     'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal',
     'control_request_authorization', 'control_subscribe_session_stream', 'control_unsubscribe_session_stream',
     'control_create_external_subscription', 'control_list_external_subscriptions', 'control_update_external_subscription',
-    'control_delete_external_subscription'],
+    'control_delete_external_subscription', 'control_live_state'],
   deny: ['write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch', 'subagent'],
   permission: 'read-only',
 } as const satisfies RoleProfile

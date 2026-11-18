@@ -4,12 +4,13 @@ import { mkdirSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Store } from '../app/store.ts'
-import { assignmentStopped, canRetry, currentReview, latestAssignment, pendingReview, runningAssignment, waitsForPerson,
+import { canRetry, currentReview, latestAssignment, pendingReview, pmTicketStatus,
   MandateExceededError, WORK_TOOLS,
-  type Assignment, type AssignmentState, type ProjectProfile, type ProjectReport, type ProjectTicketTask, type Ticket,
+  type Assignment, type AssignmentState, type PmTicketStatus, type ProjectProfile, type ProjectReport, type ProjectTicketTask, type Ticket,
   type TicketInput, type TicketMessageDelivery, type TicketReview, type Trigger, type WorkerReport } from '../core/index.ts'
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
+import { LiveStateService, type LiveStateSnapshot } from '../memory/live-state.ts'
 import { redact } from '../infra/redact.ts'
 import { NODE_CAPABILITY_DELIVERY_EVIDENCE, NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
   GUARD_DENIAL_REASON_CODES, type DeliveryEvidence, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
@@ -1165,8 +1166,11 @@ export interface ConsoleProject {
  *
  * `waiting` is the state of a Ticket whose Worker reported its result and whose PM has not decided about it yet: the
  * work is done, the Ticket stays open until the PM accepts or rejects it.
+ *
+ * The rule itself lives in the domain (`src/core/stage.ts`), so the console, the Router's summary and the live state
+ * answer with the same word for the same Ticket.
  */
-export type PmTicketStatus = 'open' | 'running' | 'waiting' | 'blocked' | 'failed' | 'completed' | 'stopped' | 'archived'
+export type { PmTicketStatus }
 
 /** The latest Assignment of a Ticket as a PM reads it: identity, lifecycle state and its own last report. */
 export interface PmContextAssignment {
@@ -1457,23 +1461,8 @@ export interface PmContextMemory {
   text: string
 }
 
-/** The status a PM sees for a Ticket; the first matching rule wins, mirroring `ticketStage` where it applies. */
-export function pmTicketStatus(ticket: Ticket): PmTicketStatus {
-  if (ticket.archived) return 'archived'
-  // A `merged` Ticket completed its work just as a `completed` one did; every other outcome ended it without that.
-  if (ticket.ended) return ticket.ended.outcome === 'completed' || ticket.ended.outcome === 'merged'
-    ? 'completed' : 'stopped'
-  const assignment = latestAssignment(ticket)
-  const report = assignment?.report?.state
-  // A person's later message lifts a blocked or failed report, so only an unanswered one still blocks the Ticket.
-  if (report === 'blocked' && waitsForPerson(ticket)) return 'blocked'
-  if (report === 'failed' && waitsForPerson(ticket)) return 'failed'
-  if (assignmentStopped(assignment) || ticket.manualStop) return 'stopped'
-  // A result that waits for the PM's decision is neither running nor open: the work is done, the Ticket is not.
-  if (currentReview(ticket)?.state === 'pending') return 'waiting'
-  if (runningAssignment(ticket)) return 'running'
-  return 'open'
-}
+/** The status a PM sees for a Ticket; the rule lives in the domain, so every reader answers with the same word. */
+export { pmTicketStatus }
 
 /**
  * The state of a Ticket, in words a person can read.
@@ -1720,6 +1709,13 @@ export class ControlPlane {
    * still allowed to run, so a path that skipped it could not invent an answer of its own.
    */
   private readonly resolver: SingleNodeResolver
+  /**
+   * The live state: the read-only projection of what this control plane holds right now.
+   *
+   * It lives in `src/memory/`, so the kernel only hands it the records to read; the scoping and the projection are the
+   * memory module's own work.
+   */
+  private readonly liveState: LiveStateService
   /**
    * The durable outbox of the coordination deliveries.
    *
@@ -2023,6 +2019,19 @@ export class ControlPlane {
         routerSessionId: () => ROUTER_SESSION_ID,
         nodeTrustEpoch: () => this.trustEpoch,
         sessionLifecycleEpoch: sessionId => this.sessionLifecycleEpoch(sessionId),
+      })
+      // The live state: a read-only projection over the records this kernel already holds. It asks the resolver for the
+      // node snapshots and reads the rest from the Store, so it never writes, never calls a model and never reaches the
+      // node.
+      this.liveState = new LiveStateService({
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        liveNodeSnapshots: () => this.resolver.getLiveNodeSnapshots(),
+        sessions: () => [...this.sessions.values()],
+        tickets: () => this.store.tickets.list(),
+        projects: () => this.store.projects.list(),
+        plans: () => this.scheduler.listPlans(),
+        routerSessionId: () => ROUTER_SESSION_ID,
       })
       // The coordination of the reports: its records live in this control plane's own file, in the same transaction as
       // the reports they are about.
@@ -8369,6 +8378,92 @@ export class ControlPlane {
   /** The audit trail, newest first: the facts the console's activity list shows. */
   auditEntries(options: { limit?: number; kind?: string } = {}): ConsoleAuditRow[] {
     return this.audit.entries(options)
+  }
+
+  /**
+   * The live state of this control plane, as the operator reads it.
+   *
+   * It is a snapshot and nothing else: it is written to no store, it triggers no model and it starts no Session. The
+   * node's connection is the resolver's own word at this moment, so a node that is reconnecting reads as `unknown` and a
+   * backend nobody may reach is never `available`.
+   */
+  liveStateForOperator(): LiveStateSnapshot {
+    return this.liveState.operator()
+  }
+
+  /**
+   * The live state one Session may read.
+   *
+   * The Session the caller proved is the only authority here: the role comes from its record, the scope from the work it
+   * owns, and nothing in the request may widen it. A Worker is checked the way a report is checked — its Assignment must
+   * still be the Ticket's current one, the Ticket must not be stopped — but a read never needs the node to be online: the
+   * facts it answers with are this control plane's own.
+   *
+   * The caller must also be the Session that owns the work it asks about. An Assignment belongs to the Worker Session the
+   * resolver names — the authoritative `worker-<assignmentId>` — so another Session record that claims the same Assignment
+   * is a record, not that Worker, and it may not read the state of work that is not its own. A PM is the PM of the Project
+   * whose delegation names it, and a Session of another node or another Project names work of another control plane: it is
+   * refused instead of answered.
+   */
+  liveStateFor(sessionId: string): LiveStateSnapshot {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) throw new ToolCallError('unauthenticated', `Unknown Session ${sessionId}`)
+    const role = record.role
+    if (role !== 'router' && role !== 'pm' && role !== 'worker') {
+      throw new ToolCallError('forbidden', 'This Session may not read the live state')
+    }
+    // A Session belongs to one node: a record that names another machine is not this control plane's Session, and the
+    // work it would read is that machine's. A record that names no node at all is a record from before the binding
+    // existed, and it is left alone.
+    if (record.nodeId !== '' && record.nodeId !== this.options.nodeId) {
+      throw new ToolCallError('forbidden',
+        `This Session belongs to the node ${record.nodeId}, not to ${this.options.nodeId}`)
+    }
+    if (role === 'worker') {
+      const assignmentId = record.assignmentId
+      if (assignmentId === undefined || assignmentId === '') {
+        throw new ToolCallError('forbidden', 'This Worker Session has no Assignment')
+      }
+      const ticket = this.ticketOfAssignment(assignmentId)
+      if (ticket === undefined) {
+        throw new ToolCallError('forbidden', 'This Worker Session runs no Assignment of this control plane')
+      }
+      // The same check a report makes, read as an inbound callback: the Assignment must still be the Ticket's current one,
+      // the Session must still be its Worker and the Ticket must not be stopped. A read needs no node, so the liveness of
+      // the other direction may not refuse it.
+      const resolved = this.resolver.resolveAssignmentNow(ticket.id, assignmentId, 'verify_callback')
+      if (!resolved.ok) {
+        const code = resolved.code === 'OWNERSHIP_MISMATCH' || resolved.code === 'PERMISSION_REVOKED'
+          || resolved.code === 'MANUALLY_STOPPED' ? 'forbidden' : 'invalid'
+        throw new ToolCallError(code, `This Worker Session may not read the live state: ${resolved.reason}`)
+      }
+      // The Assignment belongs to the Worker Session the resolver named: the authoritative `worker-<assignmentId>`. A
+      // Session record that merely claims the same Assignment is not that Worker, and it may not read the state of work
+      // that is not its own — the resolver's answer was about the real one.
+      if (resolved.handle.sessionId !== record.sessionId) {
+        throw new ToolCallError('forbidden',
+          `This Session is not the Worker of the Assignment ${assignmentId}`)
+      }
+      // The resolved target is bound to this control plane's own node and backend: a target of another machine or another
+      // backend is a different target, whatever the record says.
+      if (resolved.handle.binding.nodeId !== this.options.nodeId || resolved.handle.binding.backendId !== 'dsh') {
+        throw new ToolCallError('forbidden', 'This Worker Session is not bound to this node and backend')
+      }
+    }
+    if (role === 'pm') {
+      // The Project this Session really manages: the delegation itself, not the id the record carries. A Session that is
+      // nobody's PM manages nothing, and a record that names another Project may not read the state of this one.
+      const project = this.projects().find(entry => entry.pmSessionId === record.sessionId)
+      if (project === undefined) {
+        throw new ToolCallError('forbidden', 'This Session is not the PM of a Project of this control plane')
+      }
+      if (record.projectId !== '' && record.projectId !== project.id) {
+        throw new ToolCallError('forbidden', `This Session does not manage the Project ${record.projectId}`)
+      }
+    }
+    const result = this.liveState.forSession({ audience: role, sessionId })
+    if (!result.ok) throw new ToolCallError('forbidden', result.reason)
+    return result.snapshot
   }
 
   /**

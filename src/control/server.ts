@@ -640,6 +640,12 @@ export class ControlPlaneServer {
       return json(res, 200, { projects: this.control.consoleProjects(), workspaceRoot: this.control.projectWorkspaceRoot(),
         standaloneTickets: this.control.consoleStandaloneTickets() })
     }
+
+    // The live state: what this control plane holds right now, read once and thrown away. It is a snapshot, so the
+    // answer carries the moment it was taken and says how much of each list was left out.
+    if (method === 'GET' && path === '/v1/console/memory/live-state') {
+      return json(res, 200, this.control.liveStateForOperator())
+    }
     if (method === 'POST' && path === '/v1/console/projects') {
       const body = await readJson(req)
       const title = stringValue(body.title, 'title', true)!
@@ -1321,6 +1327,16 @@ export class ControlPlaneServer {
       const result = await this.pmToolCall(claims.sid, 'control_request_assignment', callId,
         async () => this.control.pmRequestAssignment(claims.sid, ticketId, assignmentId))
       return json(res, 200, result)
+    }
+
+    // The live state, read by the Session the token names.
+    //
+    // The token decides who acts: the scope comes from the Session's own record and the work it owns, never from the
+    // request. A PM reads its own Project, a Worker its own Assignment, and the Router the pool it manages; a node that
+    // is offline does not refuse a read, because the facts are the control plane's own.
+    if (method === 'GET' && url.pathname === '/v1/tools/memory/live-state') {
+      this.control.requireTool(claims.sid, 'control_live_state', ['pm', 'worker', 'router'], callId)
+      return json(res, 200, this.control.liveStateFor(claims.sid))
     }
 
     // The Router's read: the running state of every Project. Only a Router Session token opens it, so a PM or a Worker

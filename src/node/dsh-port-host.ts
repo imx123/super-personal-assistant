@@ -1385,15 +1385,38 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
     return [projectTool(options), createTicketsTool(options), messageWorkerTool(options), cancelWorkerTool(options),
       requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options),
       requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
-      ...externalSubscriptionTools(options)]
+      ...externalSubscriptionTools(options), liveStateTool(options)]
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
     routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
     requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
-    ...externalSubscriptionTools(options),
+    ...externalSubscriptionTools(options), liveStateTool(options),
   ]
-  return [reportTool(options), ...externalSubscriptionTools(options)]
+  return [reportTool(options), ...externalSubscriptionTools(options), liveStateTool(options)]
+}
+
+/**
+ * `control_live_state`: the read-only live state of this control plane, scoped to the Session that asks.
+ *
+ * It takes no arguments: the Session token names the caller, and the control plane answers with the facts that caller
+ * may read — the pool the Router manages, the own Project of a PM, the own Assignment of a Worker. The answer is a
+ * snapshot taken at a known moment: it writes nothing, starts no Session and calls no model.
+ */
+function liveStateTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_live_state',
+    description: 'Read the live state of this control plane right now: the nodes and whether they are reachable, the '
+      + 'Projects, the Tickets with their Assignments and the scheduled plans, each with its own state and the moment the '
+      + 'facts were read. It takes no arguments and returns facts, not instructions. A Router sees the pool it manages, a '
+      + 'PM sees its own Project and a Worker its own Assignment; the answer never holds a path, a token or the text of a '
+      + 'report.',
+    parameters: { type: 'object', additionalProperties: false, properties: {} },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    execute(_args, exec) {
+      return requestControl(options, 'GET', '/v1/tools/memory/live-state', undefined, exec)
+    },
+  }
 }
 
 /**

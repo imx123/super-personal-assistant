@@ -4,6 +4,7 @@
 > **适用范围**：`next` 主线 `P5-0` 至 `P5-6`（三域记忆系统），并为 `feat/multi-node` 预留 `node_id` / `backend_id`
 > **上位依据**：`docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md` §4 的 `P5-0`、已批准的 Phase 5 补充规范（工作树内 `.artifacts/phase5-p5-0-20261119/approved-memory-supplement.md`，与 `docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md` 的**已提交版本**同源）、[控制面内核](010-control-plane-kernel.zh-CN.md)、[控制台](017-console.zh-CN.md)
 > **本文件的效力**：这是一份**契约**，不是实现。本轮不落任何新表、不开任何写入路径、不删除任何真实数据。
+> **已实现的部分**：`P5-1` 的实时状态已经上线，它的接口与界面写在 §7 末尾；其余部分仍然是契约。
 
 ---
 
@@ -716,17 +717,17 @@ queued ──► reviewing ──┬─► active          （落库为长期记
 
 | 面板 | 数据来源（现有端点） | 现在是什么 | 权限 | 操作员能做的动作 | 扩展步骤 |
 | --- | --- | --- | --- | --- | --- |
-| **实时状态** | `GET /v1/overview`（由外壳读取后传入 `PageProps.overview`）、`PageProps.stream` | 控制面在 `overview.at` 那一刻读到的快照。节点未登记时是**未知**，不是离线。读取时间与事件流状态在**页头**说一次，面板里不重复 | 任何已连接的操作员 | 刷新、跳到项目 / 会话 / 节点部署 | `P5-1`：接入 `NodeResolver.getLiveNodeSnapshots()` 的后端能力快照与 `offline/unknown` 真实状态，替换现有 `NodeView` |
+| **实时状态** | `GET /v1/console/memory/live-state`（`P5-1` 起；`PageProps.stream` 仍由外壳给出） | 控制面在 `liveState.at` 那一刻读到的**实时快照**：节点的真实 `online / offline / unknown` 状态、项目、工单、Assignment、会话与定时计划，各自带自己的状态。节点未登记时是**未知**，不是离线；一个从未连上的后端是**未知**，不是可用。读取时间在页头说一次，**取样时间**在面板里另说一次 | 任何已连接的操作员（控制台连接密钥，或只读密钥的 `GET`） | 刷新、跳到项目 / 会话 / 节点部署 | 已上线（`P5-1`） |
 | **事件历史** | `GET /v1/console/projects`、`GET /v1/events?after=…`、`overview.retention` | 两类**已经存在**的记录，用两种底色分开：**项目档案与工单**（业务库的当前状态，随控制面重启保留）与**控制台短期日志**（会按保留规则被裁掉的短期日志，最多显示最近 12 条）。日志那块明写保留上限与当前保留行数，**不猜**已被裁掉多少行；断口只在服务端说 `gap` 时才说。并明写持久事件历史（P5-2）**尚未建立** | 同上 | 打开某个项目（跳到「项目」并选中它） | `P5-2`：加入 `event_history_index` 的精确查询面板，并把「短期日志」与「持久历史」分成两块，后者按工单/项目过滤 |
 | **长期记忆** | 无（尚不存在） | **一句话**说清长期记忆服务与候选队列**尚未建立**，一句话说明现在能手工留下的只有「项目 › 项目备忘」，并给一个去记一笔的入口。不在界面上重复五类对象的百科（那写在本文档里） | 同上 | 跳到项目页记一笔 | `P5-3`–`P5-5`：候选队列、`pending_human_confirm`、记忆列表（来源 / 编辑 / 置顶 / 遗忘）、维护巡检记录 |
 
-**读什么时候开始**：`实时状态` 不发任何请求（事实由外壳读好后传下来）；`事件历史` 的两个列表**只在该面板被打开时才读**，用面板自己的当前 `revision` 与既有 `useLoaded` 钩子；`长期记忆` 没有可读的对象。**加载中、读失败与读到了空列表是三件不同的事**，页面上分开说：没回答就是「正在读取……」，失败就是失败的原因，读到了零行才是「还没有」。
+**读什么时候开始**：`实时状态` **在该面板被打开时**读一次，之后每有一条事件或一次刷新再读一次，用面板自己的当前 `revision` 与既有 `useLoaded` 钩子；`事件历史` 的两个列表同样**只在该面板被打开时才读**；`长期记忆` 没有可读的对象。**加载中、读失败与读到了空列表是三件不同的事**，页面上分开说：没回答就是「正在读取……」，失败就是失败的原因，读到了零行才是「还没有」。**读失败时不得把旧值当成实时值**：失败会被明说，屏幕下方的旧数据会被标成「上一次读到的」。
 
 **已上线域与未来域的映射**（供后续按表扩展）：
 
 | 域 | 页面 | 数据源 | 状态 | 权限 | 成员动作 | 扩展步骤 |
 | --- | --- | --- | --- | --- | --- | --- |
-| 实时状态 | `#/memory` › 实时状态 | `/v1/overview`、`NodeResolver` | 已上线（只读） | 操作员 | 刷新、跳转 | `P5-1` |
+| 实时状态 | `#/memory` › 实时状态 | `/v1/console/memory/live-state`、`NodeResolver` | 已上线（只读） | 操作员 | 刷新、跳转 | 已上线（`P5-1`） |
 | 项目档案 | `#/projects` | `control.sqlite` 的 `project` 表 | 已上线 | 操作员 | 现有的项目生命周期动作 | 不变 |
 | 项目备忘 | `#/projects` › 项目备忘 | `console.sqlite` 的 `project_memory`；PM 侧由 `pmContext()` 带进 `control_project` 的上下文 | 已上线 | 操作员写、PM 读 | 记一笔 | 不变；**不得**并入长期记忆 |
 | 会话对话 | `#/sessions`、首页 Router 线程 | `console.sqlite` 的 `event_log`（`kind='message'`） | 已上线，但**读法有已知缺口**：`sessionMessages()` 取**最早** 200 条且不报断口 | 操作员 | 现有的消息与干预动作 | `P5-2`：改从 `event_history_index` 读，并按 I19 报断口 |
@@ -734,6 +735,35 @@ queued ──► reviewing ──┬─► active          （落库为长期记
 | 长期记忆 | `#/memory` › 长期记忆 | `memory_candidates` / `long_term_memories`（待建） | 未建 | 操作员（治理）+ `memory_manager.v1`（审核） | 查看来源、编辑、置顶、遗忘 | `P5-3`–`P5-5` |
 | 候选与审核 | `#/memory` › 长期记忆 | `memory_candidates` / `memory_conflicts`（待建） | 未建 | 操作员 + `memory_manager.v1` | 确认、退回、标记冲突 | `P5-4` |
 | 维护巡检 | `#/memory` › 长期记忆 | `memory_maintenance_runs`（待建） | 未建 | 操作员 | 查看、手动触发一次 | `P5-4` |
+
+### 7.1 `P5-1` 已上线的实时状态接口
+
+`P5-1` 把实时状态做成了 `src/memory/live-state.ts` 里的一个**只读投影**，控制面只做薄委托（把参数交给它、把它的答案原样送出去）。
+
+**两个读端点，都是 `GET`**：
+
+| 端点 | 谁用它 | 授权 | 范围 |
+| --- | --- | --- | --- |
+| `GET /v1/console/memory/live-state` | 控制台 | 控制台连接密钥，或只读密钥（只读密钥只能 `GET`） | 本控制面的全部：节点、项目、工单、Assignment、会话、计划 |
+| `GET /v1/tools/memory/live-state` | Router / PM / Worker | 该 Session 自己的工具令牌（`verifyToolToken`） | 由**该 Session 的记录**决定：Router 读它管理的池；PM 读它自己的项目与它绑定的那台节点；Worker 读它当前的 Assignment、那张工单与该工单所属项目的元数据 |
+
+**范围从不被请求决定**：调用者是谁，由它证明的令牌决定（`verifyToolToken` → 会话记录 → 角色档案 → PM 的委托）。无效、过期、被撤权、被人工停止、已被刷新顶掉的令牌，以及角色不对的调用，一律按同一套规则拒绝。**读不需要节点在线**：事实是控制面自己的记录，节点离线不构成拒绝的理由。
+
+**读的人必须是那段工作的主人**，这是范围之外的第二道闸：
+
+- **Worker**：Assignment 属于解析器点名的那一个 Session——权威的 `worker-<assignmentId>`。别的 Session 记录哪怕**声称**同一个 Assignment，也只是一条记录，不是那个 Worker，它读不到这段工作的状态（`src/control/control-plane.ts` 的 `liveStateFor` 比对 `resolved.handle.sessionId` 与令牌证明的那条记录）。解析器给出的目标还必须绑在本控制面自己的节点与后端上。
+- **PM**：项目按**真实的委托**解析——`pmSessionId` 指向谁，谁才是这个项目的 PM（`src/memory/live-state.ts` 的 `pmScope`）。记录里写着别的项目、或者属于别的节点的 Session，读的是别处的工作，一律拒绝；PM 的范围里也只留下本控制面自己节点的 Worker 记录。**空的旧绑定照旧保留**（绑定存在之前的记录不受牵连）。
+- 这道闸只挡**能指向另一个受管对象**的不一致；它不会因为节点离线而拒绝一次本来合规的本地读取。
+
+**答应的形状**是一个显式受限的快照：`at`（控制面自己的钟）、`audience`，以及六份有界清单（节点、项目、工单、Assignment、会话、计划）。每份清单带 `rows` / `total` / `omitted`，被截断时不会让人误以为看到了全部。字段只有**稳定的公开标识、状态与人写的标签**：工作区路径、令牌、模型凭据、报告正文、计划正文与控制台登录信息都不在其中。
+
+**Assignment 清单只列每张工单当前的那一次尝试**：实时状态说的是「现在在跑什么」，之前的尝试属于**历史**，归 `P5-2` 的事件历史管。工单行上的 `epoch` 仍然数着它这是第几次尝试。
+
+**节点的真实状态**：解析器说 `reconnecting` 就是 `unknown`（不是离线），后端的可用性在节点未知时是 `unknown`——**绝不**断言为可用；节点离线时是 `offline` / `unavailable`，回到在线时才是 `online` / `available`。
+
+**Agent 侧的工具**是只读的 `control_live_state`，注册给 Router、PM 与 Worker（`src/control/roles.ts` 的三份角色档案、`src/node/dsh-port-host.ts` 的真实注册），它不带参数，用该 Session 自己的令牌发一次 `GET /v1/tools/memory/live-state`。
+
+**本轮不动 Agent 的引导提示**：角色提示与节点的使用说明一字未改，工具靠它自己的说明被模型看见。实时状态的内容也**不进任何提示词**——它只从那个只读端点被读到，不被注入到 Agent 的上下文里。路由与派工同样未改。
 
 ---
 
@@ -869,7 +899,7 @@ queued ──► reviewing ──┬─► active          （落库为长期记
 
 | 步骤 | 产出 | 必须先满足 | 完成判据 |
 | --- | --- | --- | --- |
-| **P5-1** | `src/memory/live-state.ts`：按角色权限返回实时快照 | I16、I17 | 节点/会话/工单/项目/计划的实时快照带抓取时间与 `online/offline/unknown`；查询不写长期存储、不触发模型；断线如实报 |
+| **P5-1** | `src/memory/live-state.ts`：按角色权限返回实时快照 | I16、I17 | 节点/会话/工单/项目/计划的实时快照带抓取时间与 `online/offline/unknown`；查询不写长期存储、不触发模型；断线如实报（**已交付**，接口与界面见 §7.1） |
 | **P5-2** | `src/memory/event-history.ts` + `event_history_index` | I13、I14、I19、I20 | 索引独立于 20000 行 / 7 天裁剪；按 Ticket/Project 隔离精确查询；**读法必须报断口**；自己的时间戳取控制面的钟；不建全局对话向量索引；未经批准不自动删除历史 |
 | **P5-3** | `src/memory/memory-service.ts` + `memory_candidates` / `long_term_memories` | I2、I3、I4、I10、I21 | 零 LLM；幂等去重；作用域门禁；状态流转；版本更替链；脱敏；**引用而不搬运**原文 |
 | **P5-4** | `src/memory/memory-manager.ts` + `memory_manager.v1` + `memory_maintenance_runs` | I7、I12 | 受限角色只带 `memory_service.*`；纯重复直接归并；退回不隐式复活已停会话且最多重评 1 次；离线维护如实记 `skipped_offline` |

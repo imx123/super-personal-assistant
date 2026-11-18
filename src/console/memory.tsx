@@ -13,12 +13,15 @@
  * fills a gap with an example: a number the control plane did not report is not shown at all, and a read that has not
  * answered yet is shown as waiting rather than as empty.
  *
- * The wiring place for the rest of Phase 5 is the three panels below. Each one takes its facts as props, so the live
- * snapshots of P5-1, the durable history index of P5-2 and the memory service of P5-3 to P5-5 fill the same three places
- * without the page changing shape.
+ * The live state is now the control plane's own live snapshot (`P5-1`): the page asks for it when the domain is opened,
+ * says the moment it was taken, and shows what the control plane may see right now. A read that failed is said out loud
+ * and never leaves an old value looking like the present one. The wiring place for the rest of Phase 5 is the three panels
+ * below: the durable history index of P5-2 and the memory service of P5-3 to P5-5 fill the other two places without the
+ * page changing shape.
  */
 import { useState, type ReactElement } from 'react'
-import { read, type ConsoleProject, type Overview, type StreamStatus } from './api.ts'
+import { read, readLiveState, type ConsoleProject, type LiveStateList, type LiveStateNode,
+  type LiveStateSnapshot, type Overview, type StreamStatus } from './api.ts'
 import { stampOf, useLoaded, type PageProps } from './pages.tsx'
 
 /** How many of the newest console events the history panel shows. */
@@ -140,8 +143,8 @@ export function MemoryHead(props: {
 /**
  * The memory page.
  *
- * The live facts are the ones the shell already read, so the page does not ask the control plane a second time. The two
- * lists the history domain shows are read by the history domain itself, when a person opens it.
+ * The live state is read by the live domain itself, when a person opens it; the two lists the history domain shows are
+ * read by that domain, too, when a person opens it. Nothing is read twice and nothing is read before it is needed.
  */
 export function MemoryPage(props: PageProps): ReactElement {
   const [domain, setDomain] = useState<DomainKey>('live')
@@ -158,7 +161,7 @@ export function MemoryPage(props: PageProps): ReactElement {
         ))}
       </div>
       {domain === 'live'
-        ? <LiveStatePanel overview={props.overview} navigate={props.navigate} />
+        ? <LiveStateLoader revision={props.revision} stream={props.stream} navigate={props.navigate} />
         : domain === 'history'
           ? <HistoryLoader revision={props.revision} overview={props.overview}
             onOpenProject={(id) => props.navigate('projects', id)} />
@@ -168,85 +171,251 @@ export function MemoryPage(props: PageProps): ReactElement {
 }
 
 /**
- * The live state: the control plane's own snapshot, read at a known moment.
+ * The live state's own read.
  *
- * A node that never registered is not an offline node: the page says the state is unknown rather than showing a red chip
- * for a machine it has never heard of.
+ * It starts when a person opens the live state and is read again whenever the control plane recorded something or the
+ * person asked for a refresh. The read is the control plane's own: it returns a snapshot with the moment it was taken,
+ * and it writes nothing.
  */
-export function LiveStatePanel(props: {
-  overview?: Overview
+function LiveStateLoader(props: {
+  revision: number
+  stream?: StreamStatus
   navigate: (page: string, where?: string) => void
 }): ReactElement {
-  const overview = props.overview
-  if (overview === undefined) {
-    return (
-      <section id="memory-domain-live" className="memory-domain" aria-labelledby="memory-live-heading">
-        <h2 id="memory-live-heading">实时状态</h2>
-        <p className="empty">尚未读到控制面概况。</p>
-      </section>
-    )
-  }
-  const nodes = overview.nodes
+  const live = useLoaded(() => readLiveState(), props.revision)
+  return <LiveStatePanel snapshot={live.data} error={live.error} stream={props.stream} navigate={props.navigate} />
+}
+
+/** How a node's connection reads in the console. */
+function connectionWording(connection: LiveStateNode['connection']): string {
+  if (connection === 'online') return '在线'
+  if (connection === 'offline') return '离线'
+  return '状态未知'
+}
+
+/** The chip a node's connection is shown as. */
+function connectionChip(connection: LiveStateNode['connection']): string {
+  if (connection === 'online') return 'success'
+  if (connection === 'offline') return 'failure'
+  return 'muted'
+}
+
+/** How a backend's availability reads in the console. */
+function availabilityWording(availability: LiveStateNode['backends'][number]['availability']): string {
+  if (availability === 'available') return '可用'
+  if (availability === 'unavailable') return '不可用'
+  return '未知'
+}
+
+/** How a Project's status reads in the console. */
+const PROJECT_LIVE_STATUS: Record<string, string> = {
+  active: '进行中',
+  paused: '已暂停',
+  ended: '已结束',
+  archived: '已归档',
+}
+
+/** How a Ticket's status reads in the console. */
+const TICKET_LIVE_STATUS: Record<string, string> = {
+  open: '待开始',
+  running: '进行中',
+  waiting: '等待审阅',
+  blocked: '已阻塞',
+  failed: '失败',
+  completed: '已完成',
+  stopped: '已停止',
+  archived: '已归档',
+}
+
+/** How a Session's role reads in the console. */
+const SESSION_LIVE_ROLE: Record<string, string> = {
+  router: 'Router',
+  pm: 'PM',
+  worker: 'Worker',
+  scout: 'Scout',
+}
+
+/**
+ * The live state: the control plane's own snapshot, read at a known moment.
+ *
+ * A node that never registered is not an offline node: the panel says the state is unknown rather than showing a red chip
+ * for a machine it has never heard of. A read that failed never leaves an old value looking live: the failure is said
+ * out loud, and whatever is on the screen below it is marked as the last read rather than as now.
+ */
+export function LiveStatePanel(props: {
+  /** The snapshot, when a read answered. */
+  snapshot?: LiveStateSnapshot
+  /** Why the read failed, when it failed. */
+  error?: string
+  /** Whether the event stream is still carrying what follows. */
+  stream?: StreamStatus
+  navigate: (page: string, where?: string) => void
+}): ReactElement {
+  const snapshot = props.snapshot
+  const failed = props.error !== undefined && props.error !== ''
   return (
     <section id="memory-domain-live" className="memory-domain" aria-labelledby="memory-live-heading">
       <h2 id="memory-live-heading">实时状态</h2>
       <p className="quiet">
         实时状态是此刻的控制面快照，不是记录。它不写入任何长期存储，也不触发模型。
       </p>
-
-      <h3>执行节点</h3>
-      {nodes.length === 0
-        ? <p className="empty">控制面还没有登记任何节点，节点状态未知。</p>
-        : nodes.map(node => (
-          <dl className="detail-list" key={node.nodeId}>
-            <div><dt>节点</dt><dd>{node.nodeId} · {node.backend} {node.version}</dd></div>
-            <div><dt>连接状态</dt><dd>
-              <span className={`chip ${node.online ? 'success' : 'failure'}`}>{node.online ? '在线' : '离线'}</span>
-            </dd></div>
-            <div><dt>最后心跳</dt><dd>{stampOf(node.at)}</dd></div>
-            <div><dt>能力</dt><dd>{node.capabilities?.length ? node.capabilities.join('、') : '—'}</dd></div>
+      {failed
+        ? <p className="notice warning">
+          {`读取实时状态失败：${props.error}。下面的数据是上一次读到的，不是现在的状态；用上方的「刷新」重试。`}
+        </p>
+        : null}
+      {!failed && props.stream === 'reconnecting'
+        ? <p className="notice warning">事件流未连接，下面的数据可能不是最新的。</p>
+        : null}
+      {snapshot === undefined
+        ? failed
+          ? <p className="empty">还没有读到过实时状态。</p>
+          : <p className="empty">正在读取实时状态……</p>
+        : <>
+          <dl className="detail-list">
+            <div><dt>取样时间</dt><dd>{stampOf(snapshot.at)}</dd></div>
+            <div><dt>读取范围</dt><dd>{snapshot.audience === 'operator' ? '控制台可见的全部' : snapshot.audience}</dd></div>
           </dl>
-        ))}
 
-      <h3>正在发生的事</h3>
-      <div className="metrics">
-        <div className="metric">
-          <span className="metric-label">执行中的工单</span>
-          <span className="metric-value">{overview.runningTickets}</span>
-        </div>
-        <div className="metric">
-          <span className="metric-label">执行中的 Worker</span>
-          <span className="metric-value">{overview.runningWorkers}</span>
-        </div>
-        <div className="metric review">
-          <span className="metric-label">待 PM 验收</span>
-          <span className="metric-value">{overview.pendingReviews}</span>
-        </div>
-        <div className="metric">
-          <span className="metric-label">项目</span>
-          <span className="metric-value">{overview.counts.projects}</span>
-        </div>
-      </div>
-      <dl className="detail-list">
-        <div><dt>工单</dt><dd>{overview.counts.tickets}</dd></div>
-        <div><dt>会话</dt><dd>{overview.counts.sessions}</dd></div>
-        <div><dt>节点</dt><dd>{overview.counts.nodes}</dd></div>
-      </dl>
-      <div className="detail-actions">
-        <button type="button" className="action" onClick={() => props.navigate('projects')}>去项目</button>
-        <button type="button" className="action" onClick={() => props.navigate('sessions')}>去 PM / Worker 会话</button>
-        <button type="button" className="action" onClick={() => props.navigate('nodes')}>去节点部署</button>
-      </div>
+          <h3>执行节点</h3>
+          {snapshot.nodes.rows.length === 0
+            ? <p className="empty">控制面还没有登记任何节点，节点状态未知。</p>
+            : snapshot.nodes.rows.map(node => (
+              <dl className="detail-list" key={node.nodeId}>
+                <div><dt>节点</dt><dd>{node.nodeId}{node.displayName === undefined ? '' : ` · ${node.displayName}`}</dd></div>
+                <div><dt>连接状态</dt><dd>
+                  <span className={`chip ${connectionChip(node.connection)}`}>{connectionWording(node.connection)}</span>
+                </dd></div>
+                <div><dt>后端</dt><dd>
+                  {node.backends.length === 0
+                    ? '—'
+                    : node.backends.map(backend =>
+                      `${backend.backendId}（${availabilityWording(backend.availability)}）`).join('、')}
+                </dd></div>
+                <div><dt>最后心跳</dt><dd>{node.lastSeenAt === undefined ? '—' : stampOf(node.lastSeenAt)}</dd></div>
+              </dl>
+            ))}
+
+          <h3>正在发生的事</h3>
+          <dl className="detail-list">
+            <div><dt>项目</dt><dd>{snapshot.projects.total}</dd></div>
+            <div><dt>工单</dt><dd>{snapshot.tickets.total}</dd></div>
+            <div><dt>Assignment</dt><dd>{snapshot.assignments.total}</dd></div>
+            <div><dt>会话</dt><dd>{snapshot.sessions.total}</dd></div>
+            <div><dt>定时计划</dt><dd>{snapshot.schedules.total}</dd></div>
+          </dl>
+
+          <h3>项目</h3>
+          <LiveList
+            list={snapshot.projects}
+            empty="没有项目。"
+            render={project => (
+              <>
+                <b>{project.title}</b>
+                <span className="quiet">
+                  {`${PROJECT_LIVE_STATUS[project.status] ?? project.status} · ${project.projectId}`}
+                </span>
+              </>
+            )}
+            link={project => ({ label: '打开', onClick: () => props.navigate('projects', project.projectId) })} />
+
+          <h3>工单</h3>
+          <LiveList
+            list={snapshot.tickets}
+            empty="没有工单。"
+            render={ticket => (
+              <>
+                <b>{ticket.title}</b>
+                <span className="quiet">
+                  {`${TICKET_LIVE_STATUS[ticket.status] ?? ticket.status}${ticket.stopped === true ? ' · 已人工停止' : ''}`}
+                </span>
+              </>
+            )}
+            link={ticket => {
+              const projectId = ticket.projectId
+              if (projectId === undefined) return undefined
+              return { label: '打开', onClick: () => props.navigate('projects', projectId) }
+            }} />
+
+          <h3>会话</h3>
+          <LiveList
+            list={snapshot.sessions}
+            empty="没有会话。"
+            render={session => (
+              <>
+                <b>{SESSION_LIVE_ROLE[session.role] ?? session.role}</b>
+                <span className="quiet">
+                  {`${session.status}${session.stopped === true ? ' · 已人工停止' : ''} · ${session.sessionId}`}
+                </span>
+              </>
+            )}
+            link={session => ({ label: '打开', onClick: () => props.navigate('sessions', session.sessionId) })} />
+
+          <h3>定时计划</h3>
+          <LiveList
+            list={snapshot.schedules}
+            empty="没有定时计划。"
+            render={plan => (
+              <>
+                <b>{plan.name}</b>
+                <span className="quiet">
+                  {`${plan.enabled ? '已启用' : '已暂停'} · ${plan.rule} · ${stampOf(plan.nextAt)}`}
+                </span>
+              </>
+            )} />
+
+          <div className="detail-actions">
+            <button type="button" className="action" onClick={() => props.navigate('projects')}>去项目</button>
+            <button type="button" className="action" onClick={() => props.navigate('sessions')}>去 PM / Worker 会话</button>
+            <button type="button" className="action" onClick={() => props.navigate('nodes')}>去节点部署</button>
+          </div>
+        </>}
     </section>
+  )
+}
+
+/**
+ * One bounded list of the live state.
+ *
+ * A list that was cut says so: the panel never lets a reader believe it saw every row when the control plane held more.
+ * A row that leads somewhere carries the way there, so the list is a way into the work and not only a picture of it.
+ */
+function LiveList<T>(props: {
+  list: LiveStateList<T>
+  empty: string
+  render: (row: T) => ReactElement
+  /** The way into the row, when the row leads somewhere. */
+  link?: (row: T) => { label: string; onClick: () => void } | undefined
+}): ReactElement {
+  if (props.list.rows.length === 0) return <p className="empty">{props.empty}</p>
+  return (
+    <>
+      <div className="memory-rows">
+        {props.list.rows.map((row, index) => {
+          const link = props.link?.(row)
+          return (
+            <div className="setting" key={index}>
+              <span>{props.render(row)}</span>
+              {link === undefined
+                ? null
+                : <span><button type="button" className="action" onClick={link.onClick}>{link.label}</button></span>}
+            </div>
+          )
+        })}
+      </div>
+      {props.list.omitted > 0
+        ? <p className="quiet">{`另有 ${props.list.omitted} 条没有显示（共 ${props.list.total} 条）。`}</p>
+        : null}
+    </>
   )
 }
 
 /**
  * The history's own reads.
  *
- * They start when a person opens the history, not when the page opens: the live state needs no request at all, and the
- * long-term memory has none to make. The window asked for is the tail of the control plane's own log, and the control
- * plane says whether there is a hole in front of the rows it answered with.
+ * They start when a person opens the history, not when the page opens: every domain reads on its own, when a person opens
+ * it. The window asked for is the tail of the control plane's own log, and the control plane says whether there is a hole in
+ * front of the rows it answered with.
  */
 function HistoryLoader(props: {
   revision: number

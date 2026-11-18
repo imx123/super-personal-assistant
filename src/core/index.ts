@@ -9,5 +9,5 @@ export { CLEANUP_TIMEOUT_MS, CleanupTimeoutError, Engine, HANDOFF, PROJECT_TICKE
 export { MandateExceededError, UserError, USER_ERRORS, type UserErrorCode } from './errors.ts'
 export { REASONS, reasonText, said, type Reason, type ReasonCode } from './reasons.ts'
 export { MemoryRepositories } from './memory.ts'
-export { canRetry, ticketStage, type TicketStage } from './stage.ts'
+export { canRetry, pmTicketStatus, ticketStage, type PmTicketStatus, type TicketStage } from './stage.ts'
 export { key } from './ids.ts'

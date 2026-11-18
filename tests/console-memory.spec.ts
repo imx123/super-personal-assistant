@@ -8,7 +8,7 @@
 import { createElement, type ComponentProps, type ReactElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import type { ConsoleProject, Overview } from '../src/console/api.ts'
+import type { ConsoleProject, LiveStateSnapshot, Overview } from '../src/console/api.ts'
 import { EventHistoryPanel, LiveStatePanel, LongTermMemoryPanel, MemoryHead } from '../src/console/memory.tsx'
 
 /** The control plane's own snapshot, as the shell reads it. */
@@ -24,6 +24,27 @@ const overview = (over: Partial<Overview> = {}): Overview => ({
   events: { seq: 120, retained: 100 },
   audit: { entries: 7 },
   retention: { eventDays: 7, eventRows: 20000, auditDays: 0 },
+  ...over,
+})
+
+/** The live state the control plane answered with, as the console reads it. */
+const liveState = (over: Partial<LiveStateSnapshot> = {}): LiveStateSnapshot => ({
+  at: '2026-11-19T08:05:00.000Z',
+  audience: 'operator',
+  nodes: { rows: [{ nodeId: 'local', isPrimary: true, connection: 'online', lastSeenAt: '2026-11-19T08:04:00.000Z',
+    backends: [{ backendId: 'dsh', kind: 'dsh', availability: 'available',
+      capabilities: { turnInterrupt: true, twoStageReceipt: false, sessionResume: true, gitReviewDiff: true } }] }],
+    total: 1, omitted: 0 },
+  projects: { rows: [{ projectId: 'p1', title: '控制台改造', status: 'active', pmSessionId: 'pm-p1',
+    updatedAt: '2026-11-19T07:30:00.000Z' }], total: 1, omitted: 0 },
+  tickets: { rows: [{ ticketId: 't1', title: '记忆页', projectId: 'p1', status: 'running', assignmentId: 'a1',
+    updatedAt: '2026-11-19T07:30:00.000Z' }], total: 1, omitted: 0 },
+  assignments: { rows: [{ assignmentId: 'a1', ticketId: 't1', state: 'running', sessionId: 'worker-a1',
+    reportState: 'progress', epoch: 1 }], total: 1, omitted: 0 },
+  sessions: { rows: [{ sessionId: 'worker-a1', role: 'worker', status: 'running', projectId: 'p1', ticketId: 't1',
+    assignmentId: 'a1', nodeId: 'local', updatedAt: '2026-11-19T07:30:00.000Z' }], total: 1, omitted: 0 },
+  schedules: { rows: [{ planId: 's1', projectId: 'p1', name: '每夜巡检', rule: 'daily:02:00', enabled: true,
+    nextAt: '2026-11-20T02:00:00.000Z' }], total: 1, omitted: 0 },
   ...over,
 })
 
@@ -69,25 +90,71 @@ describe('the memory page', () => {
     expect(unknown).toContain('事件流状态未知')
   })
 
-  it('shows the live state the shell already read', () => {
-    const page = html(createElement(LiveStatePanel, { overview: overview(), navigate: () => {} }))
-    expect(page).toContain('执行中的工单')
+  it('shows the live state the control plane answered with', () => {
+    const page = html(createElement(LiveStatePanel, { snapshot: liveState(), navigate: () => {} }))
+    expect(page).toContain('取样时间')
     expect(page).toContain('在线')
     expect(page).toContain('local')
+    expect(page).toContain('控制台改造')
+    expect(page).toContain('记忆页')
+    expect(page).toContain('每夜巡检')
   })
 
-  it('says the live state is unknown before the control plane answered', () => {
-    const page = html(createElement(LiveStatePanel, { overview: undefined, navigate: () => {} }))
-    expect(page).toContain('尚未读到控制面概况')
+  it('says that a read which has not answered is not an empty state', () => {
+    const page = html(createElement(LiveStatePanel, { navigate: () => {} }))
+    expect(page).toContain('正在读取实时状态')
+    expect(page).not.toContain('控制面还没有登记任何节点')
   })
 
   it('says that a node it never heard of is unknown, not offline', () => {
     const page = html(createElement(LiveStatePanel, {
-      overview: overview({ nodes: [], counts: { projects: 0, tickets: 0, sessions: 0, nodes: 0 } }),
+      snapshot: liveState({ nodes: { rows: [], total: 0, omitted: 0 } }),
       navigate: () => {},
     }))
     expect(page).toContain('控制面还没有登记任何节点')
     expect(page).not.toContain('离线')
+  })
+
+  it('says a node it cannot place is of an unknown state, not an online one', () => {
+    const page = html(createElement(LiveStatePanel, {
+      snapshot: liveState({ nodes: { rows: [{ nodeId: 'other', isPrimary: false, connection: 'unknown',
+        backends: [{ backendId: 'dsh', kind: 'dsh', availability: 'unknown',
+          capabilities: { turnInterrupt: false, twoStageReceipt: false, sessionResume: false, gitReviewDiff: false } }] }],
+        total: 1, omitted: 0 } }),
+      navigate: () => {},
+    }))
+    expect(page).toContain('状态未知')
+    expect(page).not.toContain('在线')
+  })
+
+  it('never leaves an old value looking like the present one after a failed read', () => {
+    const page = html(createElement(LiveStatePanel, { snapshot: liveState(), error: 'HTTP 500', navigate: () => {} }))
+    expect(page).toContain('读取实时状态失败')
+    expect(page).toContain('不是现在的状态')
+    expect(page).toContain('刷新')
+  })
+
+  it('says the facts may not be the newest while the event stream is not connected', () => {
+    const page = html(createElement(LiveStatePanel, { snapshot: liveState(), stream: 'reconnecting', navigate: () => {} }))
+    expect(page).toContain('事件流未连接')
+    expect(page).toContain('可能不是最新的')
+  })
+
+  it('says how many rows a cut list left out', () => {
+    const page = html(createElement(LiveStatePanel, {
+      snapshot: liveState({ tickets: { rows: [{ ticketId: 't1', title: '记忆页', status: 'running',
+        updatedAt: '2026-11-19T07:30:00.000Z' }], total: 12, omitted: 11 } }),
+      navigate: () => {},
+    }))
+    expect(page).toContain('另有 11 条没有显示')
+    expect(page).toContain('共 12 条')
+  })
+
+  it('offers a way into the work it lists', () => {
+    const page = html(createElement(LiveStatePanel, { snapshot: liveState(), navigate: () => {} }))
+    expect(page).toContain('打开')
+    expect(page).toContain('去项目')
+    expect(page).toContain('去节点部署')
   })
 
   it('shows the Projects of the business store and offers to open one of them', () => {

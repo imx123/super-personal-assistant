@@ -920,6 +920,115 @@ export interface ConsoleProject {
   tickets: ConsoleTicket[]
 }
 
+/**
+ * One bounded list of the live state.
+ *
+ * `total` is how many rows are in scope in all and `omitted` how many were left out by the bound, so the console never
+ * shows a list that reads as complete when it was cut.
+ */
+export interface LiveStateList<T> {
+  rows: T[]
+  total: number
+  omitted: number
+}
+
+/** One node as the live state names it. */
+export interface LiveStateNode {
+  nodeId: string
+  displayName?: string
+  isPrimary: boolean
+  /** `online`, `offline` or `unknown`: a node nobody heard of is unknown, never offline. */
+  connection: 'online' | 'offline' | 'unknown'
+  lastSeenAt?: string
+  backends: {
+    backendId: string
+    kind: string
+    /** `available`, `unavailable` or `unknown`; an unknown backend is never reported as available. */
+    availability: 'available' | 'unavailable' | 'unknown'
+    capabilities: {
+      turnInterrupt: boolean
+      twoStageReceipt: boolean
+      sessionResume: boolean
+      gitReviewDiff: boolean
+    }
+  }[]
+}
+
+/** One Session as the live state names it. */
+export interface LiveStateSession {
+  sessionId: string
+  role: string
+  status: string
+  projectId: string
+  ticketId?: string
+  assignmentId?: string
+  nodeId: string
+  updatedAt: string
+  stopped?: boolean
+  revoked?: boolean
+}
+
+/** One Project as the live state names it. */
+export interface LiveStateProject {
+  projectId: string
+  title: string
+  status: string
+  pauseMode?: string
+  pmSessionId: string
+  updatedAt: string
+}
+
+/** One Ticket as the live state names it. */
+export interface LiveStateTicket {
+  ticketId: string
+  title: string
+  projectId?: string
+  /** The status a PM reads for it. */
+  status: string
+  assignmentId?: string
+  reviewState?: string
+  updatedAt: string
+  stopped?: boolean
+}
+
+/** One Assignment as the live state names it. */
+export interface LiveStateAssignment {
+  assignmentId: string
+  ticketId: string
+  state: string
+  sessionId?: string
+  /** The state of the Assignment's own last report; the report's text is not part of it. */
+  reportState?: string
+  epoch: number
+  startedAt?: string
+  endedAt?: string
+}
+
+/** One scheduled plan as the live state names it. */
+export interface LiveStateSchedule {
+  planId: string
+  projectId: string
+  name: string
+  rule: string
+  enabled: boolean
+  nextAt: string
+  lastState?: string
+}
+
+/** The live state of the control plane, as the console reads it. */
+export interface LiveStateSnapshot {
+  /** When the facts were read: the control plane's own clock. */
+  at: string
+  /** Who the facts are for. */
+  audience: string
+  nodes: LiveStateList<LiveStateNode>
+  projects: LiveStateList<LiveStateProject>
+  tickets: LiveStateList<LiveStateTicket>
+  assignments: LiveStateList<LiveStateAssignment>
+  sessions: LiveStateList<LiveStateSession>
+  schedules: LiveStateList<LiveStateSchedule>
+}
+
 /** One entry of a Project's own memory. */
 export interface ProjectMemoryEntry {
   id: number
@@ -1020,6 +1129,16 @@ async function request<T>(path: string, init: { method?: string; body?: unknown 
 
 /** One read. */
 export function read<T>(path: string): Promise<T> { return request<T>(path) }
+
+/**
+ * The live state of this control plane, read once.
+ *
+ * It is a snapshot: the answer carries the moment it was taken, and it is thrown away right after. Nothing is written and
+ * nothing is started by reading it.
+ */
+export function readLiveState(): Promise<LiveStateSnapshot> {
+  return read<LiveStateSnapshot>('/v1/console/memory/live-state')
+}
 
 /** One write. */
 export function write<T>(path: string, body: unknown = {}): Promise<T> {
