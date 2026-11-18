@@ -1385,15 +1385,15 @@ function controlTools(options: ControlToolOptions): ToolDefinition[] {
     return [projectTool(options), createTicketsTool(options), messageWorkerTool(options), cancelWorkerTool(options),
       requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options),
       requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
-      ...externalSubscriptionTools(options), liveStateTool(options)]
+      ...externalSubscriptionTools(options), liveStateTool(options), eventHistoryTool(options)]
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
     routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
     requestAuthorizationTool(options), subscribeSessionStreamTool(options), unsubscribeSessionStreamTool(options),
-    ...externalSubscriptionTools(options), liveStateTool(options),
+    ...externalSubscriptionTools(options), liveStateTool(options), eventHistoryTool(options),
   ]
-  return [reportTool(options), ...externalSubscriptionTools(options), liveStateTool(options)]
+  return [reportTool(options), ...externalSubscriptionTools(options), liveStateTool(options), eventHistoryTool(options)]
 }
 
 /**
@@ -1415,6 +1415,57 @@ function liveStateTool(options: ControlToolOptions): ToolDefinition {
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
     execute(_args, exec) {
       return requestControl(options, 'GET', '/v1/tools/memory/live-state', undefined, exec)
+    },
+  }
+}
+
+/**
+ * `control_event_history_query`: the durable event history of this control plane, read by an exact key.
+ *
+ * The caller names the Ticket, the Project, the Session or the Assignment whose history it wants, and the control plane
+ * answers with the facts that are in scope for it: a Worker reads its own current Ticket, a PM its own Project, the
+ * Router the pool it manages. A key of another Project reads nothing, exactly as a key that never existed reads nothing.
+ *
+ * The answer holds key facts — a dispatch, the state of a report, a review, a stop, a refusal, a scheduled run — and
+ * never the text of a report, a diff, a prompt or a path.
+ */
+function eventHistoryTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_event_history_query',
+    description: 'Read the durable event history of this control plane: the key facts of what happened there — a dispatch, '
+      + 'the state of a report, a review, a stop, a refusal, a scheduled run, a failure. Name the exact key you want: '
+      + 'ticketId, projectId, controlSessionId or assignmentId. A Worker may read only its own current Ticket, a PM only '
+      + 'its own Project, and the Router the pool it manages; a key of another Project reads nothing. The answer carries '
+      + 'no report text, no diff, no prompt and no path.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        ticketId: { type: 'string', description: 'The Ticket whose history to read.' },
+        projectId: { type: 'string', description: 'The Project whose history to read.' },
+        controlSessionId: { type: 'string', description: 'The Session whose history to read.' },
+        assignmentId: { type: 'string', description: 'The Assignment whose history to read.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'How many rows to read at most; 50 by default.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const query = new URLSearchParams()
+      for (const name of ['ticketId', 'projectId', 'controlSessionId', 'assignmentId']) {
+        const value = input[name]
+        if (typeof value === 'string' && value.trim() !== '') query.set(name, value.trim())
+      }
+      if (query.size === 0) {
+        throw new Error('Name one of ticketId, projectId, controlSessionId or assignmentId: the history is read by an '
+          + 'exact key, never by everything')
+      }
+      const limit = input.limit
+      if (typeof limit === 'number' && Number.isSafeInteger(limit) && limit >= 1 && limit <= 100) {
+        query.set('limit', String(limit))
+      }
+      const search = query.toString()
+      return requestControl(options, 'GET', `/v1/tools/memory/event-history?${search}`, undefined, exec)
     },
   }
 }

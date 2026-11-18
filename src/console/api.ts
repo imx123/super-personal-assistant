@@ -1140,6 +1140,81 @@ export function readLiveState(): Promise<LiveStateSnapshot> {
   return read<LiveStateSnapshot>('/v1/console/memory/live-state')
 }
 
+/**
+ * One row of the durable event history, as the console reads it.
+ *
+ * The row names the fact, the scope it belongs to, the record it was read from and one redacted line about it. It holds
+ * no report text, no diff, no prompt and no path: those stay in the records the row points at.
+ */
+export interface EventHistoryEntry {
+  seq: number
+  eventId: string
+  kind: string
+  at: string
+  scopeKey: string
+  ticketId: string
+  projectId: string
+  controlSessionId: string
+  assignmentId: string
+  nodeId: string
+  backendId: string
+  sourceTable: string
+  sourceId: string
+  sourceSeq: number
+  summary: string
+  detail: Record<string, string>
+}
+
+/** How much of the durable history the control plane really holds. */
+export interface EventHistoryCoverage {
+  /** The oldest row the index holds: the history starts here and nowhere earlier. */
+  since?: string
+  /** The kinds the index holds rows of. */
+  kinds: string[]
+  /** The index is never cut by age or by count. */
+  trimmed: boolean
+  /** The retention rule, in the control plane's own words. */
+  retention: string
+}
+
+/** One page of the durable event history. */
+export interface EventHistoryPage {
+  rows: EventHistoryEntry[]
+  /** The keyset position of the next page, when there is one. */
+  nextCursor?: string
+  /** Whether more rows are in scope than this page holds. */
+  hasMore: boolean
+  /** How many rows are in scope, in all. */
+  total: number
+  coverage: EventHistoryCoverage
+}
+
+/** The exact keys one read of the durable history names. */
+export interface EventHistoryQuery {
+  ticketId?: string
+  projectId?: string
+  kind?: string
+  limit?: number
+  cursor?: string
+}
+
+/**
+ * Read one page of the durable event history.
+ *
+ * The keys are exact, and the answer says how far back the history reaches: the index starts where it was built, and the
+ * facts before that are not in it.
+ */
+export function readEventHistory(query: EventHistoryQuery = {}): Promise<EventHistoryPage> {
+  const params = new URLSearchParams()
+  if (query.ticketId !== undefined && query.ticketId !== '') params.set('ticketId', query.ticketId)
+  if (query.projectId !== undefined && query.projectId !== '') params.set('projectId', query.projectId)
+  if (query.kind !== undefined && query.kind !== '') params.set('kind', query.kind)
+  if (query.limit !== undefined) params.set('limit', String(query.limit))
+  if (query.cursor !== undefined && query.cursor !== '') params.set('cursor', query.cursor)
+  const search = params.toString()
+  return read<EventHistoryPage>(`/v1/console/memory/event-history${search === '' ? '' : `?${search}`}`)
+}
+
 /** One write. */
 export function write<T>(path: string, body: unknown = {}): Promise<T> {
   return request<T>(path, { method: 'POST', body })

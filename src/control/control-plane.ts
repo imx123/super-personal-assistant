@@ -10,6 +10,7 @@ import { canRetry, currentReview, latestAssignment, pendingReview, pmTicketStatu
   type TicketInput, type TicketMessageDelivery, type TicketReview, type Trigger, type WorkerReport } from '../core/index.ts'
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
+import { EventHistoryService, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { LiveStateService, type LiveStateSnapshot } from '../memory/live-state.ts'
 import { redact } from '../infra/redact.ts'
 import { NODE_CAPABILITY_DELIVERY_EVIDENCE, NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
@@ -1717,6 +1718,15 @@ export class ControlPlane {
    */
   private readonly liveState: LiveStateService
   /**
+   * The durable event history: the key facts of what this control plane did, kept in this control plane's own file.
+   *
+   * It lives in `src/memory/`, so the kernel only hands it the records to read and the facts to write; the table, the
+   * idempotency, the scoping and the paging are the memory module's own work. The facts are written from the paths that
+   * really happened — the domain's own commit, the ingress of a request, the report of a Worker — and never from a
+   * label somebody typed.
+   */
+  private readonly durableHistory: EventHistoryService
+  /**
    * The durable outbox of the coordination deliveries.
    *
    * It owns the table every coordination writes into, the vocabulary of the states a delivery reaches and the recovery
@@ -1982,6 +1992,22 @@ export class ControlPlane {
         process.stderr.write(`superagent control-plane audit write failed: ${
           error instanceof Error ? error.message : String(error)}\n`)
       })
+      // The durable event history: its table is in this control plane's own file, next to the records it points at, so
+      // the backup and the rollback take one snapshot. It is created before the domain, because the domain's own commits
+      // are one of the paths that write into it.
+      this.durableHistory = new EventHistoryService(this.store.db, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        sessions: () => [...this.sessions.values()],
+        tickets: () => this.store.tickets.list(),
+        projects: () => this.store.projects.list(),
+        routerSessionId: () => ROUTER_SESSION_ID,
+      }, error => {
+        // A history that cannot be written is a diagnostic, never a failed piece of work: the fact is lost, the work
+        // that produced it stays done, and the loss is said out loud instead of being hidden.
+        process.stderr.write(`superagent control-plane event history write failed: ${messageOf(error)}\n`)
+      })
       // The callbacks run after construction (an Assignment starts only through a later Engine command), so the closures may
       // read `this.engine` and the Session map without an initialization-order hazard.
       const executor = new NodeExecutor({
@@ -2005,7 +2031,11 @@ export class ControlPlane {
         workerSessionId: (_ticketId, assignmentId) => this.workerSessionFor(assignmentId),
       })
       this.executor = executor
-      this.domain = createKernelDomain(this.store, options.now, executor)
+      this.domain = createKernelDomain(this.store, options.now, executor,
+        // The domain says what it committed, inside the transaction that wrote it: the durable history row is written in
+        // the same transaction as the work it describes. A write that fails is reported on stderr and the fact is lost;
+        // the work itself stays committed.
+        event => { this.durableHistory.recordDomainEvent(event) })
       // The resolver of the one node: it reads this control plane's own records, so a target is never guessed and a
       // failed resolution never falls back to a default.
       this.resolver = new SingleNodeResolver({
@@ -2746,6 +2776,11 @@ export class ControlPlane {
    */
   private publishScheduleRun(event: { run: ScheduleRun }): void {
     const run = event.run
+    // The run itself is the console's own record, in the console's own file; the row of the durable history is in this
+    // control plane's file. They are two writes and two files, so the run is written first and the row that names it
+    // follows: a restart between them leaves a run without its row, never a row without its run. A write that fails is
+    // reported on stderr and the row is lost; the run stays.
+    this.durableHistory.recordSchedule({ runId: run.runId, planId: run.planId, projectId: run.projectId, state: run.state })
     const nodeEvent: NodeEvent = {
       protocolVersion: NODE_PROTOCOL_VERSION,
       nodeId: this.options.nodeId,
@@ -2883,7 +2918,11 @@ export class ControlPlane {
     const before = this.projects().map(project => project.id)
     const project = this.store.atomic(() => {
       this.engine.recordTriggerForRouting(trigger)
-      return this.engine.createProject(trigger.id, title, goal, workspace)
+      const project = this.engine.createProject(trigger.id, title, goal, workspace)
+      // The request and the Project it became are one fact: the row of the durable history is written in the same
+      // transaction as the Project, so a history never names a Project that was not made.
+      this.durableHistory.recordTrigger({ triggerId: trigger.id, projectId: project.id })
+      return project
     })
     if (!before.includes(project.id)) {
       this.audit.record({ actor, kind: 'project', action: 'created', targetKind: 'project',
@@ -4289,24 +4328,35 @@ export class ControlPlane {
     // The handoff is written down before it goes out: the outbox holds the record of what happened to it, so a restart
     // knows whether the work reached the PM and may ask the node about it.
     const key = `router-${kind}:${request.id}`
-    const delivery = this.outbox.accept({
-      kind: 'auto_handoff',
-      idempotencyKey: key,
-      dedupKey: `auto_handoff:${request.id}`,
-      scope: `handoff:${project.id}`,
-      projectId: project.id,
-      ticketId: '',
-      assignmentId: '',
-      sourceSessionId: ROUTER_SESSION_ID,
-      targetSessionId: project.pmSessionId,
-      targetRole: 'pm',
-      nodeId: this.options.nodeId,
-      backendId: CONTROL_BACKEND,
-      expectedAssignmentEpoch: this.targetEpochs(project.pmSessionId).assignmentEpoch,
-      expectedToolTokenVersion: this.targetEpochs(project.pmSessionId).toolTokenVersion,
-      expectedNodeTrustEpoch: this.trustEpoch,
-      payload: message,
-      context: { kind: 'auto_handoff', requestId: request.id, projectId: project.id, handoffKind: kind },
+    const delivery = this.store.atomic(() => {
+      const delivery = this.outbox.accept({
+        kind: 'auto_handoff',
+        idempotencyKey: key,
+        dedupKey: `auto_handoff:${request.id}`,
+        scope: `handoff:${project.id}`,
+        projectId: project.id,
+        ticketId: '',
+        assignmentId: '',
+        sourceSessionId: ROUTER_SESSION_ID,
+        targetSessionId: project.pmSessionId,
+        targetRole: 'pm',
+        nodeId: this.options.nodeId,
+        backendId: CONTROL_BACKEND,
+        expectedAssignmentEpoch: this.targetEpochs(project.pmSessionId).assignmentEpoch,
+        expectedToolTokenVersion: this.targetEpochs(project.pmSessionId).toolTokenVersion,
+        expectedNodeTrustEpoch: this.trustEpoch,
+        payload: message,
+        context: { kind: 'auto_handoff', requestId: request.id, projectId: project.id, handoffKind: kind },
+      })
+      // The handoff and the delivery that carries it are one fact, written in one transaction: the history names a
+      // delivery that exists. A write that fails is reported on stderr and the fact is lost; the delivery stays.
+      this.durableHistory.recordHandoff({
+        deliveryId: delivery.deliveryId,
+        projectId: project.id,
+        controlSessionId: project.pmSessionId,
+        summary: '交接：Router 把一次请求交给了项目的 PM。',
+      })
+      return delivery
     })
     try {
       // The delivery is claimed before it goes out: the record says it is on its way, so a restart knows that the outcome
@@ -4786,6 +4836,8 @@ export class ControlPlane {
       const decided = this.engine.decide(id, { kind: 'accept', title, scope: goal, acknowledgement: goal,
         reason: { code: 'explicitRouted' } })
       if (!decided.ticketId) throw new ToolCallError('invalid', 'The request did not create a Ticket')
+      // The request and the Ticket it became are one fact, written in the transaction that made the Ticket.
+      this.durableHistory.recordTrigger({ triggerId: trigger.id, ticketId: decided.ticketId })
       return decided.ticketId
     })
     request.dispatchedTicket = { id: ticketId, title, goal }
@@ -4827,6 +4879,18 @@ export class ControlPlane {
     const duplicate = project.latestReport?.summary === summary
     const planned = this.store.atomic(() => {
       const next = duplicate ? project : this.engine.projectReport(project.id, summary)
+      // The row of the durable history is written in the same transaction as the report. Only the kind of the report is
+      // kept: its text is the PM's own words and stays in the Project. A write that fails is reported on stderr and the
+      // fact is lost; the report itself stays written.
+      if (!duplicate) {
+        this.durableHistory.recordReport({
+          state: kind,
+          sourceTable: 'project',
+          sourceId: project.id,
+          projectId: project.id,
+          controlSessionId: sessionId,
+        })
+      }
       // The delivery is planned even when the Project already carries this summary: the kind says what the report is, and
       // a blocker that repeats an earlier progress is still a blocker. The coordination's own key keeps a report that is
       // already known from being delivered twice.
@@ -5854,6 +5918,18 @@ export class ControlPlane {
         }
       }
       const written = this.engine.report(ticketId, report)
+      // The row of the durable history is written in the same transaction as the report. Only the state of the report is
+      // kept: its text is the Worker's own words and stays in the Ticket. A write that fails is reported on stderr and
+      // the fact is lost; the report itself stays written.
+      this.durableHistory.recordReport({
+        state: report.state,
+        sourceTable: 'assignment',
+        sourceId: own,
+        ticketId,
+        projectId: ticket.projectId ?? '',
+        assignmentId: own,
+        controlSessionId: sessionId,
+      })
       if (key !== undefined) {
         this.store.set(key, { sessionId, assignmentId: own, ticketId, payloadHash, state: report.state,
           notified: false, at: this.now() })
@@ -6309,6 +6385,17 @@ export class ControlPlane {
         if (outcome.accepted && outcome.duplicate !== true) {
           this.audit.record({ actor: 'system', kind: 'denial', action: 'refused', targetKind: 'session',
             targetId: fact.controlSessionId, detail: `${fact.reasonCode} · ${fact.toolName}` })
+          // The refusal and its row in the durable history are two writes in the same file, and they are not one
+          // transaction: the escalator owns the row of the call itself and the scope it verified the call against, and
+          // the history row is written right after it. A restart between the two leaves a refusal without its history
+          // row, never a history row without its refusal; a write that fails is reported on stderr and the row is lost.
+          this.durableHistory.recordDenial({
+            callId: fact.callId,
+            controlSessionId: fact.controlSessionId,
+            toolName: fact.toolName,
+            reasonCode: fact.reasonCode,
+            ...this.scopeOfSession(fact.controlSessionId),
+          })
         }
       })
       .catch(error => {
@@ -8392,7 +8479,7 @@ export class ControlPlane {
   }
 
   /**
-   * The live state one Session may read.
+   * The Session a read of this control plane's own facts acts as, and the fences it has to pass.
    *
    * The Session the caller proved is the only authority here: the role comes from its record, the scope from the work it
    * owns, and nothing in the request may widen it. A Worker is checked the way a report is checked — its Assignment must
@@ -8404,13 +8491,17 @@ export class ControlPlane {
    * is a record, not that Worker, and it may not read the state of work that is not its own. A PM is the PM of the Project
    * whose delegation names it, and a Session of another node or another Project names work of another control plane: it is
    * refused instead of answered.
+   *
+   * Both readers of this control plane's own facts — the live state and the durable event history — pass through here, so
+   * they refuse the same Sessions for the same reasons.
    */
-  liveStateFor(sessionId: string): LiveStateSnapshot {
+  private requireSessionReader(sessionId: string, subject: 'live state' | 'event history'):
+    { record: SessionRecord; role: 'router' | 'pm' | 'worker' } {
     const record = this.sessions.get(sessionId)
     if (record === undefined) throw new ToolCallError('unauthenticated', `Unknown Session ${sessionId}`)
     const role = record.role
     if (role !== 'router' && role !== 'pm' && role !== 'worker') {
-      throw new ToolCallError('forbidden', 'This Session may not read the live state')
+      throw new ToolCallError('forbidden', `This Session may not read the ${subject}`)
     }
     // A Session belongs to one node: a record that names another machine is not this control plane's Session, and the
     // work it would read is that machine's. A record that names no node at all is a record from before the binding
@@ -8435,7 +8526,7 @@ export class ControlPlane {
       if (!resolved.ok) {
         const code = resolved.code === 'OWNERSHIP_MISMATCH' || resolved.code === 'PERMISSION_REVOKED'
           || resolved.code === 'MANUALLY_STOPPED' ? 'forbidden' : 'invalid'
-        throw new ToolCallError(code, `This Worker Session may not read the live state: ${resolved.reason}`)
+        throw new ToolCallError(code, `This Worker Session may not read the ${subject}: ${resolved.reason}`)
       }
       // The Assignment belongs to the Worker Session the resolver named: the authoritative `worker-<assignmentId>`. A
       // Session record that merely claims the same Assignment is not that Worker, and it may not read the state of work
@@ -8461,9 +8552,39 @@ export class ControlPlane {
         throw new ToolCallError('forbidden', `This Session does not manage the Project ${record.projectId}`)
       }
     }
+    return { record, role }
+  }
+
+  /**
+   * The live state one Session may read.
+   *
+   * The fences are the ones every read of this control plane's own facts shares; the scope itself is the live state's own
+   * work, in `src/memory/live-state.ts`.
+   */
+  liveStateFor(sessionId: string): LiveStateSnapshot {
+    const { role } = this.requireSessionReader(sessionId, 'live state')
     const result = this.liveState.forSession({ audience: role, sessionId })
     if (!result.ok) throw new ToolCallError('forbidden', result.reason)
     return result.snapshot
+  }
+
+  /** The durable event history as the operator reads it: everything this control plane holds. */
+  eventHistoryForOperator(query: EventHistoryQuery): EventHistoryPage {
+    return this.durableHistory.forOperator(query)
+  }
+
+  /**
+   * The durable event history one Session may read.
+   *
+   * The Session the caller proved is the only authority: the role comes from its record and the scope from the work it
+   * owns. A key of another Project matches nothing, exactly as a key that never existed matches nothing, so the answer
+   * never says whether the thing it was asked about is there.
+   */
+  eventHistoryFor(sessionId: string, query: EventHistoryQuery): EventHistoryPage {
+    const { role } = this.requireSessionReader(sessionId, 'event history')
+    const result = this.durableHistory.forSession({ audience: role, sessionId }, query)
+    if (!result.ok) throw new ToolCallError('forbidden', result.reason)
+    return result.page
   }
 
   /**
@@ -8880,6 +9001,17 @@ export class ControlPlane {
     const ticket = this.store.tickets.get(ticketId)
     const assignment = ticket?.assignments.find(item => item.id === assignmentId)
     if (!ticket || !assignment) return
+    // The launch failed before it ran: it is a fact about this Assignment, and it belongs in the durable history next to
+    // the Ticket it happened to. The diagnostic is redacted before it is stored.
+    this.durableHistory.recordFailure({
+      sourceTable: 'assignment',
+      sourceId: assignmentId,
+      code: 'assignment_failed',
+      diagnostic: error,
+      ticketId,
+      projectId: ticket.projectId ?? '',
+      assignmentId,
+    })
     try {
       if (assignment.state === 'running') this.engine.deliveryFailed(ticketId, assignmentId, error)
       else if (ticket.assignments.at(-1)?.id === assignmentId) {
@@ -9282,6 +9414,23 @@ export class ControlPlane {
   /** The Ticket whose current or past Assignment has this id; events from replaced Assignments are ignored by Engine. */
   private ticketOfAssignment(assignmentId: string): Ticket | undefined {
     return this.store.tickets.list().find(ticket => ticket.assignments.some(assignment => assignment.id === assignmentId))
+  }
+
+  /**
+   * The work a Session owns, as the scope of a fact about it.
+   *
+   * The Assignment of the Session record names the Ticket, and the Ticket names its Project: the two are read from the
+   * control plane's own records, never from what a caller sent.
+   */
+  private scopeOfSession(sessionId: string): { ticketId?: string; projectId?: string; assignmentId?: string } {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) return {}
+    const assignmentId = record.assignmentId
+    if (assignmentId === undefined || assignmentId === '') return {}
+    const ticket = this.ticketOfAssignment(assignmentId)
+    if (ticket === undefined) return { assignmentId }
+    const projectId = ticket.projectId ?? ''
+    return { ticketId: ticket.id, ...(projectId === '' ? {} : { projectId }), assignmentId }
   }
 
   /** A JSON value the control plane stored, read back; a broken row is answered as nothing rather than failing a read. */

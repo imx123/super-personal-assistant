@@ -3,6 +3,8 @@ import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { UserError, type ProjectTicketTask, type WorkerReport } from '../core/index.ts'
+import { EVENT_HISTORY_KINDS, EVENT_HISTORY_LIMIT, EventHistoryQueryError,
+  type EventHistoryKind, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { packagePath } from '../infra/paths.ts'
 import { ROUTER_ATTACHMENT_BYTES, ROUTER_ATTACHMENT_COUNT, WORKER_REPORT_STATES,
   type NodeEvent, type RouterModel, type RouterTextAttachment } from '../shared/protocol.ts'
@@ -127,6 +129,17 @@ function cursor(value: string | string[] | null | undefined, name: string): numb
   const parsed = Number(raw)
   if (!Number.isSafeInteger(parsed) || parsed < 0) throw new HttpError(400, `${name} must be a non-negative integer`)
   return parsed
+}
+
+/**
+ * Whether one query of the durable event history names a key at all.
+ *
+ * A caller that names no key asks for "everything", and the history is read by an exact key: the scope of the reader
+ * says what it may read, but the key says which part of it the reader wants.
+ */
+function namesOneKey(query: EventHistoryQuery): boolean {
+  return [query.ticketId, query.projectId, query.controlSessionId, query.assignmentId, query.nodeId]
+    .some(value => value !== undefined && value !== '')
 }
 
 /** The Session token a tool request carries; a missing or malformed header is an authentication failure. */
@@ -646,6 +659,12 @@ export class ControlPlaneServer {
     if (method === 'GET' && path === '/v1/console/memory/live-state') {
       return json(res, 200, this.control.liveStateForOperator())
     }
+
+    // The durable event history: the key facts of what this control plane did, read by their exact keys. It is the
+    // control plane's own file, so it is not the console's pruned log, and the answer says how far back it reaches.
+    if (method === 'GET' && path === '/v1/console/memory/event-history') {
+      return json(res, 200, this.eventHistoryPage(() => this.control.eventHistoryForOperator(this.eventHistoryQuery(url))))
+    }
     if (method === 'POST' && path === '/v1/console/projects') {
       const body = await readJson(req)
       const title = stringValue(body.title, 'title', true)!
@@ -1114,6 +1133,64 @@ export class ControlPlaneServer {
   }
 
   /**
+   * One read of the durable event history.
+   *
+   * A query the service will not answer as it was written — a cursor it did not write, a limit it cannot honour — is the
+   * caller's mistake and says so, instead of becoming a broken server.
+   */
+  private eventHistoryPage(read: () => EventHistoryPage): EventHistoryPage {
+    try {
+      return read()
+    } catch (error) {
+      if (error instanceof EventHistoryQueryError) throw new HttpError(400, error.message)
+      throw error
+    }
+  }
+
+  /**
+   * The query of one read of the durable event history.
+   *
+   * The keys are exact: an empty key is no key at all, and a key of another Project matches nothing. The limit is bounded
+   * here as well as in the service, so one page can never be the whole index.
+   */
+  private eventHistoryQuery(url: URL): EventHistoryQuery {
+    const params = url.searchParams
+    const key = (name: string): string | undefined => {
+      const value = params.get(name)
+      return value === null || value === '' ? undefined : value
+    }
+    const limit = this.limit(params.get('limit'))
+    if (limit !== undefined && limit > EVENT_HISTORY_LIMIT) {
+      throw new HttpError(400, `limit must be an integer between 1 and ${EVENT_HISTORY_LIMIT}`)
+    }
+    const kind = key('kind')
+    if (kind !== undefined && !(EVENT_HISTORY_KINDS as readonly string[]).includes(kind)) {
+      throw new HttpError(400, `kind must be one of ${EVENT_HISTORY_KINDS.join(', ')}`)
+    }
+    const order = key('order')
+    if (order !== undefined && order !== 'asc' && order !== 'desc') {
+      throw new HttpError(400, 'order must be asc or desc')
+    }
+    const ticketId = key('ticketId')
+    const projectId = key('projectId')
+    const controlSessionId = key('controlSessionId')
+    const assignmentId = key('assignmentId')
+    const nodeId = key('nodeId')
+    const cursor = key('cursor')
+    return {
+      ...(ticketId === undefined ? {} : { ticketId }),
+      ...(projectId === undefined ? {} : { projectId }),
+      ...(controlSessionId === undefined ? {} : { controlSessionId }),
+      ...(assignmentId === undefined ? {} : { assignmentId }),
+      ...(nodeId === undefined ? {} : { nodeId }),
+      ...(kind === undefined ? {} : { kind: kind as EventHistoryKind }),
+      ...(limit === undefined ? {} : { limit }),
+      ...(cursor === undefined ? {} : { cursor }),
+      ...(order === undefined ? {} : { order: order as 'asc' | 'desc' }),
+    }
+  }
+
+  /**
    * The control plane's event stream: replay what the kernel already recorded, then follow it live.
    *
    * Authentication is a control-plane bearer token, checked before this method runs: the operator's, or the read-only
@@ -1337,6 +1414,22 @@ export class ControlPlaneServer {
     if (method === 'GET' && url.pathname === '/v1/tools/memory/live-state') {
       this.control.requireTool(claims.sid, 'control_live_state', ['pm', 'worker', 'router'], callId)
       return json(res, 200, this.control.liveStateFor(claims.sid))
+    }
+
+    // The durable event history, read by the Session the token names.
+    //
+    // The token decides who acts and what may be read: the scope comes from the Session's own record and the work it
+    // owns, never from the request. A key of another Project matches nothing, exactly as a key that never existed
+    // matches nothing, so the answer never says whether the thing it was asked about is there. A caller that names no
+    // key at all is refused: the history is read by an exact key, never by "everything".
+    if (method === 'GET' && url.pathname === '/v1/tools/memory/event-history') {
+      this.control.requireTool(claims.sid, 'control_event_history_query', ['pm', 'worker', 'router'], callId)
+      const query = this.eventHistoryQuery(url)
+      if (!namesOneKey(query)) {
+        throw new HttpError(400,
+          'name at least one of ticketId, projectId, controlSessionId, assignmentId or nodeId')
+      }
+      return json(res, 200, this.eventHistoryPage(() => this.control.eventHistoryFor(claims.sid, query)))
     }
 
     // The Router's read: the running state of every Project. Only a Router Session token opens it, so a PM or a Worker

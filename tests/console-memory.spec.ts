@@ -4,12 +4,15 @@
  * The page names what the control plane can see and what it cannot. A capability the control plane does not have is named
  * as absent: the durable history index and the candidate queue do not exist yet, and the console's own log is bounded and
  * must never be shown as a history that can be read back in full.
+ *
+ * The durable history is shown through its own view, which reads nothing and holds no state: the rows, the filters and the
+ * flags are given to it. That is what lets the panel be rendered here, on the server, without a React instance of its own.
  */
 import { createElement, type ComponentProps, type ReactElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import type { ConsoleProject, LiveStateSnapshot, Overview } from '../src/console/api.ts'
-import { EventHistoryPanel, LiveStatePanel, LongTermMemoryPanel, MemoryHead } from '../src/console/memory.tsx'
+import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, Overview } from '../src/console/api.ts'
+import { EventHistoryPanel, LiveStatePanel, LongTermMemoryPanel, MemoryHead, PersistentHistoryView } from '../src/console/memory.tsx'
 
 /** The control plane's own snapshot, as the shell reads it. */
 const overview = (over: Partial<Overview> = {}): Overview => ({
@@ -61,18 +64,63 @@ const project: ConsoleProject = {
   tickets: [{ id: 't1', title: '记忆页', status: 'running' }],
 }
 
+/** One fact of the durable history, as the control plane's own index holds it. */
+const entry: EventHistoryEntry = {
+  seq: 1,
+  eventId: 'event-1',
+  kind: 'dispatch',
+  at: '2026-11-19T08:00:00.000Z',
+  scopeKey: 'ticket:t1',
+  ticketId: 't1',
+  projectId: 'p1',
+  controlSessionId: '',
+  assignmentId: '',
+  nodeId: 'local',
+  backendId: 'dsh',
+  sourceTable: 'assignments',
+  sourceId: 'a1',
+  sourceSeq: 1,
+  summary: 'Worker 开始执行',
+  detail: {},
+}
+
 const html = (element: ReactElement): string => renderToStaticMarkup(element)
+
+/**
+ * The durable history's own view, with the facts a control plane that answered would give it.
+ *
+ * It is rendered on its own: the view holds no state of its own, so the markup it shows is the markup it was given.
+ */
+const durable = (over: Partial<ComponentProps<typeof PersistentHistoryView>> = {}): ReactElement =>
+  createElement(PersistentHistoryView, {
+    projects: over.projects ?? [],
+    standaloneTickets: over.standaloneTickets ?? [],
+    projectId: over.projectId ?? '',
+    ticketId: over.ticketId ?? '',
+    state: over.state ?? 'pending',
+    rows: over.rows ?? [],
+    total: over.total ?? 0,
+    coverage: over.coverage,
+    error: over.error ?? '',
+    moreError: over.moreError ?? '',
+    busy: over.busy ?? false,
+    hasMore: over.hasMore ?? false,
+    onProjectChange: over.onProjectChange ?? (() => {}),
+    onTicketChange: over.onTicketChange ?? (() => {}),
+    onClear: over.onClear ?? (() => {}),
+    onLoadMore: over.onLoadMore ?? (() => {}),
+  })
 
 /** The history panel with the facts a control plane that answered would give it. */
 const history = (over: Partial<ComponentProps<typeof EventHistoryPanel>> = {}): ReactElement =>
   createElement(EventHistoryPanel, {
-    projects: { state: 'ready', rows: [] },
-    events: { state: 'ready', rows: [] },
-    gap: false,
-    retained: 100,
-    retention: { eventDays: 7, eventRows: 20000, auditDays: 0 },
-    onOpenProject: () => {},
-    ...over,
+    projects: over.projects ?? { state: 'ready' as const, rows: [] },
+    events: over.events ?? { state: 'ready' as const, rows: [] },
+    gap: over.gap ?? false,
+    retained: over.retained ?? 100,
+    retention: over.retention ?? { eventDays: 7, eventRows: 20000, auditDays: 0 },
+    onOpenProject: over.onOpenProject ?? (() => {}),
+    durable: over.durable ?? durable(),
   })
 
 describe('the memory page', () => {
@@ -164,6 +212,26 @@ describe('the memory page', () => {
     expect(page).toContain('打开')
   })
 
+  it('shows the durable history as its own block, apart from the console log', () => {
+    const page = html(history())
+    expect(page).toContain('持久事件历史')
+    expect(page).toContain('控制台短期日志')
+    expect(page).toContain('不按天数裁剪')
+    // The two kinds of record are never presented as one: the log is the log, and it says so.
+    expect(page).toContain('不是持久历史')
+  })
+
+  it('never says the durable history does not exist', () => {
+    const page = html(history())
+    expect(page).not.toContain('还没有建立')
+  })
+
+  it('says that a read of the durable history which has not answered is not an empty list', () => {
+    const page = html(history())
+    expect(page).toContain('正在读取持久事件历史')
+    expect(page).not.toContain('这个范围里还没有记录到事实')
+  })
+
   it('names the console log as a bounded log and says how much of it is left', () => {
     const page = html(history())
     expect(page).toContain('不是持久历史')
@@ -232,5 +300,96 @@ describe('the memory page', () => {
     const page = html(createElement(LongTermMemoryPanel, { onOpenProjects: () => {} }))
     expect(page).not.toContain('五类对象')
     expect(page).not.toContain('P5-')
+  })
+})
+
+describe('the durable history panel', () => {
+  it('offers the exact-key filters the control plane really holds', () => {
+    const page = html(durable({
+      projects: [project],
+      standaloneTickets: [{ id: 't-standalone', title: '独立工单', status: 'running' }],
+    }))
+    expect(page).toContain('全部项目')
+    expect(page).toContain('控制台改造')
+    expect(page).toContain('全部工单')
+    expect(page).toContain('独立工单')
+    expect(page).toContain('清除筛选')
+  })
+
+  it('offers only the Tickets of the Project the person chose', () => {
+    const page = html(durable({
+      projects: [project],
+      standaloneTickets: [{ id: 't-standalone', title: '独立工单', status: 'running' }],
+      projectId: 'p1',
+    }))
+    expect(page).toContain('记忆页')
+    expect(page).not.toContain('独立工单')
+  })
+
+  it('says that a read which has not answered is not an empty range', () => {
+    const page = html(durable({ state: 'pending' }))
+    expect(page).toContain('正在读取持久事件历史')
+    expect(page).not.toContain('这个范围里还没有记录到事实')
+  })
+
+  it('says that a range which holds no record holds no record', () => {
+    const page = html(durable({ state: 'ready' }))
+    expect(page).toContain('这个范围里还没有记录到事实')
+  })
+
+  it('says why the read failed instead of an empty range', () => {
+    const page = html(durable({ state: 'error', error: 'HTTP 500' }))
+    expect(page).toContain('读取持久事件历史失败：HTTP 500')
+  })
+
+  it('shows each fact with its own kind, its summary and where it came from', () => {
+    const page = html(durable({ state: 'ready', rows: [entry], total: 1 }))
+    expect(page).toContain('派工')
+    expect(page).toContain('Worker 开始执行')
+    expect(page).toContain('工单 t1')
+    expect(page).toContain('来源 assignments')
+  })
+
+  it('says how many facts the range holds and how many are on the screen', () => {
+    const page = html(durable({ state: 'ready', rows: [entry], total: 12 }))
+    expect(page).toContain('这个范围里共 12 条事实，显示了 1 条。')
+  })
+
+  it('offers the next page of the range while one follows it', () => {
+    const page = html(durable({ state: 'ready', rows: [entry], total: 12, hasMore: true }))
+    expect(page).toContain('加载更多')
+  })
+
+  it('offers no next page when the range is complete', () => {
+    const page = html(durable({ state: 'ready', rows: [entry], total: 1 }))
+    expect(page).not.toContain('加载更多')
+  })
+
+  it('says that a page is on its way while it is being read', () => {
+    const page = html(durable({ state: 'ready', rows: [entry], total: 12, hasMore: true, busy: true }))
+    expect(page).toContain('正在读取……')
+  })
+
+  it('keeps the first page and offers the next one again when a page failed', () => {
+    const page = html(durable({
+      state: 'ready', rows: [entry], total: 12, hasMore: true, moreError: 'HTTP 500',
+    }))
+    expect(page).toContain('加载更多失败：HTTP 500')
+    // The rows that are already on the screen stay: a page that failed takes nothing away.
+    expect(page).toContain('Worker 开始执行')
+    // The next page may be asked for again.
+    expect(page).toContain('>加载更多</button>')
+  })
+
+  it('says how far back the history reaches', () => {
+    const page = html(durable({
+      state: 'ready',
+      rows: [entry],
+      total: 1,
+      coverage: { since: '2026-11-01T00:00:00.000Z', kinds: ['dispatch'], trimmed: false,
+        retention: '索引不按天数或行数裁剪，也不自动删除' },
+    }))
+    expect(page).toContain('最早一条是')
+    expect(page).toContain('索引开始之前的事实没有记录，也补不回来')
   })
 })

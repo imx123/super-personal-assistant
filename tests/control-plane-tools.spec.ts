@@ -349,7 +349,8 @@ describe('control-plane tool API', () => {
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription', 'control_list_external_subscriptions',
-      'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state'])
+      'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state',
+      'control_event_history_query'])
     expect(PM_PROFILE.tools.some(name => name.startsWith('orchestrator_'))).toBe(false)
   })
 })
@@ -868,10 +869,11 @@ describe('node control tools', () => {
       profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'worker-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
 
     const agent = agents.get('worker-1')!
-    // The Worker's own tools: the report it makes, the four it watches the outside world with and the live state it reads.
+    // The Worker's own tools: the report it makes, the four it watches the outside world with, the live state it reads and
+    // the durable history it may pull by an exact key.
     expect([...agent.tools.keys()]).toEqual(['control_report', 'control_create_external_subscription',
       'control_list_external_subscriptions', 'control_update_external_subscription',
-      'control_delete_external_subscription', 'control_live_state'])
+      'control_delete_external_subscription', 'control_live_state', 'control_event_history_query'])
     // The usage note rides the role prompt, so the first turn knows the tool and this Session's Ticket.
     expect(prompts).toHaveLength(1)
     expect(prompts[0]!.sessionId).toBe('worker-1')
@@ -924,7 +926,8 @@ describe('node control tools', () => {
       'control_cancel_worker', 'control_request_assignment', 'control_review_result', 'control_review_diff',
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription', 'control_list_external_subscriptions',
-      'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state'])
+      'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state',
+      'control_event_history_query'])
     // The usage note names the tools, so the PM's first turn knows how to read, create and orchestrate.
     expect(prompts[0]!.text).toContain('Use control_project')
     expect(prompts[0]!.text).toContain('control_create_tickets')
@@ -1037,10 +1040,10 @@ describe('node control tools', () => {
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
       profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'first-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
     const agent = agents.get('worker-1')!
-    // The Worker gets one registration per control tool it may call: its report, the four external subscription tools and
-    // the live state.
+    // The Worker gets one registration per control tool it may call: its report, the four external subscription tools,
+    // the live state and the durable event history.
     const registered = agent.registrations
-    expect(registered).toBe(6)
+    expect(registered).toBe(7)
 
     await host.ensureSession({ sessionId: 'worker-1', workspace: 'project-1', title: 'Worker ticket-1', role: 'worker',
       profile: WORKER_PROFILE, prompt: WORKER_PROFILE.prompt, sessionToken: 'second-token', ticketId: 'ticket-1', assignmentId: 'assignment-1' })
@@ -1048,7 +1051,7 @@ describe('node control tools', () => {
     // DSH refuses a duplicate tool name in one Agent layer, so the second ensure must not register again: the Agent
     // holds one registration per tool and nothing more.
     expect(agent.registrations).toBe(registered)
-    expect(agent.tools.size).toBe(6)
+    expect(agent.tools.size).toBe(7)
     await agent.tools.get('control_report')!.execute({ ticketId: 'ticket-1', state: 'progress', summary: 's' }, EXEC)
     expect(calls[0]!.init.headers.authorization).toBe('Bearer second-token')
   })

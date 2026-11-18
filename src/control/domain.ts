@@ -62,8 +62,13 @@ export interface KernelDomain {
 /**
  * Build the domain Engine for the standalone kernel. `kernelExecutor` keeps the domain usable without a node (tests and
  * state-only modes); a caller with an execution backend passes its own Executor, such as `NodeExecutor`.
+ *
+ * `onEvent` is told what the domain commits. It is called inside the transaction that wrote the fact, so a caller that
+ * writes its own record of the event in the same file writes it in the same transaction: the record of the work and the
+ * record of the work's history are committed together or not at all.
  */
-export function createKernelDomain(store: Repositories, now?: () => string, executor: Executor = kernelExecutor): KernelDomain {
+export function createKernelDomain(store: Repositories, now?: () => string, executor: Executor = kernelExecutor,
+  onEvent?: (event: DomainEvent) => void): KernelDomain {
   const events: DomainEvent[] = []
   const outbox = new KernelOutbox()
   const engine = new Engine({
@@ -75,7 +80,10 @@ export function createKernelDomain(store: Repositories, now?: () => string, exec
     outbox,
     reviewReady: kernelReview,
     ...(now ? { now } : {}),
-    emit: event => { events.push(event) },
+    emit: event => {
+      events.push(event)
+      onEvent?.(event)
+    },
   })
   return { engine, outbox, events }
 }
