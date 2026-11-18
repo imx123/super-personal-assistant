@@ -16,12 +16,12 @@
 | P4-1 单节点报告协调 | 已通过真实 DSH 双报告、停止与重启验收，已合入本地 `next`。 | `b9e68ba` |
 | P4-3 权限拒绝审查 | 已通过双端守卫、一次上报、人工申请与重启验收，已合入本地 `next`。 | `5111373` |
 | P4-2 直属下级会话增量摘要 | 已通过真实 DSH 与 Edge 验收，已合入本地 `next`。 | `d29f6e5` |
-| P4-4 外部观察事件订阅 | 已开始实施，将用合成群聊和短信验证关键词命中。 | `phase4/p4-4` |
+| P4-4 外部观察事件订阅 | 已通过真实 DSH 与 Edge 的合成群聊、短信和三种投递模式验收。 | `3a975aa` |
 | P4-5 至 P4-Gate、Phase 5 记忆 | 尚未开始实施。 | — |
 
 P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定向回归通过。真实 DSH 核对了两条闭环、会话干预和 Worker 停止后的重启恢复。全量测试的遗留问题和真实证据见 [P3-Gate 记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p3-gate)。
 
-`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-1、P4-3 和 P4-2 已签收。当前实施 P4-4 外部观察事件订阅与直唤醒，随后是投递恢复。Phase 4 验收通过后进入三域记忆。 [P4-2 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-2) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
+`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-1、P4-3、P4-2 和 P4-4 已签收。下一项是 P4-5 协调投递持久化与恢复，随后执行 Phase 4 整体验收。 [P4-4 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-4) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
 
 `feat/multi-node` 由跨设备负责人实施和验收。两条线共用 `NodeResolver` 接口。双 Windows 通过 Tailscale 验收后，在临时集成工作树复跑双机用例、单节点回滚和届时的主线用例。Android 是后续扩展。 [跨设备计划](docs/roadmap/MULTI_NODE_PLAN_v1.1.md)
 
@@ -43,6 +43,7 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 - 硬暂停会列出节点未确认停止的工单。软暂停期间待验收的报告会记录到数据库，项目恢复后，控制面核对当前派工和验收轮次，再把仍待验收的报告通知 PM。
 - 权限守卫拒绝会进入独立审查记录。窗口内达到阈值后通知直属上级，Router 自身的审查进入操作员控制台。上级可按审查编号提交人工授权申请，操作员可在首页记录决定。实际权限变更须由操作员另行处理。 [权限拒绝审查](docs/022-phase4-coordination-architecture.zh-CN.md#6-p4-3-权限拒绝审查实现口径)
 - Router 和 PM 可以显式订阅直属下级会话，默认每 120 秒聚合一次。摘要包含工具成败、可归属的文件改动和最新输出片段，无新活动时保持安静。控制台显示订阅状态并可打开对应会话。 [增量摘要验收](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-2)
+- 控制台首页可创建外部事件订阅、查看投递状态、注入模拟群聊或短信。群聊可按群 ID 和文本关键词组合匹配，短信可按文本关键词匹配。命中默认直送该订阅的目标。只有操作员可以显式开启双层路由。 [外部事件验收](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-4)
 - 更改任务时区并重启控制面后，重新保存日或周计划即可按新偏移计算下次运行。按间隔运行的计划保留原节奏。调度器开始执行每条计划时读取当时有效的正文和目标项目。
 
 ## 3. 两套入口与数据归属

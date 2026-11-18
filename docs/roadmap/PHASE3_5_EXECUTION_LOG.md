@@ -16,7 +16,7 @@
 | P4-1 | P4-0 | 单节点目标解析、持久报告协调与真实 DSH 验收 | DONE |
 | P4-3 | P4-1 | 真实权限守卫与拒绝上报，优先于订阅扩展 | DONE |
 | P4-2 | P4-1 | 零 LLM 下级增量摘要，真实后端验证 | DONE |
-| P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | IN_PROGRESS |
+| P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | DONE |
 | P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | NOT_STARTED |
 | P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | NOT_STARTED |
 | P5-0 | P4-Gate | 三域数据契约与设计 | NOT_STARTED |
@@ -210,4 +210,10 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Code
 
 ## P4-4
 
-2026-11-18 开始实施。以本地 `next` 的 `c173580` 为基线，Claude Code 以 `max` effort 在 `phase4/p4-4` 实施，Codex 独立验收。按用户要求，端到端用例加入虚构群聊及短信，覆盖关键词、群组和来源匹配。
+2026-11-18 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 在 `phase4/p4-4` 分批实施。Codex 独立验收候选提交 `a478ab4`，本地 `next` 的 `3a975aa` 与受测源码和测试一致。
+
+- `synthetic-group-chat` 提供 `group.message`，`synthetic-sms` 提供 `sms.received`。虚构「发布演练群」消息命中「回滚」只唤醒自建订阅的 Worker。其他群含同一个词、目标群缺少关键词、短信缺少关键词均无唤醒。Edge 从首页创建了「改期」短信订阅，注入后指定 Worker 收到一次。两条直达链路均未唤醒 Router。
+- 真实 DSH Desktop 0.2.2.0 使用隔离 `phase3-live` profile 与 `dsh-superagent/node` 插件，模型响应由本机脚本固定。控制面重启后重放相同消息没有重复唤醒，超额及已停 Worker 不再收到消息。操作员手动开启双层路由后，规则命中投预定 PM，回退将事件作为观察送给 Router。真实 Router 工具拒绝了外部事件携带的伪造请求，项目数和人工请求记录均无变化。语义条件在无评估器时记录为降级未投递。证据在 `.artifacts/phase3-5-20261117/live-yhLsMB/evidence.json`、其 DSH 工具日志及 Edge 截图。消息原始样本在 `.artifacts/phase4-p4-4-20261118/synthetic-messages.json`。本阶段的接入源为本机模拟数据。
+- 类型检查和构建通过。69 个定向文件中 1,047 项通过、1 项跳过。Windows 全量为 2,039 项通过、45 项失败、1 项跳过，失败用例与 P4-2 基线一致。确定性用例覆盖并发重复、限流、失效、回执缺失、发送前改目标以及不可信信封。测试报告见本机忽略目录 `.artifacts/phase4-p4-4-20261118/`。
+
+下一项是 P4-5 协调投递持久化与恢复。
