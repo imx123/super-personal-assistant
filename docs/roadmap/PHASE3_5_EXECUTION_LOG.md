@@ -18,7 +18,7 @@
 | P4-2 | P4-1 | 零 LLM 下级增量摘要，真实后端验证 | DONE |
 | P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | DONE |
 | P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | DONE |
-| P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | NOT_STARTED |
+| P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | DONE |
 | P5-0 | P4-Gate | 三域数据契约与设计 | NOT_STARTED |
 | P5-1 | P5-0 | Live State | NOT_STARTED |
 | P5-2 | P5-0 | 持久 Event History | NOT_STARTED |
@@ -228,3 +228,15 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Code
 - 类型检查和构建通过。73 个定向文件中 1,102 项通过、1 项跳过。Windows 全量 2,065 项通过、45 项失败、1 项跳过。与 P4-4 基线比对，失败断言和测试文件错误集合均无新增。报告见 `.artifacts/phase4-p4-5-20261118/accepted-focused.json` 和 `.artifacts/phase4-p4-5-20261118/accepted-vitest.json`。
 
 下一项是 P4-Gate，验收单节点协作闭环。双节点在跨设备分支合入时独立复跑。
+
+## P4-Gate
+
+2026-11-18 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 补充 37 项验收用例，Codex 独立运行候选 `5ee3495`。本地 `next` 的 `9fbe505` 与受测源码、测试、测试目录和依赖锁文件一致。本轮业务源码与 P4-5 相同。
+
+- 派工和交接、会话干预、报告、外部观察唤醒与重启恢复均复验。28 项用例覆盖共享解析的目标消失、代际、撤权、人工停止和离线；另 9 项核对报告、外部事件、拒绝审查和摘要的离线状态，以及自动交接重启后的 SQLite 状态、节点投递次数和原幂等键。丢回执、人工 Relay 和停机回归也已执行。离线为 FakeNode 故障注入。
+- 同一构建在隔离 DSH Desktop 0.2.2.0 的 `phase3-live` profile 加载 `dsh-superagent/node`。独立工单免确认开工，Router 工具将请求自动交给已存在项目的 PM，真实入箱一次。Scheduler 手动触发入箱一次，控制面重启后保留运行记录且无重复。真实证据在 `.artifacts/phase3-5-20261117/live-BNN2qi/evidence.json`。
+- 两名 Worker 的真实回合重叠，`ready` 和 `blocked` 报告各投递一次。PM 验收前者、保留后者的阻塞状态，并向 Router 回报项目摘要。报告场景使用本机 Gemma 4 12B，其余场景使用脚本模型驱动实际 DSH 工具。证据在 `.artifacts/phase3-5-20261117/live-FvbuMe/evidence.json`。
+- 单路摘要只采集选中的 Worker；连续拒绝由直接上级收到一次审查；合成群聊与短信命中后直达原目标。另以隔离 SQLite 模拟控制面缺回执并重启，节点证明原消息入箱，未发生补发。对应实测为 `live-U9hTSh`、`live-9OtPCp`、`live-0j3tVx` 和 `live-oGKX4p`。
+- 类型检查、构建和 63 文件的定向回归通过，共 888 项通过、1 项跳过，Scheduler 43 项通过。Windows 全量为 2,102 项通过、45 项失败、1 项跳过，失败断言集合与 P4-5 基线逐项一致。旧面板 13 个文件在默认环境因 `jsdom` 解析到不匹配的 `undici` 未运行。用预加载方式仅对测试进程加载锁定版 `undici` 后，在基线和候选上各复跑这 13 个文件，两版均为 12 项通过、104 项失败，React 渲染失败用例逐项一致。原始报告、面板对照及故障矩阵见 `.artifacts/phase4-gate-20261118/`。
+
+P4-Gate 单节点通过。双节点验收在跨设备分支合入时独立执行。下一项是 P5-0。
