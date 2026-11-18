@@ -109,10 +109,13 @@ POST /v1/console/schedules/:id/pause                 # 暂停
 POST /v1/console/schedules/:id/resume                # 恢复
 POST /v1/console/schedules/:id/run                   # 手动跑一次（失败时 502 并带原因，不报成功）
 GET  /v1/console/schedules/:id/runs?limit=           # 这个任务的历次运行
+GET  /v1/console/denials                              # 权限拒绝审查 + 计数 + 人工授权申请单
+POST /v1/console/denials/authorizations { applicationId, decision: acknowledged|declined }
+                                                  # 记录操作员对一张申请单的决定；只记录，不授予任何权限
 
 # Session token only（role 与 pid/aid 从 token 取，请求体不能改身份）
 GET  /v1/tools/pm/context
-POST /v1/tools/pm/tickets       { tasks: [{ title, goal, scope?, note?, threads? }] }
+POST /v1/tools/pm/tickets       { tasks: [{ title, goal, scope?, note?, allow_tools?, threads? }] }
 POST /v1/tools/pm/message       { ticketId, text, assignmentId? }
 POST /v1/tools/pm/cancel        { ticketId, assignmentId?, reason? }
 POST /v1/tools/pm/assignment    { ticketId }
@@ -125,8 +128,11 @@ POST /v1/tools/router/projects    { requestId, title, goal }
 POST /v1/tools/router/dispatch    { requestId, title, goal }
 POST /v1/tools/router/manage      { requestId, action, targetId, text? }
 POST /v1/tools/router/pm-proposal { requestId, projectId, instruction }
+POST /v1/tools/denial/authorization { reviewId }   # PM 与 Router 共用：就一次权限拒绝审查发起人工授权申请单
 POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 ```
+
+每条 `/v1/tools/*` 路由都先过控制面自己的权限守卫：按 Session 的角色档案判定，`deny` 先于 `tools`，越权调用记为一条**类型化的拒绝事实**（`ROLE_TOOL_DENIED` / `PROJECT_SCOPE_VIOLATION` / `MANDATE_EXCEEDED`），随后由 `denial-escalator.ts` 计数与升级。节点侧的工具调用会带上 `x-superagent-call-id` 头（工具调用自身的 id）；这个头是**调用方可控**的原文，控制面一律再按「来源 Session + 生命周期代际」加命名空间，因此两个 Session 用同一个头是两次不同的调用，一个角色无法用同一个头压掉另一个角色的事实，而重启后重放仍是同一次调用，不重复审计也不重复计数。节点自己的工具守卫另有回报通道：它带上后端给出的工具调用 id、后端名与回合，控制面核对来源节点/后端、Session、角色、Assignment 与当前活动回合之后才计入。拒绝的升级见 `/v1/console/denials`。
 
 `POST /v1/projects/:id/workers` 仍然是低层路由（浏览器不暴露）：Worker 只能因为一个 Assignment 而存在，这条路由是给「已经有 Assignment、要把它的 Worker 拉起来」用的低层入口，语义与 Phase 2 一致。
 
@@ -135,18 +141,19 @@ POST /v1/tools/token/refresh    # 无请求体，返回 { token, expiresAt }
 
 ## PM 编排工具
 
-独立控制面的 PM 有 8 个工具，全部按 Session token 限定到自己的 Project。
+独立控制面的 PM 有 9 个工具，全部按 Session token 限定到自己的 Project。
 
 | 工具 | 端点 | 语义 |
 | --- | --- | --- |
 | `control_project` | `GET /v1/tools/pm/context` | 本 Project 的 Ticket、每个 Ticket 的**当前 Assignment**、该 Assignment 的报告、**待 PM 审阅的结果**、待人回答的问题、投递失败、停止失败、人工/Project 停止标记 |
-| `control_create_tickets` | `POST /v1/tools/pm/tickets` | 建 1–5 张 Ticket（既有能力） |
+| `control_create_tickets` | `POST /v1/tools/pm/tickets` | 建 1–5 张 Ticket（既有能力）。任务可带 `allow_tools` 收窄 Worker 的工作工具；它**只能收窄** PM Mandate，更宽的列表被拒（`invalidProjectTask`），控制面另记一条 `MANDATE_EXCEEDED` |
 | `control_message_worker` | `POST /v1/tools/pm/message` | 给某 Ticket **当前 Assignment** 的 Worker 发一条协调消息 |
 | `control_cancel_worker` | `POST /v1/tools/pm/cancel` | 停止某 Ticket 当前 Assignment 的 Worker |
 | `control_request_assignment` | `POST /v1/tools/pm/assignment` | 对可派工的 Ticket 显式请求一个新 Assignment（可选 `assignmentId` 做当前性校验） |
 | `control_review_result` | `POST /v1/tools/pm/review` | 审阅某个 Assignment 报上来的结果：**接受**（Ticket 结束为 `completed`）或**拒绝**（必须给理由，理由回到同一个 Assignment）；决定要指名它决定的是哪一轮审阅（`reviewId`） |
 | `control_review_diff` | `POST /v1/tools/pm/diff` | 读这一轮审阅背后的**实际代码差异**：节点在该 Project 自己的工作区上跑固定只读 Git diff 与空白检查（有界），控制面把请求绑到 PM 自己的 Ticket/Assignment/审阅轮次 |
 | `control_project_report` | `POST /v1/tools/pm/project-report` | 保存当前项目报告并通知 Router。Router 从项目概要也能读取最新报告 |
+| `control_request_authorization` | `POST /v1/tools/denial/authorization` | 就一次**权限拒绝审查**发起显式的人工授权申请单（PM 与 Router 共用）。只带审查 id；资格取自已鉴权的调用方（必须是该审查的直属上级、上级未撤权未停机、该审查是其范围当前的那一次、受治理的那条边仍活着）。**申请单不授予任何权限**，只把审查摆到操作员面前 |
 
 规则（都复用领域既有生命周期，不是控制面自造的状态机）：
 

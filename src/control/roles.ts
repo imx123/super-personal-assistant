@@ -1,5 +1,5 @@
 /** Role profiles the control plane hands to a node. The tool names mirror the current DSH deployment. */
-import type { RoleProfile } from '../shared/protocol.ts'
+import type { GuardDenialReasonCode, RoleProfile } from '../shared/protocol.ts'
 
 /**
  * A Project PM sees its Project and its Tickets, but no shell or file write tools.
@@ -26,7 +26,11 @@ export const PM_PROFILE = {
     + 'instructions, and decide on it together with the Worker\'s own report. Use control_project_report to tell the '
     + 'Router when the Project reaches a milestone, is blocked, or needs a human decision, and say what the report is: '
     + 'kind "blocked", "completed" or "failed" reaches the Router at once, while an ordinary "progress" is merged with the '
-    + 'ones that follow. Do not edit files.',
+    + 'ones that follow. When a permission denial review tells you that a call of yours was refused and that the work '
+    + 'cannot go on within the permissions you already have, you may raise an explicit human authorization application with '
+    + 'control_request_authorization and the review id. It puts that review in front of an operator in the console; it '
+    + 'grants nothing, it changes no Mandate and it never repeats the refused call. Do not use it for anything else, and '
+    + 'do not try to grant the access yourself. Do not edit files.',
   tools: [
     'control_project',
     'control_create_tickets',
@@ -36,6 +40,7 @@ export const PM_PROFILE = {
     'control_review_result',
     'control_review_diff',
     'control_project_report',
+    'control_request_authorization',
   ],
   deny: ['write', 'edit', 'bash', 'pwsh'],
   permission: 'read-only',
@@ -128,9 +133,80 @@ export const ROUTER_PROFILE = {
     + 'propose a relay at the same time. A request that created a Project may hand work to that Project\'s own PM. Say '
     + 'that the proposal is waiting for the person to confirm it in the console, and never claim that the PM has been told. '
     + 'On explicit request, use control_router_manage to message, stop or retry a standalone Ticket, or archive or '
-    + 'unarchive a Project. Use the summary to resolve IDs. The PM owns and dispatches the work of its Project.',
+    + 'unarchive a Project. Use the summary to resolve IDs. The PM owns and dispatches the work of its Project. When a '
+    + 'permission denial review tells you that a call was refused and that the work cannot go on within the permissions the '
+    + 'superior already has, you may raise an explicit human authorization application with control_request_authorization '
+    + 'and the review id. It puts that review in front of an operator in the console; it grants nothing, it changes no '
+    + 'Mandate and it never repeats the refused call.',
   tools: ['control_router_summary', 'control_router_create_project', 'control_router_dispatch',
-    'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal'],
+    'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal',
+    'control_request_authorization'],
   deny: ['write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch', 'subagent'],
   permission: 'read-only',
 } as const satisfies RoleProfile
+
+/**
+ * The role profiles, by the stable name a Session record keeps.
+ *
+ * The name is the only thing a persisted Session carries, so it is what the control plane reads back when it has to
+ * decide what that Session may call. A name that is not here belongs to a profile this control plane does not know, and
+ * such a Session is refused rather than trusted with a guess.
+ */
+export const ROLE_PROFILES: Readonly<Record<string, RoleProfile>> = Object.freeze({
+  [PM_PROFILE.name]: PM_PROFILE,
+  [WORKER_PROFILE.name]: WORKER_PROFILE,
+  [SCOUT_PROFILE.name]: SCOUT_PROFILE,
+  [ROUTER_PROFILE.name]: ROUTER_PROFILE,
+})
+
+/**
+ * The role profile of one Session, when this control plane knows it.
+ *
+ * The lookup is by the profile name the Session was created with, never by the role alone: the profile is the whole
+ * capability set, and a role without its profile would be a guess.
+ */
+export function profileFor(name: string): RoleProfile | undefined {
+  return Object.prototype.hasOwnProperty.call(ROLE_PROFILES, name) ? ROLE_PROFILES[name] : undefined
+}
+
+/**
+ * What the role profile says about one tool.
+ *
+ * `allowed` says whether the call may go on; `reasonCode` and `reason` say why it may not, and are present only for a
+ * refusal. A profile this control plane does not know refuses everything: an unknown capability set grants nothing.
+ */
+export interface RoleToolDecision {
+  /** Whether the call may go on. */
+  readonly allowed: boolean
+  /** Why the call was refused, when it was. */
+  readonly reasonCode?: GuardDenialReasonCode
+  /** The refusal in words, when there was one. */
+  readonly reason?: string
+}
+
+/**
+ * The decision one role profile makes about one tool.
+ *
+ * `deny` is read before `tools`, and a name the profile denies is refused even when the allow list would have let it
+ * through: the deny list is the explicit statement that a capability is out of bounds, and the allow list only says what
+ * else is in. A name the allow list does not name is refused as well — a role's tool list is its whole capability set,
+ * not a lower bound.
+ *
+ * The decision is deterministic and made from the profile alone. Nothing here reads a model's output, a log line or a
+ * tool's error text: the refusal is a fact about the profile, and only a fact like that may be counted.
+ */
+export function roleToolDecision(profile: RoleProfile | undefined, toolName: string): RoleToolDecision {
+  if (profile === undefined) {
+    return { allowed: false, reasonCode: 'ROLE_TOOL_DENIED',
+      reason: 'This Session has no role profile this control plane knows, so it may call no tool' }
+  }
+  if (profile.deny.includes(toolName)) {
+    return { allowed: false, reasonCode: 'ROLE_TOOL_DENIED',
+      reason: `The ${profile.name} profile denies the tool ${toolName}` }
+  }
+  if (!profile.tools.includes(toolName)) {
+    return { allowed: false, reasonCode: 'ROLE_TOOL_DENIED',
+      reason: `The ${profile.name} profile does not grant the tool ${toolName}` }
+  }
+  return { allowed: true }
+}

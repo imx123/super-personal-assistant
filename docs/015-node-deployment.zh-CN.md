@@ -56,6 +56,10 @@ node lib/control.js                      dsh --profile superagent-node
 | `SUPERAGENT_CONSOLE_AUDIT_DAYS` | 控制面 | 否 | 审计保留天数，默认 0，表示长期保留 |
 | `SUPERAGENT_RECONCILE_INTERVAL_MS` | 控制面 | 否 | 自动清理残留会话的间隔（毫秒）。默认 `0`，可在节点部署页手动检查。 |
 | `SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS` | 控制面 | 否 | 同一上级收到两条**普通进展**报告的最小间隔（毫秒）。默认 `60000`（一分钟）：Worker 每一步都汇报时，上级不会每一步都被叫醒。`0` = 每条普通进展立刻送达。终态、阻塞、失败、丢弃、就绪**不**受此节流影响。非法值启动失败 |
+| `SUPERAGENT_DENIAL_WINDOW_MS` | 控制面 | 否 | 权限拒绝计数的**滑动窗口**宽度（毫秒），默认 `600000`（十分钟）。窗口外的拒绝不进旧窗口。非法值启动失败 |
+| `SUPERAGENT_DENIAL_THRESHOLD` | 控制面 | 否 | 一个窗口内累计多少次**有效拒绝**才生成一次上级审查，默认 `3`。同一回合重复的同一拒绝只算一次有效拒绝。非法值启动失败 |
+| `SUPERAGENT_DENIAL_COOLDOWN_MS` | 控制面 | 否 | 一次审查之后同一范围安静多久（毫秒），默认 `600000`（十分钟）。**上界有限**：冷却永不到期等于把升级永久关掉。非法值启动失败 |
+| `SUPERAGENT_DENIAL_FUSE_LIMIT` | 控制面 | 否 | 同一回合内多少次被拒调用会打断该回合，默认 `5`。打的是回合打断，不是整会话停机。非法值启动失败 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 控制面 | 否 | 定时任务的**固定**时基偏移（分钟，东为正），默认 `0` = UTC。取值范围 −720…840，非法值启动失败。用命名时区会带上夏令时规则，所以这里只给固定偏移；控制台会把这个偏移显示出来 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 控制面 | 否 | 调度器查看「到点计划」的周期（毫秒），不设置时用模块自己的默认（5 秒）。`0` = 计划仍然存在，但**不自己**到点运行，只能手动跑 |
 | `SUPERAGENT_WORKSPACE_ROOT` | 控制面 | 否 | 默认 `<node root>/workspaces`；**必须**在 `SUPERAGENT_NODE_ROOT` 之内，否则节点报 `Workspace escapes the node root` |
@@ -300,5 +304,5 @@ Session token 默认 TTL 3600s。过期后普通工具/消息路由严格返回 
 - viewer 认证、写操作 403 校验与 SSE 压测已在 P2-C 完成；TLS/反向代理仍不在本文实现，部署建议与威胁模型见 `docs/016-control-plane-tls.zh-CN.md`（纯文本提及）。本文不把 loopback 部署描述成“已经安全地暴露到网络”。
 - token refresh 默认 5 分钟宽限、cancel/command 默认 10 秒 deadline 都是上限，不是精确时间；超过 TTL+grace 且无工具调用的长任务仍失败，半失联节点可能到 10 秒才 offline。
 - 控制台的定时任务会向已启动且可用的项目 PM 发消息。独立控制面只连接一个 DSH 节点，跨节点调度和故障接替尚未实现。
-- 独立 DSH 节点安装 PM 和 Router 的角色提示词时会等待实际消息。角色工具边界以工具许可列表为准，`RoleProfile.deny` 尚未作为单独规则消费。
+- 独立 DSH 节点安装 PM 和 Router 的角色提示词时会等待实际消息。角色工具边界按 `RoleProfile` 判定：`deny` 先于 `tools`，被 deny 的名字即使在 allow 列表里也被拒绝。工作区的越界由**后端自己的文件沙箱**负责，节点只读它结构化的拒绝码（`FS_SANDBOX_DENIED`）并按调用 id 与回合配对后上报；节点自己另守一条明确规则：改文件的工具不得指向工作区的 Git 元数据。
 - 控制面锁 stale（§5.1）是已知限制；事件 `seq` 的跨重启语义已经收口为控制面自己的序号（§5.4）。

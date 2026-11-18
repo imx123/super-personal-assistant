@@ -163,6 +163,25 @@ function retentionNumber(env: Record<string, string | undefined>, name: string, 
   return value
 }
 
+/**
+ * The settings of the permission denial escalation, read from the environment.
+ *
+ * A value that is not a whole number, or that is out of range, fails startup before the kernel takes the database lock: a
+ * typo must not silently turn the escalation off, make its threshold unreachable or leave its cooldown endless.
+ *
+ * The cooldown is bounded like every other setting, so it is always finite: a cooldown that never ends would silence the
+ * escalation for good, and a wall nobody sees is a wall nobody fixes.
+ */
+function denialNumber(env: Record<string, string | undefined>, name: string, minimum: number): number | undefined {
+  const raw = env[name]
+  if (raw === undefined || raw === '') return undefined
+  const value = Number(raw)
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < minimum || value > 86_400_000) {
+    throw new Error(`${name} is invalid`)
+  }
+  return value
+}
+
 function inside(parent: string, child: string): boolean {
   const path = relative(parent, child)
   return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path))
@@ -263,6 +282,12 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
   const eventDays = retentionNumber(env, 'SUPERAGENT_CONSOLE_EVENT_DAYS', 0)
   const auditDays = retentionNumber(env, 'SUPERAGENT_CONSOLE_AUDIT_DAYS', 0)
   const progressInterval = reportProgressIntervalMs(env)
+  // The settings of the permission denial escalation: the window the denials are counted in, how many effective denials
+  // make a review, how long a scope stays quiet afterwards and how many refused calls in one turn end that turn.
+  const denialWindow = denialNumber(env, 'SUPERAGENT_DENIAL_WINDOW_MS', 1)
+  const denialThreshold = denialNumber(env, 'SUPERAGENT_DENIAL_THRESHOLD', 1)
+  const denialCooldown = denialNumber(env, 'SUPERAGENT_DENIAL_COOLDOWN_MS', 0)
+  const denialFuse = denialNumber(env, 'SUPERAGENT_DENIAL_FUSE_LIMIT', 1)
 
   const nodeUrl = env.SUPERAGENT_NODE_URL
   const node: NodePort = options.node ?? (nodeUrl
@@ -276,7 +301,11 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
     ...(refreshGraceSeconds === undefined ? {} : { sessionTokenRefreshGraceSeconds: refreshGraceSeconds }),
     ...(schedulerOffset === undefined ? {} : { schedulerTimeZoneOffsetMinutes: schedulerOffset }),
     ...(schedulerTick === undefined ? {} : { schedulerTickMs: schedulerTick }),
-    ...(progressInterval === undefined ? {} : { reportProgressIntervalMs: progressInterval }) }
+    ...(progressInterval === undefined ? {} : { reportProgressIntervalMs: progressInterval }),
+    ...(denialWindow === undefined ? {} : { denialWindowMs: denialWindow }),
+    ...(denialThreshold === undefined ? {} : { denialThreshold: denialThreshold }),
+    ...(denialCooldown === undefined ? {} : { denialCooldownMs: denialCooldown }),
+    ...(denialFuse === undefined ? {} : { denialFuseLimit: denialFuse }) }
   const control = new ControlPlane(controlOptions)
   hasSessions = () => control.sessions.size !== 0
   // The viewer token is optional: unset (or empty), the API keeps exactly the single-token behaviour it always had.

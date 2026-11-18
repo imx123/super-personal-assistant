@@ -373,6 +373,43 @@ export class FakeNode implements NodePort {
   }
 
   /**
+   * Report one refusal of the node's own tool guard, as the node reports it.
+   *
+   * The fake has no tool guard of its own, so a test that needs one writes the fact here: the tool that was refused, the
+   * reason code the guard decided, the turn the call was made in and the identity of the call itself. The turn is the one
+   * the Session really runs, so a fact is always about the work that runs now.
+   *
+   * The node id, the backend and the Assignment may be named as well, so a test can write a fact of another node, of
+   * another backend or of another Assignment and see it refused.
+   */
+  simulateGuardDenial(sessionId: string, toolName: string, reasonCode: string, options: {
+    /** The turn the call was made in; the Session's own running turn when it is not named. */
+    turnId?: string
+    /** The identity of the call; a fresh one when it is not named. */
+    callId?: string
+    /** The node the fact claims to come from. */
+    nodeId?: string
+    /** The backend the fact claims to come from. */
+    backend?: string
+    /** The Assignment the fact claims to be about. */
+    assignmentId?: string
+  } = {}): void {
+    const session = this.requireSession(sessionId)
+    const turn = options.turnId ?? this.turns.get(sessionId)?.current
+    const callId = options.callId ?? `fake-guard-${this.seq + 1}`
+    const envelope = this.sessionEnvelope(session)
+    this.emit({
+      ...envelope,
+      nodeId: options.nodeId ?? envelope.nodeId,
+      ...(options.assignmentId === undefined ? {} : { assignmentId: options.assignmentId }),
+      type: 'session.event',
+      kind: 'guard.denial',
+      data: { toolName, reasonCode, ...(turn === undefined ? {} : { turnId: String(turn) }),
+        callId, backend: options.backend ?? 'dsh' },
+    })
+  }
+
+  /**
    * Open a turn the Session keeps running, and report the turn's number.
    *
    * The fake has no model, so a turn exists only when a test opens one: that is what lets a test act on a Session that

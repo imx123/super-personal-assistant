@@ -6,6 +6,7 @@
  * status changes cross the boundary, because the control plane interprets facts and does not need the model stream.
  */
 import { mkdirSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
@@ -17,12 +18,43 @@ import type {} from '@deepseek-ai/dsh-permission-presets'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { cancelled, stopBackground } from '../executor/background.ts'
-import { WORKER_REPORT_STATES, PROJECT_GATE_CONDITIONS, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
+import { WORKER_REPORT_STATES, PROJECT_GATE_CONDITIONS, type GuardDenialReasonCode, type NodeStatus, type RoleProfile, type SessionInspection, type SessionStatus,
   type RouterModel, type RouterOptions, type WorkerReportState } from '../shared/protocol.ts'
 import { nodeWorkspace, type DshPortEvent, type DshPortHost, type NodeSessionRole } from './dsh-port.ts'
 
 /** What a cancel tells the Session's jobs when the command carried no reason of its own. */
 const STOP_REASON = 'The Session was stopped'
+/**
+ * The backend this host runs on.
+ *
+ * A refusal names the backend that decided it, so the control plane can tell a fact of its own backend from a fact that
+ * claims another one.
+ */
+const DSH_BACKEND = 'dsh'
+/**
+ * The tools the backend's file sandbox guards.
+ *
+ * The sandbox owns the file access of these tools, and a refusal of one of them is a fact about the workspace. A shell
+ * call is not one of them: the backend does not sandbox the shell the same way, and a refusal of it is not a fact about
+ * the workspace.
+ */
+const NATIVE_FILE_TOOLS: ReadonlySet<string> = new Set(['read', 'write', 'edit', 'read_image', 'glob', 'grep'])
+/**
+ * The native file tools that change a file.
+ *
+ * The Git metadata guard applies to these alone: the repository's own bookkeeping may not be changed, while a read of it
+ * is the Session's business.
+ */
+const FILE_MUTATION_TOOLS: ReadonlySet<string> = new Set(['write', 'edit'])
+/**
+ * The structured code the backend's file sandbox refuses a call with.
+ *
+ * It is a code, never a sentence: the code is the backend's own field, and a refusal without one is not a refusal this
+ * node may report.
+ */
+const FS_SANDBOX_DENIED = 'FS_SANDBOX_DENIED'
+/** How many unanswered native tool calls this host remembers. */
+const NATIVE_CALL_LIMIT = 256
 /**
  * How long a cancel waits for the whole stop to settle when the host configures nothing.
  *
@@ -155,6 +187,73 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
    * Agent whose inherited layer is new, so the boundary is applied again for that Agent.
    */
   const boundarySessions = new Map<string, unknown>()
+  /**
+   * The guard's facts of each Session: the role it runs, the Assignment it owns and the profile it may use.
+   *
+   * A refusal is reported under these facts, so the control plane knows which Session refused and which Assignment the
+   * refusal was made in.
+   */
+  const sessionGuards = new Map<string, { role: 'pm' | 'worker' | 'router'; assignmentId?: string; profile: RoleProfile }>()
+  /**
+   * The tool calls the backend made, by the id the backend gave them.
+   *
+   * The backend's own file sandbox refuses a call that reaches outside the Session's workspace, and it says so in the
+   * tool's own result. The result names the call it belongs to, so the call is found by that id: the tool name and the
+   * turn come from the call, and the result alone never decides anything.
+   */
+  const nativeCalls = new Map<string, { toolName: string; turn?: number }>()
+  /**
+   * The identity this host gives a refusal the backend gave no id for.
+   *
+   * A backend that names every call needs no such identity: the call's own id is used, and it is the same for a replay
+   * of the same call. The fallback is unique per host and per refusal, so two refusals never share it and a host that
+   * came back never repeats the id of a refusal it made before.
+   */
+  const guardNonce = randomUUID()
+  /** How many refusals this host reported under the fallback identity. */
+  let guardCounter = 0
+  /**
+   * The listeners the host tells about its events.
+   *
+   * The port subscribes once and the events are republished from there. A refusal the node's own guard decides is
+   * published the same way, so it reaches the control plane on the channel the node already owns.
+   */
+  const hostListeners = new Set<(event: DshPortEvent) => void>()
+  /** The identity of one refusal the backend gave no id for. */
+  const nextGuardId = (sessionId: string): string => `guard-${guardNonce}-${sessionId}-${++guardCounter}`
+  /**
+   * Report one refusal of the node's own tool guard to the control plane.
+   *
+   * The event names the tool, the reason code, the turn the call was made in and the identity of the call itself. It
+   * never names the arguments of the refused call, a path or an error: a refusal is a fact about the boundary, not about
+   * what the model said.
+   */
+  const reportGuardDenial = (sessionId: string, toolName: string, reasonCode: GuardDenialReasonCode,
+    callId?: string): void => {
+    const guard = sessionGuards.get(sessionId)
+    if (guard === undefined) return
+    const turn = turnState.get(sessionId)?.current
+    const identity = callId === undefined || callId === '' ? nextGuardId(sessionId) : callId
+    publishHostEvent({
+      type: 'session.event',
+      sessionId,
+      kind: 'guard.denial',
+      role: guard.role,
+      ...(guard.assignmentId === undefined ? {} : { assignmentId: guard.assignmentId }),
+      data: { toolName, reasonCode, ...(turn === undefined ? {} : { turnId: String(turn) }),
+        callId: identity, backend: DSH_BACKEND },
+    })
+  }
+  /** Hand one event of this host to every listener that is attached. */
+  const publishHostEvent = (event: DshPortEvent): void => {
+    for (const listener of [...hostListeners]) {
+      try {
+        listener(event)
+      } catch {
+        // A broken listener must not fail the call the guard just refused: the refusal itself is what matters.
+      }
+    }
+  }
   /**
    * One delivery's Input ids, by the deterministic id of the message carrying them, until a turn reports them.
    *
@@ -338,13 +437,31 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
    * A PM and a Router inherit nothing they may use, so their mask is a deny list of every inherited tool; a Worker keeps
    * the inherited names its profile names. `restrict({})` is skipped because DSH refuses an empty filter, and a minimal host
    * whose Agent has no scoped registry is left as it is.
+   *
+   * The guard reads `deny` before `tools`: a name the profile denies is refused even when the allow list would have let
+   * it through, because the deny list is the explicit statement that a capability is out of bounds. The guard also keeps
+   * the Session's own Git metadata out of reach: a call that changes a file may not touch the repository's own
+   * bookkeeping.
+   *
+   * The guard does not judge the file system as a whole. The backend's own sandbox owns the file access of the native
+   * file tools, and this node reads the refusals that sandbox makes instead of guessing where a path leads: a lexical
+   * rule about absolute paths would over-block ordinary reads and still miss the relative and symbolic cases the
+   * backend handles properly.
+   *
+   * Every refusal is reported to the control plane as a structured `guard.denial` event. It is a fact about a refusal the
+   * node decided, never a reading of the model's output, of a tool's error or of a command's result: the shell's own
+   * output is never turned into a security fact.
    */
   const applyToolBoundary = (agent: unknown, details: { sessionId: string; role: 'pm' | 'worker' | 'router'
-    profile: RoleProfile }): void => {
+    profile: RoleProfile; assignmentId?: string }): void => {
     if (boundarySessions.get(details.sessionId) === agent) return
     const tools = agentTools(agent)
     if (!tools) return
     const allowed = details.profile.tools
+    const denied = details.profile.deny
+    // The delegation's own narrowing, when the control plane sent one: the tools this Assignment's Mandate holds. A
+    // tool the role grants but the Mandate took away is a Mandate that was exceeded, not a role that may not use it.
+    const mandate = details.profile.mandateTools
     const inherited = inheritedToolNames(agent, tools)
     if (details.role === 'worker') {
       const allow = inherited.filter(name => allowed.includes(name))
@@ -353,9 +470,100 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
       tools.restrict({ deny: inherited })
     }
     if (typeof tools.guard === 'function') {
-      tools.guard(({ name }) => allowed.includes(name) ? undefined : toolBoundaryReason(details.role, allowed))
+      tools.guard((execution) => {
+        const name = execution.name
+        const callId = executionCallId(execution)
+        // `deny` first: an explicit refusal wins over the allow list.
+        if (denied.includes(name)) {
+          reportGuardDenial(details.sessionId, name, 'ROLE_TOOL_DENIED', callId)
+          return `The ${details.profile.name} profile denies the tool ${name}; `
+            + toolBoundaryReason(details.role, allowed)
+        }
+        if (!allowed.includes(name)) {
+          reportGuardDenial(details.sessionId, name, 'ROLE_TOOL_DENIED', callId)
+          return toolBoundaryReason(details.role, allowed)
+        }
+        // The Mandate's own narrowing comes after the role's own lists: a tool the delegation took away is refused as a
+        // Mandate that was exceeded. The tool stays visible to the model on purpose — the refusal is a fact the control
+        // plane counts, and a tool that simply vanished would hide it.
+        if (mandate !== undefined && !mandate.includes(name)) {
+          reportGuardDenial(details.sessionId, name, 'MANDATE_EXCEEDED', callId)
+          return `The delegation of this Assignment does not include the tool ${name}`
+        }
+        // The Git metadata of the workspace: a call that changes a file may not touch the repository's own bookkeeping.
+        // The decision is lexical and only about the path the call names, so it is the same on every machine; a read is
+        // left alone, and the shell is not judged here at all.
+        if (FILE_MUTATION_TOOLS.has(name)) {
+          const refusal = gitMetadataRefusal(execution.arguments)
+          if (refusal !== undefined) {
+            reportGuardDenial(details.sessionId, name, 'WORKSPACE_OUT_OF_BOUNDS', callId)
+            return refusal
+          }
+        }
+        return undefined
+      })
     }
     boundarySessions.set(details.sessionId, agent)
+  }
+
+  /**
+   * Remember one native tool call the backend made.
+   *
+   * Only the tool's name, the id of the call and the turn it was made in are read. The arguments of the call are never
+   * read: the backend's own sandbox owns the file access, and a path in the arguments is not a fact about the boundary.
+   */
+  const noteNativeCall = (sessionId: string, event: SessionEvent): void => {
+    if (eventType(event) !== 'tool/call') return
+    const data = eventData(event)
+    if (data === undefined) return
+    const callId = firstText(data, ['callId', 'call_id', 'toolCallId', 'id'])
+    const toolName = firstText(data, ['name', 'tool', 'toolName'])
+    if (callId === '' || toolName === '') return
+    const turn = numberOf(data.turn)
+    const current = turnState.get(sessionId)?.current
+    nativeCalls.set(nativeCallKey(sessionId, callId), { toolName, turn: turn ?? current })
+    // Only the calls that may still be answered are kept: a Session that runs many calls must not grow this forever.
+    if (nativeCalls.size > NATIVE_CALL_LIMIT) {
+      const oldest = nativeCalls.keys().next()
+      if (!oldest.done) nativeCalls.delete(oldest.value)
+    }
+  }
+
+  /**
+   * Report the refusal the backend's own file sandbox made, when it made one.
+   *
+   * The result is a refusal only when it says so in the structured field the backend uses: the error's own code. A result
+   * whose error is a plain sentence — a malformed escalation, a command that failed, a tool that refused for its own
+   * reasons — carries no code and is no refusal at all. Nothing is ever decided from the text of an error.
+   *
+   * The result is paired with its call by the id both carry, and the call is what names the tool and the turn. A result
+   * without its call, a call of another turn, a call of a tool the backend does not guard and a call the role may not
+   * make are all ignored.
+   */
+  const noteNativeResult = (sessionId: string, event: SessionEvent): void => {
+    if (eventType(event) !== 'tool/result') return
+    const data = eventData(event)
+    if (data === undefined) return
+    const message = recordOf(data.message)
+    if (message === undefined) return
+    if (message.isError !== true) return
+    const toolCallId = firstText(message, ['toolCallId', 'callId'])
+    if (toolCallId === '') return
+    if (fsErrorCodeOf(data) !== FS_SANDBOX_DENIED) return
+    const call = nativeCalls.get(nativeCallKey(sessionId, toolCallId))
+    if (call === undefined) return
+    const guard = sessionGuards.get(sessionId)
+    if (guard === undefined) return
+    // The tool must be one the backend's file sandbox really guards, and one the role may use: a refusal of a tool the
+    // profile denies is a role refusal, and a refusal of a shell call is not a fact about the workspace.
+    if (!NATIVE_FILE_TOOLS.has(call.toolName)) return
+    if (!guard.profile.tools.includes(call.toolName)) return
+    // The turn must be the one that runs right now: a refusal of a turn that is over is a late fact about work that has
+    // already moved on.
+    const current = turnState.get(sessionId)?.current
+    if (call.turn === undefined || current === undefined || call.turn !== current) return
+    nativeCalls.delete(nativeCallKey(sessionId, toolCallId))
+    reportGuardDenial(sessionId, call.toolName, 'WORKSPACE_OUT_OF_BOUNDS', toolCallId)
   }
 
   return {
@@ -369,7 +577,10 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
         applyPermission(agent, profile)
         // Its tool boundary comes before the role's own tools: a mask only filters what the Agent inherits, so the
         // `control_*` registrations that follow stay visible while a role's inherited shell/web tools are hidden.
-        applyToolBoundary(agent, { sessionId, role, profile })
+        sessionGuards.set(sessionId, { role, profile,
+          ...(assignmentId === undefined ? {} : { assignmentId }) })
+        applyToolBoundary(agent, { sessionId, role, profile,
+          ...(assignmentId === undefined ? {} : { assignmentId }) })
         // Tools are ready before any turn can start.
         installTools(agent, { sessionId, role, sessionToken,
           ...(ticketId === undefined ? {} : { ticketId }), ...(assignmentId === undefined ? {} : { assignmentId }) })
@@ -590,6 +801,10 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
           // The node's own turn facts are read in the one place the Session events are already watched: the interrupt
           // names the turn it ends, and a second registration would be a second thing to register and to release.
           noteTurnFact(sessionId, event)
+          // The backend's own file sandbox refuses a call in its result and names the call it belongs to; the call and
+          // its result are read here, where the Session events are already watched.
+          noteNativeCall(sessionId, event)
+          noteNativeResult(sessionId, event)
           const mapped = portEvent(sessionId, event, takeReadyInputs)
           if (mapped) listener(mapped)
         }),
@@ -597,8 +812,13 @@ export function createDshPortHost(input: DshPortHostInput): DshPortHost {
       // The turn facts are facts only while they are observed: a node that stops watching them does not know which turn
       // runs, and says so rather than naming a turn that ended long ago.
       observesSessionEvents = true
+      hostListeners.add(listener)
       return () => {
         for (const dispose of disposers) dispose()
+        hostListeners.delete(listener)
+        // The node stops watching the turn facts only when nobody listens any more: a second listener must not lose the
+        // first one's view of which turn runs.
+        if (hostListeners.size > 0) return
         observesSessionEvents = false
         for (const waiters of turnWaiters.values()) {
           for (const waiter of waiters) {
@@ -768,8 +988,14 @@ interface ToolBoundaryRegistry {
   schemas?(scope?: object): { name: string }[]
   /** Hide inherited tools: `deny` removes, `allow` keeps only the named ones. Own-layer registrations stay visible. */
   restrict?(filter: { allow?: string[]; deny?: string[] }): () => void
-  /** Refuse a call by returning a reason; `undefined` lets the call through. */
-  guard?(guard: (execution: { name: string }) => string | undefined): () => void
+  /**
+   * Refuse a call by returning a reason; `undefined` lets the call through.
+   *
+   * The execution carries the name of the tool, the arguments the call was made with and — when the backend gives one
+   * — the id of the call itself. The arguments are read only to decide whether a call changes the Git metadata of the
+   * workspace; nothing in them is ever reported as a fact.
+   */
+  guard?(guard: (execution: { name: string; arguments?: unknown; callId?: string }) => string | undefined): () => void
 }
 
 /** The Agent's scoped registry, when the backend returned an Agent that has one. */
@@ -804,6 +1030,130 @@ function toolBoundaryReason(role: 'pm' | 'worker' | 'router', allowed: readonly 
   return `A Worker may use only ${names}`
 }
 
+/** The argument names a tool call may carry its path in. */
+const PATH_ARGUMENTS = ['path', 'file_path', 'filePath', 'absolute_path', 'absolutePath'] as const
+
+/**
+ * The refusal a call that changes a file gets when it names the Git metadata of the workspace.
+ *
+ * The decision is lexical: the path the call names is split into its segments and one of them has to be `.git`. Nothing
+ * is resolved on the file system, so the answer is the same on every machine and a path that cannot be judged is not
+ * judged at all — the backend's own sandbox owns the file access, and this rule only keeps the repository's own
+ * bookkeeping out of reach.
+ *
+ * Only a *path argument* is read, and only the path the call names: the output of a command, the text of a file and the
+ * error of a tool are never turned into a security fact.
+ */
+function gitMetadataRefusal(args: unknown): string | undefined {
+  const values = recordOf(args)
+  if (values === undefined) return undefined
+  for (const name of PATH_ARGUMENTS) {
+    const value = values[name]
+    if (typeof value !== 'string' || value.trim() === '') continue
+    if (isGitMetadata(value.trim())) {
+      return 'The Git metadata of the workspace is not the Session\'s to change'
+    }
+  }
+  return undefined
+}
+
+/** Whether a path names the Git metadata of a repository rather than the work in it. */
+function isGitMetadata(path: string): boolean {
+  const parts = path.replace(/\\/g, '/').split('/').filter(part => part !== '' && part !== '.')
+  return parts.some(part => part === '.git')
+}
+
+/** The kind of one Session event, read without narrowing it to the backend's own union. */
+function eventType(event: unknown): string {
+  const record = recordOf(event)
+  return record !== undefined && typeof record.type === 'string' ? record.type : ''
+}
+
+/** The payload of one Session event, read without narrowing it to the backend's own union. */
+function eventData(event: unknown): Record<string, unknown> | undefined {
+  const record = recordOf(event)
+  return record === undefined ? undefined : recordOf(record.data)
+}
+
+/** A value as a record of its fields, when it is an object at all. */
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+/**
+ * The first of the named fields that holds a non-empty text.
+ *
+ * The backend names the same field in more than one shape across its versions, and the field is read under each of the
+ * names it may carry. Nothing else is read, and a field that holds no text is no value at all.
+ */
+function firstText(values: Record<string, unknown>, names: readonly string[]): string {
+  for (const name of names) {
+    const value = values[name]
+    if (typeof value === 'string' && value.trim() !== '') return value.trim()
+  }
+  return ''
+}
+
+/** A whole number, when the value is one. */
+function numberOf(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
+}
+
+/** The key one native tool call is known by: the Session it belongs to and the id the backend gave it. */
+function nativeCallKey(sessionId: string, callId: string): string {
+  return `${sessionId} ${callId}`
+}
+
+/**
+ * The identity the backend gave a tool invocation, when it gave one.
+ *
+ * The identity of the call is what makes a replay of a refusal recognisable as the very same call, so it is read from
+ * the execution the backend hands the guard.
+ */
+function executionCallId(execution: { name: string; callId?: unknown }): string | undefined {
+  const value = execution.callId
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed === '' ? undefined : trimmed
+}
+
+/**
+ * The structured error code a tool result carries, when it carries one.
+ *
+ * The backend puts its own code into the result of a refused call, and that code is the whole fact. The code is read at
+ * the few places a result may carry it — beside the message, under the result's own structured payload and inside the
+ * message's own structured payload — and nowhere else. A result whose error is a plain sentence has no code, and a
+ * sentence is never a fact about a boundary: nothing is ever read from the text of an error.
+ */
+function fsErrorCodeOf(data: Record<string, unknown>): string {
+  const direct = errorCodeOf(data.error)
+  if (direct !== '') return direct
+  const carried = recordOf(data.data)
+  if (carried !== undefined) {
+    const code = errorCodeOf(carried.error)
+    if (code !== '') return code
+  }
+  const message = recordOf(data.message)
+  if (message !== undefined) {
+    const inside = recordOf(message.data)
+    if (inside !== undefined) {
+      const code = errorCodeOf(inside.error)
+      if (code !== '') return code
+    }
+  }
+  return ''
+}
+
+/** The code of a structured error, when the value is one. */
+function errorCodeOf(value: unknown): string {
+  const error = recordOf(value)
+  if (error === undefined) return ''
+  const code = error.code
+  return typeof code === 'string' ? code.trim() : ''
+}
+
 /**
  * Register the role's control-plane proxy tools on the Agent.
  *
@@ -823,11 +1173,13 @@ function registerControlTools(agent: unknown, options: ControlToolOptions): void
 function controlTools(options: ControlToolOptions): ToolDefinition[] {
   if (options.role === 'pm') {
     return [projectTool(options), createTicketsTool(options), messageWorkerTool(options), cancelWorkerTool(options),
-      requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options)]
+      requestAssignmentTool(options), reviewResultTool(options), reviewDiffTool(options), projectReportTool(options),
+      requestAuthorizationTool(options)]
   }
   if (options.role === 'router') return [
     routerSummaryTool(options), routerRequestTool(options, 'projects'), routerRequestTool(options, 'dispatch'),
     routerProjectGateTool(options), routerManageTool(options), routerPmHandoffTool(options), routerPmProposalTool(options),
+    requestAuthorizationTool(options),
   ]
   return [reportTool(options)]
 }
@@ -845,7 +1197,7 @@ function projectTool(options: ControlToolOptions): ToolDefinition {
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
     execute(_args, exec) {
-      return requestControl(options, 'GET', '/v1/tools/pm/context', undefined, exec.signal)
+      return requestControl(options, 'GET', '/v1/tools/pm/context', undefined, exec)
     },
   }
 }
@@ -864,7 +1216,7 @@ function projectReportTool(options: ControlToolOptions): ToolDefinition {
       const arguments_ = argumentsOf(args)
       const kind = arguments_.kind === undefined ? undefined : requiredString(arguments_.kind, 'kind')
       return requestControl(options, 'POST', '/v1/tools/pm/project-report',
-        { summary: requiredString(arguments_.summary, 'summary'), ...(kind === undefined ? {} : { kind }) }, exec.signal)
+        { summary: requiredString(arguments_.summary, 'summary'), ...(kind === undefined ? {} : { kind }) }, exec)
     },
   }
 }
@@ -874,8 +1226,8 @@ function createTicketsTool(options: ControlToolOptions): ToolDefinition {
   return {
     name: 'control_create_tickets',
     description: 'Create 1-5 Tickets in this Project through the control plane. Each Ticket needs a title and a goal; '
-      + 'scope narrows the work, note routes it to the Worker, and threads lists the external "source:id" threads it '
-      + 'subscribes to.',
+      + 'scope narrows the work, note routes it to the Worker, allow_tools narrows the work tools the Worker may use, '
+      + 'and threads lists the external "source:id" threads it subscribes to.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -893,6 +1245,12 @@ function createTicketsTool(options: ControlToolOptions): ToolDefinition {
               goal: { type: 'string', description: 'What the Ticket must achieve.' },
               scope: { type: 'string', description: 'Narrower scope for the Worker.' },
               note: { type: 'string', description: 'Routing note for the Worker.' },
+              allow_tools: {
+                type: 'array',
+                description: 'The work tools the Worker of this Ticket may use. It may only narrow what the Project '
+                  + 'Mandate allows; a wider list is refused.',
+                items: { type: 'string' },
+              },
               threads: {
                 type: 'array',
                 description: 'External threads the Ticket subscribes to.',
@@ -915,7 +1273,40 @@ function createTicketsTool(options: ControlToolOptions): ToolDefinition {
     async execute(args, exec) {
       const input = argumentsOf(args)
       if (!Array.isArray(input.tasks) || input.tasks.length === 0) throw new Error('tasks must be a non-empty array')
-      return requestControl(options, 'POST', '/v1/tools/pm/tickets', { tasks: input.tasks }, exec.signal)
+      return requestControl(options, 'POST', '/v1/tools/pm/tickets', { tasks: input.tasks }, exec)
+    },
+  }
+}
+
+/**
+ * `control_request_authorization`: the explicit human authorization application a superior raises about a permission
+ * denial review.
+ *
+ * It names the review and nothing else. The control plane decides whether the caller may raise it: only the exact
+ * immediate manager of that review may, and only while the edge it governs is still alive. The application is a request
+ * in front of an operator — it grants nothing, changes no Mandate and repeats no refused call — so the tool asks and the
+ * console decides.
+ */
+function requestAuthorizationTool(options: ControlToolOptions): ToolDefinition {
+  return {
+    name: 'control_request_authorization',
+    description: 'Raise an explicit human authorization application about one permission denial review. Name the '
+      + 'review id the review message gave you. The application puts that review in front of an operator in the console; '
+      + 'it grants nothing, it changes no Mandate and it never repeats the refused call. Only the Session the review was '
+      + 'made for may raise it, and only while the work it governs is still alive.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['reviewId'],
+      properties: {
+        reviewId: { type: 'string', description: 'The id of the permission denial review.' },
+      },
+    },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
+    async execute(args, exec) {
+      const input = argumentsOf(args)
+      const reviewId = requiredString(input.reviewId, 'reviewId')
+      return requestControl(options, 'POST', '/v1/tools/denial/authorization', { reviewId }, exec)
     },
   }
 }
@@ -950,7 +1341,7 @@ function messageWorkerTool(options: ControlToolOptions): ToolDefinition {
       const text = requiredString(input.text, 'text')
       const assignmentId = input.assignmentId === undefined ? undefined : requiredString(input.assignmentId, 'assignmentId')
       return requestControl(options, 'POST', '/v1/tools/pm/message',
-        { ticketId, text, ...(assignmentId === undefined ? {} : { assignmentId }) }, exec.signal)
+        { ticketId, text, ...(assignmentId === undefined ? {} : { assignmentId }) }, exec)
     },
   }
 }
@@ -987,7 +1378,7 @@ function cancelWorkerTool(options: ControlToolOptions): ToolDefinition {
       const reason = input.reason === undefined ? undefined : requiredString(input.reason, 'reason')
       return requestControl(options, 'POST', '/v1/tools/pm/cancel',
         { ticketId, ...(assignmentId === undefined ? {} : { assignmentId }), ...(reason === undefined ? {} : { reason }) },
-        exec.signal)
+        exec)
     },
   }
 }
@@ -1022,7 +1413,7 @@ function requestAssignmentTool(options: ControlToolOptions): ToolDefinition {
       const ticketId = requiredString(input.ticketId, 'ticketId')
       const assignmentId = input.assignmentId === undefined ? undefined : requiredString(input.assignmentId, 'assignmentId')
       return requestControl(options, 'POST', '/v1/tools/pm/assignment',
-        { ticketId, ...(assignmentId === undefined ? {} : { assignmentId }) }, exec.signal)
+        { ticketId, ...(assignmentId === undefined ? {} : { assignmentId }) }, exec)
     },
   }
 }
@@ -1069,7 +1460,7 @@ function reviewResultTool(options: ControlToolOptions): ToolDefinition {
       const reason = input.reason === undefined ? undefined : requiredString(input.reason, 'reason')
       if (action === 'reject' && reason === undefined) throw new Error('a rejection needs a reason')
       return requestControl(options, 'POST', '/v1/tools/pm/review',
-        { ticketId, assignmentId, reviewId, action, ...(reason === undefined ? {} : { reason }) }, exec.signal)
+        { ticketId, assignmentId, reviewId, action, ...(reason === undefined ? {} : { reason }) }, exec)
     },
   }
 }
@@ -1109,7 +1500,7 @@ function reviewDiffTool(options: ControlToolOptions): ToolDefinition {
       const ticketId = requiredString(input.ticketId, 'ticketId')
       const reviewId = requiredString(input.reviewId, 'reviewId')
       const assignmentId = requiredString(input.assignmentId, 'assignmentId')
-      return requestControl(options, 'POST', '/v1/tools/pm/diff', { ticketId, reviewId, assignmentId }, exec.signal)
+      return requestControl(options, 'POST', '/v1/tools/pm/diff', { ticketId, reviewId, assignmentId }, exec)
     },
   }
 }
@@ -1129,7 +1520,7 @@ function routerSummaryTool(options: ControlToolOptions): ToolDefinition {
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => textContent(value) },
     execute(_args, exec) {
-      return requestControl(options, 'GET', '/v1/tools/router/summary', undefined, exec.signal)
+      return requestControl(options, 'GET', '/v1/tools/router/summary', undefined, exec)
     },
   }
 }
@@ -1155,7 +1546,7 @@ function routerRequestTool(options: ControlToolOptions, action: 'projects' | 'di
         requestId: requiredString(input.requestId, 'requestId'),
         title: requiredString(input.title, 'title'),
         goal: requiredString(input.goal, 'goal'),
-      }, exec.signal)
+      }, exec)
     },
   }
 }
@@ -1236,7 +1627,7 @@ function routerProjectGateTool(options: ControlToolOptions): ToolDefinition {
       return requestControl(options, 'POST', '/v1/tools/router/project-gate', {
         requestId: requiredString(input.requestId, 'requestId'),
         decision: input.decision,
-      }, exec.signal)
+      }, exec)
     },
   }
 }
@@ -1266,7 +1657,7 @@ function routerManageTool(options: ControlToolOptions): ToolDefinition {
         action: requiredString(input.action, 'action'),
         targetId: requiredString(input.targetId, 'targetId'),
         ...(input.text === undefined ? {} : { text: requiredString(input.text, 'text') }),
-      }, exec.signal)
+      }, exec)
     },
   }
 }
@@ -1319,7 +1710,7 @@ function routerPmHandoffTool(options: ControlToolOptions): ToolDefinition {
       return requestControl(options, 'POST', '/v1/tools/router/pm-handoff', {
         requestId: requiredString(input.requestId, 'requestId'),
         decision: input.decision,
-      }, exec.signal)
+      }, exec)
     },
   }
 }
@@ -1358,7 +1749,7 @@ function routerPmProposalTool(options: ControlToolOptions): ToolDefinition {
       const projectId = requiredString(input.projectId, 'projectId')
       const instruction = requiredString(input.instruction, 'instruction')
       return requestControl(options, 'POST', '/v1/tools/router/pm-proposal',
-        { requestId, projectId, instruction }, exec.signal)
+        { requestId, projectId, instruction }, exec)
     },
   }
 }
@@ -1403,7 +1794,7 @@ function reportTool(options: ControlToolOptions): ToolDefinition {
       return requestControl(options, 'POST', '/v1/tools/worker/report',
         { ticketId, ...(assignmentId === undefined ? {} : { assignmentId }), report,
           ...(callKey === undefined ? {} : { callKey }) },
-        exec.signal)
+        exec)
     },
   }
 }
@@ -1419,8 +1810,14 @@ function reportTool(options: ControlToolOptions): ToolDefinition {
  * never recurses, so a bad control plane cannot turn one tool call into an unbounded loop.
  */
 async function requestControl(options: ControlToolOptions, method: 'GET' | 'POST', path: string, body: unknown,
-  signal: AbortSignal): Promise<unknown> {
-  const first = await sendControl(options, options.credential.current, method, path, body, signal)
+  exec: { signal: AbortSignal }): Promise<unknown> {
+  const signal = exec.signal
+  // The identity of this very tool invocation. The backend's own id is used when it gives one; otherwise the node names
+  // the invocation itself. Either way the identity is made once and travels with the request and with the retry after a
+  // token refresh, so the control plane recognises the retry as the same call: a refused call is neither audited nor
+  // counted twice, and two calls that are really two calls stay two.
+  const callId = toolCallIdOf(exec) ?? randomUUID()
+  const first = await sendControl(options, options.credential.current, method, path, body, signal, callId)
   if (first.ok) return jsonOf(first)
   if (first.status === 401) {
     let refreshed: string | undefined
@@ -1431,7 +1828,7 @@ async function requestControl(options: ControlToolOptions, method: 'GET' | 'POST
     }
     if (refreshed !== undefined) {
       options.credential.current = refreshed
-      const retry = await sendControl(options, refreshed, method, path, body, signal)
+      const retry = await sendControl(options, refreshed, method, path, body, signal, callId)
       if (retry.ok) return jsonOf(retry)
       // At most one refresh per tool call: a retried 401 is the original refusal, not another refresh.
       return retry.status === 401 ? refusalOf(first) : refusalOf(retry)
@@ -1440,12 +1837,26 @@ async function requestControl(options: ControlToolOptions, method: 'GET' | 'POST
   return refusalOf(first)
 }
 
+/**
+ * The identity of one tool invocation, when the backend gives one.
+ *
+ * A backend that names no invocation sends nothing, and the control plane then derives the identity of the call from its
+ * own facts.
+ */
+function toolCallIdOf(exec: unknown): string | undefined {
+  const value = (exec as Partial<{ callId: unknown }>).callId
+  return typeof value === 'string' && value !== '' ? value : undefined
+}
+
 /** One authenticated request with the token that is current at the moment it is built. */
 function sendControl(options: ControlToolOptions, token: string, method: 'GET' | 'POST', path: string, body: unknown,
-  signal: AbortSignal): Promise<Awaited<ReturnType<DshPortFetch>>> {
-  return options.fetch(`${options.baseUrl}${path}`, { method,
-    headers: { authorization: `Bearer ${token}`,
-      ...(method === 'POST' ? { 'content-type': 'application/json' } : {}) },
+  signal: AbortSignal, callId?: string): Promise<Awaited<ReturnType<DshPortFetch>>> {
+  const headers: Record<string, string> = { authorization: `Bearer ${token}` }
+  if (method === 'POST') headers['content-type'] = 'application/json'
+  // The identity of the tool invocation travels with the request: the control plane recognises a retried call as the
+  // very same call, so a refusal is neither audited nor counted twice.
+  if (callId !== undefined) headers['x-superagent-call-id'] = callId
+  return options.fetch(`${options.baseUrl}${path}`, { method, headers,
     ...(method === 'POST' ? { body: JSON.stringify(body) } : {}), signal })
 }
 

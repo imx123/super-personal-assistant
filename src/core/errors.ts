@@ -89,3 +89,19 @@ export class UserError extends Error {
     this.missing = kind === 'missing'
   }
 }
+
+/**
+ * A task that asks for more than the delegation holds.
+ *
+ * The outward answer is the ordinary one: an invalid Project ticket task, with the same code, the same status and the
+ * same body as any other invalid task, so a caller that only knows the old contract sees exactly what it saw before.
+ * The fact behind it is a different one: the list names known work tools, once each, and asks for more than the PM
+ * Mandate allows. That is a Mandate that was exceeded, and the control plane records it as one. A malformed list — an
+ * unknown tool, a duplicate, something that is not an array — stays an ordinary invalid task and is not counted.
+ */
+export class MandateExceededError extends UserError {
+  constructor(reason: string) {
+    super('invalidProjectTask', { reason })
+    this.name = 'MandateExceededError'
+  }
+}

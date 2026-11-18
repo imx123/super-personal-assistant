@@ -61,8 +61,42 @@ Worker 报告沿用当前业务流程。`ready` 是节点工具现有协议里�
 
 标准匹配使用确定性条件与安全正则。可选语义条件仅允许操作员在手动低频订阅中显式配置，并要求确定性前置过滤、无工具只读评估和明确配额，降级时记录 `semantic_eval_degraded`。合成事件验收覆盖授权、重复去重、过期、限流、输入封装与正文中伪造指令。直达的失效目标不触发自动重路由、建 Project 或会话恢复。
 
-## 6. 合流与验收
+## 6. P4-3 权限拒绝审查（实现口径）
 
-- `next` 新增逻辑位于独立模块，控制面保持薄委托。Phase 4 使用 `coordination_deliveries`、`session_stream_subscriptions`、`permission_denial_counters` 和 `external_event_subscriptions`，独立于跨设备的绑定与节点回传去重表。新增记录预留 `node_id`、`backend_id`，协议在 `COORDINATION & MEMORY V1` 尾部区块追加。
+权限拒绝只有一个来源：**守卫真正拒绝的那一次调用**。控制面工具入口与节点工具桥各是一个守卫点，两处都以结构化事实回报，绝不从模型输出、日志行、任意工具报错或不可信请求文本推断。四个原因码是全部： `ROLE_TOOL_DENIED`、`PROJECT_SCOPE_VIOLATION`、`MANDATE_EXCEEDED`、`WORKSPACE_OUT_OF_BOUNDS`。节点离线、可刷新的令牌过期、模型传错 JSON 参数、普通命令非零退出、网络超时、人工停机与 Worker 主动的 `blocked` 报告都不计入。
+
+**双端判定顺序**：`RoleProfile.deny` 先于 `RoleProfile.tools`，被 deny 的名字即使在 allow 列表里也被拒绝；allow 列表之外的名字同样被拒绝。控制面按 Session 记录里的档案名取档案，档案未知即拒绝。节点侧除角色边界外还守工作区，但**只守后端自己守得住的那部分**：后端原生的文件沙箱拒绝了越界写入时，节点读它**结构化**的错误码（`FS_SANDBOX_DENIED`），按工具调用 id 把「调用」与「结果」配对，只在回合、Session、工具三者都对得上时以 `WORKSPACE_OUT_OF_BOUNDS` 上报。节点自己另守一条明确的规则：**改文件的工具**（`write`/`edit`）不得指向工作区的 Git 元数据；判定只看调用点名的路径分段是否含 `.git`，不看绝对路径、不做符号链接解析，也不声称能限制 shell。读工具照常，命令自身的输出、工具的报错文本与模型的话永远不变成安全事实；结果里没有结构化错误码的失败（参数写错的升级请求等）一律忽略。
+
+**可信节点入口**：节点的 `guard.denial` 事件走节点已认证的通道，控制面另行核对来源节点/后端、Session、角色、Assignment 与**当前活动的回合**；迟到、异节点、异后端、代号不符、无回合或原因码不在四个之列的事实一律拒收，不计数。事件里的工具名、原因码与标识符在**落库与事件流之前**先被裁剪成安全字段：被拒调用的参数、路径与报错文本不进入日志。
+
+**调用身份**：节点侧用后端给出的工具调用 id（后端不给时节点自己给这次工具调用起一个），控制面入口用调用方自己带来的 `x-superagent-call-id`（没有时由这次请求自己起一个）。两者都是**调用方可控**的原文，所以控制面一律再按「来源 Session + 生命周期代际」加命名空间：两个 Session 用同一个 id 是两次不同的调用，一个角色无法用同一个头压掉另一个角色的事实；命名空间来自控制面自己的记录，所以重启后重放仍是同一次调用，既不重复审计也不重复计数。没有身份的调用方也不会把五次调用折叠成一次：**每一次真实调用都逐条审计，熔断按真实调用次数计**。
+
+**计数与升级**（`src/control/denial-escalator.ts`，落库 `permission_denial_counters`）：按 `(controlSessionId, ticketId, assignmentEpoch, managerTarget)` 在**滑动窗口**（默认 10 分钟）内统计**有效拒绝** —— 窗口始终覆盖该范围最近 10 分钟的历史，而不是从第一次拒绝起框定的固定窗口，所以滑动时旧数字不会整段清零。有效拒绝是「同一回合、同一工具、同一原因码」的一堵墙（同回合并发折算），但**每一次真实调用都逐条审计**。达到阈值（默认 3）生成一次 `system_denial_review`；审查的身份由**范围 + 窗口当前持有的那几堵墙**派生，所以再次撞同一堵墙不会生成第二次审查，而冷却锁（默认 10 分钟，有限且可配置）**跨窗口滑动继续有效**，两者一起防止唤醒风暴。
+
+**失控熔断**：熔断按**同一回合内的原始拒绝次数**计（默认 5），与升级的语义折算分开，所以同一回合五次独立拒绝会触发一次打断，而同回合重复同一调用只算一次有效拒绝却仍能被熔断看见。熔断绑定**当前真实活动的回合**并以条件写认领，同一回合只打断一次；后续回合与其它回合不受影响。打的是回合打断，**不是整会话停机**：Session 的身份、权限与收件箱都不变。
+
+**升级目标**：项目 Worker → 本项目 PM；独立工单 Worker → Router；PM → Router；Router → 操作员告警（控制台记录，无更上层 Agent）。升级记录与 Worker 主动的 `blocked` 报告分路，互不混写。
+
+**送达的两段认领**：审查行先被**持久化认领**（`pending_manager_online` → `dispatching`）才允许上线路，认领是条件写，重试与并发恢复只有一个能拿到。发出前与线上前**各查一次**：来源 Session 仍然存在、未被撤权、未被人工停机、仍跑着同一个 Assignment、仍拥有它的 Project/工单、仍活在同一代；目标必须是「该 Project 现任 PM」或「Router」，角色与 Session 都要对上。任何一次 `await` 之后都重读目标与代际；**绝不恢复被停掉的上级**。已知未送达（离线、人工停机）的审查保持 `pending_manager_online`，等**那个上级被明确恢复**或**节点重新上线**时再送出，不会定时盲目重试。审查在途时控制面崩溃 → 结果未知（`unconfirmed`），**不再重发**。审查消息与控制台视图只带脱敏、有界的结构化元数据，不带原始参数、绝对路径、工具报错或凭据；审查的原因只存控制面自己的固定措辞，不存节点任意错误串（那里面可能有路径、任务输入或凭据）。
+
+**持久化与恢复**：计数、逐条审计、有效拒绝与审查记录都写在控制面自己的库里。审查按它持有的那几堵墙认领，重启后不会二次唤醒；仍待上线的审查在有证据表明上级可达时按同一幂等键补送一次。
+
+**审查消息里的任务上下文**：审查单除了标识符与原因码，还带一段**有界的、自有范围的受控投影**：Ticket 的阶段、Assignment 的阶段、本范围最近一次报告的类别、该 Ticket 的 review 状态、Project 的阶段。投影只读控制面自己的记录，只读**受治理的那一段**（该 Assignment 所属的 Ticket、该 Session 所属的 Project），**不读**标题、目标、note、路径、报告正文或任何模型/人的原话；没有自有 Ticket 的范围（PM、Router）如实写「无自有工单」，不借用别处的上下文。同一段投影也出现在控制台审查记录里。
+
+**人工授权申请单（§3.2 的 (b) 出口）**：审查单明确告诉上级「可以改方案，或者向操作员申请显式授权」，但只有**真正能走完这条路**才算数：
+
+- **工具**：新增窄口径工具 `control_request_authorization`，只带一个参数：审查 id。它同时挂在 PM 与 Router 的角色档案里（两个都是「直属上级」），Worker 没有。
+- **证据来自已鉴权的调用方**：控制面按**调用方自己的 Session 记录**判定资格 —— 必须是该审查的**直接上级**（`review.targetSessionId` 与调用方 Session 相同、角色相同），必须**未被撤权、未被人工停机**，且该审查必须是其范围**当前**的那一次（被新审查取代的旧审查不算）。Worker、别的 PM、被停机或撤权的上级、乱写的审查 id 一律拒绝。**受治理的那条边必须还活着**：被拒的 Session 仍活在被拒时的那个 Assignment/代际里，上级仍是该工作的现任上级。
+- **一条审查一张申请单**：申请单 id 由审查 id 派生，落库 `denial_authorization_applications`；重复请求读回同一张单（重试干净），不产生第二张。
+- **零授权变化**：申请单只是把审查摆到操作员面前，**不授予任何权限、不改任何 Mandate、不改任何角色的工具表、不重放被拒的调用**。工具本身没有「批准」语义，操作员在控制台的「已知悉 / 不授权」也只是**一条记录**；真正变更 Mandate 或配置仍走操作员自己的既有路径。申请单不携带模型的原话，只带结构化事实（审查 id、范围、原因码、工具、窗口内次数）。
+
+**PM Mandate 守卫（创建工单时）**：`src/core/engine.ts` 的 `prepareAllowTools` 里，「任务显式列出的 `allow_tools` 比 PM Mandate 更宽」原本与「参数写错」同属一类（都是 `invalidProjectTask`）。现在它有**类型化信号** `MandateExceededError`：对外仍是同一个 `invalidProjectTask` 错误体（同样的状态码与同样的文案），对内控制面按**已鉴权请求的调用 id** 记成一条 `MANDATE_EXCEEDED`。**未知工具、重复工具、不是数组、超长等畸形列表仍然只是普通无效任务，不计数**。
+
+**节点侧的收窄 Mandate**：Ticket 的 Mandate 里的 `allowTools` 是 Worker 的委派边界，独立控制面原先**完全忽略**它（Worker 一律拿整份 `worker.v1` 档案）。现在控制面把该 Ticket 的**可信收窄名单**随 `worker.create` 一起交给节点（`RoleProfile.mandateTools`），节点在自己的角色守卫里**在执行前**据此拒绝：角色给了、但委派没给的工具按 `MANDATE_EXCEEDED` 拒绝并上报。委派不管辖的工具（Session 自己的 `control_report` 等）照常可用，与旧插件的 `workOnly` 语义一致。被收窄的工具**仍然对模型可见**——拒绝本身就是控制面要计数与升级的事实，工具直接消失会把事实藏起来。
+
+## 7. 合流与验收
+
+- `next` 新增逻辑位于独立模块，控制面保持薄委托。Phase 4 使用 `coordination_deliveries`、`session_stream_subscriptions`、`permission_denial_counters`（连同 `permission_denial_calls`、`permission_denial_effective`、`permission_denial_reviews`）和 `external_event_subscriptions`，独立于跨设备的绑定与节点回传去重表。新增记录预留 `node_id`、`backend_id`，协议在 `COORDINATION & MEMORY V1` 尾部区块追加。
 - P4-1 验证双 Worker 报告及重启不重复验收。P4-3 验证真实拒绝、冷却与按回合熔断。P4-2 验证程序化单路摘要及水位线。P4-4 验证三种模式及合成事件链路。P4-5 用故障注入验证未发送、已入箱及无回执的恢复分支。
+- P4-3 已落地：`src/control/denial-escalator.ts` 与 `permission_denial_counters`（连同逐条审计表 `permission_denial_calls`、有效拒绝表 `permission_denial_effective`、审查表 `permission_denial_reviews` 与人工授权申请单表 `denial_authorization_applications`），控制面工具入口与节点工具桥双端守卫，`RoleProfile.deny` 先于 `allow` 的判定顺序，节点侧 `guard.denial` 结构化事件、后端原生 `FS_SANDBOX_DENIED` 的配对上报与改文件工具的 Git 元数据边界，协议尾部追加 `GUARD_DENIAL_REASON_CODES` 与 `GuardDenialFacts`。审查单带自有范围的受控任务上下文投影；PM/Router 可用窄口径工具 `control_request_authorization` 就一次审查发起人工授权申请单（一条审查一张、资格取自已鉴权调用方、零授权变化），操作员在控制台用既有鉴权记录一条决定。创建工单时超出 PM Mandate 的 `allow_tools` 有类型化信号（`MandateExceededError`）并按已鉴权请求 id 记为 `MANDATE_EXCEEDED`，畸形列表不计数；节点侧按 Ticket Mandate 的可信收窄名单在执行前拒绝并分类为 `MANDATE_EXCEEDED`。真实 DSH 验收由 Codex 在隔离环境执行，尚未签署。
 - 旧单节点配置和历史数据继续可读。Phase 4 验收前使用隔离副本核对旧插件、Scheduler 和 Phase 3 自动交接。合流后的双 Windows 验收由跨设备负责人执行，集成版本还需复跑已有主线回归。

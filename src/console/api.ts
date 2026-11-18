@@ -484,6 +484,135 @@ export interface CoordinationDelivery {
   error: string
 }
 
+/**
+ * One permission denial review, as the console reads it.
+ *
+ * It carries the facts of the refusal and what became of the review. The message that was sent to a superior is not part
+ * of it, and neither are the arguments of the refused call: the console shows what the guard refused and who heard
+ * about it, never what the model said.
+ */
+export interface DenialReview {
+  /** The review's own id. */
+  noticeId: string
+  /** `system_denial_review` or `operator_denial_alert`. */
+  kind: string
+  /** When the review was made. */
+  at: string
+  /** `pending_manager_online`, `dispatching`, `notified` or `unconfirmed`. */
+  status: string
+  /** The Session that was refused. */
+  controlSessionId: string
+  /** The role of that Session. */
+  role: string
+  /** The Project the Session belongs to. */
+  projectId: string
+  /** The Ticket the Session works on. */
+  ticketId: string
+  /** The Assignment the Session runs. */
+  assignmentId: string
+  /** The turn the refusals were made in. */
+  turnId: string
+  /** The tool that was refused. */
+  toolName: string
+  /** Why it was refused. */
+  reasonCode: string
+  /** How many effective denials the window held. */
+  denialCount: number
+  /** The Session the review went to; empty for an operator alert. */
+  targetSessionId: string
+  /** The role of that Session. */
+  targetRole: string
+  /** The node the refusal came from. */
+  nodeId: string
+  /** The backend the refusal came from. */
+  backendId: string
+  /** Why the review is in that state, when there is something to say. */
+  reason: string
+  /**
+   * The bounded projection of the governed work, in controlled fields only.
+   *
+   * It says which phase the Ticket, the Assignment and the Project are in, which kind of report the own scope made last
+   * and how its review stands. It never carries a title, a goal, a path or a sentence of a person or a model.
+   */
+  taskContext: string
+}
+
+/**
+ * One explicit human authorization application, as the console reads it.
+ *
+ * It names the review it is about, who raised it and what the operator decided. The arguments of the refused call and
+ * the words of the model are not part of it: an application is a request in front of an operator, never a grant.
+ */
+export interface DenialAuthorization {
+  /** The application's own id. */
+  applicationId: string
+  /** The review it is about. */
+  reviewId: string
+  /** `pending`, `acknowledged` or `declined`. */
+  status: string
+  /** The Session that raised it. */
+  applicantSessionId: string
+  /** The role of that Session. */
+  applicantRole: string
+  /** The Session that was refused. */
+  controlSessionId: string
+  /** The Project the refused Session belongs to. */
+  projectId: string
+  /** The Ticket the refused Session works on. */
+  ticketId: string
+  /** The Assignment the refused Session runs. */
+  assignmentId: string
+  /** Why the call was refused. */
+  reasonCode: string
+  /** The tool that was refused. */
+  toolName: string
+  /** How many effective denials the window held. */
+  denialCount: number
+  /** When the application was raised. */
+  requestedAt: string
+  /** When the operator decided about it. */
+  decidedAt: string
+  /** The operator's decision; empty while the application waits. */
+  decision: string
+}
+
+/**
+ * One denial counter, as the console reads it.
+ *
+ * It carries the numbers of one scope's window and nothing else: the refused calls themselves are not listed, and their
+ * arguments are not kept at all.
+ */
+export interface DenialCounter {
+  /** The scope the counter runs in. */
+  scopeKey: string
+  /** The Session the counter belongs to. */
+  controlSessionId: string
+  /** The role of that Session. */
+  role: string
+  /** The Project the Session belongs to. */
+  projectId: string
+  /** The Ticket the Session works on. */
+  ticketId: string
+  /** The Assignment the Session runs. */
+  assignmentId: string
+  /** The superior the denials are escalated to. */
+  managerTarget: string
+  /** The node the refusals came from. */
+  nodeId: string
+  /** The backend the refusals came from. */
+  backendId: string
+  /** When the window opened. */
+  windowStartedAt: string
+  /** How many effective denials the window holds. */
+  windowCount: number
+  /** When the last refusal happened. */
+  lastDenialAt: string
+  /** Until when no new review is made for this scope. */
+  cooldownUntil: string
+  /** The review the window produced, when it produced one. */
+  noticeId: string
+}
+
 /** One node as the control plane knows it. */
 export interface NodeView {  nodeId: string
   backend: string

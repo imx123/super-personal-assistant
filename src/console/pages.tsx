@@ -12,10 +12,10 @@
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import {
   messageOf, put, read, remove, write, type AuditEntry, type ConsoleProject, type ConsoleTicket,
-  type CoordinationDelivery, type FastRouteReceipt, type NodeView, type Overview, type ProjectGateRecord,
-  type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord, type RouterQueueEntry,
-  type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage, type SessionView,
-  type StopNotice,
+  type CoordinationDelivery, type DenialAuthorization, type DenialReview, type FastRouteReceipt, type NodeView, type Overview,
+  type ProjectGateRecord, type ProjectMemoryEntry, type ReconcileFinding, type ReconcileRun, type RouterHandoffRecord,
+  type RouterQueueEntry, type RouterState, type ScheduleCounts, type SchedulePlan, type ScheduleRun, type SessionMessage,
+  type SessionView, type StopNotice,
 } from './api.ts'
 import { Icon } from './icons.tsx'
 import { Markdown } from './markdown.tsx'
@@ -386,6 +386,10 @@ function activityOf(entry: AuditEntry): { title: string; meta: string; icon: str
   if (entry.kind === 'report') {
     return { title: 'Worker 报告', meta: detail, icon: 'chat', tone: entry.action === 'failed' ? 'failure' : '' }
   }
+  if (entry.kind === 'denial') {
+    return { title: entry.action === 'fused' ? '守卫打断了重复越权的回合' : '守卫拒绝了越权调用',
+      meta: detail, icon: 'fail', tone: entry.outcome === 'failed' ? 'failure' : '' }
+  }
   if (entry.kind === 'session' && entry.action.startsWith('reconcile-')) {
     const title = entry.outcome === 'ok' ? '已停止并归档残留会话'
       : entry.outcome === 'failed' ? '会话清理失败' : '会话检查发现异常'
@@ -505,11 +509,38 @@ const COORDINATION_STATUS: Record<string, string> = {
   deferred_for_resume: '等待项目恢复',
 }
 
+/** How a denial review reads in the console's own words. */
+const DENIAL_STATUS: Record<string, string> = {
+  pending_manager_online: '等待上级上线',
+  dispatching: '正在送达',
+  notified: '已通知上级',
+  unconfirmed: '节点未确认是否送达',
+}
+
+/**
+ * How an authorization application reads in the console's own words.
+ *
+ * The states say what the record is, never what was granted: an acknowledged application was noted by an operator, and
+ * nothing was authorized by it.
+ */
+const APPLICATION_STATUS: Record<string, string> = {
+  pending: '等待操作员决定',
+  acknowledged: '操作员已知悉（未授予权限）',
+  declined: '操作员不授权',
+}
+
 /** How the console shows a delivery's state: done, broken, or still on its way. */
 function coordinationTone(status: string): string {
   if (status === 'delivered_inbox' || status === 'consumed_turn') return 'success'
   if (status === 'unconfirmed' || status === 'failed_permanent' || status === 'blocked_node_unavailable') return 'failure'
   if (status === 'blocked_target_inactive' || status === 'rejected_stale_or_revoked') return 'failure'
+  return 'muted'
+}
+
+/** How the console shows a denial review's state. */
+function denialTone(status: string): string {
+  if (status === 'notified') return 'success'
+  if (status === 'unconfirmed') return 'failure'
   return 'muted'
 }
 
@@ -753,6 +784,8 @@ export function HomePage(props: PageProps): ReactElement {
   const router = useLoaded(() => read<RouterState>('/v1/console/router'), props.revision)
   const coordination = useLoaded(() => read<{ deliveries: CoordinationDelivery[] }>(
     '/v1/console/coordination/deliveries?limit=24'), props.revision)
+  const denials = useLoaded(() => read<{ reviews: DenialReview[]; applications: DenialAuthorization[] }>(
+    '/v1/console/denials?limit=24'), props.revision)
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<(RouterTextAttachment & { bytes: number })[]>([])
   const [attachmentError, setAttachmentError] = useState('')
@@ -769,6 +802,8 @@ export function HomePage(props: PageProps): ReactElement {
   const gates: ProjectGateRecord[] = router.data?.gates ?? []
   const handoffs: RouterHandoffRecord[] = router.data?.handoffs ?? []
   const deliveries: CoordinationDelivery[] = coordination.data?.deliveries ?? []
+  const denialReviews: DenialReview[] = denials.data?.reviews ?? []
+  const denialApplications: DenialAuthorization[] = denials.data?.applications ?? []
   const online = router.data?.nodeOnline !== false
   const thread = useRef<HTMLDivElement>(null)
   const input = useRef<HTMLTextAreaElement>(null)
@@ -1080,7 +1115,117 @@ export function HomePage(props: PageProps): ReactElement {
         </div>
         <CoordinationDeliveries deliveries={deliveries} />
       </section>
+
+      <section className="section" aria-labelledby="denials-title">
+        <div className="section-heading">
+          <h2 id="denials-title">权限拒绝审查</h2>
+          <span className="quiet">守卫拒绝的调用与上级审查结果</span>
+        </div>
+        <DenialReviews reviews={denialReviews} />
+        <DenialAuthorizations applications={denialApplications} refresh={props.refresh} />
+      </section>
     </>
+  )
+}
+
+/**
+ * The explicit human authorization applications the superiors raised, as the console shows them.
+ *
+ * A superior raised an application about one permission denial review and the operator decides about it here. The
+ * decision is a record and nothing else: it grants no capability, widens no Mandate and repeats no refused call, so the
+ * panel says so instead of pretending that anything was authorized. Any real change goes through the operator's own
+ * path in the console.
+ */
+function DenialAuthorizations(props: { applications: DenialAuthorization[]; refresh: () => void }): ReactElement {
+  const action = useAction(props.refresh)
+  return (
+    <div className="router-queue" aria-label="人工授权申请单">
+      <h3>人工授权申请单</h3>
+      <p className="quiet">
+        上级就一次权限拒绝审查发起的人工授权申请。记录一条决定不会授予任何权限，也不会重放被拒的调用；真正的 Mandate 或配置变更仍走操作员自己的路径。
+      </p>
+      {props.applications.length === 0
+        ? <p className="empty">还没有人工授权申请单。</p>
+        : <ul className="router-queue-list">
+          {props.applications.map(application => (
+            <li key={application.applicationId} className={application.status === 'declined' ? 'failure' : ''}>
+              <span className="router-queue-text">
+                {application.applicantRole} · {application.reasonCode} · {application.toolName}
+              </span>
+              <span className={`chip ${application.status === 'acknowledged' ? 'success' : application.status === 'declined' ? 'failure' : 'muted'}`}>
+                {APPLICATION_STATUS[application.status] ?? application.status}
+              </span>
+              <span className="quiet">
+                {' '}· 审查 {application.reviewId}
+                {' '}· 会话 {application.controlSessionId}
+                {application.ticketId === '' ? '' : ` · 工单 ${application.ticketId}`}
+                {' '}· 窗口内 {application.denialCount} 次
+              </span>
+              {application.status === 'pending'
+                ? <div className="detail-actions">
+                  <button type="button" className="action" disabled={action.state.busy}
+                    onClick={() => action.run(async () => {
+                      await write('/v1/console/denials/authorizations',
+                        { applicationId: application.applicationId, decision: 'acknowledged' })
+                      props.refresh()
+                    }, '已记录决定：操作员已知悉，未授予任何权限')}>
+                    {action.state.busy ? '正在记录…' : '记录：已知悉'}
+                  </button>
+                  <button type="button" className="action" disabled={action.state.busy}
+                    onClick={() => action.run(async () => {
+                      await write('/v1/console/denials/authorizations',
+                        { applicationId: application.applicationId, decision: 'declined' })
+                      props.refresh()
+                    }, '已记录决定：不授权')}>
+                    {action.state.busy ? '正在记录…' : '记录：不授权'}
+                  </button>
+                </div>
+                : null}
+            </li>
+          ))}
+        </ul>}
+      <ActionLine state={action.state} />
+    </div>
+  )
+}
+
+/**
+ * The permission denials the guards refused, as the console shows them.
+ *
+ * It shows what each refusal was, which reason code it carried, how many the window held and what became of the review.
+ * The message that was sent to a superior is not shown, and neither are the arguments of the refused call: the console
+ * shows the facts of a refusal, never what the model said.
+ */
+function DenialReviews(props: { reviews: DenialReview[] }): ReactElement {
+  return (
+    <div className="router-queue" aria-label="权限拒绝审查记录">
+      <p className="quiet">守卫拒绝的调用、原因码与上级审查结果。被拒调用的参数不出现在这里。</p>
+      {props.reviews.length === 0
+        ? <p className="empty">还没有权限拒绝记录。</p>
+        : <ul className="router-queue-list">
+          {props.reviews.map(review => (
+            <li key={review.noticeId} className={denialTone(review.status) === 'failure' ? 'failure' : ''}>
+              <span className="router-queue-text">
+                {review.role} · {review.reasonCode} · {review.toolName}
+              </span>
+              <span className={`chip ${denialTone(review.status)}`}>
+                {DENIAL_STATUS[review.status] ?? review.status}
+              </span>
+              <span className="quiet">
+                {' '}· 会话 {review.controlSessionId}
+                {review.ticketId === '' ? '' : ` · 工单 ${review.ticketId}`}
+                {review.assignmentId === '' ? '' : ` · 执行 ${review.assignmentId}`}
+              </span>
+              <span className="quiet"> · 窗口内 {review.denialCount} 次</span>
+              {review.targetSessionId === ''
+                ? <span className="quiet"> · 通知操作员</span>
+                : <span className="quiet"> · 目标 {review.targetSessionId}（{review.targetRole}）</span>}
+              {review.reason ? <span className="quiet"> · {review.reason}</span> : null}
+              {review.taskContext === '' ? null : <span className="quiet"> · {review.taskContext}</span>}
+            </li>
+          ))}
+        </ul>}
+    </div>
   )
 }
 

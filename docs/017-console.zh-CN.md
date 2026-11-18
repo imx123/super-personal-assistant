@@ -24,6 +24,10 @@ node lib/control.js
 | `SUPERAGENT_CONSOLE_DB` | 保存事件日志、操作日志、项目备忘、会话检查和定时任务。默认在业务数据库旁创建 `console.sqlite` |
 | `SUPERAGENT_RECONCILE_INTERVAL_MS` | 自动清理残留会话的间隔（毫秒）。默认 `0`，可在「节点部署」页手动检查 |
 | `SUPERAGENT_REPORT_PROGRESS_INTERVAL_MS` | 同一上级收到两条普通进展报告的最小间隔（毫秒）。默认 `60000`；`0` = 每条普通进展立刻送达。终态、阻塞、失败不受节流影响 |
+| `SUPERAGENT_DENIAL_WINDOW_MS` | 权限拒绝计数的滑动窗口宽度（毫秒）。默认 `600000`（十分钟） |
+| `SUPERAGENT_DENIAL_THRESHOLD` | 一个窗口内累计多少次有效拒绝才生成一次上级审查。默认 `3` |
+| `SUPERAGENT_DENIAL_COOLDOWN_MS` | 一次审查之后同一范围安静多久（毫秒）。默认 `600000`；上界有限 |
+| `SUPERAGENT_DENIAL_FUSE_LIMIT` | 同一回合内多少次被拒调用会打断该回合。默认 `5`；打断的是回合，不是整会话 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 定时任务使用的 UTC 偏移（分钟，向东为正）。默认 `0`（UTC）。 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 调度器查看「到点计划」的周期（毫秒）。默认 5 秒；`0` = 只存计划，不自己到点跑 |
 
@@ -43,6 +47,8 @@ node lib/control.js
 | 首页 · 运行概览 | 工作进行中（最新 Assignment 在跑的 Ticket）、Worker 正在执行（Session 状态为 `running`，**空闲不算**）、待 PM 验收（有 pending review 的 Ticket）、定时任务失败 | `GET /v1/overview` |
 | 首页 · 近期动向 | 控制面审计记录：项目创建、PM 分派、Assignment 启动、Worker 报告、PM 验收/返工、节点上下线、操作员的会话动作，以及**定时任务的写入与每一次运行的结果**。列表读 24 条、显示 8 条；如果最新的 8 条里没有 PM/Worker 自己的事实（工单、Assignment、报告、验收、会话），就补上最近的一条——定时任务跑得再勤，也不会把工作本身的记录挤下去 | `GET /v1/audit?limit=24` |
 | 首页 · 报告投递 | Worker 与 PM 的报告投递给谁、投递到哪一步：目标会话、报告类别、状态、节点/后端、尝试次数与失败原因。记录在控制面自己的库里，重启后仍在。**报告正文不在这里展示** —— 那是下级的原话，控制台只展示投递的事实 | `GET /v1/console/coordination/deliveries` |
+| 首页 · 权限拒绝审查 | 守卫拒绝的调用：角色、原因码、工具、窗口内次数、目标会话与审查状态（等待上级上线 / 正在送达 / 已通知上级 / 节点未确认是否送达），以及**自有范围的受控任务上下文**（Ticket / Assignment / Project 的阶段、最近一次报告的类别、review 状态）。记录在控制面自己的库里，重启后仍在。**被拒调用的参数不出现在这里** —— 控制台只展示拒绝的事实，不展示模型说了什么 | `GET /v1/console/denials` |
+| 首页 · 人工授权申请单 | 上级就一次权限拒绝审查发起的人工授权申请单：审查 id、被拒会话、范围、原因码、工具、窗口内次数、发起者与状态。操作员可以记录一条决定（已知悉 / 不授权）。**记录一条决定不授予任何权限**，也不重放被拒的调用；真正变更 Mandate 或配置仍走操作员自己的既有路径。申请单不携带模型的原话 | `GET /v1/console/denials`、`POST /v1/console/denials/authorizations` |
 | 项目 | 真实 Project；每个 Ticket 的状态由**内核**推导（`pmTicketStatus`），前端不自己算 | `GET /v1/console/projects` |
 | 会话 | 真实 PM/Worker Session（状态、Project、Assignment、工作区、DSH 会话 ID、会话令牌版本、权限状态）与节点上报的真实消息事件 | `GET /v1/sessions`、`GET /v1/console/sessions/:id/messages` |
 | 定时任务 | 查看定时任务的运行规则、任务时区、下次运行时间和历史记录。发送失败时可查看原因 | `GET /v1/console/schedules`、`POST /v1/console/schedules`、`PUT/DELETE /v1/console/schedules/:id`、`POST /v1/console/schedules/:id/pause|resume|run`、`GET /v1/console/schedules/:id/runs` |

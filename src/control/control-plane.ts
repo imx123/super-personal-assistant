@@ -5,22 +5,25 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { lockSync } from 'proper-lockfile'
 import { Store } from '../app/store.ts'
 import { assignmentStopped, canRetry, currentReview, latestAssignment, pendingReview, runningAssignment, waitsForPerson,
+  MandateExceededError, WORK_TOOLS,
   type Assignment, type AssignmentState, type ProjectProfile, type ProjectReport, type ProjectTicketTask, type Ticket,
   type TicketInput, type TicketMessageDelivery, type TicketReview, type Trigger, type WorkerReport } from '../core/index.ts'
 import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { redact } from '../infra/redact.ts'
 import { NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
-  type ProjectGateCondition } from '../shared/protocol.ts'
+  GUARD_DENIAL_REASON_CODES, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
 import type { ConsoleRuntimeSettings, NodeCommand, NodeEvent, NodePort, NodeRegistration, NodeStatus, OperatorStop, ReviewDiffResult, RoleProfile, RouterModel,
   RouterOptions, RouterTextAttachment,
-  SessionInspection, SessionRecord, SessionStatus } from '../shared/protocol.ts'
+  SessionInspection, SessionRecord, SessionStatus, GuardDenialFacts } from '../shared/protocol.ts'
 import { issueSessionToken, verifySessionToken, type SessionTokenClaims } from '../shared/session-token.ts'
 import { workspaceDirectory } from '../shared/workspace-path.ts'
 import { AuditRecorder, type AuditActor } from './console-audit.ts'
 import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectGateRow,
   type ProjectMemoryRow, type RouterHandoffRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
+import { DenialEscalator, denialCallId, DenialAuthorizationError, type DenialAuthorizationView, type DenialCounterView,
+  type DenialFact, type DenialReviewView } from './denial-escalator.ts'
 import { NodeExecutor, type DeliveryOutcome } from './executor.ts'
 import { asksForAuthority, asksForIrreversible, FAST_ROUTE_MIN_CONFIDENCE, fastRoute, type FastRouteDecision, type FastRouteFacts, type FastRouteOutcome,
   type FastRouteStage, type FastRouteTarget } from './fast-router.ts'
@@ -41,7 +44,7 @@ import { RouterRequests, routerAutoInstructionMessage, routerInstructionMessage,
   type RouterManagement, routerProjectReportMessage, type RouterProposal, type RouterRequest } from './router.ts'
 import { DEFAULT_TICK_MS, Scheduler, type ScheduleAuditEntry, type ScheduleDelivery, type ScheduleDeliveryResult, type ScheduleOverview,
   type SchedulePlan, type ScheduleRun } from './scheduler.ts'
-import { PM_PROFILE, ROUTER_PROFILE, WORKER_PROFILE } from './roles.ts'
+import { PM_PROFILE, ROUTER_PROFILE, WORKER_PROFILE, profileFor, roleToolDecision } from './roles.ts'
 
 /**
  * Statuses a node reported that already settle an ensure. A record in one of them is a Session whose lifecycle is known,
@@ -416,6 +419,14 @@ export class SessionEnsureError extends Error {
 export type ToolCallErrorCode = 'unauthenticated' | 'forbidden' | 'invalid'
 
 /**
+ * The backend this control plane runs on.
+ *
+ * Every fact about a refusal names the backend that decided it, so a fact that claims another backend is not a fact
+ * about this control plane's work.
+ */
+const CONTROL_BACKEND = 'dsh'
+
+/**
  * A refused control-plane tool call.
  *
  * The message is safe to return to the caller: it names no token, secret or Session of another Project, so a Worker can
@@ -425,6 +436,21 @@ export class ToolCallError extends Error {
   constructor(readonly code: ToolCallErrorCode, message: string) {
     super(message)
     this.name = 'ToolCallError'
+  }
+}
+
+/**
+ * A call that reached outside the Session's own Project.
+ *
+ * The refusal the caller sees is the ordinary one: a Ticket of another Project is unknown to it, so the answer says
+ * nothing about whether that Project's work exists at all. The structured reason is what the control plane keeps: it says
+ * the call reached outside the caller's own Project, which is a fact about the refusal and never about the other
+ * Project's Ticket, its id, its title or its arguments.
+ */
+export class ProjectScopeViolationError extends ToolCallError {
+  constructor(readonly reason: 'PROJECT_SCOPE_VIOLATION', message: string) {
+    super('invalid', message)
+    this.name = 'ProjectScopeViolationError'
   }
 }
 
@@ -544,6 +570,34 @@ export interface ControlPlaneOptions {
    * dropped work are never held back: they are state changes the superior has to see at once.
    */
   reportProgressIntervalMs?: number
+  /**
+   * The width of the window the permission denials are counted in, in milliseconds.
+   *
+   * The default is ten minutes. The window is a sliding one: a refusal that arrives after the window closed starts a new
+   * one, so a burst of yesterday never wakes a superior today.
+   */
+  denialWindowMs?: number
+  /**
+   * How many effective denials in one window make a review of the work.
+   *
+   * The default is three: one refusal may be a mistake, three are a wall. A burst of identical refusals in one turn counts
+   * once, so a batch of parallel calls cannot make a review by itself.
+   */
+  denialThreshold?: number
+  /**
+   * How long one scope stays quiet after a review, in milliseconds.
+   *
+   * The default is ten minutes. The cooldown is finite on purpose: a cooldown that never ends would silence the escalation
+   * for good, and a wall nobody sees is a wall nobody fixes.
+   */
+  denialCooldownMs?: number
+  /**
+   * How many refused calls in one turn end that turn.
+   *
+   * The default is five. The turn is interrupted, never stopped: the Session keeps its identity, its authority and its
+   * inbox, and only the turn that keeps hitting the same wall is ended.
+   */
+  denialFuseLimit?: number
 }
 
 export interface ControlPlaneState {
@@ -1401,6 +1455,91 @@ function turnNumber(data: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
+/**
+ * The facts of one refusal the node's tool guard reported, when they are a refusal this control plane may count.
+ *
+ * The payload is untrusted protocol data: only a plain tool name, one of the four reason codes and the bounded
+ * identifiers of the call are read, and everything else in it is dropped. A fact that names another reason code, a tool
+ * name that is not a plain name or an identity that is not an identity is not a permission denial, and it is refused
+ * rather than guessed at.
+ */
+function guardDenialFacts(data: unknown): GuardDenialFacts | undefined {
+  if (typeof data !== 'object' || data === null) return undefined
+  const raw = data as { toolName?: unknown; reasonCode?: unknown; turnId?: unknown; callId?: unknown; backend?: unknown }
+  const toolName = safeToolName(raw.toolName)
+  if (toolName === '') return undefined
+  const reasonCode = typeof raw.reasonCode === 'string' ? raw.reasonCode.trim() : ''
+  if (!GUARD_DENIAL_REASON_CODES.includes(reasonCode as GuardDenialReasonCode)) return undefined
+  const turnId = safeIdentity(raw.turnId)
+  const callId = safeIdentity(raw.callId)
+  const backend = safeIdentity(raw.backend)
+  return {
+    toolName,
+    reasonCode: reasonCode as GuardDenialReasonCode,
+    ...(turnId === '' ? {} : { turnId }),
+    ...(callId === '' ? {} : { callId }),
+    ...(backend === '' ? {} : { backend }),
+  }
+}
+
+/**
+ * The facts of a refusal, as the event log and the event stream may keep them.
+ *
+ * Only the tool's name, the reason code and the identifiers of the call survive. The arguments of a refused call, a path
+ * and the text of an error are the lower-trust data of a model that was already told no, and they never reach the durable
+ * log or the stream: a refusal that carries more than these fields is written as the empty husk of a refusal.
+ */
+function sanitizedGuardDenial(data: unknown): unknown {
+  const facts = guardDenialFacts(data)
+  if (facts === undefined) return { toolName: '', reasonCode: '' }
+  return {
+    toolName: facts.toolName,
+    reasonCode: facts.reasonCode,
+    ...(facts.turnId === undefined ? {} : { turnId: facts.turnId }),
+    ...(facts.callId === undefined ? {} : { callId: facts.callId }),
+    ...(facts.backend === undefined ? {} : { backend: facts.backend }),
+  }
+}
+
+/**
+ * A tool name this control plane may keep.
+ *
+ * A tool name is a plain name: letters, digits, dots, dashes, colons and underscores, and nothing else. A name that is
+ * not one of those is not a tool name, and it is never recorded.
+ */
+const SAFE_TOOL_NAME = /^[A-Za-z0-9_.:-]{1,64}$/
+
+/** The tool name of a refusal, when the value is one this control plane may keep. */
+function safeToolName(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  return SAFE_TOOL_NAME.test(trimmed) ? trimmed : ''
+}
+
+/**
+ * An identifier this control plane may keep.
+ *
+ * An identifier is a bounded token without whitespace and without control characters: a turn number, a tool call id, a
+ * backend name. Anything else is not an identifier, and it is never recorded.
+ */
+function safeIdentity(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const trimmed = value.trim()
+  if (trimmed === '' || trimmed.length > 128) return ''
+  for (const character of trimmed) {
+    const code = character.codePointAt(0) ?? 0
+    if (code <= 0x20 || code === 0x7f) return ''
+  }
+  return trimmed
+}
+
+/** The role a tool route belongs to, in the words the refusals have always used. */
+function toolRoleLabel(role: 'pm' | 'worker' | 'router'): string {
+  if (role === 'pm') return 'PM'
+  if (role === 'router') return 'Router'
+  return 'Worker'
+}
+
 /** The shape of a message id a person may choose for themselves: a UUID. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
@@ -1494,6 +1633,21 @@ export class ControlPlane {
    * delivery really did.
    */
   private readonly reports: ReportCoordinator
+  /**
+   * The escalation of the permission denials the control plane and the node's tool bridge refuse.
+   *
+   * It owns the counters, the burst folding, the fuse and the reviews; the control plane owns the facts of a refusal and
+   * the delivery of a review. A denial is only ever a fact about a refusal that a guard decided, never a guess made from
+   * a model's output, a log line or an arbitrary tool error.
+   */
+  private readonly denials: DenialEscalator
+  /**
+   * The escalations a refusal started and that have not settled yet.
+   *
+   * A refused tool call is answered at once and the escalation follows in the background: the caller never waits for a
+   * message to a superior. The work is kept so a shutdown, a test or an operator can wait for it to settle.
+   */
+  private readonly denialWork = new Set<Promise<unknown>>()
   readonly sessions = new Map<string, SessionRecord>()
   readonly nodes = new Map<string, NodeStatus>()
   readonly events: NodeEvent[] = []
@@ -1622,6 +1776,8 @@ export class ControlPlane {
   private trustEpoch = 0
   /** Whether the deliveries a previous run left open have already been looked at. */
   private reportRecoveryDone = false
+  /** Whether the denial reviews a previous run left open have already been looked at. */
+  private denialRecoveryDone = false
   /** The periodic heartbeat timer, owned by this kernel so `close` can stop it. */
   private heartbeatTimer: ReturnType<typeof setTimeout> | undefined
   /** Whether the loop is running; also true while a beat is in flight, when no timer exists yet. */
@@ -1765,6 +1921,31 @@ export class ControlPlane {
         targetEpochs: sessionId => this.targetEpochs(sessionId),
         nodeTrustEpoch: () => this.trustEpoch,
       }, { progressIntervalMs: options.reportProgressIntervalMs })
+      // The escalation of the permission denials: its records live in this control plane's own file, next to the counters
+      // they count and the reviews they made. The control plane owns the facts and the delivery; this module owns the
+      // counting, the burst folding, the fuse and the routing.
+      this.denials = new DenialEscalator(this.store, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        session: sessionId => this.sessions.get(sessionId),
+        project: projectId => this.store.projects.get(projectId),
+        ticketOfAssignment: assignmentId => this.ticketOfAssignment(assignmentId),
+        routerSessionId: () => ROUTER_SESSION_ID,
+        currentTurn: sessionId => this.sessionTurns.get(sessionId),
+        targetEpochs: sessionId => this.targetEpochs(sessionId),
+        resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
+        resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
+        deliver: (sessionId, text, idempotencyKey, validateForSend) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend),
+        interruptTurn: (sessionId, reason, turn) => this.interruptTurn(sessionId, reason, turn),
+        audit: input => { this.audit.record(input) },
+      }, {
+        ...(options.denialWindowMs === undefined ? {} : { windowMs: options.denialWindowMs }),
+        ...(options.denialThreshold === undefined ? {} : { threshold: options.denialThreshold }),
+        ...(options.denialCooldownMs === undefined ? {} : { cooldownMs: options.denialCooldownMs }),
+        ...(options.denialFuseLimit === undefined ? {} : { fuseLimit: options.denialFuseLimit }),
+      })
       // The scheduler keeps its plans in the console's own file, in tables of its own: the domain's schema is untouched, and
       // an old plugin binary never opens this file. The kernel owns the delivery — it is the only one that knows a Project's
       // PM Session and whether the node really holds it.
@@ -1909,6 +2090,25 @@ export class ControlPlane {
       registration: value })
     // The node is there: the deliveries a previous run left open can be looked at now, and only now.
     await this.recoverReportDeliveries()
+    await this.recoverDenials()
+  }
+
+  /**
+   * Look at the denial reviews a previous run of this control plane left open.
+   *
+   * A review that waited for a superior that could not be reached is carried out again under its own key: the key is the
+   * review's id, and the node executes a repeated key at most once, so a review that already arrived is never delivered
+   * twice. A review that was notified, and one whose outcome is unknown, are left alone.
+   */
+  private async recoverDenials(): Promise<void> {
+    if (this.denialRecoveryDone) return
+    this.denialRecoveryDone = true
+    try {
+      await this.denials.recover()
+    } catch (error) {
+      // A recovery that fails is a diagnostic: the records stay as they are and the work continues.
+      process.stderr.write(`superagent control-plane denial recovery failed: ${messageOf(error)}\n`)
+    }
   }
 
   /**
@@ -4497,15 +4697,28 @@ export class ControlPlane {
    *
    * The Session, not the request body, names the Project: a PM Session only manages the Project whose `pmSessionId` it
    * is, and the Engine's own `notProjectPm` check is the second line of defense behind this one.
+   *
+   * A task that asks for more tools than the PM Mandate holds is a Mandate that was exceeded, and it is recorded as one
+   * — under the identity of the call the caller proved. The caller still sees the ordinary answer: an invalid task, with
+   * the same status and the same body as any other invalid task. A malformed tool list stays an ordinary invalid task
+   * and is not counted.
    */
-  pmCreateTickets(sessionId: string, tasks: readonly ProjectTicketTask[]): Ticket[] {
+  pmCreateTickets(sessionId: string, tasks: readonly ProjectTicketTask[], callId?: string): Ticket[] {
     const record = this.requireToolSession(sessionId, 'pm')
     const project = this.store.projects.get(record.projectId)
     if (!project) throw new ToolCallError('invalid', `Unknown Project ${record.projectId}`)
     if (project.pmSessionId !== sessionId) {
       throw new ToolCallError('forbidden', 'Only this Project\'s PM Session may create its Tickets')
     }
-    const tickets = this.engine.createProjectTickets(project.id, sessionId, tasks)
+    let tickets: Ticket[]
+    try {
+      tickets = this.engine.createProjectTickets(project.id, sessionId, tasks)
+    } catch (error) {
+      if (error instanceof MandateExceededError) {
+        this.recordDenial(record, 'control_create_tickets', 'MANDATE_EXCEEDED', callId)
+      }
+      throw error
+    }
     // The PM's own dispatch of work: one entry per Ticket it created, with the Ticket's own title and nothing else.
     this.auditTicketsCreated(project, tickets)
     return tickets
@@ -5092,10 +5305,18 @@ export class ControlPlane {
   /**
    * A Ticket of the caller's own Project, read from the persistent record. A Ticket of another Project is unknown to the
    * caller, so its existence is never confirmed across the Project boundary.
+   *
+   * The two refusals are told apart, but only inside the control plane. A Ticket that does not exist at all is an ordinary
+   * invalid call, while a Ticket that exists and belongs to another Project is a call that reached outside the caller's own
+   * Project. The second one is refused with the very same answer as the first — the caller learns nothing about another
+   * Project's work — and it carries a typed reason, so the HTTP ingress can record it as the permission denial it is.
    */
   private requireProjectTicket(project: ProjectProfile, ticketId: string): Ticket {
     const ticket = this.store.tickets.get(ticketId)
-    if (!ticket || ticket.projectId !== project.id) throw new ToolCallError('invalid', `Unknown ticket ${ticketId}`)
+    if (!ticket) throw new ToolCallError('invalid', `Unknown ticket ${ticketId}`)
+    if (ticket.projectId !== project.id) {
+      throw new ProjectScopeViolationError('PROJECT_SCOPE_VIOLATION', `Unknown ticket ${ticketId}`)
+    }
     return ticket
   }
 
@@ -5164,7 +5385,7 @@ export class ControlPlane {
    * the report and never fails the Worker's own call.
    */
   workerReport(sessionId: string, ticketId: string, assignmentId: string | undefined, report: WorkerReport,
-    callKey?: string): Ticket {
+    callKey?: string, toolCallId?: string): Ticket {
     const record = this.requireToolSession(sessionId, 'worker')
     const own = record.assignmentId
     if (!own) throw new ToolCallError('forbidden', 'This Worker Session has no Assignment')
@@ -5173,6 +5394,12 @@ export class ControlPlane {
     }
     const ticket = this.store.tickets.get(ticketId)
     if (!ticket || (ticket.projectId ?? ticket.id) !== record.projectId) {
+      // A Ticket of another Project is a fact the caller is not told: the refusal says only that the Ticket is unknown,
+      // exactly as it always did. The control plane still knows what happened, and the fact is recorded as the scope
+      // violation it is — for the operator and for the review that may follow, never for the model that made the call.
+      if (ticket !== undefined) {
+        this.recordDenial(record, 'control_report', 'PROJECT_SCOPE_VIOLATION', toolCallId)
+      }
       throw new ToolCallError('invalid', `Unknown ticket ${ticketId}`)
     }
     const current = ticket.assignments.at(-1)
@@ -5571,6 +5798,235 @@ export class ControlPlane {
   }
 
   /**
+   * The tool a Session may call, decided by the role profile it was created with.
+   *
+   * This is the control plane's own tool ingress guard, and it is the authority: the Session's profile is its whole
+   * capability set, and `deny` is read before `tools`, so a name the profile denies is refused even when the allow list
+   * would have let it through.
+   *
+   * A refusal is a *typed* fact, never a guess. The decision is made from the profile alone — not from a model's output,
+   * a log line, an arbitrary tool error or a piece of untrusted request text — and only such a decision is recorded as a
+   * permission denial.
+   *
+   * The refusal is recorded before it is thrown, and the escalation it may cause is carried out afterwards: the caller is
+   * never made to wait for a message to a superior.
+   */
+  requireTool(sessionId: string, toolName: string, role: 'pm' | 'worker' | 'router' | readonly ('pm' | 'worker' | 'router')[],
+    callId?: string): void {
+    const record = this.sessions.get(sessionId)
+    if (!record) throw new ToolCallError('unauthenticated', `Unknown Session ${sessionId}`)
+    // A tool that two roles share names both of them: the Session must hold one of them, and a Session that holds
+    // neither is refused exactly as a Session of the wrong role is.
+    const roles: readonly ('pm' | 'worker' | 'router')[] = typeof role === 'string' ? [role] : role
+    if (!roles.some(item => item === record.role)) {
+      this.recordDenial(record, toolName, 'ROLE_TOOL_DENIED', callId)
+      throw new ToolCallError('forbidden', `A ${roles.map(item => toolRoleLabel(item)).join(' or ')} Session token is required`)
+    }
+    const decision = roleToolDecision(profileFor(record.toolProfile), toolName)
+    if (!decision.allowed) {
+      this.recordDenial(record, toolName, decision.reasonCode ?? 'ROLE_TOOL_DENIED', callId)
+      throw new ToolCallError('forbidden', decision.reason ?? `This Session may not call ${toolName}`)
+    }
+    // The delegation the Session holds: a PM Session is the PM of exactly one Project, and one that is not it has no
+    // delegation to act with. The refusal is the one the domain has always given, and the fact behind it is recorded.
+    if (record.role === 'pm') {
+      const project = this.store.projects.get(record.projectId)
+      if (project !== undefined && project.pmSessionId !== sessionId) {
+        this.recordDenial(record, toolName, 'MANDATE_EXCEEDED', callId)
+        throw new ToolCallError('forbidden', 'Only this Project\'s PM Session may manage its Tickets')
+      }
+    }
+  }
+
+  /**
+   * Record a refusal that reached outside the Session's own Project.
+   *
+   * The fact is built from the Session's own record and from the route's own tool name: nothing the caller sent is copied
+   * into it, and in particular no Ticket of another Project — its id, its title or its arguments — is named anywhere in it.
+   * The identity of the call is the one the caller proved, so a retried request is recognised as the very same call and is
+   * neither audited nor counted twice.
+   */
+  recordScopeDenial(sessionId: string, toolName: string, callId?: string): void {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) return
+    this.recordDenial(record, toolName, 'PROJECT_SCOPE_VIOLATION', callId)
+  }
+
+  /**
+   * Record one refusal of the tool ingress as a permission denial.
+   *
+   * The fact is built from the Session's own record and from the decision the profile made: nothing the caller sent is
+   * copied into it. The call's identity is the one the caller proved, so a retried request is recognised as the very same
+   * call and is neither audited nor counted twice.
+   */
+  private recordDenial(record: SessionRecord, toolName: string, reasonCode: GuardDenialReasonCode,
+    callId?: string): void {
+    const turn = this.sessionTurns.get(record.sessionId)
+    const turnId = turn === undefined ? '' : String(turn)
+    // The identity of the call: the id the caller proved, namespaced by the Session and the life it lived in. A caller
+    // that proves none gets an identity derived from the facts of the call itself.
+    const native = callId ?? denialCallId([record.sessionId, toolName, reasonCode, turnId])
+    this.trackDenial({
+      source: 'control_plane',
+      controlSessionId: record.sessionId,
+      toolName,
+      reasonCode,
+      turnId,
+      callId: this.denialCallIdOf('control_plane', record.sessionId, native),
+      nodeId: this.options.nodeId,
+      backendId: CONTROL_BACKEND,
+    })
+  }
+
+  /**
+   * Hand one refusal to the escalator and keep the work that follows it.
+   *
+   * The counter of the refusal is written before this returns, so the number is right as soon as the caller is told
+   * "no". The escalation itself — a message to a superior, an interrupt of a turn — is carried out in the background: a
+   * refused call never waits for a node round trip.
+   */
+  private trackDenial(fact: DenialFact): void {
+    const work = this.denials.record(fact)
+      .then(outcome => {
+        if (outcome.accepted && outcome.duplicate !== true) {
+          this.audit.record({ actor: 'system', kind: 'denial', action: 'refused', targetKind: 'session',
+            targetId: fact.controlSessionId, detail: `${fact.reasonCode} · ${fact.toolName}` })
+        }
+      })
+      .catch(error => {
+        process.stderr.write(`superagent control-plane denial escalation failed: ${messageOf(error)}\n`)
+      })
+    this.denialWork.add(work)
+    void work.finally(() => { this.denialWork.delete(work) })
+  }
+
+  /** Wait for the escalations a refusal started to finish. */
+  async settleDenials(): Promise<void> {
+    while (this.denialWork.size > 0) await Promise.all([...this.denialWork])
+  }
+
+  /**
+   * Carry out the denial reviews that wait for a superior, now that there is evidence that it can be reached.
+   *
+   * A review that waits for a superior is never sent on a guess: it is sent when the superior can be resolved for a
+   * message right now — a person resumed it, or the node it lives on came back. The work is kept, so a shutdown waits
+   * for it, and the claim of a review keeps two visits from sending it twice.
+   */
+  private revisitDenials(sessionId?: string): void {
+    const work = this.denials.revisit(sessionId)
+      .catch(error => {
+        process.stderr.write(`superagent control-plane denial revisit failed: ${messageOf(error)}\n`)
+      })
+    this.denialWork.add(work)
+    void work.finally(() => { this.denialWork.delete(work) })
+  }
+
+  /**
+   * Record a refusal the node's own tool guard decided.
+   *
+   * The fact arrives on the node's authenticated channel, but it is still checked: it must name one of the four reason
+   * codes, a tool, and a Session of this control plane that is still bound to this node. A fact of another node, of
+   * another backend, of another Session or of a turn that is over is refused here rather than counted.
+   */
+  private applyGuardDenial(event: NodeEvent): void {
+    if (event.type !== 'session.event' || event.kind !== 'guard.denial') return
+    const facts = guardDenialFacts(event.data)
+    if (facts === undefined) return
+    // The node that reported it must be the node this control plane talks to, and the backend must be the one it runs:
+    // a fact of another machine or of another backend is not a fact about this work.
+    if (event.nodeId !== this.options.nodeId) return
+    if (facts.backend !== CONTROL_BACKEND) return
+    const record = this.sessions.get(event.sessionId)
+    if (record === undefined) return
+    if (record.nodeId !== '' && record.nodeId !== this.options.nodeId) return
+    if (record.revokedAt !== undefined) return
+    if (record.operatorStop !== undefined) return
+    // The Session must be one that is still there: a Session the node reported as gone or archived is not the Session
+    // this fact is about.
+    if (record.status === 'stopped' || record.status === 'archived') return
+    // The role of the event must be the role of the Session: a fact that claims another role is not this Session's.
+    if (event.role !== record.role) return
+    // The Assignment the fact names must be the one the Session runs: a fact about another Assignment is not this
+    // Session's work, whatever the Session id says — and a fact that names no Assignment at all is refused too.
+    if (record.assignmentId !== undefined && event.assignmentId !== record.assignmentId) return
+    // The turn must be the one that runs right now: a fact about a turn that is over is a late fact, and a fact about
+    // no turn at all cannot be attributed to the work that runs now.
+    const known = this.sessionTurns.get(event.sessionId)
+    if (known === undefined) return
+    const turnId = facts.turnId ?? ''
+    if (turnId === '' || turnId !== String(known)) return
+    // The identity of the call is the backend's own, and it is required: a refusal without an identity cannot be told
+    // apart from a replay of another refusal.
+    const native = facts.callId
+    if (native === undefined) return
+    this.trackDenial({
+      source: 'node_guard',
+      controlSessionId: event.sessionId,
+      toolName: facts.toolName,
+      reasonCode: facts.reasonCode,
+      turnId,
+      // The identity of the call is namespaced by the Session and the life it lived in: two Sessions that happen to use
+      // the same id are two calls, and a replay of one call is the very same call.
+      callId: this.denialCallIdOf('node_guard', event.sessionId, native),
+      nodeId: event.nodeId,
+      backendId: facts.backend,
+    })
+  }
+
+  /**
+   * The identity of one refused call, as this control plane counts it.
+   *
+   * The identity is namespaced by the Session that made the call and by the life it lived in: the same raw id of two
+   * Sessions are two different calls, so one role cannot suppress another role's fact by sending the same id. The
+   * namespace is read from the control plane's own records, so it survives a restart — a replay of a refusal is
+   * recognised as the very same call and is neither audited nor counted twice.
+   */
+  private denialCallIdOf(source: 'control_plane' | 'node_guard', sessionId: string, native: string): string {
+    const epochs = this.targetEpochs(sessionId)
+    return denialCallId([source, sessionId, String(epochs.assignmentEpoch), native])
+  }
+
+  /** The denial reviews the escalator holds, newest last. */
+  denialReviews(limit = 50): DenialReviewView[] { return this.denials.views(limit) }
+
+  /** The denial counters the escalator holds, newest first. */
+  denialCounters(limit = 50): DenialCounterView[] { return this.denials.counterViews(limit) }
+
+  /**
+   * Raise an explicit human authorization application about one denial review.
+   *
+   * The caller's Session is the authority: only the exact immediate manager of the review may raise one, only while the
+   * edge it governs is alive, and only for the review that is the current one of its scope. The application is a request
+   * in front of an operator — it grants nothing, changes no Mandate and repeats no refused call.
+   */
+  requestDenialAuthorization(sessionId: string, reviewId: string): DenialAuthorizationView {
+    try {
+      return this.denials.requestAuthorization(sessionId, reviewId)
+    } catch (error) {
+      if (error instanceof DenialAuthorizationError) throw new ToolCallError('forbidden', error.reason)
+      throw error
+    }
+  }
+
+  /**
+   * Record the operator's decision on one authorization application.
+   *
+   * The decision is a record: it grants no capability and changes no configuration. Any real change of a Mandate goes
+   * through the operator's own path in the console.
+   */
+  decideDenialAuthorization(applicationId: string, decision: 'acknowledged' | 'declined'): DenialAuthorizationView {
+    try {
+      return this.denials.decideAuthorization(applicationId, decision)
+    } catch (error) {
+      if (error instanceof DenialAuthorizationError) throw new ToolCallError('invalid', error.reason)
+      throw error
+    }
+  }
+
+  /** The authorization applications the escalator holds, newest first. */
+  denialAuthorizations(limit = 50): DenialAuthorizationView[] { return this.denials.authorizations(limit) }
+
+  /**
    * Ensure the Project's PM Session. The workspace is created under `workspaceRoot`; the PM gets a short-lived token
    * and the PM role profile. A record the current node generation already confirmed (`idle`, `running`, `stopped`,
    * `archived`, …) is returned as it is.
@@ -5844,6 +6300,26 @@ export class ControlPlane {
     return settled
   }
 
+  /**
+   * The role profile a Worker Session runs under, narrowed by the Mandate of the Ticket it works on.
+   *
+   * The Ticket's Mandate is the delegation the Worker holds: its `allowTools` names the work tools the delegation keeps.
+   * The node enforces that list before a call runs, and a tool the delegation took away is refused as a Mandate that was
+   * exceeded — not as a role that may not use the tool at all. A Ticket whose Mandate names no list keeps the role's
+   * whole tool set.
+   *
+   * The list is the Ticket's own, read from the domain's record and never from the request: it is the trusted narrowing,
+   * and the control plane is the only one that may hand it to the node. The tools the Mandate does not govern — the
+   * Session's own report and coordination tools — stay available, exactly as the old plugin's own worker path keeps them.
+   */
+  private workerProfileFor(assignmentId: string, ticketId: string): RoleProfile {
+    const ticket = this.ticketOfAssignment(assignmentId) ?? this.store.tickets.get(ticketId)
+    const narrowed = ticket?.mandate.allowTools
+    if (narrowed === undefined || narrowed.length === 0) return WORKER_PROFILE
+    const effective = WORKER_PROFILE.tools.filter(name => !WORK_TOOLS.includes(name) || narrowed.includes(name))
+    return { ...WORKER_PROFILE, mandateTools: effective }
+  }
+
   private async ensureWorker(projectId: string | undefined, assignmentId: string, ticketId: string,
     prompt: string): Promise<SessionRecord> {
     const sessionId = `worker-${assignmentId}`
@@ -5882,7 +6358,8 @@ export class ControlPlane {
     const createKey = retry ? this.uniqueKey('worker-create-confirm', assignmentId) : `worker-create:${assignmentId}`
     try {
       await this.options.node.send({ ...this.base(createKey), type: 'worker.create', sessionId, projectId: workspaceId,
-        assignmentId, ticketId, workspace: path, profile: WORKER_PROFILE, sessionToken: token, prompt })
+        assignmentId, ticketId, workspace: path, profile: this.workerProfileFor(assignmentId, ticketId),
+        sessionToken: token, prompt })
     } catch (error) {
       // An ensure that failed on an abnormal receipt must not answer with a Session an operator stopped either.
       const failed = await this.recoverEnsureFailure(record, error, 'Worker')
@@ -6865,6 +7342,9 @@ export class ControlPlane {
         if (session.status === 'stopped' || session.status === 'archived') {
           throw new OperatorError(409, `The node did not bring the Session ${sessionId} back; it still reports it as ${session.status}`)
         }
+        // A review that waited for this Session may go out now: the superior is reachable again. The review is only
+        // carried out when the evidence says so, and the claim of a review keeps two such visits from sending it twice.
+        this.revisitDenials(sessionId)
         return { resumed: true, session, tokenVersion: record.tokenVersion ?? 0 }
       } catch (error) {
         // The resume failed: the Session stays stopped, with the operator's own stop on it.
@@ -7400,6 +7880,9 @@ export class ControlPlane {
     // The scheduler writes to the console's own file, so it is stopped before that file is closed: a delivery still in
     // flight gets its record written instead of finding a closed database.
     await this.stopScheduler()
+    // A review that is on its way is written down before the file closes: one that may have gone out is marked as
+    // unconfirmed and never sent again, and one that may not is still pending.
+    await this.settleDenials()
     this.unsubscribe()
     this.eventListeners.clear()
     this.sessions.clear()
@@ -7772,7 +8255,12 @@ export class ControlPlane {
         targetKind: 'node', targetId: status.nodeId, detail: status.backend })
     }
     // A node that came back may take the messages that waited for it.
-    if (status.nodeId === this.options.nodeId && status.online) this.scheduleRouterQueue()
+    if (status.nodeId === this.options.nodeId && status.online) {
+      this.scheduleRouterQueue()
+      // A review that waited for a superior on this node may go out now: the node is reachable again. The review is
+      // only carried out when the evidence says so, and the claim of a review keeps two visits from sending it twice.
+      if (previous !== undefined && previous.online === false) this.revisitDenials()
+    }
   }
 
   /**
@@ -7854,7 +8342,12 @@ export class ControlPlane {
     switch (event.type) {
       case 'node.status': return { ...event, seq, nodeSeq }
       case 'session.status': return { ...event, seq, nodeSeq }
-      case 'session.event': return { ...event, seq, nodeSeq }
+      // A refusal is written down as the facts of a refusal: the tool's name, the reason code and the identifiers of
+      // the call. The arguments of the refused call, a path and the text of an error never reach the log or the stream.
+      case 'session.event': {
+        const data = event.kind === 'guard.denial' ? sanitizedGuardDenial(event.data) : event.data
+        return { ...event, seq, nodeSeq, data }
+      }
       case 'session.inspected': return { ...event, seq, nodeSeq }
       // The arguments of a tool call are the model's input; the log keeps the call, not its input.
       case 'tool.call': return { ...event, seq, nodeSeq, args: undefined }
@@ -7925,6 +8418,9 @@ export class ControlPlane {
       record.updatedAt = event.at
       if (event.type === 'session.event') {
         this.applyTurnFact(event)
+        // A refusal the node's own tool guard decided: it is a fact about a call that was already refused, and it is
+        // counted only when it passes the checks the escalator makes.
+        this.applyGuardDenial(event)
       }
       if (event.type === 'session.event' && record.assignmentId !== undefined
         && (event.kind === 'turn-start' || event.kind === 'turn-end')) {

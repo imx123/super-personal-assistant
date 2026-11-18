@@ -236,4 +236,7 @@ function profileField(value: unknown, path: string): void {
   stringArray(profile, 'deny', path)
   identifier(profile, 'permission', path)
   optionalString(profile, 'model', path)
+  // The Mandate's own narrowing, when the control plane sent one: a list of tool names the node enforces before a call
+  // runs. A malformed list is refused here rather than ignored, because a node that ignores it would enforce nothing.
+  optionalStringArray(profile, 'mandateTools', path)
 }

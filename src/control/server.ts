@@ -1,5 +1,5 @@
 /** Minimal loopback HTTP API for the standalone control-plane kernel. */
-import { timingSafeEqual } from 'node:crypto'
+import { randomUUID, timingSafeEqual } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { UserError, type ProjectTicketTask, type WorkerReport } from '../core/index.ts'
@@ -9,7 +9,7 @@ import { ROUTER_ATTACHMENT_BYTES, ROUTER_ATTACHMENT_COUNT, WORKER_REPORT_STATES,
 import { SessionTokenError } from '../shared/session-token.ts'
 import { DeploymentError, type DeploymentScope, type DeploymentSettings } from '../shared/deployment.ts'
 import { CONSOLE_BUNDLE, CONSOLE_CSP, ConsoleAssets } from './console-assets.ts'
-import { ControlPlane, EVENT_REPLAY_LIMIT, OperatorError, SessionEnsureError, ToolCallError,
+import { ControlPlane, EVENT_REPLAY_LIMIT, OperatorError, ProjectScopeViolationError, SessionEnsureError, ToolCallError,
   type ToolCallErrorCode } from './control-plane.ts'
 import { ScheduleError, describeScheduleRule, parseScheduleRule, type SchedulePlan } from './scheduler.ts'
 import { type PmProjectReportKind } from './report-coordinator.ts'
@@ -138,6 +138,34 @@ function bearer(header: string | undefined): string {
 /** The Worker report states a tool may submit; `waiting` is the Executor's own, never a Worker's claim. */
 const REPORT_STATES = WORKER_REPORT_STATES
 
+/**
+ * The identity of one tool call.
+ *
+ * The node sends the id of the tool invocation with every control-plane call, so a call that is retried after a token
+ * refresh is recognised as the very same call and is neither audited nor counted twice. A caller that sends none still
+ * gets one: the request names itself, so two calls that are really two calls never collapse into one.
+ *
+ * The header is the caller's own word, so it is read as a plain token and never as an identity on its own: the control
+ * plane namespaces it by the Session that sent it, and two callers that send the same text are two different calls.
+ */
+function toolCallId(header: string | string[] | undefined): string {
+  const value = Array.isArray(header) ? header[0] : header
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed !== '' && trimmed.length <= 128 && isPlainToken(trimmed)) return trimmed
+  }
+  return randomUUID()
+}
+
+/** Whether a text is a plain token: no whitespace and no control characters. */
+function isPlainToken(text: string): boolean {
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0
+    if (code <= 0x20 || code === 0x7f) return false
+  }
+  return true
+}
+
 function stringValue(value: unknown, name: string, required: boolean): string | undefined {
   if (value === undefined) {
     if (required) throw new HttpError(400, `${name} is required`)
@@ -178,6 +206,20 @@ function parseTasks(value: unknown): ProjectTicketTask[] {
     if (scope !== undefined) parsed.scope = scope
     const note = stringValue(task.note, `${path}.note`, false)
     if (note) parsed.note = note
+    // The work tools the task allows: the list may only narrow the PM Mandate's, and the Engine refuses a list that
+    // widens it. The names are read here so a body that carries something else is refused before the domain sees it.
+    if (task.allow_tools !== undefined) {
+      if (!Array.isArray(task.allow_tools)) throw new HttpError(400, `${path}.allow_tools must be an array`)
+      const tools = task.allow_tools.map((name, at) => {
+        if (typeof name !== 'string') throw new HttpError(400, `${path}.allow_tools[${at}] must be a string`)
+        const trimmed = name.trim()
+        if (trimmed === '' || trimmed.length > 64) {
+          throw new HttpError(400, `${path}.allow_tools[${at}] must be a tool name`)
+        }
+        return trimmed
+      })
+      parsed.allow_tools = tools
+    }
     if (task.threads !== undefined) {
       if (!Array.isArray(task.threads)) throw new HttpError(400, `${path}.threads must be an array`)
       parsed.threads = task.threads.map((thread, at) => threadValue(thread, `${path}.threads[${at}]`))
@@ -577,6 +619,36 @@ export class ControlPlaneServer {
       return json(res, 200, { deliveries: this.control.coordinationDeliveries(limit ?? 50) })
     }
 
+    // The permission denials the guards refused: what each refusal was, how many the window held and what became of the
+    // review. The record is durable, so the console shows it after a restart of the control plane as well. The message
+    // that was sent to a superior is not part of it: the console shows the facts of a refusal, never the arguments the
+    // refused call carried.
+    //
+    // The authorization applications are part of the same panel: a superior raised one about a review, and the operator
+    // decides about it here.
+    if (method === 'GET' && path === '/v1/console/denials') {
+      const limit = this.limit(url.searchParams.get('limit'))
+      return json(res, 200, { reviews: this.control.denialReviews(limit ?? 50),
+        counters: this.control.denialCounters(limit ?? 50),
+        applications: this.control.denialAuthorizations(limit ?? 50) })
+    }
+
+    // The operator's decision on one authorization application.
+    //
+    // The decision is a record and nothing else: it grants no capability, widens no Mandate, changes no role's tool list
+    // and repeats no refused call. Any real change goes through the operator's own path, which this record never touches.
+    // The application's own facts are read from the control plane's record, so no raw tool argument is copied anywhere.
+    if (method === 'POST' && path === '/v1/console/denials/authorizations') {
+      const body = await readJson(req)
+      const applicationId = text(body.applicationId)
+      const decision = text(body.decision)
+      if (decision !== 'acknowledged' && decision !== 'declined') {
+        throw new HttpError(400, 'decision must be "acknowledged" or "declined"')
+      }
+      const application = this.control.decideDenialAuthorization(applicationId, decision)
+      return json(res, 200, { application })
+    }
+
     // The scheduled plans: the plans themselves, and what every run of them did.
     //
     // A plan is a clock and a sentence. It never runs a command, never starts a Session and never dispatches a Worker: at
@@ -957,6 +1029,26 @@ export class ControlPlaneServer {
   }
 
   /**
+   * One PM tool call, with a refusal that reached outside the caller's own Project recorded as the fact it is.
+   *
+   * The refusal the caller sees is the ordinary one: the other Project's Ticket is unknown to it, and the answer says
+   * nothing about whether it exists. The fact behind the refusal is recorded with the Session that made the call, the
+   * route's own tool name and the identity the caller proved — and never with the other Project's Ticket, its id or its
+   * arguments. The decision is read from the typed error the kernel raised, never from the message it carries.
+   */
+  private async pmToolCall<T>(sessionId: string, toolName: string, callId: string | undefined,
+    call: () => Promise<T>): Promise<T> {
+    try {
+      return await call()
+    } catch (error) {
+      if (error instanceof ProjectScopeViolationError) {
+        this.control.recordScopeDenial(sessionId, toolName, callId)
+      }
+      throw error
+    }
+  }
+
+  /**
    * The control-plane tools a PM or Worker calls through its Session token.
    *
    * These routes exist for the node's proxy tools: the token proves which Session acts, and the kernel derives the
@@ -965,6 +1057,9 @@ export class ControlPlaneServer {
   private async handleTool(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
     const method = req.method ?? 'GET'
     const token = bearer(req.headers.authorization)
+    // The identity of this very call, when the caller proved one: the node sends the id of the tool invocation, so a
+    // retried call is recognised as the same call and never counted twice.
+    const callId = toolCallId(req.headers['x-superagent-call-id'])
 
     // Refreshing extends the caller's own Session and reads no body: the present token selects it, so no role check is
     // needed. It is checked before the ordinary tool routes because this is the one place a token one generation behind the
@@ -983,19 +1078,19 @@ export class ControlPlaneServer {
 
     // The PM's read path: its own Project and Tickets, derived from the token's Session and never from a body.
     if (method === 'GET' && url.pathname === '/v1/tools/pm/context') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_project', 'pm', callId)
       return json(res, 200, this.control.pmContext(claims.sid))
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/pm/tickets') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_create_tickets', 'pm', callId)
       const body = await readJson(req)
-      const tickets = this.control.pmCreateTickets(claims.sid, parseTasks(body.tasks))
+      const tickets = this.control.pmCreateTickets(claims.sid, parseTasks(body.tasks), callId)
       return json(res, 200, { tickets })
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/pm/project-report') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_project_report', 'pm', callId)
       const body = await readJson(req)
       const summary = stringValue(body.summary, 'summary', true)!
       if (summary.length > 4000) throw new ToolCallError('invalid', 'A Project report may contain at most 4000 characters')
@@ -1011,24 +1106,26 @@ export class ControlPlaneServer {
     // The PM's coordination message to the Worker of one of its own Tickets. The Ticket is checked against the
     // Project the token names, and an Assignment the caller names must still be the current one.
     if (method === 'POST' && url.pathname === '/v1/tools/pm/message') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_message_worker', 'pm', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const message = text(body.text)
       const assignmentId = body.assignmentId === undefined ? undefined : text(body.assignmentId)
-      const result = this.control.pmMessageWorker(claims.sid, ticketId, message, assignmentId)
+      const result = await this.pmToolCall(claims.sid, 'control_message_worker', callId,
+        async () => this.control.pmMessageWorker(claims.sid, ticketId, message, assignmentId))
       return json(res, 200, { delivered: result.delivered, ticket: result.ticket })
     }
 
     // The PM's request to stop a Worker. The domain ends the Assignment and asks the node to stop the Session; the
     // answer says whether the node confirmed it, so a node failure is visible rather than a silent success.
     if (method === 'POST' && url.pathname === '/v1/tools/pm/cancel') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_cancel_worker', 'pm', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const assignmentId = body.assignmentId === undefined ? undefined : text(body.assignmentId)
       const reason = typeof body.reason === 'string' && body.reason.trim() !== '' ? body.reason.trim() : undefined
-      const result = await this.control.pmCancelWorker(claims.sid, ticketId, assignmentId, reason)
+      const result = await this.pmToolCall(claims.sid, 'control_cancel_worker', callId,
+        async () => this.control.pmCancelWorker(claims.sid, ticketId, assignmentId, reason))
       return json(res, 200, result)
     }
 
@@ -1036,7 +1133,7 @@ export class ControlPlaneServer {
     // Ticket is checked against the Project the token names, the Assignment the caller names must be the one whose result
     // waits for review, and the review the caller names is the round it decides.
     if (method === 'POST' && url.pathname === '/v1/tools/pm/review') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_review_result', 'pm', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const assignmentId = text(body.assignmentId)
@@ -1045,8 +1142,9 @@ export class ControlPlaneServer {
       if (action !== 'accept' && action !== 'reject') throw new HttpError(400, 'action must be "accept" or "reject"')
       const reason = body.reason === undefined ? undefined : text(body.reason)
       if (action === 'reject' && reason === undefined) throw new HttpError(400, 'A rejection needs a reason')
-      const result = await this.control.pmReview(claims.sid, ticketId, assignmentId,
-        { action, reviewId, ...(reason === undefined ? {} : { reason }) })
+      const result = await this.pmToolCall(claims.sid, 'control_review_result', callId,
+        async () => this.control.pmReview(claims.sid, ticketId, assignmentId,
+          { action, reviewId, ...(reason === undefined ? {} : { reason }) }))
       return json(res, 200, result)
     }
 
@@ -1055,33 +1153,35 @@ export class ControlPlaneServer {
     // read-only Git command set; the control plane binds the request to the review the caller named and refuses another
     // Project's Ticket, another Assignment's review and a review that no longer waits for a decision.
     if (method === 'POST' && url.pathname === '/v1/tools/pm/diff') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_review_diff', 'pm', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const reviewId = text(body.reviewId)
       const assignmentId = text(body.assignmentId)
-      const result = await this.control.pmReviewDiff(claims.sid, ticketId, reviewId, assignmentId)
+      const result = await this.pmToolCall(claims.sid, 'control_review_diff', callId,
+        async () => this.control.pmReviewDiff(claims.sid, ticketId, reviewId, assignmentId))
       return json(res, 200, result)
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/pm/assignment') {
-      if (claims.role !== 'pm') throw new ToolCallError('forbidden', 'A PM Session token is required')
+      this.control.requireTool(claims.sid, 'control_request_assignment', 'pm', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const assignmentId = body.assignmentId === undefined ? undefined : text(body.assignmentId)
-      const result = await this.control.pmRequestAssignment(claims.sid, ticketId, assignmentId)
+      const result = await this.pmToolCall(claims.sid, 'control_request_assignment', callId,
+        async () => this.control.pmRequestAssignment(claims.sid, ticketId, assignmentId))
       return json(res, 200, result)
     }
 
     // The Router's read: the running state of every Project. Only a Router Session token opens it, so a PM or a Worker
     // token cannot borrow the Router's view and a Router token cannot borrow a PM's tools.
     if (method === 'GET' && url.pathname === '/v1/tools/router/summary') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_summary', 'router', callId)
       return json(res, 200, this.control.routerSummary())
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/router/projects') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_create_project', 'router', callId)
       const body = await readJson(req)
       const requestId = text(body.requestId)
       const title = stringValue(body.title, 'title', true)!
@@ -1091,7 +1191,7 @@ export class ControlPlaneServer {
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/router/project-gate') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_project_gate', 'router', callId)
       const body = await readJson(req)
       const requestId = text(body.requestId)
       // The decision is read and judged by the control plane: the Router states it, the control plane decides.
@@ -1100,7 +1200,7 @@ export class ControlPlaneServer {
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/router/dispatch') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_dispatch', 'router', callId)
       const body = await readJson(req)
       const result = this.control.routerDispatch(claims.sid, text(body.requestId),
         stringValue(body.title, 'title', true)!, stringValue(body.goal, 'goal', true)!)
@@ -1108,7 +1208,7 @@ export class ControlPlaneServer {
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/router/manage') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_manage', 'router', callId)
       const body = await readJson(req)
       const action = body.action
       if (action !== 'message_ticket' && action !== 'stop_ticket' && action !== 'retry_ticket'
@@ -1124,7 +1224,7 @@ export class ControlPlaneServer {
     // It proposes; it does not send. The request id names the request the Router may propose for, the Project is
     // checked against the domain, and a request may carry at most one proposal.
     if (method === 'POST' && url.pathname === '/v1/tools/router/pm-proposal') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_pm_proposal', 'router', callId)
       const body = await readJson(req)
       const requestId = text(body.requestId)
       const projectId = text(body.projectId)
@@ -1137,7 +1237,7 @@ export class ControlPlaneServer {
     // The decision is read and judged by the control plane: the request has to ask for work, the Project has to be the
     // one the request names, and the instruction has to be the person's own words. A request may reach one PM only.
     if (method === 'POST' && url.pathname === '/v1/tools/router/pm-handoff') {
-      if (claims.role !== 'router') throw new ToolCallError('forbidden', 'A Router Session token is required')
+      this.control.requireTool(claims.sid, 'control_router_pm_handoff', 'router', callId)
       const body = await readJson(req)
       const requestId = text(body.requestId)
       const result = await this.control.routerPmHandoff(claims.sid, requestId, body.decision)
@@ -1145,15 +1245,30 @@ export class ControlPlaneServer {
     }
 
     if (method === 'POST' && url.pathname === '/v1/tools/worker/report') {
-      if (claims.role !== 'worker') throw new ToolCallError('forbidden', 'A Worker Session token is required')
+      this.control.requireTool(claims.sid, 'control_report', 'worker', callId)
       const body = await readJson(req)
       const ticketId = text(body.ticketId)
       const assignmentId = body.assignmentId === undefined ? undefined : text(body.assignmentId)
       // The call's own id: the node sends the tool invocation's id, so a replayed call is recognised as the same call.
       // A node that sends none keeps the older behaviour, which never suppresses a new fact.
       const callKey = body.callKey === undefined ? undefined : stringValue(body.callKey, 'callKey', true)!
-      const ticket = this.control.workerReport(claims.sid, ticketId, assignmentId, parseWorkerReport(body.report), callKey)
+      const ticket = this.control.workerReport(claims.sid, ticketId, assignmentId, parseWorkerReport(body.report), callKey,
+        callId)
       return json(res, 200, { ticket })
+    }
+
+    // The explicit human authorization application a PM or the Router raises about a permission denial review.
+    //
+    // It names the review and nothing else. The control plane checks that the caller is the exact immediate manager of
+    // that review, that the edge it governs is still alive and that the review is the current one of its scope. The
+    // application is a request in front of an operator: it grants nothing, changes no Mandate and repeats no refused
+    // call. One review has one application, so a retried call is clean.
+    if (method === 'POST' && url.pathname === '/v1/tools/denial/authorization') {
+      this.control.requireTool(claims.sid, 'control_request_authorization', ['pm', 'router'], callId)
+      const body = await readJson(req)
+      const reviewId = text(body.reviewId)
+      const application = this.control.requestDenialAuthorization(claims.sid, reviewId)
+      return json(res, 200, { application })
     }
 
     throw new HttpError(404, 'Not found')

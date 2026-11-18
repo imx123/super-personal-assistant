@@ -1,5 +1,5 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
-import { UserError } from './errors.ts'
+import { MandateExceededError, UserError } from './errors.ts'
 import { assignmentSessionId, currentReview, isoTime, latestAssignment, liveTicket, pmSessionId, reviewById, runningAssignment,
   threadKey, waitsForPerson, workerSessionId, WORK_TOOLS } from './model.ts'
 import type { Assignment, ChannelRef, Decision, Handoff, PolicyEffect, ProjectNote, ProjectProfile, ProjectTicketTask,
@@ -142,7 +142,10 @@ function prepareAllowTools(value: unknown, inherited: readonly string[] | undefi
   if (!tools.length) return base
   if (base) {
     const outside = tools.filter(name => !base.includes(name))
-    if (outside.length) invalidTask(`allow_tools cannot widen the PM Mandate: ${outside.join(', ')}`)
+    // The list is otherwise valid and asks for more than the delegation holds: that is a Mandate that was exceeded, not a
+    // malformed list. The outward answer stays the ordinary one — the same code, the same status and the same body as any
+    // other invalid task — and the fact behind it is typed, so the control plane may count it as what it is.
+    if (outside.length) throw new MandateExceededError(`allow_tools cannot widen the PM Mandate: ${outside.join(', ')}`)
   }
   return tools
 }

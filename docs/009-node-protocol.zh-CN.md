@@ -27,6 +27,8 @@
 - **对外的 `seq` 是控制面自己的序号**，不是节点的：节点重启会从 1 重新计数，而控制面把每条事件写进自己的持久日志，序号跨控制面重启单调递增。客户端看到的 `seq` 一律是控制面的序号，`after=` / `Last-Event-ID` 用它续接；节点自己的计数以 `nodeSeq` 保留在同一条事件里，所以节点重启仍然看得见（`nodeSeq` 变小即节点重启过）。
 - 日志有界（默认 20000 条 / 7 天）。被裁掉的那一段用 `gap` 明确告知（`GET /v1/events` 返回 `gap: true`，SSE 写一条 `: gap` 注释），不会悄悄少一段。
 - `tool.call` 事件在**记录与广播时都不带 `args`**：工具入参是模型自己的输入，可能含人粘贴进去的密钥。审计里另有该次工具调用的记录（只有工具名）。
+- **`session.event` 的 `guard.denial` 种类是节点自己的工具守卫拒绝了一次调用的事实**：事件带工具名、原因码（`ROLE_TOOL_DENIED` / `PROJECT_SCOPE_VIOLATION` / `MANDATE_EXCEEDED` / `WORKSPACE_OUT_OF_BOUNDS`）、回合号、**后端给出的那次调用的 id** 与后端名。它不带任何参数、路径或工具报错文本；控制面在落库与事件流之前还会再裁一遍，只留工具名、标识符与原因码。控制面另行核对来源节点/后端、Session、角色、Assignment 与当前活动回合之后才计入。
+- **`RoleProfile.mandateTools` 是这一次委派自己的收窄名单**：控制面在 `worker.create` 里随角色档案一起下发，名单来自 **Ticket 的 Mandate 自己那份记录**，只有控制面能给（模型给不了、调用方给不了）。节点在自己的角色守卫里**在执行前**据此拒绝：角色给了、但委派没给的工具按 `MANDATE_EXCEEDED` 拒绝，并以 `guard.denial` 上报。名单格式不对（不是字符串数组）时命令直接被拒——忽略一份名单等于什么都没守。名单只约束**工作工具**，Session 自己的 `control_report` 等不在其内。
 - `session.inspect` 要求节点回一条 `session.inspected`，`requestId` 回显命令的 `idempotencyKey`；应答带 `found`、可选 `status`、`backendSessionId` 和 `ready`。`ready=false` 表示 Session 已存在但角色提示词/工具安装失败，控制面必须按失败处理，不能因为收到过 `idle` 就当成功。
 - 显式状态查询是控制面确认 `starting`/`failed` 记录的唯一无损手段：命令回执和第一次状态事件都可能丢失，重发命令不足以证明 Session 的真实状态。
 - `session.message` 和 `session.archive` 只在后端真正接受/完成后回执；投递或归档失败必须让命令失败，控制面不会把 HTTP 200 当作成功。

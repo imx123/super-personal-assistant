@@ -218,6 +218,17 @@ export interface RoleProfile {
   permission: string
   /** Model id within the backend; absent means the backend's or deployment's default. */
   model?: string
+  /**
+   * The tools this delegation holds, when it holds fewer than the role's own list.
+   *
+   * It is the Mandate's own narrowing, carried to the node by the control plane that owns it: a tool the role grants but
+   * this list does not name is refused as a Mandate that was exceeded, not as a role that may not use it. Absent means the
+   * delegation holds the role's whole tool set.
+   *
+   * The list is the control plane's own fact — the Ticket's Mandate — and never the caller's: a node trusts it because it
+   * arrives on the control plane's own authenticated channel, not because the model asked for it.
+   */
+  mandateTools?: readonly string[]
 }
 
 /** What a node announces when it registers; `nodeId` must match the command envelope. */
@@ -436,7 +447,7 @@ export type NodeEvent =
   | (EventEnvelope & { type: 'session.status'; status: SessionStatus })
   | (EventEnvelope & {
     type: 'session.event'
-    kind: 'message' | 'turn-start' | 'turn-end' | 'error' | 'usage'
+    kind: 'message' | 'turn-start' | 'turn-end' | 'error' | 'usage' | 'guard.denial'
     /**
      * The event's own facts.
      *
@@ -444,6 +455,10 @@ export type NodeEvent =
      * ended (`completed`, `aborted`, `blocked`, `error`, `max-tokens`, `interrupted`) and, for an `aborted` turn, the
      * `cause` that aborted it (`user` for a turn a person interrupted). The cause is what tells an interrupted turn from
      * one that failed on its own.
+     *
+     * A `guard.denial` carries the {@link GuardDenialFacts} of one call the node's own tool guard refused. It is a fact
+     * about a refusal that already happened, never an instruction: the control plane counts it, and the model that made
+     * the call is told about the refusal by the node itself.
      */
     data?: unknown
   })
@@ -513,4 +528,55 @@ export interface NodePort {
    * gives the control plane the only loss-proof confirmation of a `starting` record.
    */
   inspect?(sessionId: string, routerDetails?: true): Promise<SessionInspection>
+}
+
+/**
+ * The reason codes a permission denial may carry.
+ *
+ * They are the only reasons that count towards the escalation of a denial. Everything else — a node that is offline, a
+ * token that may be refreshed, a model that sent a malformed argument, a command that exited with a non-zero status, a
+ * network timeout, a person who stopped a Session, a Worker's own `blocked` report — is a fact about something else and
+ * never becomes a denial.
+ *
+ * `ROLE_TOOL_DENIED` is a call for a tool the role may not use, `PROJECT_SCOPE_VIOLATION` a call that reaches outside the
+ * Session's own Project, `MANDATE_EXCEEDED` a call that goes beyond the delegation the Session holds, and
+ * `WORKSPACE_OUT_OF_BOUNDS` a call that reaches outside the Session's workspace or into Git's own metadata.
+ */
+export const GUARD_DENIAL_REASON_CODES = [
+  'ROLE_TOOL_DENIED',
+  'PROJECT_SCOPE_VIOLATION',
+  'MANDATE_EXCEEDED',
+  'WORKSPACE_OUT_OF_BOUNDS',
+] as const
+
+/** One reason a permission denial may carry. */
+export type GuardDenialReasonCode = (typeof GUARD_DENIAL_REASON_CODES)[number]
+
+/**
+ * The structured facts of one call a guard refused.
+ *
+ * They are the only things the control plane counts. There is no free text here and no tool arguments: a denial is a fact
+ * about a refusal, and the arguments of the refused call are the lower-trust data of a model that was already told no.
+ *
+ * `turnId` names the turn the call was made in, and it is what binds a refusal to the turn that produced it. It is
+ * absent when the guard cannot name a turn, and the control plane then treats the refusal as a fact without a turn.
+ *
+ * `callId` is the stable identity the backend gave the call itself — the id of the tool invocation, not of the event
+ * that carried it. It is what makes a replay of a refusal recognisable as the very same call: the same call always has
+ * the same id, and another call never shares it.
+ *
+ * `backend` names the backend that decided the refusal. The control plane runs one backend, and a fact that claims
+ * another one is not a fact about this work.
+ */
+export interface GuardDenialFacts {
+  /** The tool the call was made for. */
+  readonly toolName: string
+  /** Why the guard refused it. */
+  readonly reasonCode: GuardDenialReasonCode
+  /** The turn the call was made in, when the guard knows it. */
+  readonly turnId?: string
+  /** The stable identity of the call the backend made. */
+  readonly callId?: string
+  /** The backend that decided the refusal. */
+  readonly backend?: string
 }

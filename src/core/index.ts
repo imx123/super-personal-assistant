@@ -6,7 +6,7 @@ export { CLEANUP_TIMEOUT_MS, CleanupTimeoutError, Engine, HANDOFF, PROJECT_TICKE
   type ProjectHandoffRequest, type ProjectHandoffResult, type ProjectPauseReport, type ProjectPauseWorkers, type ReceiveResult,
   type Reply, type ReplyRequest, type TicketHandoffRequest, type TicketMessageDelivery, type TicketMessageRequest,
   type TicketSplitRequest, type WorkerReport } from './engine.ts'
-export { UserError, USER_ERRORS, type UserErrorCode } from './errors.ts'
+export { MandateExceededError, UserError, USER_ERRORS, type UserErrorCode } from './errors.ts'
 export { REASONS, reasonText, said, type Reason, type ReasonCode } from './reasons.ts'
 export { MemoryRepositories } from './memory.ts'
 export { canRetry, ticketStage, type TicketStage } from './stage.ts'
