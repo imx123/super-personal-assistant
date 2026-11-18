@@ -14,7 +14,7 @@
 | P3-Gate | P3-1–P3-4 | 两条真实 DSH 业务闭环、干预及兼容 | DONE |
 | P4-0 | P3-Gate | 协作事件评审稿、共享 `NodeResolver` 类型及回传契约 | DONE |
 | P4-1 | P4-0 | 单节点目标解析、持久报告协调与真实 DSH 验收 | DONE |
-| P4-3 | P4-1 | 真实权限守卫与拒绝上报，优先于订阅扩展 | NOT_STARTED |
+| P4-3 | P4-1 | 真实权限守卫与拒绝上报，优先于订阅扩展 | IN_PROGRESS |
 | P4-2 | P4-1 | 零 LLM 下级增量摘要，真实后端验证 | NOT_STARTED |
 | P4-4 | P4-0、P4-3 | 外部观察订阅及三种投递模式，合成事件 E2E | NOT_STARTED |
 | P4-5 | P4-1–P4-4 | 持久投递与跨路径恢复验收 | NOT_STARTED |
@@ -184,4 +184,8 @@ Claude Code 使用 MiniMax M3.1 Flash、`--effort max` 编写隔离实验，Code
 - 在真实 DSH Desktop 0.2.2.0 与本地 Gemma 4 12B 中，两名 Worker 的回合实际重叠。PM 各收到一次 `ready` 和 `blocked` 报告，验收前者、保留后者的阻塞状态，并向 Router 汇报。控制面重启后 Review 与投递未重复。人工停止 PM 后的报告记录为阻断、尝试次数为 0。再次重启后，控制台 API 仍返回原因且不暴露报告正文。初次运行时模型将 `ready` 写在正文并误用 `progress` 状态，明确验收提示中的工具字段后以同一代码复跑通过。
 - 实测证据为 `.artifacts/phase3-5-20261117/live-xn0K3d/evidence.json`。Worker 人工停止、实际回合中止、重启后归档和旧消息返回 409 的回归证据为 `.artifacts/phase3-5-20261117/live-cjAnjh/evidence.json`。源撤权、目标换绑和等待期间的软暂停使用 FakeNode 故障注入验证。
 
-下一任务为 P4-3 权限拒绝审查。通用投递和恢复仍由 P4-5 签收，双节点能力由跨设备分支验收。
+通用投递和恢复仍由 P4-5 签收，双节点能力由跨设备分支验收。
+
+## P4-3
+
+2026-11-18 开始实施。以本地 `next` 的 `208dab6` 为基线，由 Claude Code 以 `max` effort 在 `phase4/p4-3` 实施，Codex 独立验收。验收覆盖权威拒绝来源、持久计数与去重、按治理关系通知上级、同回合熔断、停止边界和重启行为。
