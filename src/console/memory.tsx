@@ -7,26 +7,32 @@
  * control plane's own words: a machine it has never heard of is unknown, not offline. The event history is what the control
  * plane's own files hold today: the Projects and Tickets of the business store, the durable event history of key facts
  * filed by Ticket and Project, and the console's own short-lived log, which is named as short-lived and never as a
- * history that can be read back in full. The long-term memory is not there yet, so the page says so and points at the
- * manual Project notes that are.
+ * history that can be read back in full. The long-term memory is the control plane's own queue of proposals and the
+ * memories a decision made of them.
  *
- * Nothing here writes. The page reads the control plane's own API with the key the console already holds, and it never
- * fills a gap with an example: a number the control plane did not report is not shown at all, and a read that has not
- * answered yet is shown as waiting rather than as empty.
+ * The live state and the event history are read-only. The long-term memory is where a person may act: a proposal may be
+ * offered, and a proposal may be approved or sent back. Neither writes a memory directly — a memory is written when a
+ * decision about a candidate says so, and the panel names that order instead of hiding it.
+ *
+ * Nothing here fills a gap with an example: a number the control plane did not report is not shown at all, and a read
+ * that has not answered yet is shown as waiting rather than as empty.
  *
  * The live state is now the control plane's own live snapshot (`P5-1`): the page asks for it when the domain is opened,
  * says the moment it was taken, and shows what the control plane may see right now. A read that failed is said out loud
  * and never leaves an old value looking like the present one. The durable event history is now the control plane's own
  * index of key facts (`P5-2`), read by the exact key of a Ticket or a Project and told apart from the console's own
  * short-lived log. Its pages belong to the range they were read for: a page that answers after the person changed the
- * range is dropped, so one Project's facts never land in another's list. The wiring place for the rest of Phase 5 is the
- * last panel: the memory service of `P5-3` to `P5-5` fills it without the page changing shape.
+ * range is dropped, so one Project's facts never land in another's list. The long-term memory is now the control plane's
+ * own service (`P5-3`): the queue of proposals, the memories that are in force, and the decision a person takes about a
+ * proposal. The wiring place for the rest of Phase 5 is the same panel: the retrieval of `P5-5` fills it without the page
+ * changing shape.
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
-import { messageOf, read, readEventHistory, readLiveState, type ConsoleProject, type ConsoleTicket,
+import { decideMemoryCandidate, messageOf, read, readEventHistory, readLiveState, readLongTermMemories,
+  readMemoryCandidates, submitMemoryCandidate, type ConsoleProject, type ConsoleTicket,
   type EventHistoryCoverage, type EventHistoryEntry, type LiveStateList, type LiveStateNode,
-  type LiveStateSnapshot, type Overview, type StreamStatus } from './api.ts'
-import { stampOf, useLoaded, type PageProps } from './pages.tsx'
+  type LiveStateSnapshot, type MemoryCandidateView, type MemoryRecordView, type Overview, type StreamStatus } from './api.ts'
+import { stampOf, useAction, useLoaded, type PageProps } from './pages.tsx'
 
 /** How many of the newest console events the history panel shows. */
 const EVENT_TAIL = 12
@@ -185,7 +191,8 @@ export function MemoryPage(props: PageProps): ReactElement {
         : domain === 'history'
           ? <HistoryLoader revision={props.revision} overview={props.overview}
             onOpenProject={(id) => props.navigate('projects', id)} />
-          : <LongTermMemoryPanel onOpenProjects={() => props.navigate('projects')} />}
+          : <LongTermMemoryPanel revision={props.revision} refresh={props.refresh}
+            onOpenProjects={() => props.navigate('projects')} />}
     </div>
   )
 }
@@ -878,26 +885,302 @@ function historyCoverageText(coverage: EventHistoryCoverage): string {
 }
 
 /**
- * The long-term memory: what is not there yet, and what is.
+ * The long-term memory: the queue of proposals, the memories that are in force, and the decision a person takes.
  *
- * The page says plainly that the service and the queue do not exist, and points at the manual Project notes that do. The
- * five objects of the memory system are written down in the contract; repeating them here as a list would only make the
- * console heavier without making it truer.
+ * The service exists now (`P5-3`), so the panel says what it really is: a proposal enters the queue and waits, and it
+ * becomes a memory only when a decision says so. There is no action here that writes a memory directly, and there is no
+ * action that forgets one — the forgetting of a memory is still undecided, so the panel does not offer it.
+ *
+ * The loader reads; the view beside it shows. The loader holds the rows, the flags of the read and the words of the
+ * form; the view turns them into the panel a person reads. That is what lets the panel be rendered on its own, without
+ * a React instance of its own, and it is why every state here is a prop rather than something the view looks up.
  */
-export function LongTermMemoryPanel(props: { onOpenProjects: () => void }): ReactElement {
+export function LongTermMemoryPanel(props: {
+  /** The revision of the control plane's own facts: a new fact is read again. */
+  revision: number
+  /** Read the page's facts again, after an action that left no event behind. */
+  refresh: () => void
+  onOpenProjects: () => void
+}): ReactElement {
+  const queue = useLoaded(() => readMemoryCandidates(), props.revision)
+  const saved = useLoaded(() => readLongTermMemories(), props.revision)
+  const projects = useLoaded(() => read<{ projects: ConsoleProject[] }>('/v1/console/projects'), props.revision)
+  const [content, setContent] = useState('')
+  const [scope, setScope] = useState('user_global|global')
+  const action = useAction(() => props.refresh())
+
+  /** One decision about one proposal, and the words that say what it did. */
+  const decide = (candidate: MemoryCandidateView, decision: 'approve' | 'reject'): void => {
+    action.run(
+      () => decideMemoryCandidate({ candidateId: candidate.candidateId, decision, checksum: candidate.checksum }),
+      result => decisionWording((result as { code?: string }).code ?? ''))
+  }
+
+  /** One proposal, offered by the person who is looking at the page. */
+  const propose = (): void => {
+    if (content.trim() === '') return
+    const [scopeType = '', scopeId = ''] = scope.split('|')
+    action.run(
+      () => submitMemoryCandidate({ content: content.trim(), scopeType, scopeId }),
+      // The words are cleared only once the control plane has taken them: a refused proposal keeps what was written.
+      () => { setContent(''); return '候选已进入队列，等待一次决定。' })
+  }
+
+  const options = [
+    { value: 'user_global|global', label: '全局偏好（跨项目）' },
+    ...(projects.data?.projects ?? []).map(project =>
+      ({ value: `project|project:${project.id}`, label: `项目：${project.title}` })),
+  ]
+
+  return (
+    <LongTermMemoryView
+      candidates={queue.data?.rows ?? []}
+      memories={saved.data?.rows ?? []}
+      queueState={queue.error !== '' ? 'error' : queue.data === undefined ? 'pending' : 'ready'}
+      listState={saved.error !== '' ? 'error' : saved.data === undefined ? 'pending' : 'ready'}
+      error={queue.error !== '' ? queue.error : saved.error}
+      busy={action.state.busy}
+      message={action.state.message}
+      actionError={action.state.error}
+      content={content}
+      scope={scope}
+      scopeOptions={options}
+      onContentChange={setContent}
+      onScopeChange={setScope}
+      onSubmit={propose}
+      onApprove={candidate => decide(candidate, 'approve')}
+      onReject={candidate => decide(candidate, 'reject')}
+      onOpenProjects={props.onOpenProjects} />
+  )
+}
+
+/**
+ * The long-term memory's own view: the queue, the memories that are in force, and the decision a person takes.
+ *
+ * It reads nothing and starts nothing: the rows, the flags of the read and the words of the form are given to it. A read
+ * that has not answered is shown as waiting, a failed read as the failure it was, and a read that answered with no rows
+ * as an empty queue — three different things, never one.
+ */
+export function LongTermMemoryView(props: {
+  /** The proposals that wait for a decision. */
+  candidates: MemoryCandidateView[]
+  /** The memories that are in force. */
+  memories: MemoryRecordView[]
+  /** What the read of the queue came back with. */
+  queueState: 'pending' | 'error' | 'ready'
+  /** What the read of the memories came back with. */
+  listState: 'pending' | 'error' | 'ready'
+  /** Why a read failed, when it did. */
+  error: string
+  /** Whether an action is running. */
+  busy: boolean
+  /** What the last action did. */
+  message: string
+  /** Why the last action failed, when it did. */
+  actionError: string
+  /** The body of the proposal the person is writing. */
+  content: string
+  /** The scope the proposal is offered for. */
+  scope: string
+  /** The scopes the person may choose from. */
+  scopeOptions: { value: string; label: string }[]
+  onContentChange: (value: string) => void
+  onScopeChange: (value: string) => void
+  /** The person offered a proposal. */
+  onSubmit: () => void
+  /** The person approved a proposal. */
+  onApprove: (candidate: MemoryCandidateView) => void
+  /** The person sent a proposal back. */
+  onReject: (candidate: MemoryCandidateView) => void
+  onOpenProjects: () => void
+}): ReactElement {
+  const waiting = props.candidates.filter(candidate => REVIEWABLE_STATES.includes(candidate.status))
   return (
     <section id="memory-domain-longterm" className="memory-domain" aria-labelledby="memory-longterm-heading">
       <h2 id="memory-longterm-heading">长期记忆</h2>
-      <p className="notice warning">
-        长期记忆服务与候选队列还没有建立：候选的入队、审核与检索都没有开放，这一页没有任何可召回的长期记忆。
-      </p>
       <p className="quiet">
-        现在能手工留给一个项目的，只有「项目 › 项目备忘」里操作员自己写的便签。它由人维护，不会被模型改写，
-        也不会进入候选队列；这一页不保存任何东西，也不发起任何审核。
+        候选先入队，再由人决定：一条候选只有经过同库审核才会成为长期记忆。外部来源的事实会被标为不可信，
+        永远不能自动进入全局作用域。
       </p>
+
+      {props.actionError !== ''
+        ? <p className="notice warning">{`操作失败：${props.actionError}`}</p>
+        : null}
+      {props.message !== ''
+        ? <p className="notice success">{props.message}</p>
+        : null}
+
+      <div className="memory-block">
+        <div className="memory-block-head">
+          <h3>提出一条候选</h3>
+          <span className="memory-tag">入队后等待决定</span>
+        </div>
+        <div className="memory-form">
+          <label htmlFor="memory-candidate-content">
+            <span>要记住的事实</span>
+            <textarea id="memory-candidate-content" rows={3} value={props.content}
+              placeholder="例如：这个项目统一用 pnpm，不要用 npm。"
+              onChange={event => props.onContentChange(event.target.value)} />
+          </label>
+          <label htmlFor="memory-candidate-scope">
+            <span>作用域</span>
+            <select id="memory-candidate-scope" value={props.scope}
+              onChange={event => props.onScopeChange(event.target.value)}>
+              {props.scopeOptions.map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          <div className="detail-actions">
+            <button type="button" className="action" onClick={props.onSubmit}
+              disabled={props.busy || props.content.trim() === ''}>
+              {props.busy ? '正在提交……' : '提交候选'}
+            </button>
+          </div>
+        </div>
+        <p className="quiet">
+          正文里不能有路径、密钥或提示词；控制面会在写入前检查并拒绝这样的候选。
+        </p>
+      </div>
+
+      <div className="memory-block">
+        <div className="memory-block-head">
+          <h3>候选队列</h3>
+          <span className="memory-tag">等待决定</span>
+        </div>
+        {props.queueState === 'error'
+          ? <p className="empty">{`读取候选队列失败：${props.error}`}</p>
+          : props.queueState === 'pending'
+            ? <p className="empty">正在读取候选队列……</p>
+            : props.candidates.length === 0
+              ? <p className="empty">队列里还没有候选。</p>
+              : <div className="memory-rows">
+                {props.candidates.map(candidate => (
+                  <div className="setting" key={candidate.candidateId}>
+                    <span>
+                      <b>{candidate.content}</b>
+                      <span className="quiet">
+                        {`${scopeWording(candidate.scopeType, candidate.scopeId)} · ${trustWording(candidate.sourceTrust)} · ${candidateStatusWording(candidate.status)}`}
+                      </span>
+                      <span className="quiet">
+                        {`${candidate.proposedByRole || '系统'} 提出 · ${stampOf(candidate.createdAt)}`}
+                      </span>
+                      {candidate.sourceRefs.length === 0
+                        ? <span className="quiet">没有可核验的来源引用。</span>
+                        : <span className="quiet">
+                          {`来源：${candidate.sourceRefs.map(ref =>
+                            `${ref.kind}:${ref.id}${ref.verified ? '' : '（未核验）'}`).join('、')}`}
+                        </span>}
+                      {candidate.reviewNote !== ''
+                        ? <span className="quiet">{`审核意见：${candidate.reviewNote}`}</span>
+                        : null}
+                    </span>
+                    {REVIEWABLE_STATES.includes(candidate.status)
+                      ? <span className="memory-action">
+                        <button type="button" className="action" onClick={() => props.onApprove(candidate)}
+                          aria-label={`通过候选 ${candidate.candidateId}`}
+                          disabled={props.busy}>通过</button>
+                        <button type="button" className="action" onClick={() => props.onReject(candidate)}
+                          aria-label={`退回候选 ${candidate.candidateId}`}
+                          disabled={props.busy}>退回</button>
+                      </span>
+                      : null}
+                  </div>
+                ))}
+              </div>}
+        {props.queueState === 'ready' && props.candidates.length > 0
+          ? <p className="quiet">{`队列里共 ${props.candidates.length} 条，其中 ${waiting.length} 条等待决定。`}</p>
+          : null}
+      </div>
+
+      <div className="memory-block">
+        <div className="memory-block-head">
+          <h3>已保存的长期记忆</h3>
+          <span className="memory-tag">生效中</span>
+        </div>
+        {props.listState === 'error'
+          ? <p className="empty">{`读取长期记忆失败：${props.error}`}</p>
+          : props.listState === 'pending'
+            ? <p className="empty">正在读取长期记忆……</p>
+            : props.memories.length === 0
+              ? <p className="empty">还没有生效的长期记忆。</p>
+              : <div className="memory-rows">
+                {props.memories.map(memory => (
+                  <div className="setting" key={memory.memoryId}>
+                    <span>
+                      <b>{memory.content}</b>
+                      <span className="quiet">
+                        {`${scopeWording(memory.scopeType, memory.scopeId)} · ${trustWording(memory.sourceTrust)} · 置信度 ${memory.confidence.toFixed(2)}`}
+                      </span>
+                      <span className="quiet">
+                        {`${memory.memoryId} · 最后核验 ${stampOf(memory.lastVerifiedAt)}`}
+                      </span>
+                      {memory.sourceRefs.length === 0
+                        ? <span className="quiet">没有来源引用。</span>
+                        : <span className="quiet">
+                          {`来源：${memory.sourceRefs.map(ref =>
+                            `${ref.kind}:${ref.id}${ref.verified ? '' : '（未核验）'}`).join('、')}`}
+                        </span>}
+                    </span>
+                  </div>
+                ))}
+              </div>}
+        {props.listState === 'ready' && props.memories.length > 0
+          ? <p className="quiet">{`共 ${props.memories.length} 条生效中的长期记忆。`}</p>
+          : null}
+      </div>
+
       <div className="detail-actions">
         <button type="button" className="action" onClick={props.onOpenProjects}>去项目页记一笔</button>
       </div>
+      <p className="quiet">
+        「项目 › 项目备忘」里的便签由人维护，不进入候选队列，也不参与这里的检索。遗忘一条记忆的做法还没有定，
+        这一页因此不提供删除。
+      </p>
     </section>
   )
+}
+
+/** The states a candidate may be decided from. */
+const REVIEWABLE_STATES: readonly string[] = ['queued', 'reviewing', 'pending_human_confirm']
+
+/** How a candidate's state reads in the console. */
+function candidateStatusWording(status: string): string {
+  if (status === 'queued') return '等待审核'
+  if (status === 'reviewing') return '审核中'
+  if (status === 'active') return '已成为长期记忆'
+  if (status === 'duplicate') return '与已有记忆重复，已归并'
+  if (status === 'superseded') return '已被新版本取代'
+  if (status === 'conflict_pending') return '存在冲突，等待确认'
+  if (status === 'pending_human_confirm') return '等待人工确认'
+  if (status === 'expired_candidate') return '已过期冷置'
+  if (status === 'needs_reverify') return '需要复核'
+  if (status === 'rejected') return '已退回'
+  return status
+}
+
+/** What a decision did, in the console's own words. */
+function decisionWording(code: string): string {
+  if (code === 'APPROVED') return '已通过：这条候选成为了一条长期记忆。'
+  if (code === 'REJECTED') return '已退回：这条候选不会进入长期记忆。'
+  if (code === 'MERGED') return '与已有记忆重复：来源已并入那条记忆，没有新建。'
+  if (code === 'CONFLICT_HELD') return '已记为冲突：两边都暂时不生效，等待人工确认。'
+  if (code === 'SUPERSEDED') return '已取代旧记忆：旧版本保留溯源，但不再参与召回。'
+  return '已完成。'
+}
+
+/** How the trust of a fact reads in the console. */
+function trustWording(trust: string): string {
+  if (trust === 'operator_explicit') return '操作员明确声明'
+  if (trust === 'verified_execution') return '已验收的执行结论'
+  if (trust === 'external_tainted') return '外部来源（不可信）'
+  return trust
+}
+
+/** How a scope reads in the console. */
+function scopeWording(scopeType: string, scopeId: string): string {
+  if (scopeType === 'user_global') return '全局'
+  if (scopeType === 'node_env') return `机器 ${scopeId.replace(/^node:/, '')}`
+  if (scopeType === 'project') return `项目 ${scopeId.replace(/^project:/, '')}`
+  return scopeId
 }

@@ -11,8 +11,9 @@
 import { createElement, type ComponentProps, type ReactElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, Overview } from '../src/console/api.ts'
-import { EventHistoryPanel, LiveStatePanel, LongTermMemoryPanel, MemoryHead, PersistentHistoryView } from '../src/console/memory.tsx'
+import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, MemoryCandidateView, MemoryRecordView,
+  Overview } from '../src/console/api.ts'
+import { EventHistoryPanel, LiveStatePanel, LongTermMemoryView, MemoryHead, PersistentHistoryView } from '../src/console/memory.tsx'
 
 /** The control plane's own snapshot, as the shell reads it. */
 const overview = (over: Partial<Overview> = {}): Overview => ({
@@ -85,6 +86,89 @@ const entry: EventHistoryEntry = {
 }
 
 const html = (element: ReactElement): string => renderToStaticMarkup(element)
+
+/** One proposal of the queue, as the control plane answered with it. */
+const candidate = (over: Partial<MemoryCandidateView> = {}): MemoryCandidateView => ({
+  candidateId: 'cand_000000000001',
+  scopeType: 'project',
+  scopeId: 'project:p1',
+  proposedScopeType: 'project',
+  proposedScopeId: 'project:p1',
+  content: '这个项目统一用 pnpm，不要用 npm。',
+  status: 'queued',
+  sourceTrust: 'operator_explicit',
+  sourceRefs: [{ kind: 'review', id: 'r1', at: '2026-11-19T08:00:00.000Z', summary: '评审通过', verified: true }],
+  proposedByRole: 'operator',
+  proposedBySessionId: '',
+  provisionalSameSession: false,
+  revisionCount: 0,
+  conflictWithId: '',
+  confidence: 0.9,
+  importance: 0,
+  reviewNote: '',
+  createdAt: '2026-11-19T08:00:00.000Z',
+  updatedAt: '2026-11-19T08:00:00.000Z',
+  reviewedAt: '',
+  expiresAt: '2026-12-19T08:00:00.000Z',
+  checksum: 'abc123',
+  ...over,
+})
+
+/** One memory that is in force, as the control plane answered with it. */
+const memory = (over: Partial<MemoryRecordView> = {}): MemoryRecordView => ({
+  memoryId: 'mem_000000000001',
+  scopeType: 'project',
+  scopeId: 'project:p1',
+  content: '这个项目统一用 pnpm，不要用 npm。',
+  status: 'active',
+  sourceTrust: 'operator_explicit',
+  sourceRefs: [{ kind: 'review', id: 'r1', at: '2026-11-19T08:00:00.000Z', summary: '评审通过', verified: true }],
+  supersedesId: '',
+  supersededById: '',
+  conflictWithId: '',
+  pinned: false,
+  importance: 0,
+  confidence: 0.9,
+  utility: 0,
+  validFrom: '2026-11-19T08:00:00.000Z',
+  lastVerifiedAt: '2026-11-19T08:00:00.000Z',
+  deprecatedAt: '',
+  createdAt: '2026-11-19T08:00:00.000Z',
+  updatedAt: '2026-11-19T08:00:00.000Z',
+  nodeId: 'local',
+  backendId: 'dsh',
+  checksum: 'def456',
+  ...over,
+})
+
+/**
+ * The long-term memory's own view, with the facts a control plane that answered would give it.
+ *
+ * It is rendered on its own: the view holds no state of its own, so the markup it shows is the markup it was given.
+ */
+const longTerm = (over: Partial<ComponentProps<typeof LongTermMemoryView>> = {}): ReactElement =>
+  createElement(LongTermMemoryView, {
+    candidates: over.candidates ?? [],
+    memories: over.memories ?? [],
+    queueState: over.queueState ?? 'ready',
+    listState: over.listState ?? 'ready',
+    error: over.error ?? '',
+    busy: over.busy ?? false,
+    message: over.message ?? '',
+    actionError: over.actionError ?? '',
+    content: over.content ?? '',
+    scope: over.scope ?? 'user_global|global',
+    scopeOptions: over.scopeOptions ?? [
+      { value: 'user_global|global', label: '全局偏好（跨项目）' },
+      { value: 'project|project:p1', label: '项目：控制台改造' },
+    ],
+    onContentChange: over.onContentChange ?? (() => {}),
+    onScopeChange: over.onScopeChange ?? (() => {}),
+    onSubmit: over.onSubmit ?? (() => {}),
+    onApprove: over.onApprove ?? (() => {}),
+    onReject: over.onReject ?? (() => {}),
+    onOpenProjects: over.onOpenProjects ?? (() => {}),
+  })
 
 /**
  * The durable history's own view, with the facts a control plane that answered would give it.
@@ -289,17 +373,99 @@ describe('the memory page', () => {
     expect(page).not.toContain('序号 8')
   })
 
-  it('says that the long-term memory does not exist yet and points at the manual notes', () => {
-    const page = html(createElement(LongTermMemoryPanel, { onOpenProjects: () => {} }))
-    expect(page).toContain('长期记忆服务与候选队列还没有建立')
+  it('points at the manual notes and no longer says the service is missing', () => {
+    const page = html(longTerm())
+    expect(page).not.toContain('长期记忆服务与候选队列还没有建立')
     expect(page).toContain('项目 › 项目备忘')
     expect(page).toContain('去项目页记一笔')
   })
 
   it('does not repeat the five objects of the memory system in the console', () => {
-    const page = html(createElement(LongTermMemoryPanel, { onOpenProjects: () => {} }))
+    const page = html(longTerm())
     expect(page).not.toContain('五类对象')
     expect(page).not.toContain('P5-')
+  })
+})
+
+describe('the long-term memory panel', () => {
+  it('says that a read which has not answered is not an empty queue', () => {
+    const page = html(longTerm({ queueState: 'pending', listState: 'pending' }))
+    expect(page).toContain('正在读取候选队列')
+    expect(page).toContain('正在读取长期记忆')
+    expect(page).not.toContain('队列里还没有候选')
+    expect(page).not.toContain('还没有生效的长期记忆')
+  })
+
+  it('says that a read which answered with no rows holds no rows', () => {
+    const page = html(longTerm())
+    expect(page).toContain('队列里还没有候选')
+    expect(page).toContain('还没有生效的长期记忆')
+  })
+
+  it('says why a read failed instead of an empty list', () => {
+    const page = html(longTerm({ queueState: 'error', listState: 'error', error: 'HTTP 500' }))
+    expect(page).toContain('读取候选队列失败：HTTP 500')
+    expect(page).toContain('读取长期记忆失败：HTTP 500')
+    expect(page).not.toContain('队列里还没有候选')
+  })
+
+  it('shows a proposal with its scope, its trust, its state and its sources', () => {
+    const page = html(longTerm({ candidates: [candidate()] }))
+    expect(page).toContain('这个项目统一用 pnpm')
+    expect(page).toContain('项目 p1')
+    expect(page).toContain('操作员明确声明')
+    expect(page).toContain('等待审核')
+    expect(page).toContain('来源：review:r1')
+  })
+
+  it('offers the decision a person takes about a proposal that waits', () => {
+    const page = html(longTerm({ candidates: [candidate()] }))
+    expect(page).toContain('通过')
+    expect(page).toContain('退回')
+  })
+
+  it('offers no decision about a proposal that has already been decided', () => {
+    const page = html(longTerm({
+      candidates: [candidate({ status: 'active' })],
+    }))
+    expect(page).toContain('已成为长期记忆')
+    expect(page).not.toContain('>通过</button>')
+    expect(page).not.toContain('>退回</button>')
+  })
+
+  it('says that a source the control plane could not check is unverified', () => {
+    const page = html(longTerm({
+      candidates: [candidate({ sourceRefs: [{ kind: 'ticket', id: 't9', at: '', summary: '', verified: false }] })],
+    }))
+    expect(page).toContain('ticket:t9（未核验）')
+  })
+
+  it('shows the memories that are in force with their own id and last verification', () => {
+    const page = html(longTerm({ memories: [memory()] }))
+    expect(page).toContain('这个项目统一用 pnpm')
+    expect(page).toContain('mem_000000000001')
+    expect(page).toContain('最后核验')
+  })
+
+  it('says what the last decision did, and says why it failed', () => {
+    const done = html(longTerm({ message: '已通过：这条候选成为了一条长期记忆。' }))
+    expect(done).toContain('已通过：这条候选成为了一条长期记忆。')
+    const failed = html(longTerm({ actionError: 'HTTP 409' }))
+    expect(failed).toContain('操作失败：HTTP 409')
+  })
+
+  it('offers the scopes a proposal may be made for', () => {
+    const page = html(longTerm())
+    expect(page).toContain('全局偏好（跨项目）')
+    expect(page).toContain('项目：控制台改造')
+    expect(page).toContain('提交候选')
+  })
+
+  it('does not offer a way to forget a memory, because that is not decided yet', () => {
+    const page = html(longTerm({ memories: [memory()] }))
+    expect(page).toContain('遗忘一条记忆的做法还没有定')
+    expect(page).not.toContain('>遗忘</button>')
+    expect(page).not.toContain('>删除</button>')
   })
 })
 

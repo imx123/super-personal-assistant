@@ -1215,6 +1215,135 @@ export function readEventHistory(query: EventHistoryQuery = {}): Promise<EventHi
   return read<EventHistoryPage>(`/v1/console/memory/event-history${search === '' ? '' : `?${search}`}`)
 }
 
+/**
+ * One source reference of a candidate or a memory, as the console reads it.
+ *
+ * It names the record the fact came from and one redacted line about it. It never carries the record's own text: a
+ * report's body, a diff and a prompt stay where they were written.
+ */
+export interface MemorySourceRef {
+  kind: string
+  id: string
+  at: string
+  summary: string
+  /** Whether the control plane really holds the record this reference names. */
+  verified: boolean
+}
+
+/** One candidate of the queue, as the console reads it. */
+export interface MemoryCandidateView {
+  candidateId: string
+  scopeType: string
+  scopeId: string
+  proposedScopeType: string
+  proposedScopeId: string
+  /** The body of the proposal, already redacted. */
+  content: string
+  status: string
+  sourceTrust: string
+  sourceRefs: MemorySourceRef[]
+  proposedByRole: string
+  proposedBySessionId: string
+  /** Whether the proposal may be read inside the Session that made it while it waits. */
+  provisionalSameSession: boolean
+  revisionCount: number
+  conflictWithId: string
+  confidence: number
+  importance: number
+  reviewNote: string
+  createdAt: string
+  updatedAt: string
+  reviewedAt: string
+  expiresAt: string
+  /** The checksum of this version of the candidate; a decision made on an older one is refused. */
+  checksum: string
+}
+
+/** One page of the candidate queue. */
+export interface MemoryCandidatePage {
+  rows: MemoryCandidateView[]
+  total: number
+}
+
+/** One memory, as the console reads it. */
+export interface MemoryRecordView {
+  memoryId: string
+  scopeType: string
+  scopeId: string
+  /** The body of the memory, already redacted. */
+  content: string
+  status: string
+  sourceTrust: string
+  sourceRefs: MemorySourceRef[]
+  supersedesId: string
+  supersededById: string
+  conflictWithId: string
+  pinned: boolean
+  importance: number
+  confidence: number
+  utility: number
+  validFrom: string
+  lastVerifiedAt: string
+  deprecatedAt: string
+  createdAt: string
+  updatedAt: string
+  nodeId: string
+  backendId: string
+  checksum: string
+}
+
+/** One page of the memories. */
+export interface MemoryRecordPage {
+  rows: MemoryRecordView[]
+  total: number
+}
+
+/** Read the queue of candidates. */
+export function readMemoryCandidates(query: { status?: string; limit?: number } = {}): Promise<MemoryCandidatePage> {
+  const params = new URLSearchParams()
+  if (query.status !== undefined && query.status !== '') params.set('status', query.status)
+  if (query.limit !== undefined) params.set('limit', String(query.limit))
+  const search = params.toString()
+  return read<MemoryCandidatePage>(`/v1/console/memory/candidates${search === '' ? '' : `?${search}`}`)
+}
+
+/** Read the memories that are in force. */
+export function readLongTermMemories(query: { status?: string; limit?: number } = {}): Promise<MemoryRecordPage> {
+  const params = new URLSearchParams()
+  if (query.status !== undefined && query.status !== '') params.set('status', query.status)
+  if (query.limit !== undefined) params.set('limit', String(query.limit))
+  const search = params.toString()
+  return read<MemoryRecordPage>(`/v1/console/memory/memories${search === '' ? '' : `?${search}`}`)
+}
+
+/**
+ * Offer one fact to be remembered.
+ *
+ * It enters the queue and waits for a decision: the console may propose a memory, and it may not write one.
+ *
+ * The candidate comes back with the answer when the caller may see the row. A proposal that is already in the queue is
+ * answered with `duplicate: true` and no row at all when the caller may not see it — the console is the operator's own
+ * console, so it always may.
+ */
+export function submitMemoryCandidate(input: { content: string; scopeType: string; scopeId: string }):
+  Promise<{ candidate?: MemoryCandidateView; duplicate: boolean }> {
+  return write<{ candidate?: MemoryCandidateView; duplicate: boolean }>('/v1/console/memory/candidates', input)
+}
+
+/**
+ * Take one decision about one candidate.
+ *
+ * The decision names the version of the candidate it was made on, so a decision about a candidate that changed in the
+ * meantime is refused rather than deciding about the wrong thing.
+ */
+export function decideMemoryCandidate(input: { candidateId: string; decision: string; checksum: string;
+  memoryId?: string; note?: string }): Promise<{ code: string; candidate: MemoryCandidateView; memory?: MemoryRecordView }> {
+  return write<{ code: string; candidate: MemoryCandidateView; memory?: MemoryRecordView }>(
+    `/v1/console/memory/candidates/${encodeURIComponent(input.candidateId)}/decision`,
+    { decision: input.decision, checksum: input.checksum, ...(input.memoryId === undefined ? {} : { memoryId: input.memoryId }),
+      ...(input.note === undefined ? {} : { note: input.note }) })
+}
+
 /** One write. */
 export function write<T>(path: string, body: unknown = {}): Promise<T> {
   return request<T>(path, { method: 'POST', body })

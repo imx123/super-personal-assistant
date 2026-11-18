@@ -920,6 +920,19 @@ export class EventSubscriptionService {
   }
 
   /**
+   * One disposition of an external event, read by its own id.
+   *
+   * The disposition is the only record of an external event the control plane keeps: the event's own payload never
+   * reaches a database, so a reference to what came from outside may name the disposition and nothing else. A
+   * disposition that is not there is not there.
+   */
+  disposition(dispositionId: string): ExternalDispositionView | undefined {
+    const row = this.store.db.prepare('SELECT * FROM external_event_dispositions WHERE disposition_id = ?')
+      .get(dispositionId) as Record<string, unknown> | undefined
+    return row === undefined ? undefined : this.dispositionView(row)
+  }
+
+  /**
    * Change one subscription that already exists, for a person.
    *
    * A new target is checked as a new target is: the resolver reads it again, and a target that is not there any more is

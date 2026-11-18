@@ -5,6 +5,8 @@ import type { AddressInfo } from 'node:net'
 import { UserError, type ProjectTicketTask, type WorkerReport } from '../core/index.ts'
 import { EVENT_HISTORY_KINDS, EVENT_HISTORY_LIMIT, EventHistoryQueryError,
   type EventHistoryKind, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
+import { MEMORY_LIST_LIMIT, type MemoryDecisionKind, type MemoryRefusalCode } from '../memory/memory-service.ts'
+import { SOURCE_REF_KINDS, sourceRefKindOf, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { packagePath } from '../infra/paths.ts'
 import { ROUTER_ATTACHMENT_BYTES, ROUTER_ATTACHMENT_COUNT, WORKER_REPORT_STATES,
   type NodeEvent, type RouterModel, type RouterTextAttachment } from '../shared/protocol.ts'
@@ -190,6 +192,32 @@ function stringValue(value: unknown, name: string, required: boolean): string | 
   const trimmed = value.trim()
   if (required && trimmed === '') throw new HttpError(400, `${name} must be a non-empty string`)
   return trimmed
+}
+
+/**
+ * The decision one request names about one candidate.
+ *
+ * The five decisions are the ones the memory service knows. Anything else is a client error: a decision the control
+ * plane does not understand must not be treated as a refusal of its own.
+ */
+function memoryDecision(value: unknown): MemoryDecisionKind {
+  if (value === 'approve' || value === 'reject' || value === 'merge' || value === 'conflict' || value === 'supersede') {
+    return value
+  }
+  throw new HttpError(400, 'The decision must be approve, reject, merge, conflict or supersede')
+}
+
+/**
+ * The status a refusal of a decision is answered with.
+ *
+ * A decision made on a candidate that changed is a conflict, not a mistake: the caller may read the candidate again and
+ * decide about the version that is really there. A candidate or a memory that is not there is a 404, and everything
+ * else is a request the control plane will not carry out as it was written.
+ */
+function memoryRefusalStatus(code: MemoryRefusalCode): number {
+  if (code === 'CANDIDATE_NOT_FOUND' || code === 'MEMORY_NOT_FOUND') return 404
+  if (code === 'STALE_CANDIDATE' || code === 'CONFLICT_ALREADY_OPEN') return 409
+  return 400
 }
 
 /**
@@ -664,6 +692,51 @@ export class ControlPlaneServer {
     // control plane's own file, so it is not the console's pruned log, and the answer says how far back it reaches.
     if (method === 'GET' && path === '/v1/console/memory/event-history') {
       return json(res, 200, this.eventHistoryPage(() => this.control.eventHistoryForOperator(this.eventHistoryQuery(url))))
+    }
+
+    // The long-term memory: the queue of proposals and the memories that are in force. Both are read from the control
+    // plane's own file, and both are read-only — a memory is written when a decision says so, never by a read.
+    if (method === 'GET' && path === '/v1/console/memory/candidates') {
+      return json(res, 200, this.control.memoryCandidatesForOperator(this.memoryCandidateQuery(url)))
+    }
+    if (method === 'GET' && path === '/v1/console/memory/memories') {
+      return json(res, 200, this.control.memoryRecordsForOperator(this.memoryRecordQuery(url)))
+    }
+
+    // A proposal is a proposal: the operator may offer one, and it waits in the queue for a decision. There is no route
+    // that writes a memory directly.
+    if (method === 'POST' && path === '/v1/console/memory/candidates') {
+      const body = await readJson(req)
+      const result = this.control.submitMemoryCandidate({
+        content: text(body.content),
+        scopeType: text(body.scopeType),
+        scopeId: text(body.scopeId),
+        ...(body.importance === undefined ? {} : { importance: Number(body.importance) }),
+        ...(body.sourceRefs === undefined ? {} : { sourceRefs: this.sourceRefs(body.sourceRefs) }),
+      })
+      if (!result.ok) throw new HttpError(400, result.reason)
+      // A proposal that is already in the queue is answered with the row only to the caller that may see it. The
+      // console is the operator's own console, so it always may; a Session that may not gets the fact and nothing else.
+      const candidate = result.candidate
+      if (candidate === undefined) return json(res, 201, { duplicate: true })
+      return json(res, 201, { candidate, duplicate: result.duplicate })
+    }
+
+    // One decision about one proposal. It names the version it was made on, so a decision about a proposal that changed
+    // in the meantime is refused instead of deciding about the wrong thing.
+    const decisionRoute = /^\/v1\/console\/memory\/candidates\/([^/]+)\/decision$/.exec(path)
+    if (method === 'POST' && decisionRoute !== null) {
+      const body = await readJson(req)
+      const result = this.control.decideMemoryCandidate({
+        candidateId: decodeURIComponent(decisionRoute[1] ?? ''),
+        decision: memoryDecision(body.decision),
+        checksum: text(body.checksum),
+        ...(body.memoryId === undefined ? {} : { memoryId: text(body.memoryId) }),
+        ...(typeof body.note === 'string' ? { note: body.note } : {}),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      return json(res, 200, { code: result.code, candidate: result.candidate,
+        ...(result.memory === undefined ? {} : { memory: result.memory }) })
     }
     if (method === 'POST' && path === '/v1/console/projects') {
       const body = await readJson(req)
@@ -1187,6 +1260,69 @@ export class ControlPlaneServer {
       ...(limit === undefined ? {} : { limit }),
       ...(cursor === undefined ? {} : { cursor }),
       ...(order === undefined ? {} : { order: order as 'asc' | 'desc' }),
+    }
+  }
+
+  /**
+   * The source references one request offers.
+   *
+   * A reference names a record of the control plane's own tables and one redacted line about it. The kind must be one
+   * the control plane knows: a reference to a kind it cannot look up would be a claim nobody could check, and it is
+   * refused here rather than stored as if it were a fact.
+   */
+  private sourceRefs(value: unknown): SourceRefInput[] {
+    if (!Array.isArray(value)) throw new HttpError(400, 'sourceRefs must be an array')
+    return value.map(entry => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        throw new HttpError(400, 'A source reference must be an object')
+      }
+      const record = entry as Record<string, unknown>
+      const kind = text(record.kind)
+      if (sourceRefKindOf(kind) === undefined) {
+        throw new HttpError(400, `A source reference must name one of ${SOURCE_REF_KINDS.join(', ')}`)
+      }
+      return {
+        kind: kind as SourceRefKind,
+        id: text(record.id),
+        ...(typeof record.summary === 'string' ? { summary: record.summary } : {}),
+      }
+    })
+  }
+
+  /**
+   * The query of one read of the candidate queue.
+   *
+   * A status narrows the queue, and a limit bounds the page. Both are bounded here as well as in the service, so one
+   * request can never be the whole queue.
+   */
+  private memoryCandidateQuery(url: URL): { status?: string; limit?: number } {
+    const status = url.searchParams.get('status')
+    const limit = this.limit(url.searchParams.get('limit'))
+    if (limit !== undefined && limit > MEMORY_LIST_LIMIT) {
+      throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_LIST_LIMIT}`)
+    }
+    return {
+      ...(status === null || status === '' ? {} : { status }),
+      ...(limit === undefined ? {} : { limit }),
+    }
+  }
+
+  /**
+   * The query of one read of the memories.
+   *
+   * The list holds the memories that are in force. A status may ask for another one — the ones that were superseded
+   * keep their history — and the limit bounds the page.
+   */
+  private memoryRecordQuery(url: URL): { status?: string; limit?: number; includeInactive?: boolean } {
+    const status = url.searchParams.get('status')
+    const limit = this.limit(url.searchParams.get('limit'))
+    if (limit !== undefined && limit > MEMORY_LIST_LIMIT) {
+      throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_LIST_LIMIT}`)
+    }
+    return {
+      ...(status === null || status === '' ? {} : { status }),
+      ...(limit === undefined ? {} : { limit }),
+      ...(status === null || status === '' ? {} : { includeInactive: true }),
     }
   }
 

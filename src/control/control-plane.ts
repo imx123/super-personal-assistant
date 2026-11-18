@@ -12,6 +12,9 @@ import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { EventHistoryService, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { LiveStateService, type LiveStateSnapshot } from '../memory/live-state.ts'
+import { MemoryService, type MemoryCandidatePage, type MemoryDecisionKind, type MemoryDecisionRequest,
+  type MemoryDecisionResult, type MemoryRecordPage, type MemorySubmitRequest, type MemorySubmitResult } from '../memory/memory-service.ts'
+import { type MemoryCaller, type MemorySourceRecord, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { redact } from '../infra/redact.ts'
 import { NODE_CAPABILITY_DELIVERY_EVIDENCE, NODE_CAPABILITY_TURN_INTERRUPT, NODE_PROTOCOL_VERSION, NodeUnconfirmedError, PROJECT_GATE_CONDITIONS,
   GUARD_DENIAL_REASON_CODES, type DeliveryEvidence, type GuardDenialReasonCode, type ProjectGateCondition } from '../shared/protocol.ts'
@@ -1727,6 +1730,15 @@ export class ControlPlane {
    */
   private readonly durableHistory: EventHistoryService
   /**
+   * The long-term memory: the candidate queue and the memories a decision made of them.
+   *
+   * It lives in `src/memory/`, so the kernel only hands it the records it reads and the facts it writes; the scope, the
+   * trust, the redaction and the transitions are the memory module's own work. It is the only place a long-term memory
+   * is written: the console, the memory manager of `P5-4` and the retriever of `P5-5` all go through it, so there is
+   * one answer to what may be remembered and one place where a memory is born.
+   */
+  private readonly memory: MemoryService
+  /**
    * The durable outbox of the coordination deliveries.
    *
    * It owns the table every coordination writes into, the vocabulary of the states a delivery reaches and the recovery
@@ -2007,6 +2019,19 @@ export class ControlPlane {
         // A history that cannot be written is a diagnostic, never a failed piece of work: the fact is lost, the work
         // that produced it stays done, and the loss is said out loud instead of being hidden.
         process.stderr.write(`superagent control-plane event history write failed: ${messageOf(error)}\n`)
+      })
+      // The long-term memory: the candidate queue and the memories a decision made of them. Its tables are in this
+      // control plane's own file, next to the records the memories point at, so a memory never refers to a Ticket that
+      // is no longer there. It writes nothing on its own — a memory is written when somebody decides that it is one.
+      this.memory = new MemoryService(this.store.db, {
+        now: () => this.now(),
+        nodeId: () => this.options.nodeId,
+        backendId: () => CONTROL_BACKEND,
+        nodeIds: () => [...this.nodes.keys()],
+        projectIds: () => this.store.projects.list().map(project => project.id),
+        source: (kind, id) => this.memorySource(kind, id),
+      }, error => {
+        process.stderr.write(`superagent control-plane memory write failed: ${messageOf(error)}\n`)
       })
       // The callbacks run after construction (an Assignment starts only through a later Engine command), so the closures may
       // read `this.engine` and the Session map without an initialization-order hazard.
@@ -8585,6 +8610,151 @@ export class ControlPlane {
     const result = this.durableHistory.forSession({ audience: role, sessionId }, query)
     if (!result.ok) throw new ToolCallError('forbidden', result.reason)
     return result.page
+  }
+
+  // ─── the long-term memory ───────────────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * The caller the console acts as.
+   *
+   * The operator is a person at the console and not a Session: it holds no session id and no work of its own, and the
+   * only thing that says what it may do is the credential the request carried.
+   */
+  private operatorCaller(): MemoryCaller {
+    return { role: 'operator', sessionId: '', nodeId: '', projectId: undefined, ticketId: undefined }
+  }
+
+  /** The candidate queue, as the operator reads it. */
+  memoryCandidatesForOperator(options: { status?: string; limit?: number } = {}): MemoryCandidatePage {
+    return this.memory.listCandidates(this.operatorCaller(), options)
+  }
+
+  /** The memories in force, as the operator reads them. */
+  memoryRecordsForOperator(options: { status?: string; limit?: number; includeInactive?: boolean } = {}): MemoryRecordPage {
+    return this.memory.listMemories(this.operatorCaller(), options)
+  }
+
+  /**
+   * One proposal, offered by the operator.
+   *
+   * The body, the scope and the sources are checked by the memory service before anything is written: the console may
+   * only say what a person may say, and it may not write a memory directly — it may only propose one.
+   *
+   * The sources are optional: they name the records the person's words came from, and the control plane checks each of
+   * them against what it really holds. A source it cannot find does not disappear — it stays, marked unverified, and the
+   * fact it belongs to loses its trust.
+   */
+  submitMemoryCandidate(input: { content: string; scopeType: string; scopeId: string; importance?: number;
+    sourceRefs?: readonly SourceRefInput[] }): MemorySubmitResult {
+    const request: MemorySubmitRequest = {
+      caller: this.operatorCaller(),
+      content: input.content,
+      scope: { scopeType: input.scopeType, scopeId: input.scopeId },
+      ...(input.importance === undefined ? {} : { importance: input.importance }),
+      ...(input.sourceRefs === undefined ? {} : { sourceRefs: input.sourceRefs }),
+    }
+    return this.memory.submit(request)
+  }
+
+  /**
+   * One decision about one candidate, taken by the operator.
+   *
+   * The decision names the version of the candidate it was made on, so a decision made on a candidate that changed in
+   * the meantime is refused instead of deciding about the wrong thing.
+   */
+  decideMemoryCandidate(input: { candidateId: string; decision: MemoryDecisionKind; checksum: string;
+    memoryId?: string; note?: string }): MemoryDecisionResult {
+    const request: MemoryDecisionRequest = {
+      caller: this.operatorCaller(),
+      candidateId: input.candidateId,
+      decision: input.decision,
+      expectedChecksum: input.checksum,
+      ...(input.memoryId === undefined ? {} : { memoryId: input.memoryId }),
+      ...(input.note === undefined ? {} : { note: input.note }),
+    }
+    return this.memory.decide(request)
+  }
+
+  /**
+   * The record a source reference names, when the control plane really holds it.
+   *
+   * The answer decides two things at once: whether the reference may be believed at all, and whether the fact it
+   * carries is a conclusion the control plane confirmed. A Ticket that ended is a conclusion; a report that was merely
+   * delivered is not; an observation from outside is never one.
+   */
+  private memorySource(kind: SourceRefKind, id: string): MemorySourceRecord | undefined {
+    switch (kind) {
+      case 'ticket': {
+        const ticket = this.store.tickets.get(id)
+        if (ticket === undefined) return undefined
+        return {
+          at: ticket.updatedAt,
+          authoritative: ticket.ended !== undefined && ticket.ended.outcome !== 'stopped',
+          tainted: false,
+          ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
+        }
+      }
+      case 'assignment': {
+        const ticket = this.ticketOfAssignment(id)
+        if (ticket === undefined) return undefined
+        const assignment = ticket.assignments.find(entry => entry.id === id)
+        if (assignment === undefined) return undefined
+        return {
+          at: assignment.endedAt ?? assignment.startedAt ?? assignment.createdAt,
+          authoritative: assignment.state === 'ended',
+          tainted: false,
+          ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
+        }
+      }
+      case 'review': {
+        for (const ticket of this.store.tickets.list()) {
+          const review = ticket.reviews?.find(entry => entry.id === id)
+          if (review === undefined) continue
+          return {
+            at: review.decidedAt ?? review.at,
+            authoritative: review.state === 'accepted',
+            tainted: false,
+            ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
+          }
+        }
+        return undefined
+      }
+      case 'delivery': {
+        const row = this.outbox.row(id)
+        if (row === undefined) return undefined
+        // A wake-up that carried an external observation is an observation, not a conclusion: the envelope around it
+        // makes it safe to read, never trustworthy, so the fact that leans on it stays untrusted.
+        return { at: row.at, authoritative: false, tainted: row.kind === 'external_wakeup',
+          ...(row.projectId === '' ? {} : { projectId: row.projectId }),
+          ...(row.nodeId === '' ? {} : { nodeId: row.nodeId }) }
+      }
+      case 'audit': {
+        const seq = Number(id)
+        if (!Number.isInteger(seq)) return undefined
+        const row = this.consoleStore.auditEntry(seq)
+        if (row === undefined) return undefined
+        return { at: row.at, authoritative: false, tainted: false }
+      }
+      case 'console_note': {
+        const noteId = Number(id)
+        if (!Number.isInteger(noteId)) return undefined
+        const row = this.consoleStore.memory(noteId)
+        if (row === undefined) return undefined
+        return { at: row.at, authoritative: false, tainted: false, projectId: row.projectId }
+      }
+      case 'operator_message': {
+        const row = this.consoleStore.routerMessage(id)
+        if (row === undefined) return undefined
+        return { at: row.at, authoritative: false, tainted: false }
+      }
+      case 'external_event': {
+        const row = this.externalEvents.disposition(id)
+        if (row === undefined) return undefined
+        return { at: row.at, authoritative: false, tainted: true }
+      }
+      default:
+        return undefined
+    }
   }
 
   /**

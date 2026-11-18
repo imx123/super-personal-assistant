@@ -562,6 +562,18 @@ export class ConsoleStore {
   }
 
   /**
+   * One audit entry, read by its own sequence.
+   *
+   * The trail is a sequence of facts about what a person did, and a record that names one of them has to be able to
+   * find it. An entry that is not there is not there: the answer says so instead of inventing a row.
+   */
+  auditEntry(seq: number): ConsoleAuditRow | undefined {
+    const row = this.db.prepare(
+      'SELECT seq, at, actor, kind, action, target_kind, target_id, outcome, detail FROM audit WHERE seq = ?').get(seq)
+    return row === undefined ? undefined : this.auditRow(row)
+  }
+
+  /**
    * Record one entry of a Project's own memory.
    *
    * The entries are facts of that Project alone: they are read by the Project's PM and by nobody else. The table keeps
@@ -586,6 +598,18 @@ export class ConsoleStore {
       .all(projectId, limit)
     return rows.map(row => ({ id: numberOf(row.id), projectId: stringOf(row.project_id), at: stringOf(row.at),
       actor: stringOf(row.actor), text: stringOf(row.text) }))
+  }
+
+  /**
+   * One entry of a Project's memory, read by its own id.
+   *
+   * A record that names a note has to be able to find it, and a note that is not there is not there: the answer says
+   * so instead of inventing a row.
+   */
+  memory(id: number): ProjectMemoryRow | undefined {
+    const row = this.db.prepare('SELECT id, project_id, at, actor, text FROM project_memory WHERE id = ?').get(id)
+    return row === undefined ? undefined : { id: numberOf(row.id), projectId: stringOf(row.project_id),
+      at: stringOf(row.at), actor: stringOf(row.actor), text: stringOf(row.text) }
   }
 
   /** How many entries one Project's memory holds. */
