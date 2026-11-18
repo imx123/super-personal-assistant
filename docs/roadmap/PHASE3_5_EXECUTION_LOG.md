@@ -21,8 +21,8 @@
 | P4-Gate | P4-0–P4-5 | 协作闭环与兼容回归，双节点合入时复跑 | DONE |
 | P5-0 | P4-Gate | 三域数据契约与设计 | DONE |
 | P5-1 | P5-0 | Live State | DONE |
-| P5-2 | P5-0 | 持久 Event History | IN_PROGRESS |
-| P5-3 | P5-0 | Memory Service 与候选队列 | NOT_STARTED |
+| P5-2 | P5-0 | 持久 Event History | DONE |
+| P5-3 | P5-0 | Memory Service 与候选队列 | IN_PROGRESS |
 | P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | NOT_STARTED |
 | P5-5 | P5-1、P5-2、P5-3 | 按需检索与排序，验证检索进入模型 | NOT_STARTED |
 | P5-6 | P3、P4、P5 主功能 | 三域与路由协作闭环，真实模型 | NOT_STARTED |
@@ -260,3 +260,13 @@ P5-1 开始实施按角色授权的实时状态查询与配套页面。
 - 类型检查、构建和 16 个定向文件通过，共 275 项。Windows 全量 2,142 项通过、45 项失败，失败断言集合与 P5-0 基线一致。结果在 `.artifacts/phase5-p5-1-20261119/`。
 
 P5-2 开始实现持久事件历史和控制台精确查询。
+
+## P5-2
+
+2026-11-19 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 实施，Codex 独立验收。候选 `c7ef27d` 与本地 `next` 的 `30c6d97` 在受测文件上一致。
+
+- `event_history_index` 与业务库共用 SQLite 文件，独立于控制台短期日志裁剪。关键事实按业务来源留存。精确键在读取作用域内筛选，覆盖范围也受访问权限限制。历史从功能启用后记录。独立提交的拒绝与定时运行记录在两步写入间退出时可能缺少索引行，具体边界见 [Phase 5 数据契约](../023-phase5-memory-contract.zh-CN.md)。
+- 在同一隔离 DSH Desktop 0.2.2.0 的 `phase3-live` profile 加载 `dsh-superagent/node`。实际创建项目和 Scheduler 手动运行，Router 调用 `control_event_history_query`。控制面重启后复查项目的同一组 52 条事实；Edge 验证项目筛选、50 至 52 条的分页、旧分页响应被丢弃及短期日志分栏。390px 无横向溢出。证据见 `.artifacts/phase3-5-20261117/live-Da39kE/evidence.json` 与同目录截图。
+- 类型检查、构建、21 个定向文件共 387 项通过。Windows 全量 2,179 项通过、45 项失败，失败断言集合与 P5-1 逐项一致。报告见 `.artifacts/phase5-p5-2-20261119/`。
+
+P5-3 先实现候选与长期记忆事实的存储、作用域和人工审核。遗忘语义仍待确定，继续推进独立的交付内容。
