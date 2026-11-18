@@ -11,8 +11,8 @@
 import { createElement, type ComponentProps, type ReactElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, MemoryCandidateView, MemoryRecordView,
-  Overview } from '../src/console/api.ts'
+import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, MemoryCandidateView, MemoryMaintenanceRunView,
+  MemoryRecordView, MemoryReviewRunView, Overview } from '../src/console/api.ts'
 import { EventHistoryPanel, LiveStatePanel, LongTermMemoryView, MemoryHead, PersistentHistoryView } from '../src/console/memory.tsx'
 
 /** The control plane's own snapshot, as the shell reads it. */
@@ -102,6 +102,8 @@ const candidate = (over: Partial<MemoryCandidateView> = {}): MemoryCandidateView
   proposedBySessionId: '',
   provisionalSameSession: false,
   revisionCount: 0,
+  reevaluations: 0,
+  returnedToSessionId: '',
   conflictWithId: '',
   confidence: 0.9,
   importance: 0,
@@ -141,6 +143,49 @@ const memory = (over: Partial<MemoryRecordView> = {}): MemoryRecordView => ({
   ...over,
 })
 
+/** One review the memory manager was woken for, as the control plane answered with it. */
+const review = (over: Partial<MemoryReviewRunView> = {}): MemoryReviewRunView => ({
+  runId: 'memrun-1',
+  jobId: 'memjob-1',
+  kind: 'review',
+  candidateId: 'cand_000000000001',
+  checksum: 'abc123',
+  scopeType: 'project',
+  scopeId: 'project:p1',
+  sourceKeys: ['review:r1'],
+  sessionId: 'memory-manager',
+  nodeId: 'local',
+  backendId: 'dsh',
+  generation: '7',
+  state: 'dispatched',
+  detail: '',
+  preparedAt: '2026-11-19T08:00:00.000Z',
+  updatedAt: '2026-11-19T08:00:00.000Z',
+  finishedAt: '',
+  expiresAt: '2026-11-19T08:05:00.000Z',
+  ...over,
+})
+
+/** One run of the daily inspection, as the control plane answered with it. */
+const maintenance = (over: Partial<MemoryMaintenanceRunView> = {}): MemoryMaintenanceRunView => ({
+  runId: 'mem-maint-20261119080000',
+  at: '2026-11-19T08:00:00.000Z',
+  state: 'succeeded',
+  nodeId: 'local',
+  backendId: 'dsh',
+  checked: 3,
+  duplicates: 1,
+  conflicts: 0,
+  expired: 2,
+  stale: 1,
+  summary: '查看了 3 条候选。',
+  detail: '',
+  nextAt: '2026-11-20T08:00:00.000Z',
+  preparedAt: '2026-11-19T08:00:00.000Z',
+  finishedAt: '2026-11-19T08:00:05.000Z',
+  ...over,
+})
+
 /**
  * The long-term memory's own view, with the facts a control plane that answered would give it.
  *
@@ -150,6 +195,10 @@ const longTerm = (over: Partial<ComponentProps<typeof LongTermMemoryView>> = {})
   createElement(LongTermMemoryView, {
     candidates: over.candidates ?? [],
     memories: over.memories ?? [],
+    reviews: over.reviews ?? [],
+    reviewState: over.reviewState ?? 'ready',
+    maintenance: over.maintenance ?? [],
+    maintenanceState: over.maintenanceState ?? 'ready',
     queueState: over.queueState ?? 'ready',
     listState: over.listState ?? 'ready',
     error: over.error ?? '',
@@ -167,6 +216,7 @@ const longTerm = (over: Partial<ComponentProps<typeof LongTermMemoryView>> = {})
     onSubmit: over.onSubmit ?? (() => {}),
     onApprove: over.onApprove ?? (() => {}),
     onReject: over.onReject ?? (() => {}),
+    onInspect: over.onInspect ?? (() => {}),
     onOpenProjects: over.onOpenProjects ?? (() => {}),
   })
 
@@ -421,7 +471,9 @@ describe('the long-term memory panel', () => {
   it('offers the decision a person takes about a proposal that waits', () => {
     const page = html(longTerm({ candidates: [candidate()] }))
     expect(page).toContain('通过')
-    expect(page).toContain('退回')
+    // The manual decision is "not adopted"; the passive return is a different thing and says so.
+    expect(page).toContain('不采纳')
+    expect(page).not.toContain('>退回</button>')
   })
 
   it('offers no decision about a proposal that has already been decided', () => {
@@ -430,7 +482,7 @@ describe('the long-term memory panel', () => {
     }))
     expect(page).toContain('已成为长期记忆')
     expect(page).not.toContain('>通过</button>')
-    expect(page).not.toContain('>退回</button>')
+    expect(page).not.toContain('>不采纳</button>')
   })
 
   it('says that a source the control plane could not check is unverified', () => {
@@ -466,6 +518,58 @@ describe('the long-term memory panel', () => {
     expect(page).toContain('遗忘一条记忆的做法还没有定')
     expect(page).not.toContain('>遗忘</button>')
     expect(page).not.toContain('>删除</button>')
+  })
+
+  it('shows the candidates that wait for a person apart, and offers the decision there', () => {
+    const page = html(longTerm({ candidates: [candidate({ status: 'pending_human_confirm' })] }))
+    expect(page).toContain('等待人工确认')
+    expect(page).toContain('只有人能决定')
+    expect(page).toContain('不采纳')
+  })
+
+  it('says that no candidate waits for a person when none does', () => {
+    const page = html(longTerm({ candidates: [candidate({ status: 'queued' })] }))
+    expect(page).toContain('没有等待人工确认的候选')
+  })
+
+  it('names a passive return as what it is, apart from the manual decision', () => {
+    const page = html(longTerm({ candidates: [candidate({ status: 'reviewing', revisionCount: 1,
+      returnedToSessionId: 'router' })] }))
+    expect(page).toContain('已退回给 router')
+    expect(page).toContain('被动退回，不唤醒会话')
+  })
+
+  it('shows the review queue of the memory manager as it really stands', () => {
+    const page = html(longTerm({ reviews: [review({ state: 'dispatched' })] }))
+    expect(page).toContain('记忆管理员的审核队列')
+    expect(page).toContain('审核中')
+    expect(page).toContain('cand_000000000001')
+  })
+
+  it('says that a review which has not answered is not an empty queue', () => {
+    const page = html(longTerm({ reviewState: 'pending' }))
+    expect(page).toContain('正在读取审核队列')
+    expect(page).not.toContain('还没有审核记录')
+  })
+
+  it('shows the inspection that really ran and when the next one is due', () => {
+    const page = html(longTerm({ maintenance: [maintenance()] }))
+    expect(page).toContain('每日巡检')
+    expect(page).toContain('巡检完成')
+    expect(page).toContain('下次巡检')
+    expect(page).toContain('立即巡检一次')
+  })
+
+  it('says that an inspection which did not run did not run', () => {
+    const page = html(longTerm({ maintenance: [maintenance({ state: 'skipped_offline' })] }))
+    expect(page).toContain('节点离线，本轮未运行')
+    expect(page).not.toContain('巡检完成')
+  })
+
+  it('says that an inspection which has not answered is not an empty record', () => {
+    const page = html(longTerm({ maintenanceState: 'pending' }))
+    expect(page).toContain('正在读取巡检记录')
+    expect(page).not.toContain('还没有巡检记录')
   })
 })
 

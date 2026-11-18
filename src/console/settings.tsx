@@ -39,6 +39,13 @@ const CONTROL_FIELDS = [
     ],
   },
   {
+    title: '记忆与每日巡检',
+    items: [
+      ['SUPERAGENT_MEMORY_MAINTENANCE', '每日记忆巡检', 'on 或 off。填 off 后每日巡检不自动运行；巡检记录里会如实写明它被关掉了，不会写成已完成。'],
+      ['SUPERAGENT_MEMORY_MAINTENANCE_AT', '每日记忆巡检时刻（UTC）', 'HH:MM，默认 03:00。控制面停机期间错过的时间窗不补跑，只跑当天这一格。'],
+    ],
+  },
+  {
     title: '目录、数据库与日志保留',
     items: [
       ['SUPERAGENT_CONTROL_DB', '业务数据库', '项目、工单和会话的 SQLite 文件。填写绝对路径，切换路径会打开目标库，历史数据需自行迁移。'],

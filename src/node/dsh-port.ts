@@ -17,10 +17,10 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 /**
  * The roles a node runs a Session for.
  *
- * The protocol's `SessionRole` also names the `scout`, which the node never runs: a node ensures a PM, a Worker or the
- * Router, and nothing else.
+ * The protocol's `SessionRole` also names the `scout`, which the node never runs: a node ensures a PM, a Worker, the
+ * Router or the memory manager, and nothing else.
  */
-export type NodeSessionRole = 'pm' | 'worker' | 'router'
+export type NodeSessionRole = 'pm' | 'worker' | 'router' | 'manager'
 
 /**
  * One event the host reports, before the port stamps its envelope.
@@ -278,6 +278,17 @@ export class DshNodePort implements NodePort {
         this.sessions.set(command.sessionId, { projectId: '', role: 'router' })
         await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: 'Router',
           role: 'router', prompt: command.prompt, profile: command.profile, sessionToken: command.sessionToken })
+        break
+      }
+
+      // The memory manager: one Session of its own, in a workspace of its own, bound to no Project. The node keeps it
+      // apart from every Project's Sessions and from the Router's, exactly as it does for the Router.
+      case 'memory_manager.ensure': {
+        const workspace = this.workspaceOf(command.workspace)
+        mkdirSync(workspace, { recursive: true, mode: 0o700 })
+        this.sessions.set(command.sessionId, { projectId: '', role: 'manager' })
+        await this.host.ensureSession({ sessionId: command.sessionId, workspace, title: 'Memory Manager',
+          role: 'manager', prompt: command.prompt, profile: command.profile, sessionToken: command.sessionToken })
         break
       }
 

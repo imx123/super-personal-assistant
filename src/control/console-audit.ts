@@ -12,7 +12,7 @@ import type { ConsoleAuditRow, ConsoleStore } from './console-store.ts'
 export type AuditActor = 'operator' | 'pm' | 'worker' | 'router' | 'system'
 /** What kind of thing was acted on. */
 export type AuditKind = 'project' | 'ticket' | 'assignment' | 'report' | 'review' | 'node' | 'session' | 'schedule'
-  | 'denial'
+  | 'denial' | 'memory'
 /** How an action ended. */
 export type AuditOutcome = 'ok' | 'failed' | 'skipped'
 

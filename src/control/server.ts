@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { UserError, type ProjectTicketTask, type WorkerReport } from '../core/index.ts'
 import { EVENT_HISTORY_KINDS, EVENT_HISTORY_LIMIT, EventHistoryQueryError,
   type EventHistoryKind, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
+import { MEMORY_MANAGER_LIST_LIMIT } from '../memory/memory-manager.ts'
 import { MEMORY_LIST_LIMIT, type MemoryDecisionKind, type MemoryRefusalCode } from '../memory/memory-service.ts'
 import { SOURCE_REF_KINDS, sourceRefKindOf, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { packagePath } from '../infra/paths.ts'
@@ -216,7 +217,33 @@ function memoryDecision(value: unknown): MemoryDecisionKind {
  */
 function memoryRefusalStatus(code: MemoryRefusalCode): number {
   if (code === 'CANDIDATE_NOT_FOUND' || code === 'MEMORY_NOT_FOUND') return 404
-  if (code === 'STALE_CANDIDATE' || code === 'CONFLICT_ALREADY_OPEN') return 409
+  if (code === 'STALE_CANDIDATE' || code === 'CONFLICT_ALREADY_OPEN' || code === 'REEVALUATION_LIMIT_REACHED'
+    || code === 'DUPLICATE_CONTENT') {
+    return 409
+  }
+  if (code === 'REEVALUATION_NOT_PERMITTED') return 403
+  return 400
+}
+
+/**
+ * The status a refusal of the memory manager is answered with.
+ *
+ * A job or a candidate that is not there is a 404, a job that moved on — it is stale, finished or bound to another
+ * Session — is a 409, and a Session that may not call at all is a 403. The rest is a request the control plane will not
+ * carry out as it was written.
+ */
+function managerRefusalStatus(code: string): number {
+  if (code === 'JOB_NOT_FOUND' || code === 'CANDIDATE_NOT_FOUND' || code === 'MEMORY_NOT_FOUND') return 404
+  if (code === 'JOB_STALE' || code === 'JOB_FINISHED' || code === 'JOB_NOT_BOUND' || code === 'CHECKSUM_MISMATCH'
+    || code === 'SOURCE_MISMATCH' || code === 'CANDIDATE_MISMATCH' || code === 'REVIEW_ALREADY_ACTIVE'
+    || code === 'RETURN_LIMIT_REACHED' || code === 'STALE_CANDIDATE' || code === 'CONFLICT_ALREADY_OPEN'
+    || code === 'CANDIDATE_NOT_REVIEWABLE' || code === 'JOB_EXPIRED') {
+    return 409
+  }
+  if (code === 'NOT_A_MANAGER' || code === 'SESSION_REVOKED' || code === 'SESSION_STOPPED' || code === 'SESSION_FOREIGN'
+    || code === 'SESSION_STALE' || code === 'NOT_PERMITTED' || code === 'GLOBAL_PROMOTION_REFUSED') {
+    return 403
+  }
   return 400
 }
 
@@ -701,6 +728,24 @@ export class ControlPlaneServer {
     }
     if (method === 'GET' && path === '/v1/console/memory/memories') {
       return json(res, 200, this.control.memoryRecordsForOperator(this.memoryRecordQuery(url)))
+    }
+
+    // The memory manager's own record: the reviews it was woken for and the daily inspection it ran. Both are read
+    // from the control plane's own file, so what the console shows is what really happened.
+    if (method === 'GET' && path === '/v1/console/memory/reviews') {
+      return json(res, 200, { rows: this.control.memoryReviewRunsForOperator(this.memoryLimit(url)) })
+    }
+
+    // The daily inspection: its own record, its counters and when the next one is due.
+    if (method === 'GET' && path === '/v1/console/memory/maintenance') {
+      return json(res, 200, { rows: this.control.memoryMaintenanceRunsForOperator(this.memoryLimit(url)) })
+    }
+
+    // A run of the inspection, now, by a person. The answer is what really happened: a node that is offline is reported
+    // as not run, never as a success.
+    if (method === 'POST' && path === '/v1/console/memory/maintenance/run') {
+      const run = await this.control.runMemoryMaintenance({ reason: 'manual' })
+      return json(res, 200, { run })
     }
 
     // A proposal is a proposal: the operator may offer one, and it waits in the queue for a decision. There is no route
@@ -1327,6 +1372,20 @@ export class ControlPlaneServer {
   }
 
   /**
+   * The bound one read of the manager's own record asks for.
+   *
+   * The list is bounded: a record of a hundred runs is no more useful to an operator than a record of twenty, and the
+   * page stays a page.
+   */
+  private memoryLimit(url: URL): number | undefined {
+    const limit = this.limit(url.searchParams.get('limit'))
+    if (limit !== undefined && limit > MEMORY_MANAGER_LIST_LIMIT) {
+      throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_MANAGER_LIST_LIMIT}`)
+    }
+    return limit
+  }
+
+  /**
    * The control plane's event stream: replay what the kernel already recorded, then follow it live.
    *
    * Authentication is a control-plane bearer token, checked before this method runs: the operator's, or the read-only
@@ -1566,6 +1625,74 @@ export class ControlPlaneServer {
           'name at least one of ticketId, projectId, controlSessionId, assignmentId or nodeId')
       }
       return json(res, 200, this.eventHistoryPage(() => this.control.eventHistoryFor(claims.sid, query)))
+    }
+
+    // The memory manager's four tools. The token decides who acts: only a manager Session may call them, and the job the
+    // call names is the one the control plane prepared for that very Session — a job of another Session, of an older
+    // generation or already finished is refused before anything is read.
+    if (method === 'POST' && url.pathname === '/v1/tools/memory/review') {
+      this.control.requireTool(claims.sid, 'memory_service_review_candidate', 'manager', callId)
+      const body = await readJson(req)
+      const result = this.control.memoryReviewFor(claims.sid, text(body.jobId))
+      if (!result.ok) throw new HttpError(managerRefusalStatus(result.code), result.reason)
+      return json(res, 200, { job: result.job, candidate: result.candidate })
+    }
+
+    if (method === 'POST' && url.pathname === '/v1/tools/memory/search') {
+      this.control.requireTool(claims.sid, 'memory_service_search_memories', 'manager', callId)
+      const body = await readJson(req)
+      const result = this.control.memorySearchFor(claims.sid, text(body.jobId), text(body.query))
+      if (!result.ok) throw new HttpError(managerRefusalStatus(result.code), result.reason)
+      return json(res, 200, { job: result.job, rows: result.rows })
+    }
+
+    if (method === 'POST' && url.pathname === '/v1/tools/memory/decide') {
+      this.control.requireTool(claims.sid, 'memory_service_decide', 'manager', callId)
+      const body = await readJson(req)
+      const result = this.control.memoryDecideBy(claims.sid, {
+        jobId: text(body.jobId),
+        candidateId: text(body.candidateId),
+        checksum: text(body.checksum),
+        decision: memoryDecision(body.decision),
+        ...(body.memoryId === undefined ? {} : { memoryId: text(body.memoryId) }),
+        ...(typeof body.note === 'string' ? { note: body.note } : {}),
+      })
+      if (!result.ok) throw new HttpError(managerRefusalStatus(result.code), result.reason)
+      return json(res, 200, { code: result.code, job: result.job })
+    }
+
+    if (method === 'POST' && url.pathname === '/v1/tools/memory/return') {
+      this.control.requireTool(claims.sid, 'memory_service_return_candidate', 'manager', callId)
+      const body = await readJson(req)
+      const result = this.control.memoryReturnBy(claims.sid, {
+        jobId: text(body.jobId),
+        candidateId: text(body.candidateId),
+        checksum: text(body.checksum),
+        reason: text(body.reason),
+      })
+      if (!result.ok) throw new HttpError(managerRefusalStatus(result.code), result.reason)
+      return json(res, 200, { job: result.job, returnId: result.returnId })
+    }
+
+    // The proposal the Router or the PM may offer. The caller is the Session the token proved: the scope is checked
+    // against its own authority and every source against the records the control plane really holds. A proposal that
+    // names a candidate is that same candidate, said once more by the Session it was sent back to.
+    if (method === 'POST' && url.pathname === '/v1/tools/memory/propose') {
+      this.control.requireTool(claims.sid, 'control_memory_propose', ['router', 'pm'], callId)
+      const body = await readJson(req)
+      const result = this.control.memoryProposeFor(claims.sid, {
+        content: text(body.content),
+        scopeType: text(body.scopeType),
+        scopeId: text(body.scopeId),
+        ...(body.importance === undefined ? {} : { importance: Number(body.importance) }),
+        ...(body.sourceRefs === undefined ? {} : { sourceRefs: this.sourceRefs(body.sourceRefs) }),
+        ...(body.candidateId === undefined ? {} : { candidateId: text(body.candidateId) }),
+        ...(body.checksum === undefined ? {} : { checksum: text(body.checksum) }),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      const candidate = result.candidate
+      if (candidate === undefined) return json(res, 201, { duplicate: true })
+      return json(res, 201, { candidate, duplicate: result.duplicate })
     }
 
     // The Router's read: the running state of every Project. Only a Router Session token opens it, so a PM or a Worker

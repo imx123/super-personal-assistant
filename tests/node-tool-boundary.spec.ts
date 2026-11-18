@@ -152,7 +152,8 @@ describe('node role tool boundary', () => {
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription',
       'control_list_external_subscriptions', 'control_update_external_subscription',
-      'control_delete_external_subscription', 'control_live_state', 'control_event_history_query'])
+      'control_delete_external_subscription', 'control_live_state', 'control_event_history_query',
+      'control_memory_propose'])
     expect(registry.log).toEqual(['schemas', 'restrict', 'guard', 'register:control_project',
       'register:control_create_tickets', 'register:control_message_worker', 'register:control_cancel_worker',
       'register:control_request_assignment', 'register:control_review_result', 'register:control_review_diff',
@@ -160,7 +161,7 @@ describe('node role tool boundary', () => {
       'register:control_subscribe_session_stream', 'register:control_unsubscribe_session_stream',
       'register:control_create_external_subscription', 'register:control_list_external_subscriptions',
       'register:control_update_external_subscription', 'register:control_delete_external_subscription',
-      'register:control_live_state', 'register:control_event_history_query'])
+      'register:control_live_state', 'register:control_event_history_query', 'register:control_memory_propose'])
   })
 
   it('keeps only the worker profile\'s inherited tools and guards the rest', async () => {
@@ -196,7 +197,8 @@ describe('node role tool boundary', () => {
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription',
       'control_list_external_subscriptions', 'control_update_external_subscription',
-      'control_delete_external_subscription', 'control_live_state', 'control_event_history_query'])
+      'control_delete_external_subscription', 'control_live_state', 'control_event_history_query',
+      'control_memory_propose'])
   })
 
   it('applies the boundary again to a resumed Agent', async () => {

@@ -218,6 +218,29 @@ export class FakeNode implements NodePort {
         break
       }
 
+      // The memory manager: one Session of its own, bound to no Project and to no Router. The fake keeps it apart the
+      // same way the real node does.
+      case 'memory_manager.ensure': {
+        const workspace = this.resolveWorkspace(command.workspace)
+        const at = this.now()
+        const session: SessionRecord = {
+          sessionId: command.sessionId,
+          backendSessionId: command.sessionId,
+          projectId: '',
+          role: 'manager',
+          nodeId: this.options.nodeId,
+          workspace,
+          status: 'idle',
+          toolProfile: command.profile.name,
+          createdAt: at,
+          updatedAt: at,
+        }
+        this.sessions.set(session.sessionId, session)
+        this.tokens.set(session.sessionId, command.sessionToken)
+        this.emitSessionStatus(session, 'idle')
+        break
+      }
+
       case 'session.message': {
         const session = this.requireSession(command.sessionId)
         if (session.status === 'archived' || session.status === 'stopped') {

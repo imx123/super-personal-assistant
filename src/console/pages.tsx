@@ -407,6 +407,21 @@ function activityOf(entry: AuditEntry): { title: string; meta: string; icon: str
     return { title: entry.action === 'fused' ? '守卫打断了重复越权的回合' : '守卫拒绝了越权调用',
       meta: detail, icon: 'fail', tone: entry.outcome === 'failed' ? 'failure' : '' }
   }
+  if (entry.kind === 'memory') {
+    if (entry.action === 'review-started') {
+      return { title: '记忆管理员开始审核一条候选', meta: entry.targetId, icon: 'chat', tone: '' }
+    }
+    if (entry.action === 'reviewed') {
+      return { title: '记忆管理员决定了一条候选', meta: entry.targetId, icon: 'ok', tone: 'success' }
+    }
+    if (entry.action === 'returned') {
+      return { title: '一条候选被退回，等待补充上下文', meta: entry.targetId, icon: 'chat', tone: '' }
+    }
+    if (entry.action === 'maintenance') {
+      return { title: entry.outcome === 'failed' ? '每日记忆巡检没有完成' : '每日记忆巡检完成',
+        meta: entry.targetId, icon: 'clock', tone: entry.outcome === 'failed' ? 'failure' : 'success' }
+    }
+  }
   if (entry.kind === 'session' && entry.action.startsWith('reconcile-')) {
     const title = entry.outcome === 'ok' ? '已停止并归档残留会话'
       : entry.outcome === 'failed' ? '会话清理失败' : '会话检查发现异常'

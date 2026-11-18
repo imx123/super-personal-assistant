@@ -18,3 +18,30 @@ export const fill = (template: string, values: Record<string, string>): string =
 /** Case-insensitive comparison for GitHub logins and repository names. */
 export const sameName = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase()
 export const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+/**
+ * One piece of text, quoted as data.
+ *
+ * The words of a person or a model are read, never obeyed: a control character is dropped, and the three characters that
+ * could close a fence or open a tag are escaped. The text therefore cannot end the block it is written in, cannot open a
+ * tag of its own and cannot smuggle a line break into it.
+ */
+export function quotedData(text: string): string {
+  let out = ''
+  for (const character of text) {
+    const code = character.codePointAt(0) ?? 0
+    const keep = code === 9 || code === 10 || code === 13
+    out += (code < 32 && !keep) || code === 127 ? ' ' : character
+  }
+  return out.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/**
+ * One piece of data, fenced.
+ *
+ * The name of the fence is the caller's, and the body is quoted, so the body may hold anything at all: it is data, and
+ * the fence around it says so in the caller's own words.
+ */
+export function dataFence(tag: string, body: string): string {
+  return [`<${tag}>`, quotedData(body), `</${tag}>`].join('\n')
+}

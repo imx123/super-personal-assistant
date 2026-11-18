@@ -47,13 +47,17 @@ export const WORKER_REPORT_STATES = ['progress', 'ready', 'blocked', 'failed', '
 export type WorkerReportState = (typeof WORKER_REPORT_STATES)[number]
 
 /**
- * What a Session is for: a Project's PM, an Assignment's Worker, read-only reconnaissance, or the Router.
+ * What a Session is for: a Project's PM, an Assignment's Worker, read-only reconnaissance, the Router, or the memory
+ * manager.
  *
  * The Router is the one Session that belongs to no Project: it is the console's own conversation, and it names no
  * Assignment. It still gets a Session id, a token and a lifecycle of its own, so the same boundaries as every other
  * role apply to it.
+ *
+ * The manager is the other Session that belongs to no Project: a system role that reviews the memory candidates and
+ * holds nothing else. It is woken on demand and holds the least privilege of any role here.
  */
-export type SessionRole = 'pm' | 'worker' | 'scout' | 'router'
+export type SessionRole = 'pm' | 'worker' | 'scout' | 'router' | 'manager'
 
 /**
  * How one read-only Git review of a Project's workspace ended.
@@ -257,6 +261,10 @@ export interface ConsoleRuntimeSettings {
   schedulerTickMs: number
   reconcileIntervalMs: number
   tokenRefreshGraceSeconds: number
+  /** Whether the daily memory inspection runs on its own. */
+  memoryMaintenanceEnabled: boolean
+  /** The minute of the day, in UTC, the daily memory inspection is due at. */
+  memoryMaintenanceMinuteOfDay: number
 }
 
 export interface RouterOptions {
@@ -378,6 +386,21 @@ export type NodeCommand =
      * control plane never sends it — so the protocol version does not move.
      */
     type: 'router.ensure'
+    sessionId: string
+    workspace: string
+    profile: RoleProfile
+    sessionToken: string
+    prompt: string
+  })
+  | (CommandEnvelope & {
+    /**
+     * Ensure the memory manager's Session.
+     *
+     * The manager belongs to no Project either: the command names its own Session id and its own workspace, and the node
+     * keeps it apart from every Project's Sessions and from the Router's. The command is additive — a node that does not
+     * know it refuses it, and an older control plane never sends it — so the protocol version does not move.
+     */
+    type: 'memory_manager.ensure'
     sessionId: string
     workspace: string
     profile: RoleProfile

@@ -24,14 +24,16 @@
  * short-lived log. Its pages belong to the range they were read for: a page that answers after the person changed the
  * range is dropped, so one Project's facts never land in another's list. The long-term memory is now the control plane's
  * own service (`P5-3`): the queue of proposals, the memories that are in force, and the decision a person takes about a
- * proposal. The wiring place for the rest of Phase 5 is the same panel: the retrieval of `P5-5` fills it without the page
- * changing shape.
+ * proposal. The memory manager of `P5-4` fills the same panel: the queue of reviews it was woken for, the candidates that
+ * wait for a person, and the daily inspection with its real result and the next time it is due. The wiring place for the
+ * rest of Phase 5 is the same panel: the retrieval of `P5-5` fills it without the page changing shape.
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { decideMemoryCandidate, messageOf, read, readEventHistory, readLiveState, readLongTermMemories,
-  readMemoryCandidates, submitMemoryCandidate, type ConsoleProject, type ConsoleTicket,
-  type EventHistoryCoverage, type EventHistoryEntry, type LiveStateList, type LiveStateNode,
-  type LiveStateSnapshot, type MemoryCandidateView, type MemoryRecordView, type Overview, type StreamStatus } from './api.ts'
+  readMemoryCandidates, readMemoryMaintenance, readMemoryReviews, runMemoryMaintenance, submitMemoryCandidate,
+  type ConsoleProject, type ConsoleTicket, type EventHistoryCoverage, type EventHistoryEntry, type LiveStateList,
+  type LiveStateNode, type LiveStateSnapshot, type MemoryCandidateView, type MemoryMaintenanceRunView,
+  type MemoryRecordView, type MemoryReviewRunView, type Overview, type StreamStatus } from './api.ts'
 import { stampOf, useAction, useLoaded, type PageProps } from './pages.tsx'
 
 /** How many of the newest console events the history panel shows. */
@@ -260,6 +262,7 @@ const SESSION_LIVE_ROLE: Record<string, string> = {
   pm: 'PM',
   worker: 'Worker',
   scout: 'Scout',
+  manager: '记忆管理员',
 }
 
 /**
@@ -904,6 +907,8 @@ export function LongTermMemoryPanel(props: {
 }): ReactElement {
   const queue = useLoaded(() => readMemoryCandidates(), props.revision)
   const saved = useLoaded(() => readLongTermMemories(), props.revision)
+  const reviews = useLoaded(() => readMemoryReviews(), props.revision)
+  const maintenance = useLoaded(() => readMemoryMaintenance(), props.revision)
   const projects = useLoaded(() => read<{ projects: ConsoleProject[] }>('/v1/console/projects'), props.revision)
   const [content, setContent] = useState('')
   const [scope, setScope] = useState('user_global|global')
@@ -926,6 +931,13 @@ export function LongTermMemoryPanel(props: {
       () => { setContent(''); return '候选已进入队列，等待一次决定。' })
   }
 
+  /** One inspection, now, by the person who is looking at the page. */
+  const inspect = (): void => {
+    action.run(
+      () => runMemoryMaintenance(),
+      result => maintenanceWording((result as { run?: MemoryMaintenanceRunView }).run))
+  }
+
   const options = [
     { value: 'user_global|global', label: '全局偏好（跨项目）' },
     ...(projects.data?.projects ?? []).map(project =>
@@ -936,6 +948,10 @@ export function LongTermMemoryPanel(props: {
     <LongTermMemoryView
       candidates={queue.data?.rows ?? []}
       memories={saved.data?.rows ?? []}
+      reviews={reviews.data?.rows ?? []}
+      reviewState={reviews.error !== '' ? 'error' : reviews.data === undefined ? 'pending' : 'ready'}
+      maintenance={maintenance.data?.rows ?? []}
+      maintenanceState={maintenance.error !== '' ? 'error' : maintenance.data === undefined ? 'pending' : 'ready'}
       queueState={queue.error !== '' ? 'error' : queue.data === undefined ? 'pending' : 'ready'}
       listState={saved.error !== '' ? 'error' : saved.data === undefined ? 'pending' : 'ready'}
       error={queue.error !== '' ? queue.error : saved.error}
@@ -950,6 +966,7 @@ export function LongTermMemoryPanel(props: {
       onSubmit={propose}
       onApprove={candidate => decide(candidate, 'approve')}
       onReject={candidate => decide(candidate, 'reject')}
+      onInspect={inspect}
       onOpenProjects={props.onOpenProjects} />
   )
 }
@@ -966,6 +983,14 @@ export function LongTermMemoryView(props: {
   candidates: MemoryCandidateView[]
   /** The memories that are in force. */
   memories: MemoryRecordView[]
+  /** The reviews the memory manager was woken for. */
+  reviews: MemoryReviewRunView[]
+  /** What the read of the review queue came back with. */
+  reviewState: 'pending' | 'error' | 'ready'
+  /** The runs of the daily inspection. */
+  maintenance: MemoryMaintenanceRunView[]
+  /** What the read of the inspection's record came back with. */
+  maintenanceState: 'pending' | 'error' | 'ready'
   /** What the read of the queue came back with. */
   queueState: 'pending' | 'error' | 'ready'
   /** What the read of the memories came back with. */
@@ -990,11 +1015,15 @@ export function LongTermMemoryView(props: {
   onSubmit: () => void
   /** The person approved a proposal. */
   onApprove: (candidate: MemoryCandidateView) => void
-  /** The person sent a proposal back. */
+  /** The person did not adopt a proposal. */
   onReject: (candidate: MemoryCandidateView) => void
+  /** The person asked for an inspection now. */
+  onInspect: () => void
   onOpenProjects: () => void
 }): ReactElement {
   const waiting = props.candidates.filter(candidate => REVIEWABLE_STATES.includes(candidate.status))
+  const forHuman = props.candidates.filter(candidate => candidate.status === 'pending_human_confirm')
+  const last = props.maintenance[0]
   return (
     <section id="memory-domain-longterm" className="memory-domain" aria-labelledby="memory-longterm-heading">
       <h2 id="memory-longterm-heading">长期记忆</h2>
@@ -1045,6 +1074,52 @@ export function LongTermMemoryView(props: {
 
       <div className="memory-block">
         <div className="memory-block-head">
+          <h3>等待人工确认</h3>
+          <span className="memory-tag">只有人能决定</span>
+        </div>
+        <p className="quiet">
+          这些候选只能由人决定：记忆管理员不能替人通过、归并或取代它们。它们来自全局作用域、来自无法核验的来源，
+          或者已经退回过一次。
+        </p>
+        {props.queueState === 'error'
+          ? <p className="empty">{`读取候选队列失败：${props.error}`}</p>
+          : props.queueState === 'pending'
+            ? <p className="empty">正在读取候选队列……</p>
+            : forHuman.length === 0
+              ? <p className="empty">没有等待人工确认的候选。</p>
+              : <div className="memory-rows">
+                {forHuman.map(candidate => (
+                  <div className="setting" key={`human-${candidate.candidateId}`}>
+                    <span>
+                      <b>{candidate.content}</b>
+                      <span className="quiet">
+                        {`${scopeWording(candidate.scopeType, candidate.scopeId)} · ${trustWording(candidate.sourceTrust)} · ${candidateStatusWording(candidate.status)}`}
+                      </span>
+                      <span className="quiet">
+                        {`${candidate.proposedByRole || '系统'} 提出 · ${stampOf(candidate.createdAt)}`}
+                      </span>
+                      {candidate.returnedToSessionId !== ''
+                        ? <span className="quiet">{`已退回给 ${candidate.returnedToSessionId}，等待补充上下文。`}</span>
+                        : null}
+                    </span>
+                    <span className="memory-action">
+                      <button type="button" className="action" onClick={() => props.onApprove(candidate)}
+                        aria-label={`通过候选 ${candidate.candidateId}`}
+                        disabled={props.busy}>通过</button>
+                      <button type="button" className="action" onClick={() => props.onReject(candidate)}
+                        aria-label={`不采纳候选 ${candidate.candidateId}`}
+                        disabled={props.busy}>不采纳</button>
+                    </span>
+                  </div>
+                ))}
+              </div>}
+        {props.queueState === 'ready' && forHuman.length > 0
+          ? <p className="quiet">{`共 ${forHuman.length} 条候选等待人工确认。`}</p>
+          : null}
+      </div>
+
+      <div className="memory-block">
+        <div className="memory-block-head">
           <h3>候选队列</h3>
           <span className="memory-tag">等待决定</span>
         </div>
@@ -1071,6 +1146,9 @@ export function LongTermMemoryView(props: {
                           {`来源：${candidate.sourceRefs.map(ref =>
                             `${ref.kind}:${ref.id}${ref.verified ? '' : '（未核验）'}`).join('、')}`}
                         </span>}
+                      {candidate.returnedToSessionId !== ''
+                        ? <span className="quiet">{`已退回给 ${candidate.returnedToSessionId}，等待补充上下文（被动退回，不唤醒会话）。`}</span>
+                        : null}
                       {candidate.reviewNote !== ''
                         ? <span className="quiet">{`审核意见：${candidate.reviewNote}`}</span>
                         : null}
@@ -1081,8 +1159,8 @@ export function LongTermMemoryView(props: {
                           aria-label={`通过候选 ${candidate.candidateId}`}
                           disabled={props.busy}>通过</button>
                         <button type="button" className="action" onClick={() => props.onReject(candidate)}
-                          aria-label={`退回候选 ${candidate.candidateId}`}
-                          disabled={props.busy}>退回</button>
+                          aria-label={`不采纳候选 ${candidate.candidateId}`}
+                          disabled={props.busy}>不采纳</button>
                       </span>
                       : null}
                   </div>
@@ -1091,6 +1169,79 @@ export function LongTermMemoryView(props: {
         {props.queueState === 'ready' && props.candidates.length > 0
           ? <p className="quiet">{`队列里共 ${props.candidates.length} 条，其中 ${waiting.length} 条等待决定。`}</p>
           : null}
+      </div>
+
+      <div className="memory-block">
+        <div className="memory-block-head">
+          <h3>记忆管理员的审核队列</h3>
+          <span className="memory-tag">受限系统角色</span>
+        </div>
+        <p className="quiet">
+          记忆管理员是控制面的受限系统角色，只带四个审核工具：读一条候选、在同一作用域里查已有记忆、提交一个结论、
+          把候选退回。它没有文件、命令、网络、派工或发消息的权限；它退回候选时只写入对方的被动队列，不唤醒会话。
+        </p>
+        {props.reviewState === 'error'
+          ? <p className="empty">读取审核队列失败。</p>
+          : props.reviewState === 'pending'
+            ? <p className="empty">正在读取审核队列……</p>
+            : props.reviews.length === 0
+              ? <p className="empty">还没有审核记录。</p>
+              : <div className="memory-rows">
+                {props.reviews.map(review => (
+                  <div className="setting" key={review.jobId}>
+                    <span>
+                      <b>{reviewStateWording(review.state)}</b>
+                      <span className="quiet">
+                        {`${review.candidateId || '（无候选）'} · ${review.scopeType}:${review.scopeId}`}
+                      </span>
+                      <span className="quiet">
+                        {`${stampOf(review.preparedAt)}${review.finishedAt === '' ? '' : ` · 结束于 ${stampOf(review.finishedAt)}`}`}
+                      </span>
+                      {review.detail !== '' ? <span className="quiet">{review.detail}</span> : null}
+                    </span>
+                  </div>
+                ))}
+              </div>}
+      </div>
+
+      <div className="memory-block">
+        <div className="memory-block-head">
+          <h3>每日巡检</h3>
+          <span className="memory-tag">如实记录</span>
+        </div>
+        <p className="quiet">
+          巡检每天在固定时刻检查候选队列和记忆，并把结果写进控制面自己的库。节点离线、重启中断或只做了检查没能处理时，
+          记录里写的是真实状态，不会写成「已完成」。
+        </p>
+        {props.maintenanceState === 'error'
+          ? <p className="empty">读取巡检记录失败。</p>
+          : props.maintenanceState === 'pending'
+            ? <p className="empty">正在读取巡检记录……</p>
+            : props.maintenance.length === 0
+              ? <p className="empty">还没有巡检记录。</p>
+              : <div className="memory-rows">
+                {props.maintenance.map(run => (
+                  <div className="setting" key={run.runId}>
+                    <span>
+                      <b>{maintenanceStateWording(run.state)}</b>
+                      <span className="quiet">
+                        {`${stampOf(run.at)} · 查看 ${run.checked} 条 · 重复 ${run.duplicates} · 冲突 ${run.conflicts} · 冷置 ${run.expired} · 待复核 ${run.stale}`}
+                      </span>
+                      {run.summary !== '' ? <span className="quiet">{run.summary}</span> : null}
+                      {run.nextAt !== '' ? <span className="quiet">{`下次巡检：${stampOf(run.nextAt)}`}</span> : null}
+                    </span>
+                  </div>
+                ))}
+              </div>}
+        {props.maintenanceState === 'ready' && last !== undefined && last.nextAt !== ''
+          ? <p className="quiet">{`下次巡检安排在 ${stampOf(last.nextAt)}。`}</p>
+          : null}
+        <div className="detail-actions">
+          <button type="button" className="action" onClick={props.onInspect} disabled={props.busy}>
+            {props.busy ? '正在巡检……' : '立即巡检一次'}
+          </button>
+        </div>
+        <p className="quiet">巡检是操作员的动作：只有控制台连接密钥能运行它，只读密钥只能查看记录。</p>
       </div>
 
       <div className="memory-block">
@@ -1155,14 +1306,52 @@ function candidateStatusWording(status: string): string {
   if (status === 'pending_human_confirm') return '等待人工确认'
   if (status === 'expired_candidate') return '已过期冷置'
   if (status === 'needs_reverify') return '需要复核'
-  if (status === 'rejected') return '已退回'
+  if (status === 'rejected') return '未被采纳'
   return status
+}
+
+/**
+ * How a review of the memory manager reads.
+ *
+ * The wording says what really happened: a job that was prepared but never dispatched is not a review, and a job that
+ * was interrupted is not a review that failed — nobody knows how it ended.
+ */
+function reviewStateWording(state: string): string {
+  if (state === 'prepared') return '已准备，尚未派发'
+  if (state === 'dispatched') return '审核中'
+  if (state === 'completed') return '审核已完成'
+  if (state === 'failed') return '审核未完成'
+  if (state === 'interrupted') return '审核被中断，结果未知'
+  return state
+}
+
+/**
+ * How a run of the daily inspection reads.
+ *
+ * A run that did not happen is never worded as a success: an offline node, a switched-off inspection and a run the
+ * control plane was interrupted in the middle of all say what they are.
+ */
+function maintenanceStateWording(state: string): string {
+  if (state === 'attempted') return '巡检已开始，结果未知'
+  if (state === 'succeeded') return '巡检完成'
+  if (state === 'failed') return '巡检未完成'
+  if (state === 'skipped_offline') return '节点离线，本轮未运行'
+  if (state === 'skipped_no_node') return '没有可用的节点，本轮未运行'
+  if (state === 'skipped_disabled') return '巡检已关闭，本轮未运行'
+  if (state === 'interrupted') return '巡检被中断，结果未知'
+  return state
+}
+
+/** What one inspection did, in the console's own words. */
+function maintenanceWording(run: MemoryMaintenanceRunView | undefined): string {
+  if (run === undefined) return '巡检已运行。'
+  return `巡检${maintenanceStateWording(run.state)}：查看 ${run.checked} 条候选，重复 ${run.duplicates}，冲突 ${run.conflicts}。`
 }
 
 /** What a decision did, in the console's own words. */
 function decisionWording(code: string): string {
   if (code === 'APPROVED') return '已通过：这条候选成为了一条长期记忆。'
-  if (code === 'REJECTED') return '已退回：这条候选不会进入长期记忆。'
+  if (code === 'REJECTED') return '未采纳：这条候选不会进入长期记忆。'
   if (code === 'MERGED') return '与已有记忆重复：来源已并入那条记忆，没有新建。'
   if (code === 'CONFLICT_HELD') return '已记为冲突：两边都暂时不生效，等待人工确认。'
   if (code === 'SUPERSEDED') return '已取代旧记忆：旧版本保留溯源，但不再参与召回。'

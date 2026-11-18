@@ -1247,6 +1247,10 @@ export interface MemoryCandidateView {
   /** Whether the proposal may be read inside the Session that made it while it waits. */
   provisionalSameSession: boolean
   revisionCount: number
+  /** How many times the proposer said this candidate once more after it was sent back. */
+  reevaluations: number
+  /** The Session the candidate was sent back to, when it was; a return is passive and wakes nobody. */
+  returnedToSessionId: string
   conflictWithId: string
   confidence: number
   importance: number
@@ -1263,6 +1267,52 @@ export interface MemoryCandidateView {
 export interface MemoryCandidatePage {
   rows: MemoryCandidateView[]
   total: number
+}
+
+/** One review the memory manager was woken for, as the console reads it. */
+export interface MemoryReviewRunView {
+  runId: string
+  jobId: string
+  kind: string
+  candidateId: string
+  checksum: string
+  scopeType: string
+  scopeId: string
+  sourceKeys: string[]
+  sessionId: string
+  nodeId: string
+  backendId: string
+  generation: string
+  /** `prepared`, `dispatched`, `completed`, `failed` or `interrupted`. */
+  state: string
+  detail: string
+  preparedAt: string
+  updatedAt: string
+  finishedAt: string
+  /** When the job runs out of time, when nothing decided about the candidate in the meantime. */
+  expiresAt: string
+}
+
+/** One run of the daily inspection, as the console reads it. */
+export interface MemoryMaintenanceRunView {
+  runId: string
+  /** When the run was due. */
+  at: string
+  /** `attempted`, `succeeded`, `failed`, `skipped_offline`, `skipped_no_node`, `skipped_disabled` or `interrupted`. */
+  state: string
+  nodeId: string
+  backendId: string
+  checked: number
+  duplicates: number
+  conflicts: number
+  expired: number
+  stale: number
+  summary: string
+  detail: string
+  /** When the next run is due. */
+  nextAt: string
+  preparedAt: string
+  finishedAt: string
 }
 
 /** One memory, as the console reads it. */
@@ -1342,6 +1392,36 @@ export function decideMemoryCandidate(input: { candidateId: string; decision: st
     `/v1/console/memory/candidates/${encodeURIComponent(input.candidateId)}/decision`,
     { decision: input.decision, checksum: input.checksum, ...(input.memoryId === undefined ? {} : { memoryId: input.memoryId }),
       ...(input.note === undefined ? {} : { note: input.note }) })
+}
+
+/**
+ * Read the reviews the memory manager was woken for.
+ *
+ * It is the persisted record of what was prepared, dispatched and finished — not a live computation, so what the page
+ * shows is what really happened.
+ */
+export function readMemoryReviews(limit?: number): Promise<{ rows: MemoryReviewRunView[] }> {
+  const search = limit === undefined ? '' : `?limit=${limit}`
+  return read<{ rows: MemoryReviewRunView[] }>(`/v1/console/memory/reviews${search}`)
+}
+
+/**
+ * Read the runs of the daily inspection.
+ *
+ * The same persisted record: the state of the last run, the counters it counted and when the next one is due.
+ */
+export function readMemoryMaintenance(limit?: number): Promise<{ rows: MemoryMaintenanceRunView[] }> {
+  const search = limit === undefined ? '' : `?limit=${limit}`
+  return read<{ rows: MemoryMaintenanceRunView[] }>(`/v1/console/memory/maintenance${search}`)
+}
+
+/**
+ * Run the daily inspection now.
+ *
+ * The answer is what really happened: a node that is offline is reported as not run, never as a success.
+ */
+export function runMemoryMaintenance(): Promise<{ run: MemoryMaintenanceRunView }> {
+  return write<{ run: MemoryMaintenanceRunView }>('/v1/console/memory/maintenance/run', {})
 }
 
 /** One write. */

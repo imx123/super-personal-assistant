@@ -20,6 +20,7 @@ import { AgentDelivery } from '../app/delivery.ts'
 import { initializeRoleModel, resolveRoleModel } from '../app/role-models.ts'
 import type { RoleModel } from '../policy.ts'
 import type { DeliveryEvidence, RoleProfile, RouterModel, RouterOptions } from '../shared/protocol.ts'
+import type { NodeSessionRole } from './dsh-port.ts'
 import type { DshPortSessions } from './dsh-port-host.ts'
 
 /**
@@ -31,7 +32,11 @@ import type { DshPortSessions } from './dsh-port-host.ts'
  * (docs/013 §1.2).
  */
 export const NODE_ROLE_PRESETS = { pm: 'dsh-superagent-pm', worker: 'dsh-superagent-worker',
-  router: 'dsh-superagent-router' } as const
+  router: 'dsh-superagent-router',
+  // The memory manager runs the read-only Router preset: the node profile defines no preset of its own, and the
+  // manager's capability set is not the preset's — the role profile and the tool boundary are, and they leave the
+  // manager with exactly its four review tools and nothing else.
+  manager: 'dsh-superagent-router' } as const
 
 /**
  * The part of DSH's preset registry (`@deepseek-ai/dsh-agent-preset-registry`) an Agent is created with.
@@ -98,7 +103,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Resolves, resumes or creates `sessionId`, then names it; returns the live Agent for the host's proxy tools. */
-  async ensure(sessionId: string, directory: string, title: string, role: 'pm' | 'worker' | 'router',
+  async ensure(sessionId: string, directory: string, title: string, role: NodeSessionRole,
     profile?: RoleProfile): Promise<Agent> {
     const id = sessionId as SessionId
     let agent = this.ctx.agents.get(id)
@@ -247,7 +252,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Creates a new Agent on `id` in `directory`, recording the role preset in the Session's metadata. */
-  private async create(id: SessionId, directory: string, role: 'pm' | 'worker' | 'router', profile?: RoleProfile): Promise<Agent> {
+  private async create(id: SessionId, directory: string, role: NodeSessionRole, profile?: RoleProfile): Promise<Agent> {
     const preset = await this.rolePreset(role)
     const options: CreateAgentOptions = { sessionId: id, meta: { cwd: directory, agentPreset: preset },
       setup: agentCtx => this.mount(agentCtx, preset), ...modelOptions(profile) }
@@ -255,7 +260,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Resumes the persisted Session on `id`, recomposing the role preset in its fresh scope. */
-  private async resume(id: SessionId, role: 'pm' | 'worker' | 'router', profile?: RoleProfile): Promise<Agent> {
+  private async resume(id: SessionId, role: NodeSessionRole, profile?: RoleProfile): Promise<Agent> {
     const preset = await this.rolePreset(role)
     const options: ResumeAgentOptions = { resumeSessionId: id, setup: agentCtx => this.mount(agentCtx, preset),
       ...modelOptions(profile) }
@@ -263,7 +268,7 @@ export class NodeSessions implements DshPortSessions {
   }
 
   /** Resolves one of the node profile's presets, failing before creation when the profile does not define it. */
-  private async rolePreset(role: 'pm' | 'worker' | 'router'): Promise<string> {
+  private async rolePreset(role: NodeSessionRole): Promise<string> {
     const presets = this.ctx.get('agentPresets') as AgentPresets | undefined
     if (typeof presets?.resolve !== 'function' || typeof presets.mount !== 'function') {
       throw new Error('The node requires @deepseek-ai/dsh-agent-preset-registry: the agentPresets service is not available')

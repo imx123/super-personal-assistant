@@ -92,6 +92,9 @@ function pluginSessions(sessions: Sessions): DshPortSessions {
       if (role === 'router') {
         throw new Error('This node does not host a Router Session: its Sessions have no Router role')
       }
+      if (role === 'manager') {
+        throw new Error('This node does not host a memory manager Session: its Sessions have no memory manager role')
+      }
       return sessions.ensure(sessionId, directory, title, role)
     },
     prompt(sessionId, idempotencyKey, text, mode, onDelivered) {

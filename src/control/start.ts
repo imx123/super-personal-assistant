@@ -85,6 +85,34 @@ function reconcileIntervalMs(env: Record<string, string | undefined>): number {
 }
 
 /**
+ * Whether the daily memory inspection runs on its own, and when it is due.
+ *
+ * Unset keeps the default: the inspection runs at 03:00 UTC. `SUPERAGENT_MEMORY_MAINTENANCE=off` switches it off — the
+ * inspection then writes down that it was switched off rather than pretending it ran — and
+ * `SUPERAGENT_MEMORY_MAINTENANCE_AT` names the minute of the day, in UTC, it is due at.
+ */
+function memoryMaintenance(env: Record<string, string | undefined>): {
+  enabled: boolean
+  minuteOfDay: number
+} {
+  const state = env.SUPERAGENT_MEMORY_MAINTENANCE
+  if (state !== undefined && state !== '' && state !== 'on' && state !== 'off') {
+    throw new Error('SUPERAGENT_MEMORY_MAINTENANCE must be on or off')
+  }
+  const at = env.SUPERAGENT_MEMORY_MAINTENANCE_AT
+  let minuteOfDay = 180
+  if (at !== undefined && at !== '') {
+    const match = /^(\d{1,2}):(\d{2})$/.exec(at)
+    if (match === null) throw new Error('SUPERAGENT_MEMORY_MAINTENANCE_AT must be HH:MM')
+    const hours = Number(match[1])
+    const minutes = Number(match[2])
+    if (hours > 23 || minutes > 59) throw new Error('SUPERAGENT_MEMORY_MAINTENANCE_AT must be HH:MM')
+    minuteOfDay = hours * 60 + minutes
+  }
+  return { enabled: state !== 'off', minuteOfDay }
+}
+
+/**
  * Where the built console lives.
  *
  * The build puts the console's bundle in the package's own `lib` directory. A deployment that keeps it elsewhere says so;
@@ -314,8 +342,12 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
   const node: NodePort = options.node ?? (nodeUrl
     ? new HttpNodePort({ url: nodeUrl, token: required(env, 'SUPERAGENT_NODE_TOKEN'), nodeId })
     : new FakeNode({ nodeId, root: workspaceRoot }))
+  // The daily memory inspection: when it runs and whether it runs at all.
+  const memoryMaintenanceSchedule = memoryMaintenance(env)
   const controlOptions: ControlPlaneOptions = { dbPath, consoleDbPath, nodeId, node, secret: token, workspaceRoot,
     reconcileIntervalMs: reconcileIntervalMs(env),
+    memoryMaintenanceEnabled: memoryMaintenanceSchedule.enabled,
+    memoryMaintenanceMinuteOfDay: memoryMaintenanceSchedule.minuteOfDay,
     ...(eventRows === undefined ? {} : { consoleEventRows: eventRows }),
     ...(eventDays === undefined ? {} : { consoleEventDays: eventDays }),
     ...(auditDays === undefined ? {} : { consoleAuditDays: auditDays }),
@@ -352,6 +384,9 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
     if (options.heartbeatMs !== 0) control.startHeartbeat(options.heartbeatMs)
     // The orphan reconciliation runs on its own only when the deployment asks for it; the console can always run it by hand.
     control.startReconcile()
+    // The daily memory inspection runs on its own clock. It is a light look at the clock, not a busy loop: a slot that
+    // was missed is not replayed, and a run whose node is offline is written down as not run.
+    control.startMemoryMaintenance()
     // The scheduler looks for the plans that came due. It is started after the registration, because a plan needs a node to
     // deliver to, and it is stopped before the database closes.
     control.startScheduler()
@@ -366,6 +401,7 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
         closed = true
         control.stopHeartbeat()
         control.stopReconcile()
+        control.stopMemoryMaintenance()
         // The order matters: the API stops first, so no new request arrives; the scheduler stops next, so a delivery still
         // in flight is finished and written down; the kernel closes last, and it is what closes the database.
         await api.close().catch(() => {})

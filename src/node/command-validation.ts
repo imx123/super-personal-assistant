@@ -110,6 +110,15 @@ export function validateNodeCommand(value: unknown): NodeCommand {
       profileField(command.profile, `${type}.profile`)
       break
 
+    // The memory manager belongs to no Project either: it names its own Session, its own workspace and its own profile.
+    case 'memory_manager.ensure':
+      identifier(command, 'sessionId', type)
+      identifier(command, 'workspace', type)
+      identifier(command, 'sessionToken', type)
+      stringField(command, 'prompt', type)
+      profileField(command.profile, `${type}.profile`)
+      break
+
     case 'session.message':
       identifier(command, 'sessionId', type)
       stringField(command, 'text', type)

@@ -39,9 +39,9 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { redact } from '../infra/redact.ts'
 import {
   allowedScopes, candidateIdempotencyKey, contentFingerprint, containsAbsolutePath, containsSecret, mayPropose,
-  maySeeCandidate, nodeIdOf, proposalAuthority, projectIdOf, scopeOf, validateSourceRefs, type MemoryCaller,
-  type MemoryScope, type MemoryScopeSet, type MemorySourceRecord, type MemorySourceRef, type SourceRefInput,
-  type SourceRefKind, type SourceTrust,
+  maySeeCandidate, nodeIdOf, proposalAuthority, projectIdOf, recordWithinCaller, scopeOf, validateSourceRefs,
+  type MemoryCaller, type MemoryScope, type MemoryScopeSet, type MemorySourceRecord, type MemorySourceRef,
+  type SourceRefInput, type SourceRefKind, type SourceTrust,
 } from './memory-scope.ts'
 
 /** The states a candidate may be in. */
@@ -56,6 +56,17 @@ export type MemoryCandidateStatus =
   | 'expired_candidate'
   | 'needs_reverify'
   | 'rejected'
+
+/** The most times one candidate may be sent back to the Session that proposed it. */
+export const MEMORY_RETURN_LIMIT = 1
+
+/**
+ * The most times one candidate may be said once more by the Session that proposed it.
+ *
+ * A candidate goes round once: the manager sends it back, the proposer says it once more, and the manager reviews that
+ * version. A second round waits for a person.
+ */
+export const MEMORY_REEVALUATION_LIMIT = 1
 
 /** The states a memory may be in. */
 export type MemoryStatus = 'active' | 'superseded' | 'forgotten' | 'needs_reverify' | 'conflict_pending'
@@ -113,6 +124,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
   proposed_by_role TEXT NOT NULL DEFAULT '',
   provisional_same_session INTEGER NOT NULL DEFAULT 0,
   revision_count INTEGER NOT NULL DEFAULT 0,
+  reevaluations INTEGER NOT NULL DEFAULT 0,
   returned_to_session_id TEXT NOT NULL DEFAULT '',
   conflict_with_id TEXT NOT NULL DEFAULT '',
   confidence REAL NOT NULL DEFAULT 0,
@@ -227,6 +239,10 @@ export interface MemoryCandidateView {
   /** Whether the proposal may be read inside the Session that made it while it waits. */
   readonly provisionalSameSession: boolean
   readonly revisionCount: number
+  /** How many times the proposer has said this candidate once more after it was sent back. */
+  readonly reevaluations: number
+  /** The Session the candidate was sent back to, when it was. */
+  readonly returnedToSessionId: string
   readonly conflictWithId: string
   readonly confidence: number
   readonly importance: number
@@ -301,6 +317,11 @@ export type MemoryRefusalCode =
   | 'NOT_A_DUPLICATE'
   | 'SCOPE_MISMATCH'
   | 'CONFLICT_ALREADY_OPEN'
+  | 'RETURN_LIMIT_REACHED'
+  | 'RETURN_NOT_PERMITTED'
+  | 'REEVALUATION_NOT_PERMITTED'
+  | 'REEVALUATION_LIMIT_REACHED'
+  | 'DUPLICATE_CONTENT'
   | 'NOT_PERMITTED'
 
 /**
@@ -316,13 +337,55 @@ export type MemorySubmitResult =
   | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
 
 /** What a decision did. */
-export type MemoryDecisionCode = 'APPROVED' | 'REJECTED' | 'MERGED' | 'CONFLICT_HELD' | 'SUPERSEDED'
+export type MemoryDecisionCode = 'APPROVED' | 'REJECTED' | 'MERGED' | 'CONFLICT_HELD' | 'SUPERSEDED' | 'RETURNED'
+  | 'HELD_FOR_HUMAN'
 
 /** The answer of a decision. */
 export type MemoryDecisionResult =
   | { readonly ok: true; readonly code: MemoryDecisionCode; readonly candidate: MemoryCandidateView;
       readonly memory?: MemoryRecordView }
   | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
+
+/** One request to send a candidate back to the Session that proposed it. */
+export interface MemoryReturnRequest {
+  /** The caller, as the control plane authenticated it. */
+  readonly caller: MemoryCaller
+  readonly candidateId: string
+  /** The checksum of the candidate as the caller read it. */
+  readonly expectedChecksum: string
+  /** The Session the candidate goes back to. */
+  readonly toSessionId: string
+  /** Why the candidate goes back, in words the person may read. */
+  readonly reason?: string
+}
+
+/** One request to put a candidate into the queue that waits for a person. */
+export interface MemoryHoldRequest {
+  /** The caller, as the control plane authenticated it. */
+  readonly caller: MemoryCaller
+  readonly candidateId: string
+  /** The checksum of the candidate as the caller read it. */
+  readonly expectedChecksum: string
+  /** Why a person has to look at it. */
+  readonly note?: string
+}
+
+/**
+ * One request to say a candidate once more.
+ *
+ * It is the second half of the bounded return: the candidate went back to the Session that proposed it, and that Session
+ * says the fact again — with more context, or as it was. The caller is the Session the candidate was sent back to, and
+ * the checksum is the version the return captured.
+ */
+export interface MemoryReevaluationRequest {
+  /** The caller, as the control plane authenticated it. */
+  readonly caller: MemoryCaller
+  readonly candidateId: string
+  /** The checksum of the candidate as the passive return captured it. */
+  readonly expectedChecksum: string
+  /** The body the proposer says now; the old one stays when it says nothing. */
+  readonly content?: string
+}
 
 /** One proposal: what somebody offered to be remembered. */
 export interface MemorySubmitRequest {
@@ -373,11 +436,25 @@ export class MemoryService {
    * Make sure the tables are there, in the way every other table of this control plane is made.
    *
    * The migration is idempotent and owns no version: a database that already has the tables keeps them, and a database
-   * that was opened before this module existed gets them. There is no older shape of the tables to move away from — they
-   * arrived with this module — so nothing is rewritten and no column is added afterwards.
+   * that was opened before this module existed gets them. The tables arrived with this module, so there is no older shape
+   * of them to move away from; the only column that was added afterwards is the counter of the re-evaluations, and a
+   * database of the earlier shape gets it here.
    */
   private migrate(): void {
     this.db.exec(SCHEMA)
+    this.ensureColumn('memory_candidates', 'reevaluations', 'INTEGER NOT NULL DEFAULT 0')
+  }
+
+  /**
+   * Give a table a column it did not have, once.
+   *
+   * The table's own columns are the truth: a database that already has the column keeps it, and a database of the older
+   * shape gets it and keeps its rows. Nothing else about the table is rewritten.
+   */
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]
+    if (columns.some(entry => entry.name === column)) return
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`)
   }
 
   // ─── proposing ───────────────────────────────────────────────────────────────────────────────────────────────────
@@ -423,6 +500,10 @@ export class MemoryService {
 
     const validated = validateSourceRefs(request.sourceRefs ?? [], (kind, id) => this.host.source(kind, id),
       { operator: request.caller.role === 'operator', scope })
+    const foreign = this.foreignSource(validated.refs, request.caller)
+    if (foreign !== undefined) {
+      return { ok: false, code: 'SCOPE_NOT_PERMITTED', reason: foreign }
+    }
     const body = redact(content)
     const fingerprint = contentFingerprint(body, scope)
     const idempotencyKey = candidateIdempotencyKey(validated.refs, fingerprint, scope)
@@ -472,6 +553,26 @@ export class MemoryService {
   private duplicateOf(row: CandidateRow, caller: MemoryCaller): MemorySubmitResult {
     if (!maySeeCandidate(caller, row.row.proposed_by_session_id)) return { ok: true, duplicate: true }
     return { ok: true, duplicate: true, candidate: this.candidateView(row) }
+  }
+
+  /**
+   * The reason a proposal may not lean on the records it names, when it may not.
+   *
+   * A reference that names a record of another Project — or of another machine — is refused outright: a PM may not carry
+   * a conclusion out of the work it came from, and a Worker may not do it either. The rule is about the records the
+   * control plane really holds, not about the words around them: a reference that names no record at all is left to the
+   * trust that already follows it, and a reference of the caller's own work is fine.
+   */
+  private foreignSource(refs: readonly MemorySourceRef[], caller: MemoryCaller): string | undefined {
+    for (const ref of refs) {
+      if (!ref.verified) continue
+      const record = this.host.source(ref.kind, ref.id)
+      if (record === undefined) continue
+      if (recordWithinCaller(record, caller)) continue
+      return 'This proposal leans on a record of another Project or another machine; a fact may not be carried out of '
+        + 'the work it came from.'
+    }
+    return undefined
   }
 
   /**
@@ -877,6 +978,222 @@ export class MemoryService {
   }
 
   /**
+   * One candidate, read by its id.
+   *
+   * The queue of the operator and of the memory manager is the whole queue; a Session reads only the candidate it
+   * proposed itself. An id that names no candidate is answered in exactly the same way as one that does: the answer does
+   * not say whether the id ever existed.
+   */
+  readCandidate(caller: MemoryCaller, candidateId: string): { found: true; candidate: MemoryCandidateView } | { found: false } {
+    const row = this.candidateById(candidateId)
+    if (row === undefined) return { found: false }
+    if (!maySeeCandidate(caller, row.row.proposed_by_session_id)) return { found: false }
+    return { found: true, candidate: this.candidateView(row) }
+  }
+
+  /**
+   * The memories of one scope, and of no other.
+   *
+   * The memory manager reviews one candidate at a time, and what it may compare that candidate against is the scope the
+   * candidate is about: a project fact is compared with the project's own memories, never with another project's. The
+   * scope is named by the caller of the review, which is the control plane itself and not the request.
+   */
+  listMemoriesInScope(scope: MemoryScope, options: { status?: string; limit?: number } = {}): MemoryRecordPage {
+    const limit = this.limitOf(options.limit)
+    const clauses = ['scope_type = ?', 'scope_id = ?']
+    const params: SQLInputValue[] = [scope.scopeType, scope.scopeId]
+    if (options.status !== undefined && options.status !== '') {
+      clauses.push('status = ?')
+      params.push(options.status)
+    } else {
+      clauses.push("status IN ('active', 'conflict_pending')")
+    }
+    const where = clauses.join(' AND ')
+    const total = Number((this.db.prepare(`SELECT COUNT(*) AS total FROM long_term_memories WHERE ${where}`)
+      .get(...params) as { total: number }).total)
+    const rows = this.db.prepare(
+      `SELECT * FROM long_term_memories WHERE ${where} ORDER BY pinned DESC, updated_at DESC, seq DESC LIMIT ?`)
+      .all(...params, limit) as Record<string, SQLInputValue>[]
+    return { rows: rows.map(row => this.memoryView(memoryOf(row))), total }
+  }
+
+  /**
+   * Send one candidate back to the Session that proposed it.
+   *
+   * The request is passive: the candidate remembers that it was sent back and to whom, and nobody is woken. The Session
+   * that proposed it may read the request when it is running on its own business, and a Session an operator stopped, a
+   * paused Project or an ended Session keeps the request waiting until a person brings it back.
+   *
+   * One candidate is sent back at most once: a second request about the same proposal is refused, and the candidate then
+   * waits for a person instead of going round again.
+   */
+  returnCandidate(request: MemoryReturnRequest): MemoryDecisionResult {
+    if (request.caller.role !== 'operator' && request.caller.role !== 'manager') {
+      return { ok: false, code: 'NOT_PERMITTED',
+        reason: 'Only a person at the console, or the memory manager, may send a candidate back.' }
+    }
+    try {
+      return this.transaction((): MemoryDecisionResult => {
+        const candidate = this.candidateById(request.candidateId)
+        if (candidate === undefined) {
+          return { ok: false, code: 'CANDIDATE_NOT_FOUND', reason: 'There is no such candidate.' }
+        }
+        if (candidate.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_CANDIDATE',
+            reason: 'This candidate changed since it was read; read it again before deciding about it.' }
+        }
+        if (!REVIEWABLE.includes(candidate.row.status as MemoryCandidateStatus)) {
+          return { ok: false, code: 'CANDIDATE_NOT_REVIEWABLE',
+            reason: `This candidate is ${candidate.row.status} and waits for no decision.` }
+        }
+        if (candidate.row.revision_count >= MEMORY_RETURN_LIMIT) {
+          return { ok: false, code: 'RETURN_LIMIT_REACHED',
+            reason: 'This candidate was already sent back once; it waits for a person now.' }
+        }
+        const now = this.host.now()
+        this.db.prepare(
+          "UPDATE memory_candidates SET status = 'reviewing', revision_count = revision_count + 1, "
+          + 'returned_to_session_id = ?, review_note = ?, updated_at = ? WHERE candidate_id = ?')
+          .run(bounded(request.toSessionId), bounded(request.reason ?? ''), now, candidate.row.candidate_id)
+        const updated = this.candidateById(candidate.row.candidate_id)!
+        return { ok: true, code: 'RETURNED', candidate: this.candidateView(updated) }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The candidate could not be sent back.' }
+    }
+  }
+
+  /**
+   * Say one candidate once more.
+   *
+   * This is the second half of the bounded return: a candidate the manager could not judge went back to the Session that
+   * proposed it, and that Session may say the fact again — with more context, or as it was — and the same candidate goes
+   * back into the queue for a review. It is the same candidate and never a new one: the id, the scope, the sources, the
+   * trust and the proposer stay what they were, and only the body may change.
+   *
+   * The bound is one. A candidate goes round once: the proposer says it once more and the manager reviews that version; a
+   * second round waits for a person. The caller must be the Session the candidate was sent back to, the version it acts on
+   * must be the one the return captured, and the caller must still hold the authority over the scope it speaks about.
+   */
+  reevaluate(request: MemoryReevaluationRequest): MemorySubmitResult {
+    try {
+      return this.transaction((): MemorySubmitResult => {
+        const candidate = this.candidateById(request.candidateId)
+        if (candidate === undefined) {
+          return { ok: false, code: 'CANDIDATE_NOT_FOUND', reason: 'There is no such candidate.' }
+        }
+        if (candidate.row.status !== 'reviewing') {
+          return { ok: false, code: 'CANDIDATE_NOT_REVIEWABLE',
+            reason: `This candidate is ${candidate.row.status} and waits for no re-evaluation.` }
+        }
+        if (candidate.row.returned_to_session_id !== request.caller.sessionId
+          || candidate.row.proposed_by_session_id !== request.caller.sessionId) {
+          return { ok: false, code: 'REEVALUATION_NOT_PERMITTED',
+            reason: 'Only the Session that proposed this candidate may say it once more.' }
+        }
+        if (candidate.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_CANDIDATE',
+            reason: 'This candidate changed since it was sent back; read it again before saying it once more.' }
+        }
+        if (candidate.row.reevaluations >= MEMORY_REEVALUATION_LIMIT) {
+          return { ok: false, code: 'REEVALUATION_LIMIT_REACHED',
+            reason: 'This candidate was already said once more; it waits for a person now.' }
+        }
+        const scope = this.scopeOfRow(candidate.row.scope_type, candidate.row.scope_id)
+        if (!mayPropose(proposalAuthority(request.caller), scope)) {
+          return { ok: false, code: 'SCOPE_NOT_PERMITTED',
+            reason: `This caller may not state a fact about ${scope.scopeId}.` }
+        }
+        let body = candidate.row.content
+        let fingerprint = candidate.row.content_fingerprint
+        let idempotencyKey = candidate.row.idempotency_key
+        if (request.content !== undefined) {
+          const text = request.content.trim()
+          if (text === '') return { ok: false, code: 'EMPTY_CONTENT', reason: 'A memory says something.' }
+          if (text.length > MEMORY_CONTENT_LIMIT) {
+            return { ok: false, code: 'CONTENT_TOO_LONG',
+              reason: `A memory holds at most ${MEMORY_CONTENT_LIMIT} characters.` }
+          }
+          const leak = leakOf(text)
+          if (leak !== undefined) {
+            return { ok: false, code: 'REDACTION_REJECTED',
+              reason: `The body carries ${leak === 'path' ? 'a path on a machine' : 'a secret'}; a memory may not keep it.` }
+          }
+          const redacted = redact(text)
+          if (redacted !== candidate.row.content) {
+            body = redacted
+            fingerprint = contentFingerprint(body, scope)
+            idempotencyKey = candidateIdempotencyKey(parseRefs(candidate.row.source_refs), fingerprint, scope)
+            // The same words are one row: another candidate of this scope that already says them, and another row that
+            // already answers to them, both refuse the second writing.
+            const same = this.liveCandidateOfFingerprint(scope, fingerprint)
+            if (same !== undefined && same.row.candidate_id !== candidate.row.candidate_id) {
+              return { ok: false, code: 'DUPLICATE_CONTENT',
+                reason: 'Another candidate of this scope already says that; it is not written twice.' }
+            }
+            const written = this.candidateOfIdempotency(idempotencyKey)
+            if (written !== undefined && written.row.candidate_id !== candidate.row.candidate_id) {
+              return { ok: false, code: 'DUPLICATE_CONTENT',
+                reason: 'This proposal is already in the queue; it is not written twice.' }
+            }
+          }
+        }
+        const now = this.host.now()
+        // The candidate goes back into the queue it came from: a fact about the person, or one nobody could check, waits
+        // for a person again — saying it once more does not make it a fact the manager may judge.
+        const status = this.statusOfSubmission(scope, candidate.row.source_trust as SourceTrust)
+        this.db.prepare(`
+          UPDATE memory_candidates
+            SET content = ?, content_fingerprint = ?, idempotency_key = ?, status = ?,
+                reevaluations = reevaluations + 1, updated_at = ?
+            WHERE candidate_id = ?
+        `).run(body, fingerprint, idempotencyKey, status, now, candidate.row.candidate_id)
+        const updated = this.candidateById(candidate.row.candidate_id)!
+        return { ok: true, duplicate: false, candidate: this.candidateView(updated) }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The candidate could not be said once more.' }
+    }
+  }
+
+  /**
+   * Put one candidate into the queue that waits for a person.
+   *
+   * This is where a case the manager cannot judge ends up: a fact that only a person may confirm, a candidate that went
+   * round once already, or one whose sources cannot be checked. It is not a decision and it does not make a fact
+   * effective — it only says that a person has to look at it.
+   */
+  holdForHuman(request: MemoryHoldRequest): MemoryDecisionResult {
+    if (request.caller.role !== 'operator' && request.caller.role !== 'manager') {
+      return { ok: false, code: 'NOT_PERMITTED',
+        reason: 'Only a person at the console, or the memory manager, may hold a candidate for a person.' }
+    }
+    try {
+      return this.transaction((): MemoryDecisionResult => {
+        const candidate = this.candidateById(request.candidateId)
+        if (candidate === undefined) {
+          return { ok: false, code: 'CANDIDATE_NOT_FOUND', reason: 'There is no such candidate.' }
+        }
+        if (candidate.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_CANDIDATE',
+            reason: 'This candidate changed since it was read; read it again before deciding about it.' }
+        }
+        if (!REVIEWABLE.includes(candidate.row.status as MemoryCandidateStatus)) {
+          return { ok: false, code: 'CANDIDATE_NOT_REVIEWABLE',
+            reason: `This candidate is ${candidate.row.status} and waits for no decision.` }
+        }
+        const updated = this.markCandidate(candidate.row, 'pending_human_confirm', request.note)
+        return { ok: true, code: 'HELD_FOR_HUMAN', candidate: this.candidateView(updated) }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The candidate could not be held.' }
+    }
+  }
+
+  /**
    * The proposals one Session may read while they wait.
    *
    * These are the proposals the person made in that Session and that Session alone may use until a decision is made.
@@ -909,6 +1226,8 @@ export class MemoryService {
       proposedBySessionId: row.row.proposed_by_session_id,
       provisionalSameSession: row.row.provisional_same_session === 1,
       revisionCount: row.row.revision_count,
+      reevaluations: row.row.reevaluations,
+      returnedToSessionId: row.row.returned_to_session_id,
       conflictWithId: row.row.conflict_with_id,
       confidence: row.row.confidence,
       importance: row.row.importance,
@@ -1060,8 +1379,11 @@ export class MemoryService {
    * The work is one fact: a candidate that becomes a memory and the memory itself are written together, or neither is.
    * A savepoint is used rather than a bare transaction, so the service may be called from inside a transaction of the
    * domain and still leave it to that transaction to decide what is kept.
+   *
+   * The caller may run its own writes inside it: the records of the control plane that speak of a candidate and the
+   * candidate itself are then written together, or neither is.
    */
-  private transaction<T>(work: () => T): T {
+  transaction<T>(work: () => T): T {
     const name = `memory_atomic_${this.depth++}`
     this.db.exec(`SAVEPOINT ${name}`)
     try {
@@ -1081,6 +1403,7 @@ export class MemoryService {
 /** The fields of one row of the candidate table. */
 interface CandidateFields {
   readonly candidate_id: string
+  readonly idempotency_key: string
   readonly scope_type: string
   readonly scope_id: string
   readonly proposed_scope_type: string
@@ -1094,6 +1417,8 @@ interface CandidateFields {
   readonly proposed_by_role: string
   readonly provisional_same_session: number
   readonly revision_count: number
+  readonly reevaluations: number
+  readonly returned_to_session_id: string
   readonly conflict_with_id: string
   readonly confidence: number
   readonly importance: number
@@ -1146,6 +1471,7 @@ interface MemoryRow {
 function candidateOf(row: Record<string, SQLInputValue>): CandidateRow {
   const read: CandidateFields = {
     candidate_id: String(row.candidate_id),
+    idempotency_key: String(row.idempotency_key),
     scope_type: String(row.scope_type),
     scope_id: String(row.scope_id),
     proposed_scope_type: String(row.proposed_scope_type),
@@ -1159,6 +1485,8 @@ function candidateOf(row: Record<string, SQLInputValue>): CandidateRow {
     proposed_by_role: String(row.proposed_by_role),
     provisional_same_session: Number(row.provisional_same_session),
     revision_count: Number(row.revision_count),
+    reevaluations: Number(row.reevaluations ?? 0),
+    returned_to_session_id: String(row.returned_to_session_id ?? ''),
     conflict_with_id: String(row.conflict_with_id),
     confidence: Number(row.confidence),
     importance: Number(row.importance),

@@ -204,6 +204,29 @@ export function mayPropose(authority: MemoryProposalAuthority, scope: MemoryScop
 }
 
 /**
+ * Whether a record the control plane holds belongs to the work of this caller.
+ *
+ * The operator and the Router manage this whole control plane, so every record here is theirs. A PM and a Worker own one
+ * piece of work: the Project they were delegated and the machine they run on. A record of another Project or of another
+ * machine is not theirs, and a fact may not lean on it — a conclusion about another project's work is not a conclusion
+ * about this one, however true it is.
+ *
+ * The rule is about the record, not about the words around it: a reference that names a record of another Project is
+ * refused, and a reference that names no record at all is left to the trust that already follows it.
+ */
+export function recordWithinCaller(record: MemorySourceRecord, caller: MemoryCaller): boolean {
+  if (caller.role === 'operator' || caller.role === 'router' || caller.role === 'manager') return true
+  if (record.projectId !== undefined && record.projectId !== '' && caller.projectId !== undefined
+    && caller.projectId !== '' && record.projectId !== caller.projectId) {
+    return false
+  }
+  if (record.nodeId !== undefined && record.nodeId !== '' && caller.nodeId !== '' && record.nodeId !== caller.nodeId) {
+    return false
+  }
+  return true
+}
+
+/**
  * Whether one caller may see the row of one candidate.
  *
  * The operator reads the whole queue, and the memory manager reads it because it reviews it. A Session reads the row of

@@ -23,6 +23,7 @@
 - `NodeEvent` 是节点回传的事件：节点状态、Session 状态、Session 事件、状态应答、只读代码审阅结果、工具调用。
 - 事件带 `seq`，控制面用它检测丢事件和排序。
 - `router.ensure` 为控制面的 Router 创建独立会话。命令包含 `sessionId`、工作区、角色 profile、`sessionToken` 和提示词。`dsh-superagent-router` 预设下的代理工具允许它查进度、建项目、派独立工单、管理工单或项目和提交 PM 转发提议。工具契约见 `src/control/roles.ts`。旧版本节点可能拒绝该命令。
+- `memory_manager.ensure` 为控制面的记忆管理员创建独立会话，形状与 `router.ensure` 一样：命令包含 `sessionId`、工作区、角色 profile、`sessionToken` 和提示词。这个会话不属于任何 Project，它跑的是只读的 `dsh-superagent-router` 预设，而它真正的能力集是角色档案里的四个 `memory_service.*` 审核工具——预设决定后端由哪些服务组成，角色档案与工具守卫决定模型能调用什么。旧版本节点可能拒绝该命令。
 - **`control_router_pm_proposal` 只提交提议，不投递**：`control_router_pm_instruction` 这个名字已经不用了——旧的那个名字是「直接转达」，会让人以为 Router 自己就能把话送到某个项目的 PM。现在这个工具只在控制面里记下一条**待确认的转发提议**（目标 Project、真正会发出去的原文、提议 id），真正发送要等人在控制台里确认，Router 的 token 开不了那条确认端点。节点侧的工具名、profile 的提示词与控制面的端点是一起改的，旧节点不认识新工具名就等于没有这条写路径。
 - **对外的 `seq` 是控制面自己的序号**，不是节点的：节点重启会从 1 重新计数，而控制面把每条事件写进自己的持久日志，序号跨控制面重启单调递增。客户端看到的 `seq` 一律是控制面的序号，`after=` / `Last-Event-ID` 用它续接；节点自己的计数以 `nodeSeq` 保留在同一条事件里，所以节点重启仍然看得见（`nodeSeq` 变小即节点重启过）。
 - 日志有界（默认 20000 条 / 7 天）。被裁掉的那一段用 `gap` 明确告知（`GET /v1/events` 返回 `gap: true`，SSE 写一条 `: gap` 注释），不会悄悄少一段。

@@ -350,7 +350,7 @@ describe('control-plane tool API', () => {
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription', 'control_list_external_subscriptions',
       'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state',
-      'control_event_history_query'])
+      'control_event_history_query', 'control_memory_propose'])
     expect(PM_PROFILE.tools.some(name => name.startsWith('orchestrator_'))).toBe(false)
   })
 })
@@ -927,7 +927,7 @@ describe('node control tools', () => {
       'control_project_report', 'control_request_authorization', 'control_subscribe_session_stream',
       'control_unsubscribe_session_stream', 'control_create_external_subscription', 'control_list_external_subscriptions',
       'control_update_external_subscription', 'control_delete_external_subscription', 'control_live_state',
-      'control_event_history_query'])
+      'control_event_history_query', 'control_memory_propose'])
     // The usage note names the tools, so the PM's first turn knows how to read, create and orchestrate.
     expect(prompts[0]!.text).toContain('Use control_project')
     expect(prompts[0]!.text).toContain('control_create_tickets')

@@ -13,6 +13,9 @@ const FIELDS = {
     SUPERAGENT_WORKSPACE_ROOT: 'path', SUPERAGENT_CONSOLE_EVENT_ROWS: 'rows',
     SUPERAGENT_CONSOLE_EVENT_DAYS: 'days', SUPERAGENT_CONSOLE_AUDIT_DAYS: 'days',
     SUPERAGENT_SCHEDULER_OFFSET_MINUTES: 'offset',
+    // The daily memory inspection: `on` or `off`, and the minute of the day (UTC) it is due at.
+    SUPERAGENT_MEMORY_MAINTENANCE: 'optionalText',
+    SUPERAGENT_MEMORY_MAINTENANCE_AT: 'optionalText',
   },
   node: {
     SUPERAGENT_NODE_URL: 'url', SUPERAGENT_CONTROL_URL: 'optionalUrl',
