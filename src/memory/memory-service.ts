@@ -34,12 +34,13 @@
  * suppressing the fact, or a deletion that takes the text with it — and the user has not chosen. So no tombstone table
  * is created, no memory is deleted, and there is no action here that would forget anything.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { redact } from '../infra/redact.ts'
 import {
   allowedScopes, candidateIdempotencyKey, contentFingerprint, containsAbsolutePath, containsSecret, mayPropose,
-  maySeeCandidate, nodeIdOf, proposalAuthority, projectIdOf, recordWithinCaller, scopeOf, validateSourceRefs,
+  maySeeCandidate, nodeIdOf, parseSourceRefs, proposalAuthority, projectIdOf, projectScope, recordWithinCaller, scopeOf,
+  validateSourceRefs,
   type MemoryCaller, type MemoryScope, type MemoryScopeSet, type MemorySourceRecord, type MemorySourceRef,
   type SourceRefInput, type SourceRefKind, type SourceTrust,
 } from './memory-scope.ts'
@@ -91,6 +92,28 @@ export const MEMORY_CANDIDATE_RETENTION_DAYS = 30
 
 /** How much a merge may raise the confidence of a memory. */
 const CONFIDENCE_STEP = 0.02
+
+/**
+ * The most the usefulness of a memory may ever be.
+ *
+ * A fact may be worth a lot, but the number that counts how useful it was is a number inside `[0, 1]`: it says how
+ * often the fact was really used, and a fact that was used a hundred times is not worth a hundred times as much.
+ */
+export const MEMORY_UTILITY_MAX = 1
+
+/** How fast the usefulness of a memory grows with every real use of it. */
+export const MEMORY_UTILITY_RATE = 0.5
+
+/** How much one dispute takes from the confidence of a memory. */
+export const MEMORY_DISPUTE_STEP = 0.1
+
+/**
+ * The confidence under which a memory waits for somebody to look at it again.
+ *
+ * A memory that was called misleading often enough stops being injected on its own: it waits for the next inspection,
+ * which is where a person decides whether it is still true.
+ */
+export const MEMORY_CONFIDENCE_FLOOR = 0.3
 
 /**
  * The tables of the memory service.
@@ -194,6 +217,26 @@ CREATE TABLE IF NOT EXISTS memory_id_sequence (
   value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO memory_id_sequence (name, value) VALUES ('memory', 0), ('candidate', 0), ('conflict', 0);
+CREATE TABLE IF NOT EXISTS memory_use_credits (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  credit_id TEXT NOT NULL UNIQUE,
+  memory_id TEXT NOT NULL,
+  evidence_key TEXT NOT NULL,
+  evidence_kind TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  utility REAL NOT NULL DEFAULT 0,
+  at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_use_credits_pair ON memory_use_credits(memory_id, evidence_key);
+CREATE TABLE IF NOT EXISTS memory_disputes (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  dispute_id TEXT NOT NULL UNIQUE,
+  memory_id TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  confidence REAL NOT NULL DEFAULT 0,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_disputes_memory ON memory_disputes(memory_id, at);
 `
 
 /**
@@ -322,7 +365,42 @@ export type MemoryRefusalCode =
   | 'REEVALUATION_NOT_PERMITTED'
   | 'REEVALUATION_LIMIT_REACHED'
   | 'DUPLICATE_CONTENT'
+  | 'EVIDENCE_NOT_VERIFIED'
   | 'NOT_PERMITTED'
+
+/**
+ * One piece of evidence that a memory was really used.
+ *
+ * The evidence is a record the control plane holds: a review that was accepted or an Assignment that ended. It is never
+ * a sentence an Agent wrote about itself — a claim of use is not a use.
+ */
+export interface MemoryUseEvidence {
+  /** The review the PM accepted. */
+  readonly reviewId?: string
+  /** The Assignment that ended. */
+  readonly assignmentId?: string
+}
+
+/** What one credit did to one memory. */
+export interface MemoryUseCredit {
+  readonly memoryId: string
+  /** The usefulness of the memory after the credit. */
+  readonly utility: number
+  /** How many real uses the memory has had. */
+  readonly effectiveUseCount: number
+  /** Whether this piece of evidence had already been counted for this memory. */
+  readonly alreadyCredited: boolean
+}
+
+/** The answer of a credit. */
+export type MemoryUseResult =
+  | { readonly ok: true; readonly credited: readonly MemoryUseCredit[] }
+  | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
+
+/** The answer of a dispute. */
+export type MemoryDisputeResult =
+  | { readonly ok: true; readonly memory: MemoryRecordView }
+  | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
 
 /**
  * The answer of a proposal.
@@ -860,7 +938,7 @@ export class MemoryService {
    */
   private mergeInto(target: MemoryRow, candidate: CandidateFields): void {
     const now = this.host.now()
-    const refs = mergeRefs(parseRefs(target.row.source_refs), parseRefs(candidate.source_refs))
+    const refs = mergeRefs(parseSourceRefs(target.row.source_refs), parseSourceRefs(candidate.source_refs))
     this.db.prepare(
       'UPDATE long_term_memories SET source_refs = ?, last_verified_at = ?, confidence = ?, updated_at = ? WHERE memory_id = ?')
       .run(JSON.stringify(refs), now, Math.min(1, target.row.confidence + CONFIDENCE_STEP), now, target.row.memory_id)
@@ -1124,7 +1202,7 @@ export class MemoryService {
           if (redacted !== candidate.row.content) {
             body = redacted
             fingerprint = contentFingerprint(body, scope)
-            idempotencyKey = candidateIdempotencyKey(parseRefs(candidate.row.source_refs), fingerprint, scope)
+            idempotencyKey = candidateIdempotencyKey(parseSourceRefs(candidate.row.source_refs), fingerprint, scope)
             // The same words are one row: another candidate of this scope that already says them, and another row that
             // already answers to them, both refuse the second writing.
             const same = this.liveCandidateOfFingerprint(scope, fingerprint)
@@ -1208,6 +1286,165 @@ export class MemoryService {
     return rows.map(row => this.candidateView(candidateOf(row)))
   }
 
+  // ─── what a memory was worth ─────────────────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Write down that a memory was shown to somebody.
+   *
+   * An exposure is a count and nothing else. It says how often a memory was in front of somebody, and it may not make
+   * the memory more useful than it was: a memory that was read often would otherwise keep itself alive by being read,
+   * and a fact nobody ever used would look as good as a fact that carried a whole Project.
+   */
+  recordExposure(caller: MemoryCaller, memoryIds: readonly string[]): number {
+    const scopes = allowedScopes(caller)
+    let written = 0
+    for (const memoryId of memoryIds) {
+      if (memoryId === '') continue
+      const row = this.memoryById(memoryId)
+      if (row === undefined || row.row.status !== 'active') continue
+      if (!this.withinScopes(row.row, scopes)) continue
+      this.db.prepare('UPDATE long_term_memories SET exposure_count = exposure_count + 1 WHERE memory_id = ?')
+        .run(memoryId)
+      written += 1
+    }
+    return written
+  }
+
+  /**
+   * Write down that a memory was really used.
+   *
+   * A memory becomes more useful only when the control plane can show that it was used: an Assignment that ended or a
+   * review that was accepted. The evidence is looked up in the records the control plane itself holds — a sentence an
+   * Agent wrote about itself is not evidence, and a memory that was never injected is not used either.
+   *
+   * The credit is written once per piece of evidence: the same accepted review does not count twice, not after a
+   * restart and not after a retry. The usefulness grows towards its bound and never past it, so a fact that was used
+   * many times is worth more than one that was used once and no more than one that was used a thousand times.
+   */
+  creditEffectiveUse(request: { readonly memoryIds: readonly string[];
+    readonly evidence: MemoryUseEvidence }): MemoryUseResult {
+    const evidence = this.evidenceOf(request.evidence)
+    if (evidence === undefined) {
+      return { ok: false, code: 'EVIDENCE_NOT_VERIFIED',
+        reason: 'A memory becomes more useful only when the control plane can show that it was used: name a review that '
+          + 'was accepted or an Assignment that ended.' }
+    }
+    const credited: MemoryUseCredit[] = []
+    try {
+      this.transaction((): void => {
+        for (const memoryId of request.memoryIds) {
+          const row = this.memoryById(memoryId)
+          if (row === undefined || row.row.status !== 'active') continue
+          if (!this.withinEvidence(row.row, evidence)) continue
+          const counted = row.row.effective_use_count
+          const already = this.db.prepare(
+            'SELECT credit_id FROM memory_use_credits WHERE memory_id = ? AND evidence_key = ?')
+            .get(memoryId, evidence.key) as { credit_id: string } | undefined
+          if (already !== undefined) {
+            credited.push({ memoryId, utility: row.row.utility, effectiveUseCount: counted, alreadyCredited: true })
+            continue
+          }
+          const count = counted + 1
+          const utility = Math.min(MEMORY_UTILITY_MAX,
+            MEMORY_UTILITY_MAX * (1 - Math.exp(-MEMORY_UTILITY_RATE * count)))
+          const now = this.host.now()
+          this.db.prepare(
+            'UPDATE long_term_memories SET effective_use_count = ?, utility = ?, last_verified_at = ?, updated_at = ? '
+            + 'WHERE memory_id = ?').run(count, utility, now, now, memoryId)
+          this.db.prepare(
+            'INSERT INTO memory_use_credits (credit_id, memory_id, evidence_key, evidence_kind, evidence_id, utility, at) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?)')
+            .run(`credit-${randomUUID()}`, memoryId, evidence.key, evidence.kind, evidence.id, utility, now)
+          credited.push({ memoryId, utility, effectiveUseCount: count, alreadyCredited: false })
+        }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The credit could not be written.' }
+    }
+    return { ok: true, credited }
+  }
+
+  /**
+   * Write down that a memory misled somebody.
+   *
+   * A person at the console says so, and the memory answers for it: its confidence falls by a step, the number of
+   * disputes grows, and a memory whose confidence falls under the floor waits for somebody to look at it again instead
+   * of being injected on its own.
+   */
+  disputeMemory(request: { readonly caller: MemoryCaller; readonly memoryId: string; readonly reason?: string }):
+    MemoryDisputeResult {
+    if (request.caller.role !== 'operator') {
+      return { ok: false, code: 'NOT_PERMITTED',
+        reason: 'Only a person at the console may mark a memory as misleading.' }
+    }
+    const row = this.memoryById(request.memoryId)
+    if (row === undefined) return { ok: false, code: 'MEMORY_NOT_FOUND', reason: 'There is no such memory.' }
+    if (row.row.status !== 'active') {
+      return { ok: false, code: 'MEMORY_NOT_ACTIVE',
+        reason: `This memory is ${row.row.status} and takes no dispute.` }
+    }
+    try {
+      this.transaction(() => {
+        const confidence = Math.max(0, row.row.confidence - MEMORY_DISPUTE_STEP)
+        const status = confidence < MEMORY_CONFIDENCE_FLOOR ? 'needs_reverify' : row.row.status
+        const now = this.host.now()
+        this.db.prepare(
+          'UPDATE long_term_memories SET disputed_count = disputed_count + 1, confidence = ?, status = ?, updated_at = ? '
+          + 'WHERE memory_id = ?').run(confidence, status, now, request.memoryId)
+        this.db.prepare(
+          'INSERT INTO memory_disputes (dispute_id, memory_id, reason, confidence, at) VALUES (?, ?, ?, ?, ?)')
+          .run(`dispute-${randomUUID()}`, request.memoryId, bounded(request.reason ?? ''), confidence, now)
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The dispute could not be written.' }
+    }
+    return { ok: true, memory: this.memoryView(this.memoryById(request.memoryId)!) }
+  }
+
+  /**
+   * The evidence a credit leans on, when the control plane really holds it.
+   *
+   * A review that was accepted and an Assignment that ended are conclusions; a review that is still waiting and an
+   * Assignment that is still running are not. The record itself is the authority — never a sentence anybody wrote
+   * about the work.
+   */
+  private evidenceOf(evidence: MemoryUseEvidence):
+    { readonly key: string; readonly kind: string; readonly id: string; readonly projectId: string } | undefined {
+    if (evidence.reviewId !== undefined && evidence.reviewId !== '') {
+      const record = this.host.source('review', evidence.reviewId)
+      if (record === undefined || !record.authoritative) return undefined
+      return { key: `review:${evidence.reviewId}`, kind: 'review', id: evidence.reviewId,
+        projectId: record.projectId ?? '' }
+    }
+    if (evidence.assignmentId !== undefined && evidence.assignmentId !== '') {
+      const record = this.host.source('assignment', evidence.assignmentId)
+      if (record === undefined || !record.authoritative) return undefined
+      return { key: `assignment:${evidence.assignmentId}`, kind: 'assignment', id: evidence.assignmentId,
+        projectId: record.projectId ?? '' }
+    }
+    return undefined
+  }
+
+  /**
+   * Whether a memory may be credited by a piece of evidence.
+   *
+   * A fact about the person may be credited by any work; a fact about a Project only by the work of that Project.
+   */
+  private withinEvidence(row: MemoryFields, evidence: { readonly projectId: string }): boolean {
+    if (row.scope_type === 'user_global') return true
+    if (evidence.projectId === '') return false
+    if (row.scope_type !== 'project') return false
+    return row.scope_id === projectScope(evidence.projectId).scopeId
+  }
+
+  /** Whether a row belongs to one of the scopes a reader may read. */
+  private withinScopes(row: MemoryFields, scopes: MemoryScopeSet): boolean {
+    if (scopes.all) return true
+    return scopes.scopes.some(scope => scope.scopeType === row.scope_type && scope.scopeId === row.scope_id)
+  }
+
   // ─── the shape of a row ──────────────────────────────────────────────────────────────────────────────────────────
 
   /** One candidate, read back for a reader. */
@@ -1221,7 +1458,7 @@ export class MemoryService {
       content: redact(row.row.content),
       status: row.row.status,
       sourceTrust: row.row.source_trust,
-      sourceRefs: parseRefs(row.row.source_refs),
+      sourceRefs: parseSourceRefs(row.row.source_refs),
       proposedByRole: row.row.proposed_by_role,
       proposedBySessionId: row.row.proposed_by_session_id,
       provisionalSameSession: row.row.provisional_same_session === 1,
@@ -1249,7 +1486,7 @@ export class MemoryService {
       content: redact(row.row.content),
       status: row.row.status,
       sourceTrust: row.row.source_trust,
-      sourceRefs: parseRefs(row.row.source_refs),
+      sourceRefs: parseSourceRefs(row.row.source_refs),
       supersedesId: row.row.supersedes_id,
       supersededById: row.row.superseded_by_id,
       conflictWithId: row.row.conflict_with_id,
@@ -1446,6 +1683,9 @@ interface MemoryFields {
   readonly importance: number
   readonly confidence: number
   readonly utility: number
+  readonly exposure_count: number
+  readonly effective_use_count: number
+  readonly disputed_count: number
   readonly valid_from: string
   readonly last_verified_at: string
   readonly deprecated_at: string
@@ -1517,6 +1757,9 @@ function memoryOf(row: Record<string, SQLInputValue>): MemoryRow {
     importance: Number(row.importance),
     confidence: Number(row.confidence),
     utility: Number(row.utility),
+    exposure_count: Number(row.exposure_count ?? 0),
+    effective_use_count: Number(row.effective_use_count ?? 0),
+    disputed_count: Number(row.disputed_count ?? 0),
     valid_from: String(row.valid_from),
     last_verified_at: String(row.last_verified_at),
     deprecated_at: String(row.deprecated_at),
@@ -1531,20 +1774,6 @@ function memoryOf(row: Record<string, SQLInputValue>): MemoryRow {
 /** The checksum of one row: it names the version a decision was made on. */
 function checksumOf(id: string, status: string, updatedAt: string, fingerprint: string): string {
   return createHash('sha256').update(`${id} ${status} ${updatedAt} ${fingerprint}`).digest('hex').slice(0, 32)
-}
-
-/** The source references of one row, read back as the objects they were written as. */
-function parseRefs(value: string): readonly MemorySourceRef[] {
-  if (value === '') return []
-  try {
-    const parsed = JSON.parse(value) as unknown
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((entry): entry is MemorySourceRef =>
-      entry !== null && typeof entry === 'object' && typeof (entry as MemorySourceRef).kind === 'string'
-      && typeof (entry as MemorySourceRef).id === 'string')
-  } catch {
-    return []
-  }
 }
 
 /** The source references of two rows, kept apart by what they name. */

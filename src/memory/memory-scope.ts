@@ -239,6 +239,25 @@ export function maySeeCandidate(caller: MemoryCaller, proposedBySessionId: strin
   return caller.sessionId !== '' && caller.sessionId === proposedBySessionId
 }
 
+/**
+ * The source references of one row, read back as the objects they were written as.
+ *
+ * A row that holds something else — a body that was cut short, a column that was never filled — has no references
+ * rather than broken ones: a reader that cannot make sense of the column is told nothing, not half of something.
+ */
+export function parseSourceRefs(value: string): readonly MemorySourceRef[] {
+  if (value === '') return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((entry): entry is MemorySourceRef =>
+      entry !== null && typeof entry === 'object' && typeof (entry as MemorySourceRef).kind === 'string'
+      && typeof (entry as MemorySourceRef).id === 'string')
+  } catch {
+    return []
+  }
+}
+
 /** One source reference as a caller offers it. */
 export interface SourceRefInput {
   readonly kind: SourceRefKind

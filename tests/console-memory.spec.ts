@@ -12,6 +12,7 @@ import { createElement, type ComponentProps, type ReactElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { ConsoleProject, EventHistoryEntry, LiveStateSnapshot, MemoryCandidateView, MemoryMaintenanceRunView,
+  MemorySearchHitView, MemorySearchPage,
   MemoryRecordView, MemoryReviewRunView, Overview } from '../src/console/api.ts'
 import { EventHistoryPanel, LiveStatePanel, LongTermMemoryView, MemoryHead, PersistentHistoryView } from '../src/console/memory.tsx'
 
@@ -186,6 +187,52 @@ const maintenance = (over: Partial<MemoryMaintenanceRunView> = {}): MemoryMainte
   ...over,
 })
 
+/** One hit of the memory search, as the control plane answered with it. */
+const searchHit = (over: Partial<MemorySearchHitView> = {}): MemorySearchHitView => ({
+  memoryId: 'mem_000000000001',
+  scopeType: 'project',
+  scopeId: 'project:p1',
+  content: '这个项目统一用 pnpm，不要用 npm。',
+  confidence: 0.9,
+  importance: 0,
+  utility: 0,
+  freshness: 1,
+  score: 0.42,
+  lastVerifiedAt: '2026-11-19T08:00:00.000Z',
+  sourceTrust: 'operator_explicit',
+  sourceRefs: [{ kind: 'review', id: 'r1', at: '2026-11-19T08:00:00.000Z', summary: '评审通过', verified: true }],
+  conflictWarning: false,
+  staleWarning: false,
+  tainted: false,
+  pinned: false,
+  breakdown: {
+    relevance: 0.6,
+    lexical: 0.5,
+    vector: 0,
+    coverage: 1,
+    priority: 0.575,
+    importance: 0,
+    confidence: 0.9,
+    freshness: 1,
+    utility: 0,
+    weights: { importance: 0.35, confidence: 0.25, freshness: 0.25, utility: 0.15 },
+  },
+  reasons: ['相关性 0.60（关键词 0.50，命中 100% 的词）', '内在优先级 0.58（重要性 0.00、置信度 0.90、新鲜度 1.00、效用 0.00）'],
+  ...over,
+})
+
+/** The answer of the memory search, as the control plane gave it. */
+const search = (over: Partial<MemorySearchPage> = {}): MemorySearchPage => ({
+  hits: [searchHit()],
+  degraded: false,
+  degradedReason: '',
+  asOf: '2026-11-19T08:00:00.000Z',
+  considered: 4,
+  minRelevance: 0.3,
+  weights: { importance: 0.35, confidence: 0.25, freshness: 0.25, utility: 0.15 },
+  ...over,
+})
+
 /**
  * The long-term memory's own view, with the facts a control plane that answered would give it.
  *
@@ -217,6 +264,14 @@ const longTerm = (over: Partial<ComponentProps<typeof LongTermMemoryView>> = {})
     onApprove: over.onApprove ?? (() => {}),
     onReject: over.onReject ?? (() => {}),
     onInspect: over.onInspect ?? (() => {}),
+    searchQuery: over.searchQuery ?? '',
+    search: over.search,
+    searchState: over.searchState ?? 'idle',
+    searchError: over.searchError ?? '',
+    onSearchQueryChange: over.onSearchQueryChange ?? (() => {}),
+    onSearch: over.onSearch ?? (() => {}),
+    onClearSearch: over.onClearSearch ?? (() => {}),
+    onDispute: over.onDispute ?? (() => {}),
     onOpenProjects: over.onOpenProjects ?? (() => {}),
   })
 
@@ -570,6 +625,81 @@ describe('the long-term memory panel', () => {
     const page = html(longTerm({ maintenanceState: 'pending' }))
     expect(page).toContain('正在读取巡检记录')
     expect(page).not.toContain('还没有巡检记录')
+  })
+})
+
+describe('the search of the long-term memory', () => {
+  it('offers the words to look for and the two ways out of the search', () => {
+    const page = html(longTerm({ searchQuery: 'pnpm' }))
+    expect(page).toContain('检索长期记忆')
+    expect(page).toContain('id="memory-search-query"')
+    expect(page).toContain('value="pnpm"')
+    expect(page).toContain('检索')
+    expect(page).toContain('清除')
+    // The search is a read: nothing about it writes a memory.
+    expect(page).not.toContain('>遗忘</button>')
+  })
+
+  it('shows what the search found, with its scope, its sources and the reasons of its score', () => {
+    const page = html(longTerm({ search: search(), searchState: 'ready', searchQuery: 'pnpm' }))
+    expect(page).toContain('这个项目统一用 pnpm，不要用 npm。')
+    expect(page).toContain('项目 p1')
+    expect(page).toContain('来源：review:r1')
+    expect(page).toContain('相关性 0.60')
+    expect(page).toContain('内在优先级 0.58')
+    expect(page).toContain('mem_000000000001')
+    expect(page).toContain('在 4 条候选记忆中命中 1 条')
+  })
+
+  it('shows the relevance floor and the weights the search really ran with', () => {
+    const page = html(longTerm({ search: search(), searchState: 'ready', searchQuery: 'pnpm' }))
+    expect(page).toContain('相关度门槛 0.30')
+    expect(page).toContain('重要性 0.35')
+    expect(page).toContain('置信度 0.25')
+    expect(page).toContain('新鲜度 0.25')
+    expect(page).toContain('效用 0.15')
+  })
+
+  it('says that a memory which waits for a new verification and one that came from outside say so', () => {
+    const page = html(longTerm({
+      search: search({ hits: [searchHit({ staleWarning: true, tainted: true, conflictWarning: true })] }),
+      searchState: 'ready',
+      searchQuery: 'pnpm',
+    }))
+    expect(page).toContain('待核验时效')
+    expect(page).toContain('存在未决冲突，已降权')
+  })
+
+  it('says that a search which has not answered is not an empty answer', () => {
+    const page = html(longTerm({ searchState: 'pending', searchQuery: 'pnpm' }))
+    expect(page).toContain('正在检索长期记忆')
+    expect(page).not.toContain('没有匹配的记忆')
+  })
+
+  it('says why a search failed instead of showing nothing', () => {
+    const page = html(longTerm({ searchState: 'error', searchError: 'HTTP 500' }))
+    expect(page).toContain('检索失败：HTTP 500')
+    expect(page).not.toContain('没有匹配的记忆')
+  })
+
+  it('says that a search which answered with no rows holds no rows', () => {
+    const page = html(longTerm({ search: search({ hits: [] }), searchState: 'ready', searchQuery: 'pnpm' }))
+    expect(page).toContain('没有匹配的记忆')
+  })
+
+  it('says that the search fell back when a path was not there', () => {
+    const page = html(longTerm({
+      search: search({ degraded: true, degradedReason: '没有配置向量编码接口，检索退回关键词路径。' }),
+      searchState: 'ready',
+      searchQuery: 'pnpm',
+    }))
+    expect(page).toContain('检索已降级')
+    expect(page).toContain('没有配置向量编码接口')
+  })
+
+  it('offers the person to say that a memory misled somebody', () => {
+    const page = html(longTerm({ search: search(), searchState: 'ready', searchQuery: 'pnpm' }))
+    expect(page).toContain('标为误导')
   })
 })
 

@@ -62,6 +62,11 @@ node lib/control.js                      dsh --profile superagent-node
 | `SUPERAGENT_DENIAL_FUSE_LIMIT` | 控制面 | 否 | 同一回合内多少次被拒调用会打断该回合，默认 `5`。打的是回合打断，不是整会话停机。非法值启动失败 |
 | `SUPERAGENT_SCHEDULER_OFFSET_MINUTES` | 控制面 | 否 | 定时任务的**固定**时基偏移（分钟，东为正），默认 `0` = UTC。取值范围 −720…840，非法值启动失败。用命名时区会带上夏令时规则，所以这里只给固定偏移；控制台会把这个偏移显示出来 |
 | `SUPERAGENT_SCHEDULER_TICK_MS` | 控制面 | 否 | 调度器查看「到点计划」的周期（毫秒），不设置时用模块自己的默认（5 秒）。`0` = 计划仍然存在，但**不自己**到点运行，只能手动跑 |
+| `SUPERAGENT_MEMORY_MIN_RELEVANCE` | 控制面 | 否 | 长期记忆检索的相关度门槛 `R_min`，默认 `0.30`；取值 `[0, 1]`，非数字或越界启动失败。检索的每个答案都带着当次的门槛，控制台也显示它 |
+| `SUPERAGENT_MEMORY_WEIGHT_IMPORTANCE` | 控制面 | 否 | 内在优先级里「重要性」的权重 `w_I`，默认 `0.35`；取值 `[0, 1]`，非数字或越界启动失败 |
+| `SUPERAGENT_MEMORY_WEIGHT_CONFIDENCE` | 控制面 | 否 | 内在优先级里「置信度」的权重 `w_C`，默认 `0.25`；取值 `[0, 1]`，非数字或越界启动失败 |
+| `SUPERAGENT_MEMORY_WEIGHT_FRESHNESS` | 控制面 | 否 | 内在优先级里「新鲜度」的权重 `w_F`，默认 `0.25`；取值 `[0, 1]`，非数字或越界启动失败 |
+| `SUPERAGENT_MEMORY_WEIGHT_UTILITY` | 控制面 | 否 | 内在优先级里「效用」的权重 `w_U`，默认 `0.15`；取值 `[0, 1]`，非数字或越界启动失败 |
 | `SUPERAGENT_WORKSPACE_ROOT` | 控制面 | 否 | 默认 `<node root>/workspaces`；**必须**在 `SUPERAGENT_NODE_ROOT` 之内，否则节点报 `Workspace escapes the node root` |
 | `SUPERAGENT_NODE_URL` | 控制面 | 生产必填 | 节点 base URL。不设置时控制面使用内置 `FakeNode`（测试/兼容），不会连接真实节点 |
 | `SUPERAGENT_NODE_TOKEN` | 控制面 | `NODE_URL` 存在时必填 | 与节点侧相同 |

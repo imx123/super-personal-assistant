@@ -12,11 +12,13 @@ import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { EventHistoryService, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { LiveStateService, type LiveStateSnapshot } from '../memory/live-state.ts'
+import { MemoryRetriever, type EmbeddingProvider, type MemoryRetrievalConfig, type MemorySearchResult } from '../memory/retriever.ts'
 import { MemoryManager, MEMORY_MAINTENANCE_MAX_REVIEWS, MEMORY_MANAGER_PROFILE_NAME, MEMORY_REVIEW_JOB_TIMEOUT_MS,
   currentMaintenanceSlot, nextMaintenanceSlot, sourceKeysOf, type MemoryMaintenanceRunView, type MemoryManagerCaller,
   type MemoryManagerRefusalCode, type MemoryReturnCaller, type MemoryReviewRunView } from '../memory/memory-manager.ts'
 import { MemoryService, type MemoryCandidatePage, type MemoryCandidateView, type MemoryDecisionKind, type MemoryDecisionRequest,
-  type MemoryDecisionResult, type MemoryRecordPage, type MemorySubmitRequest, type MemorySubmitResult } from '../memory/memory-service.ts'
+  type MemoryDecisionResult, type MemoryDisputeResult, type MemoryRecordPage, type MemorySubmitRequest,
+  type MemorySubmitResult, type MemoryUseResult } from '../memory/memory-service.ts'
 import { scopeOf, type MemoryCaller, type MemorySourceRecord, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { redact } from '../infra/redact.ts'
 import { dataFence } from '../infra/text.ts'
@@ -664,6 +666,21 @@ export interface ControlPlaneOptions {
    * a run that did not finish knows nothing about the queue it was looking at.
    */
   memoryMaintenanceTimeoutMs?: number
+  /**
+   * The knobs of the recall: the relevance floor `R_min` and the weights of the inner priority `P`.
+   *
+   * A deployment sets them at startup (the environment reads them) and a test may set them directly. What is not given
+   * keeps the default of the memory module, and the search answers with the numbers it actually ran with, so a person
+   * may see what the control plane was told to do.
+   */
+  memoryRetrieval?: Partial<MemoryRetrievalConfig>
+  /**
+   * The optional semantic path: a provider that turns text into numbers and nothing else.
+   *
+   * The control plane reaches no network of its own: a provider is whatever the embedding that is configured outside it
+   * gives it, and a provider that is not there is not an error — the search falls back to the keyword path and says so.
+   */
+  embeddingProvider?: EmbeddingProvider
   /**
    * How long one review job may stay under way, in milliseconds.
    *
@@ -1861,6 +1878,14 @@ export class ControlPlane {
    */
   private readonly memory: MemoryService
   /**
+   * The retriever: the ranked recall of the long-term memory.
+   *
+   * It lives in `src/memory/`, so the kernel only hands it the clock and the caller: the scopes, the ranking, the keyword
+   * index and the way out when the semantic path is not there are the memory module's own work. It reads the memories
+   * and writes nothing — the counters of a memory belong to the service that writes it.
+   */
+  private readonly retriever: MemoryRetriever
+  /**
    * The memory manager: the queue of reviews, the authority of the system role that runs them, and the daily inspection.
    *
    * It lives in `src/memory/`, so the kernel only hands it the records it reads and the facts it writes; the jobs, the
@@ -2201,6 +2226,21 @@ export class ControlPlane {
         source: (kind, id) => this.memorySource(kind, id),
       }, error => {
         process.stderr.write(`superagent control-plane memory write failed: ${messageOf(error)}\n`)
+      })
+      // The retriever: the ranked recall of the memories the service holds. It reads the same file and writes nothing; the
+      // keyword index beside the memories is created here and kept in step by the triggers of the memory table itself.
+      //
+      // The knobs of the recall are the deployment's own: what was configured is what the search runs with. No semantic
+      // path is configured unless one was given — the control plane reaches no network of its own, and a search that
+      // needs one says that it fell back instead of waiting for something that is not there.
+      this.retriever = new MemoryRetriever(this.store.db, {
+        now: () => this.now(),
+      }, {
+        ...(options.memoryRetrieval === undefined ? {} : { config: options.memoryRetrieval }),
+        ...(options.embeddingProvider === undefined ? {} : { embeddingProvider: options.embeddingProvider }),
+        onError: error => {
+          process.stderr.write(`superagent control-plane memory index write failed: ${messageOf(error)}\n`)
+        },
       })
       // The callbacks run after construction (an Assignment starts only through a later Engine command), so the closures may
       // read `this.engine` and the Session map without an initialization-order hazard.
@@ -6477,6 +6517,14 @@ export class ControlPlane {
    */
   get reportProgressIntervalMs(): number { return this.reports.progressInterval }
 
+  /**
+   * The knobs the recall runs with, as they are in force right now.
+   *
+   * They are the deployment's own: what the environment configured is what the search scores with, and the search says
+   * so in every answer it gives.
+   */
+  get memoryRetrievalConfig(): MemoryRetrievalConfig { return this.retriever.retrievalConfig }
+
   /** The Session a tool call acts as; a token of the wrong role is refused before any domain check runs. */
   private requireToolSession(sessionId: string, role: 'pm' | 'worker' | 'router'): SessionRecord {
     const record = this.sessions.get(sessionId)
@@ -8693,7 +8741,8 @@ export class ControlPlane {
    * Both readers of this control plane's own facts — the live state and the durable event history — pass through here, so
    * they refuse the same Sessions for the same reasons.
    */
-  private requireSessionReader(sessionId: string, subject: 'live state' | 'event history' | 'the memory queue'):
+  private requireSessionReader(sessionId: string,
+    subject: 'live state' | 'event history' | 'the memory queue' | 'the long-term memory'):
     { record: SessionRecord; role: 'router' | 'pm' | 'worker' } {
     const record = this.sessions.get(sessionId)
     if (record === undefined) throw new ToolCallError('unauthenticated', `Unknown Session ${sessionId}`)
@@ -8805,6 +8854,124 @@ export class ControlPlane {
   /** The memories in force, as the operator reads them. */
   memoryRecordsForOperator(options: { status?: string; limit?: number; includeInactive?: boolean } = {}): MemoryRecordPage {
     return this.memory.listMemories(this.operatorCaller(), options)
+  }
+
+  /**
+   * The memories a search found, as the operator reads them.
+   *
+   * The operator may read every scope of this control plane, so the search may look at every memory that is in force. A
+   * scope may be named to narrow it; a scope nobody may read is the same thing as no scope at all.
+   *
+   * The search itself is the memory module's own work: the scopes of the caller, the keyword index, the ranking and the
+   * way out when the semantic path is not there. The kernel only hands it the clock and the caller.
+   */
+  async memorySearchForOperator(input: { query: string; limit?: number; scopeType?: string; scopeId?: string }):
+    Promise<MemorySearchResult> {
+    const scope = input.scopeType === undefined || input.scopeType === '' || input.scopeId === undefined
+      || input.scopeId === ''
+      ? undefined
+      : { scopeType: input.scopeType, scopeId: input.scopeId }
+    return this.retriever.search({
+      caller: this.operatorCaller(),
+      query: input.query,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+      ...(scope === undefined ? {} : { scope: scope }),
+    })
+  }
+
+  /**
+   * The memories one Session may search.
+   *
+   * The Session the token proved is the only authority: the role comes from its record, the Project from the work it
+   * really owns, and the machine from the node it runs on. A Worker reads the Project of the Ticket it works on and
+   * nothing else; a PM reads the Project it was really delegated; the Router reads the pool it manages.
+   */
+  async memorySearchForSession(sessionId: string, input: { query: string; limit?: number }): Promise<MemorySearchResult> {
+    const { record } = this.requireSessionReader(sessionId, 'the long-term memory')
+    const caller = this.memoryReaderCaller(sessionId, record)
+    if (caller === undefined) {
+      throw new ToolCallError('forbidden', 'This Session may not search the long-term memory.')
+    }
+    return this.retriever.search({
+      caller,
+      query: input.query,
+      ...(input.limit === undefined ? {} : { limit: input.limit }),
+    })
+  }
+
+  /**
+   * The caller a search is made as.
+   *
+   * The fences are the ones every read of this control plane's own facts shares, and the work is the one the Session
+   * really owns: a PM's Project is the one it was really delegated, and a Worker's Project is the one of the Ticket it
+   * currently works on — not the one its record names.
+   */
+  private memoryReaderCaller(sessionId: string, record: SessionRecord): MemoryCaller | undefined {
+    if (record.role === 'router') {
+      // The Router is the one Session of this control plane: a record that merely claims the role is not it.
+      if (record.sessionId !== ROUTER_SESSION_ID) return undefined
+      return { role: 'router', sessionId: record.sessionId, nodeId: record.nodeId, projectId: undefined,
+        ticketId: undefined }
+    }
+    if (record.role === 'pm') {
+      const project = this.projects().find(entry => entry.pmSessionId === record.sessionId)
+      if (project === undefined) return undefined
+      return { role: 'pm', sessionId: record.sessionId, nodeId: record.nodeId, projectId: project.id,
+        ticketId: undefined }
+    }
+    if (record.role === 'worker') {
+      const assignmentId = record.assignmentId
+      if (assignmentId === undefined || assignmentId === '') return undefined
+      const ticket = this.ticketOfAssignment(assignmentId)
+      if (ticket === undefined) return undefined
+      return { role: 'worker', sessionId: record.sessionId, nodeId: record.nodeId, projectId: ticket.projectId,
+        ticketId: ticket.id }
+    }
+    return undefined
+  }
+
+  /**
+   * One memory that a person says misled somebody.
+   *
+   * The console is the operator's own console, so this is the one place a memory may be called misleading: its confidence
+   * falls a step, and one that falls under the floor waits for a person instead of being injected on its own.
+   */
+  memoryDisputeByOperator(input: { memoryId: string; reason?: string }): MemoryDisputeResult {
+    return this.memory.disputeMemory({
+      caller: this.operatorCaller(),
+      memoryId: input.memoryId,
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    })
+  }
+
+  /**
+   * Write down that some memories were really used.
+   *
+   * The gate is the evidence: an Assignment that ended or a review that was accepted, looked up in the records this
+   * control plane holds. A sentence anybody wrote about the work is not evidence, so a credit without one is refused and
+   * nothing is written. The same piece of evidence is counted once per memory, however often it is offered.
+   *
+   * No route reaches this: the wiring of the evidence belongs to the round that assembles the context of a turn, and
+   * until then nothing may claim that a memory was used.
+   */
+  creditMemoryUse(input: { readonly memoryIds: readonly string[]; readonly reviewId?: string;
+    readonly assignmentId?: string }): MemoryUseResult {
+    return this.memory.creditEffectiveUse({
+      memoryIds: input.memoryIds,
+      evidence: {
+        ...(input.reviewId === undefined ? {} : { reviewId: input.reviewId }),
+        ...(input.assignmentId === undefined ? {} : { assignmentId: input.assignmentId }),
+      },
+    })
+  }
+
+  /**
+   * Write down that some memories were shown to somebody.
+   *
+   * An exposure is a count and nothing else: it never makes a memory more useful than it was.
+   */
+  recordMemoryExposure(caller: MemoryCaller, memoryIds: readonly string[]): number {
+    return this.memory.recordExposure(caller, memoryIds)
   }
 
   /**

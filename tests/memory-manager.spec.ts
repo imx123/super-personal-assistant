@@ -72,7 +72,8 @@ describe('the memory manager role', () => {
     // No workspace, no terminal, no network, no dispatch, no control and no message of its own.
     for (const forbidden of ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'pwsh', 'web_search', 'web_fetch',
       'subagent', 'send_message', 'control_report', 'control_create_tickets', 'control_project',
-      'control_message_worker', 'control_live_state', 'control_event_history_query', 'control_memory_propose']) {
+      'control_message_worker', 'control_live_state', 'control_event_history_query', 'control_memory_search',
+      'control_memory_propose']) {
       expect(tools, forbidden).not.toContain(forbidden)
     }
     const denied = [...MEMORY_MANAGER_PROFILE.deny] as string[]

@@ -1348,6 +1348,85 @@ export interface MemoryRecordPage {
   total: number
 }
 
+/** One hit of the memory search, as the console reads it. */
+export interface MemorySearchHitView {
+  memoryId: string
+  scopeType: string
+  scopeId: string
+  content: string
+  confidence: number
+  importance: number
+  utility: number
+  freshness: number
+  score: number
+  lastVerifiedAt: string
+  sourceTrust: string
+  sourceRefs: MemorySourceRef[]
+  conflictWarning: boolean
+  staleWarning: boolean
+  tainted: boolean
+  pinned: boolean
+  /** The numbers behind the score. */
+  breakdown: {
+    relevance: number
+    lexical: number
+    vector: number
+    coverage: number
+    priority: number
+    importance: number
+    confidence: number
+    freshness: number
+    utility: number
+    weights: { importance: number; confidence: number; freshness: number; utility: number }
+  }
+  /** The same numbers in words. */
+  reasons: string[]
+}
+
+/** The answer of the memory search. */
+export interface MemorySearchPage {
+  hits: MemorySearchHitView[]
+  /** Whether the search had to leave a path out. */
+  degraded: boolean
+  /** Why it did. */
+  degradedReason: string
+  /** The moment the answer was made. */
+  asOf: string
+  /** How many rows the search looked at. */
+  considered: number
+  /** The relevance floor the search ran with. */
+  minRelevance: number
+  weights: { importance: number; confidence: number; freshness: number; utility: number }
+}
+
+/**
+ * Search the memories that answer a question.
+ *
+ * The search is a read: the control plane filters by the scopes of the operator first and ranks what is left. The answer
+ * says how many rows it looked at and whether it had to leave the semantic path out.
+ */
+export function searchMemories(query: { query: string; limit?: number; scopeType?: string; scopeId?: string }):
+  Promise<MemorySearchPage> {
+  const params = new URLSearchParams()
+  params.set('q', query.query)
+  if (query.limit !== undefined) params.set('limit', String(query.limit))
+  if (query.scopeType !== undefined && query.scopeType !== '') params.set('scopeType', query.scopeType)
+  if (query.scopeId !== undefined && query.scopeId !== '') params.set('scopeId', query.scopeId)
+  return read<MemorySearchPage>(`/v1/console/memory/search?${params.toString()}`)
+}
+
+/**
+ * Say that a memory misled somebody.
+ *
+ * It is the one write a memory itself takes, and it belongs to the operator: the confidence of the memory falls a step,
+ * and one that falls under the floor waits for a person instead of being injected on its own.
+ */
+export function disputeMemory(input: { memoryId: string; reason?: string }): Promise<{ memory: MemoryRecordView }> {
+  return write<{ memory: MemoryRecordView }>(
+    `/v1/console/memory/memories/${encodeURIComponent(input.memoryId)}/dispute`,
+    { ...(input.reason === undefined ? {} : { reason: input.reason }) })
+}
+
 /** Read the queue of candidates. */
 export function readMemoryCandidates(query: { status?: string; limit?: number } = {}): Promise<MemoryCandidatePage> {
   const params = new URLSearchParams()

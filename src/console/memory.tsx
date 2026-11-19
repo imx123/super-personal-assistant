@@ -29,11 +29,13 @@
  * rest of Phase 5 is the same panel: the retrieval of `P5-5` fills it without the page changing shape.
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
-import { decideMemoryCandidate, messageOf, read, readEventHistory, readLiveState, readLongTermMemories,
-  readMemoryCandidates, readMemoryMaintenance, readMemoryReviews, runMemoryMaintenance, submitMemoryCandidate,
+import { decideMemoryCandidate, disputeMemory, messageOf, read, readEventHistory, readLiveState, readLongTermMemories,
+  readMemoryCandidates, readMemoryMaintenance, readMemoryReviews, runMemoryMaintenance, searchMemories,
+  submitMemoryCandidate,
   type ConsoleProject, type ConsoleTicket, type EventHistoryCoverage, type EventHistoryEntry, type LiveStateList,
   type LiveStateNode, type LiveStateSnapshot, type MemoryCandidateView, type MemoryMaintenanceRunView,
-  type MemoryRecordView, type MemoryReviewRunView, type Overview, type StreamStatus } from './api.ts'
+  type MemoryRecordView, type MemoryReviewRunView, type MemorySearchHitView, type MemorySearchPage, type Overview,
+  type StreamStatus } from './api.ts'
 import { stampOf, useAction, useLoaded, type PageProps } from './pages.tsx'
 
 /** How many of the newest console events the history panel shows. */
@@ -913,6 +915,13 @@ export function LongTermMemoryPanel(props: {
   const [content, setContent] = useState('')
   const [scope, setScope] = useState('user_global|global')
   const action = useAction(() => props.refresh())
+  // The search of the memory: the words the person typed, the answer the control plane gave and the generation that
+  // answer belongs to. A search that is answered after another one was started is dropped when it arrives.
+  const [searchQuery, setSearchQuery] = useState('')
+  const [search, setSearch] = useState<MemorySearchPage | undefined>(undefined)
+  const [searchError, setSearchError] = useState('')
+  const [searching, setSearching] = useState(false)
+  const searchGeneration = useRef(0)
 
   /** One decision about one proposal, and the words that say what it did. */
   const decide = (candidate: MemoryCandidateView, decision: 'approve' | 'reject'): void => {
@@ -938,6 +947,46 @@ export function LongTermMemoryPanel(props: {
       result => maintenanceWording((result as { run?: MemoryMaintenanceRunView }).run))
   }
 
+  /**
+   * One search, and the answer of that search alone.
+   *
+   * Every search carries a generation of its own. A person who asks a second question before the first answer arrives
+   * gets the newer answer only: the older one is dropped when it comes back, so a slow answer never overwrites a
+   * newer one and a result of one question never stands under another.
+   */
+  const runSearch = (): void => {
+    const query = searchQuery.trim()
+    if (query === '') return
+    const mine = ++searchGeneration.current
+    setSearching(true)
+    setSearchError('')
+    void searchMemories({ query, limit: 10 }).then(result => {
+      if (mine !== searchGeneration.current) return
+      setSearch(result)
+      setSearching(false)
+    }, (reason: unknown) => {
+      if (mine !== searchGeneration.current) return
+      setSearchError(messageOf(reason))
+      setSearching(false)
+    })
+  }
+
+  /** Clear the search: the words, the answer and any answer still on its way. */
+  const clearSearch = (): void => {
+    searchGeneration.current += 1
+    setSearchQuery('')
+    setSearch(undefined)
+    setSearchError('')
+    setSearching(false)
+  }
+
+  /** One memory that the person says misled somebody. */
+  const dispute = (hit: MemorySearchHitView): void => {
+    action.run(
+      () => disputeMemory({ memoryId: hit.memoryId, reason: '操作员在控制台标为误导。' }),
+      () => '已记录：这条记忆的置信度下降，等待再次核验。')
+  }
+
   const options = [
     { value: 'user_global|global', label: '全局偏好（跨项目）' },
     ...(projects.data?.projects ?? []).map(project =>
@@ -961,12 +1010,20 @@ export function LongTermMemoryPanel(props: {
       content={content}
       scope={scope}
       scopeOptions={options}
+      searchQuery={searchQuery}
+      search={search}
+      searchState={searchError !== '' ? 'error' : searching ? 'pending' : search === undefined ? 'idle' : 'ready'}
+      searchError={searchError}
       onContentChange={setContent}
       onScopeChange={setScope}
       onSubmit={propose}
       onApprove={candidate => decide(candidate, 'approve')}
       onReject={candidate => decide(candidate, 'reject')}
       onInspect={inspect}
+      onSearchQueryChange={setSearchQuery}
+      onSearch={runSearch}
+      onClearSearch={clearSearch}
+      onDispute={dispute}
       onOpenProjects={props.onOpenProjects} />
   )
 }
@@ -1009,6 +1066,14 @@ export function LongTermMemoryView(props: {
   scope: string
   /** The scopes the person may choose from. */
   scopeOptions: { value: string; label: string }[]
+  /** The words the person is searching for. */
+  searchQuery: string
+  /** The answer of the last search, when there was one. */
+  search: MemorySearchPage | undefined
+  /** What the search knows: nothing yet, waiting, failed or answered. */
+  searchState: 'idle' | 'pending' | 'error' | 'ready'
+  /** Why the search failed, when it did. */
+  searchError: string
   onContentChange: (value: string) => void
   onScopeChange: (value: string) => void
   /** The person offered a proposal. */
@@ -1017,6 +1082,14 @@ export function LongTermMemoryView(props: {
   onApprove: (candidate: MemoryCandidateView) => void
   /** The person did not adopt a proposal. */
   onReject: (candidate: MemoryCandidateView) => void
+  /** The person changed the words of the search. */
+  onSearchQueryChange: (value: string) => void
+  /** The person asked for the search. */
+  onSearch: () => void
+  /** The person cleared the search. */
+  onClearSearch: () => void
+  /** The person says that a memory misled somebody. */
+  onDispute: (hit: MemorySearchHitView) => void
   /** The person asked for an inspection now. */
   onInspect: () => void
   onOpenProjects: () => void
@@ -1038,6 +1111,86 @@ export function LongTermMemoryView(props: {
       {props.message !== ''
         ? <p className="notice success">{props.message}</p>
         : null}
+
+      <div className="memory-block memory-search">
+        <div className="memory-block-head">
+          <h3>检索长期记忆</h3>
+          <span className="memory-tag">按相关度排序</span>
+        </div>
+        <p className="quiet">
+          检索先在存储层按作用域与状态硬过滤，再打分：只有调用方有权读取、且处于生效状态的记忆才会进入候选集，
+          别的项目的内容不会出现在候选集、结果、计数或理由里。打分用的统计量同样只算调用方自己那批行，
+          所以别处的记忆动不了这里的分数与顺序。中文问题同样能命中——关键词索引读不出中文时会退回
+          逐词比对；语义向量通道未配置或不可用时也退回关键词通道，并在下面写明。
+        </p>
+        <div className="memory-form">
+          <label htmlFor="memory-search-query">
+            <span>要找什么</span>
+            <input id="memory-search-query" type="search" value={props.searchQuery} maxLength={200}
+              placeholder="例如：包管理器 / pnpm"
+              onChange={event => props.onSearchQueryChange(event.target.value)}
+              onKeyDown={event => { if (event.key === 'Enter') props.onSearch() }} />
+          </label>
+          <div className="detail-actions">
+            <button type="button" className="action" onClick={props.onSearch}
+              disabled={props.busy || props.searchQuery.trim() === ''}>
+              {props.searchState === 'pending' ? '正在检索……' : '检索'}
+            </button>
+            <button type="button" className="action" onClick={props.onClearSearch}
+              disabled={props.searchQuery === '' && props.searchState === 'idle'}>清除</button>
+          </div>
+        </div>
+        {props.searchState === 'error'
+          ? <p className="empty">{`检索失败：${props.searchError}`}</p>
+          : props.searchState === 'pending'
+            ? <p className="empty">正在检索长期记忆……</p>
+            : props.searchState === 'ready' && props.search !== undefined && props.search.hits.length === 0
+              ? <p className="empty">没有匹配的记忆。检索只看生效中的记忆，作用域之外的不在候选集里。</p>
+              : null}
+        {props.search !== undefined && props.search.hits.length > 0
+          ? <div className="memory-rows">
+            {props.search.hits.map(hit => (
+              <div className="setting" key={hit.memoryId}>
+                <span>
+                  <b>{hit.content}</b>
+                  <span className="quiet">
+                    {`${scopeWording(hit.scopeType, hit.scopeId)} · ${trustWording(hit.sourceTrust)} · 得分 ${hit.score.toFixed(3)}`}
+                  </span>
+                  <span className="quiet">
+                    {`${hit.memoryId} · 最后核验 ${stampOf(hit.lastVerifiedAt)}`}
+                  </span>
+                  <span className="quiet">{hit.reasons.join('；')}</span>
+                  {hit.sourceRefs.length === 0
+                    ? <span className="quiet">没有来源引用。</span>
+                    : <span className="quiet">
+                      {`来源：${hit.sourceRefs.map(ref =>
+                        `${ref.kind}:${ref.id}${ref.verified ? '' : '（未核验）'}`).join('、')}`}
+                    </span>}
+                  {hit.staleWarning ? <span className="quiet">待核验时效。</span> : null}
+                  {hit.conflictWarning ? <span className="quiet">存在未决冲突，已降权。</span> : null}
+                </span>
+                <span className="memory-action">
+                  <button type="button" className="action" onClick={() => props.onDispute(hit)}
+                    aria-label={`把记忆 ${hit.memoryId} 标为误导`}
+                    disabled={props.busy}>标为误导</button>
+                </span>
+              </div>
+            ))}
+          </div>
+          : null}
+        {props.search !== undefined
+          ? <p className="quiet">
+            {`在 ${props.search.considered} 条候选记忆中命中 ${props.search.hits.length} 条，相关度门槛 `
+              + `${props.search.minRelevance.toFixed(2)}，权重 `
+              + `重要性 ${props.search.weights.importance.toFixed(2)}、置信度 ${props.search.weights.confidence.toFixed(2)}、`
+              + `新鲜度 ${props.search.weights.freshness.toFixed(2)}、效用 ${props.search.weights.utility.toFixed(2)}，`
+              + `检索于 ${stampOf(props.search.asOf)}。`}
+          </p>
+          : null}
+        {props.search !== undefined && props.search.degraded
+          ? <p className="quiet">{`检索已降级：${props.search.degradedReason}`}</p>
+          : null}
+      </div>
 
       <div className="memory-block">
         <div className="memory-block-head">

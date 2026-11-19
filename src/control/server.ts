@@ -7,6 +7,7 @@ import { EVENT_HISTORY_KINDS, EVENT_HISTORY_LIMIT, EventHistoryQueryError,
   type EventHistoryKind, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { MEMORY_MANAGER_LIST_LIMIT } from '../memory/memory-manager.ts'
 import { MEMORY_LIST_LIMIT, type MemoryDecisionKind, type MemoryRefusalCode } from '../memory/memory-service.ts'
+import { MEMORY_SEARCH_LIMIT } from '../memory/retriever.ts'
 import { SOURCE_REF_KINDS, sourceRefKindOf, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { packagePath } from '../infra/paths.ts'
 import { ROUTER_ATTACHMENT_BYTES, ROUTER_ATTACHMENT_COUNT, WORKER_REPORT_STATES,
@@ -728,6 +729,37 @@ export class ControlPlaneServer {
     }
     if (method === 'GET' && path === '/v1/console/memory/memories') {
       return json(res, 200, this.control.memoryRecordsForOperator(this.memoryRecordQuery(url)))
+    }
+
+    // The search of the long-term memory: the memories that answer a question, ranked, each with the reasons why it is
+    // where it is. It is a read like every other one, and the operator may read every scope this control plane holds.
+    if (method === 'GET' && path === '/v1/console/memory/search') {
+      const query = text(url.searchParams.get('q'))
+      const limit = this.limit(url.searchParams.get('limit'))
+      if (limit !== undefined && limit > MEMORY_SEARCH_LIMIT) {
+        throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_SEARCH_LIMIT}`)
+      }
+      const scopeType = url.searchParams.get('scopeType')
+      const scopeId = url.searchParams.get('scopeId')
+      return json(res, 200, await this.control.memorySearchForOperator({
+        query,
+        ...(limit === undefined ? {} : { limit }),
+        ...(scopeType === null || scopeType === '' ? {} : { scopeType }),
+        ...(scopeId === null || scopeId === '' ? {} : { scopeId }),
+      }))
+    }
+
+    // One memory that a person says misled somebody. It is the one write a memory itself takes, and it belongs to the
+    // operator alone: the confidence of the memory falls a step, and one that falls under the floor waits for a person.
+    const disputeRoute = /^\/v1\/console\/memory\/memories\/([^/]+)\/dispute$/.exec(path)
+    if (method === 'POST' && disputeRoute !== null) {
+      const body = await readJson(req)
+      const result = this.control.memoryDisputeByOperator({
+        memoryId: decodeURIComponent(disputeRoute[1] ?? ''),
+        ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      return json(res, 200, { memory: result.memory })
     }
 
     // The memory manager's own record: the reviews it was woken for and the daily inspection it ran. Both are read
@@ -1625,6 +1657,24 @@ export class ControlPlaneServer {
           'name at least one of ticketId, projectId, controlSessionId, assignmentId or nodeId')
       }
       return json(res, 200, this.eventHistoryPage(() => this.control.eventHistoryFor(claims.sid, query)))
+    }
+
+    // The search of the long-term memory, read by the Session the token names.
+    //
+    // The token decides who acts and what may be read: the scope comes from the Session's own record and the work it
+    // owns, never from the request. A Worker reads the Project of the Ticket it works on, a PM the Project it was really
+    // delegated, the Router the pool it manages; nothing of another Project is read, counted or shown.
+    if (method === 'GET' && url.pathname === '/v1/tools/memory/search') {
+      this.control.requireTool(claims.sid, 'control_memory_search', ['pm', 'worker', 'router'], callId)
+      const query = text(url.searchParams.get('q'))
+      const limit = this.limit(url.searchParams.get('limit'))
+      if (limit !== undefined && limit > MEMORY_SEARCH_LIMIT) {
+        throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_SEARCH_LIMIT}`)
+      }
+      return json(res, 200, await this.control.memorySearchForSession(claims.sid, {
+        query,
+        ...(limit === undefined ? {} : { limit }),
+      }))
     }
 
     // The memory manager's four tools. The token decides who acts: only a manager Session may call them, and the job the

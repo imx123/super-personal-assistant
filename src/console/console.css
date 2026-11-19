@@ -326,11 +326,14 @@ svg{width:18px;height:18px;flex:none}
 /* The long-term memory: a proposal the person writes, a queue of proposals and the memories that are in force. */
 .memory-form{display:grid;gap:10px;margin:10px 0 6px}
 .memory-form label{display:grid;gap:4px;min-width:0;font-size:12px;color:var(--muted)}
-.memory-form textarea,.memory-form select{width:100%;max-width:100%;box-sizing:border-box;border:1px solid var(--edge);border-radius:8px;padding:8px;background:var(--white);font:inherit;color:var(--ink);min-width:0}
+.memory-form textarea,.memory-form select,.memory-form input{width:100%;max-width:100%;box-sizing:border-box;border:1px solid var(--edge);border-radius:8px;padding:8px;background:var(--white);font:inherit;color:var(--ink);min-width:0}
 .memory-form textarea{resize:vertical;overflow-wrap:anywhere}
 /* The two decisions of a proposal keep their words on one line; the text beside them wraps instead. */
 .memory-action{display:inline-flex;flex:none;gap:6px;flex-wrap:wrap}
 .memory-action .action{white-space:nowrap}
+/* The search of the memory: the words, the two buttons and the answer. The answer wraps; the buttons keep their words. */
+.memory-search .detail-actions{margin-top:0}
+@media(max-width:420px){.memory-block{padding:10px 11px}.memory-rows .setting{flex-wrap:wrap;align-items:flex-start}.memory-action{flex:1 1 100%}.memory-action .action{flex:1 1 auto}}
 @media(max-width:1050px){.app{grid-template-columns:194px minmax(0,1fr)}.brand{font-size:16px}}
 @media(width > 800px){
   .app[data-sidebar-collapsed=true]{grid-template-columns:64px minmax(0,1fr)}

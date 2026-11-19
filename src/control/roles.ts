@@ -66,6 +66,7 @@ export const PM_PROFILE = {
     'control_delete_external_subscription',
     'control_live_state',
     'control_event_history_query',
+    'control_memory_search',
     'control_memory_propose',
   ],
   deny: ['write', 'edit', 'bash', 'pwsh'],
@@ -91,6 +92,7 @@ export const WORKER_PROFILE = {
     'control_create_external_subscription', 'control_list_external_subscriptions', 'control_update_external_subscription',
     'control_delete_external_subscription', 'control_live_state',
     'control_event_history_query',
+    'control_memory_search',
   ],
   deny: [
     'orchestrator_project_report',
@@ -192,7 +194,8 @@ export const ROUTER_PROFILE = {
     'control_router_project_gate', 'control_router_manage', 'control_router_pm_handoff', 'control_router_pm_proposal',
     'control_request_authorization', 'control_subscribe_session_stream', 'control_unsubscribe_session_stream',
     'control_create_external_subscription', 'control_list_external_subscriptions', 'control_update_external_subscription',
-    'control_delete_external_subscription', 'control_live_state', 'control_event_history_query', 'control_memory_propose'],
+    'control_delete_external_subscription', 'control_live_state', 'control_event_history_query',
+    'control_memory_search', 'control_memory_propose'],
   deny: ['write', 'edit', 'bash', 'pwsh', 'web_search', 'web_fetch', 'subagent'],
   permission: 'read-only',
 } as const satisfies RoleProfile

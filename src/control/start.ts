@@ -8,6 +8,8 @@
 import { existsSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { packagePath } from '../infra/paths.ts'
+import { DEFAULT_MEMORY_RETRIEVAL_CONFIG, MEMORY_RETRIEVAL_BOUNDS, type MemoryRetrievalConfig,
+  type MemoryRetrievalWeights } from '../memory/retriever.ts'
 import { FakeNode } from '../node/fake-node.ts'
 import type { NodePort } from '../shared/protocol.ts'
 import { DeploymentError, DeploymentSettings } from '../shared/deployment.ts'
@@ -233,6 +235,58 @@ function inside(parent: string, child: string): boolean {
   return path === '' || (path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path))
 }
 
+/**
+ * A share of something, as a deployment writes it.
+ *
+ * A value that is not a number, or that lies outside the range the retrieval allows, fails startup before the kernel
+ * takes the database lock: a typo must not silently change the ranking of every memory this control plane holds.
+ */
+function retrievalShare(env: Record<string, string | undefined>, name: string,
+  bounds: { readonly min: number; readonly max: number }): number | undefined {
+  const raw = env[name]
+  if (raw === undefined || raw === '') return undefined
+  const value = raw.trim()
+  // Whole digits with an optional fraction: no sign, no exponent, no unit and no thousands separator.
+  if (!/^\d+(\.\d+)?$/.test(value)) throw new Error(`${name} is invalid`)
+  const number = Number(value)
+  if (!Number.isFinite(number) || number < bounds.min || number > bounds.max) {
+    throw new Error(`${name} is invalid`)
+  }
+  return number
+}
+
+/**
+ * The knobs of the recall, read from the environment.
+ *
+ * Unset keeps the defaults of the memory module. The relevance floor and the four weights are shares, so they lie in
+ * `[0, 1]`; a weight that was not named keeps the default of the module, so a deployment may set one of them and leave
+ * the rest alone. What is read here is what the search runs with, and every answer of the search says so.
+ */
+function memoryRetrieval(env: Record<string, string | undefined>): Partial<MemoryRetrievalConfig> | undefined {
+  const minRelevance = retrievalShare(env, 'SUPERAGENT_MEMORY_MIN_RELEVANCE', MEMORY_RETRIEVAL_BOUNDS.minRelevance)
+  const weights: Record<keyof MemoryRetrievalWeights, number> = { ...DEFAULT_MEMORY_RETRIEVAL_CONFIG.weights }
+  let named = false
+  const names: readonly (readonly [string, keyof MemoryRetrievalWeights])[] = [
+    ['SUPERAGENT_MEMORY_WEIGHT_IMPORTANCE', 'importance'],
+    ['SUPERAGENT_MEMORY_WEIGHT_CONFIDENCE', 'confidence'],
+    ['SUPERAGENT_MEMORY_WEIGHT_FRESHNESS', 'freshness'],
+    ['SUPERAGENT_MEMORY_WEIGHT_UTILITY', 'utility'],
+  ]
+  for (const [name, key] of names) {
+    const value = retrievalShare(env, name, MEMORY_RETRIEVAL_BOUNDS.weight)
+    if (value === undefined) continue
+    weights[key] = value
+    named = true
+  }
+  if (minRelevance === undefined && !named) return undefined
+  // The knobs are read once and built once: a knob that was not named is not in the object at all, so the module keeps
+  // its own default and nothing is passed down as an undefined that would count as a value.
+  return {
+    ...(minRelevance === undefined ? {} : { minRelevance }),
+    ...(named ? { weights } : {}),
+  }
+}
+
 function deploymentSettings(base: Record<string, string | undefined>, hasSessions: () => boolean) {
   const root = base.SUPERAGENT_NODE_ROOT ?? join(process.cwd(), '.superagent-control')
   const db = resolve(base.SUPERAGENT_CONTROL_DB ?? join(root, 'control.sqlite'))
@@ -344,10 +398,13 @@ export async function startControlPlane(options: ControlPlaneStartOptions = {}):
     : new FakeNode({ nodeId, root: workspaceRoot }))
   // The daily memory inspection: when it runs and whether it runs at all.
   const memoryMaintenanceSchedule = memoryMaintenance(env)
+  // The knobs of the recall: the relevance floor and the weights the deployment ranked its memories with.
+  const retrieval = memoryRetrieval(env)
   const controlOptions: ControlPlaneOptions = { dbPath, consoleDbPath, nodeId, node, secret: token, workspaceRoot,
     reconcileIntervalMs: reconcileIntervalMs(env),
     memoryMaintenanceEnabled: memoryMaintenanceSchedule.enabled,
     memoryMaintenanceMinuteOfDay: memoryMaintenanceSchedule.minuteOfDay,
+    ...(retrieval === undefined ? {} : { memoryRetrieval: retrieval }),
     ...(eventRows === undefined ? {} : { consoleEventRows: eventRows }),
     ...(eventDays === undefined ? {} : { consoleEventDays: eventDays }),
     ...(auditDays === undefined ? {} : { consoleAuditDays: auditDays }),
