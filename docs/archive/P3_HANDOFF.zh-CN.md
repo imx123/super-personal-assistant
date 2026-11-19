@@ -1,6 +1,6 @@
 # P3 任务交接设计
 
-> 历史文档。旧插件的任务交接设计与当时的验收记录。独立控制面的现状见 [项目交接](../project_handoff.md)。
+> 历史文档。旧插件的任务交接设计与当时的验收记录。独立控制面的现状见 [项目交接](../../project_handoff.md)。
 
 > 状态：P3-A、P3-B 与两轮 P3 审核修复（原生 DSH 停止、cleanup 失败传播与有界等待、Handoff assignment 绑定、同 Project split、异步 split/跨 Project 接收、starting 状态与启动恢复、transfer 并发复核、cancel 标记按回合绑定）均已实现。本文保留设计边界与决策记录；实现细节见 `docs/001`、`docs/002`、`docs/005`、`docs/007` 与 BASELINE。
 

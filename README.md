@@ -41,7 +41,7 @@ Start with the [handoff](project_handoff.md), [console guide](docs/017-console.z
 - [016 Control-plane TLS](docs/016-control-plane-tls.zh-CN.md): viewer authentication, SSE and reverse-proxy TLS guidance (Chinese)
 - [017 Console](docs/017-console.zh-CN.md): Router, projects, sessions, schedules and settings (Chinese)
 
-Historical milestones and evidence are listed in the [handoff](project_handoff.md#6-文档入口).
+See the [execution log](docs/roadmap/PHASE3_5_EXECUTION_LOG.md) for acceptance results and the [archive](docs/archive/README.md) for earlier plugin documentation.
 
 ## Development
 

@@ -1,6 +1,6 @@
 # 基线说明
 
-> 历史文档。旧插件阶段的开发日志。当前能力、启动入口和验收记录见 [项目交接](../project_handoff.md)。
+> 历史文档。旧插件阶段的开发日志。当前能力、启动入口和验收记录见 [项目交接](../../project_handoff.md)。
 
 ## 这是什么
 
@@ -438,7 +438,7 @@ P2 总验收见 [P2_ACCEPTANCE.zh-CN.md](P2_ACCEPTANCE.zh-CN.md)。以下是本�
 
 ## 文档说明
 
-`docs/000` 到 `docs/008` 是上游文档；与本基线不一致的地方，以本文件和新增的 `docs/002` 主入口小节为准。`docs/PHASE1_MODIFICATION_PLAN_V2.zh-CN.md` 是历史计划，不是当前验收依据。
+`docs/000` 到 `docs/008` 是上游文档；与本基线不一致的地方，以本文件和新增的 `docs/002` 主入口小节为准。`docs/archive/PHASE1_MODIFICATION_PLAN_V2.zh-CN.md` 是历史计划，不是当前验收依据。
 
 本次改动涉及的文件：
 
