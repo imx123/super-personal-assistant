@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { KV } from '../src/kv.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { type NodeCommand, type NodeEvent, type NodePort } from '../src/shared/protocol.ts'
@@ -170,7 +171,7 @@ describe('control-plane retries and command keys', () => {
 
     await control.sendMessage(pm.sessionId, 'a')
     await control.sendMessage(pm.sessionId, 'b')
-    expect(node.messages.get(pm.sessionId)).toEqual(['a', 'b'])
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toEqual(['a', 'b'])
     const sent = node.commands.filter((command): command is Extract<NodeCommand, { type: 'session.message' }> => command.type === 'session.message')
     expect(sent).toHaveLength(2)
     expect(new Set(sent.map(command => command.idempotencyKey)).size).toBe(2)

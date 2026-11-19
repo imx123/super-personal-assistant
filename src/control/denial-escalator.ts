@@ -38,7 +38,8 @@ import { redact } from '../infra/redact.ts'
 import { NodeUnconfirmedError, GUARD_DENIAL_REASON_CODES, type GuardDenialReasonCode, type SessionRecord,
   type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
-import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
+import { readContext, type CoordinationDeliveryKind, type CoordinationDeliveryRow, type DeliveryOutbox,
+  type DeliveryRevalidation } from './delivery-outbox.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
 
 /**
@@ -398,7 +399,8 @@ export interface DenialEscalatorHost {
    * The call throws when the message did not go out. A missing receipt means the message may have arrived and is never
    * repeated on a guess.
    */
-  deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void): Promise<void>
+  deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void,
+    kind?: CoordinationDeliveryKind): Promise<void>
   /** Interrupt the Session's current turn, and only that turn. */
   interruptTurn(sessionId: string, reason: string, turn: number):
     Promise<{ interrupted: boolean; confirmed: boolean; refusal?: string; error?: string }>
@@ -1228,7 +1230,7 @@ export class DenialEscalator {
     try {
       await this.host.deliver(review.targetSessionId, review.payload, review.noticeId, () => {
         this.assertSendable(review)
-      })
+      }, 'denial_review')
     } catch (error) {
       // A missing receipt is not a refusal: the message may have arrived, so it is neither a failure nor to be repeated.
       if (error instanceof NodeUnconfirmedError) {

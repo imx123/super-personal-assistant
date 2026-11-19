@@ -25,6 +25,15 @@ import type { ExternalDeliveryMode, ExternalFieldCondition, ExternalFieldOp, Ext
 /** The kinds a PM's own report about its Project may name. */
 const PROJECT_REPORT_KINDS: readonly string[] = ['progress', 'blocked', 'completed', 'failed']
 
+/**
+ * What a memory that is not there is answered with.
+ *
+ * The answer is the same for an id that was never given, an id that names a memory that is not in force and an id that
+ * was deleted: it does not say which of the three it was, so the answer never tells a caller that an id once named
+ * something.
+ */
+const MEMORY_NOT_FOUND_MESSAGE = '记忆不存在或已被用户删除'
+
 export interface ControlPlaneServerOptions {
   /** Bearer token required by every `/v1` route; `/health` stays public. */
   token: string
@@ -219,11 +228,33 @@ function memoryDecision(value: unknown): MemoryDecisionKind {
 function memoryRefusalStatus(code: MemoryRefusalCode): number {
   if (code === 'CANDIDATE_NOT_FOUND' || code === 'MEMORY_NOT_FOUND') return 404
   if (code === 'STALE_CANDIDATE' || code === 'CONFLICT_ALREADY_OPEN' || code === 'REEVALUATION_LIMIT_REACHED'
-    || code === 'DUPLICATE_CONTENT') {
+    || code === 'DUPLICATE_CONTENT' || code === 'STALE_MEMORY' || code === 'MEMORY_NOT_ACTIVE') {
     return 409
   }
   if (code === 'REEVALUATION_NOT_PERMITTED') return 403
   return 400
+}
+
+/**
+ * The memory ids a report may name.
+ *
+ * They are the model's own claim about what it used, and the control plane checks every one of them against the ledger of
+ * the injection it wrote itself — so a name that was never in front of the task counts for nothing. The list is bounded
+ * here as well: a report that names hundreds of memories is not a report about a task.
+ */
+function parseAppliedMemoryIds(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value)) throw new HttpError(400, 'appliedMemoryIds must be an array of memory ids')
+  if (value.length > 20) throw new HttpError(400, 'appliedMemoryIds may name at most 20 memories')
+  const ids: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') throw new HttpError(400, 'appliedMemoryIds must hold memory ids')
+    const id = entry.trim()
+    if (id === '') continue
+    if (id.length > 128) throw new HttpError(400, 'appliedMemoryIds must hold short memory ids')
+    ids.push(id)
+  }
+  return ids
 }
 
 /**
@@ -730,6 +761,14 @@ export class ControlPlaneServer {
     if (method === 'GET' && path === '/v1/console/memory/memories') {
       return json(res, 200, this.control.memoryRecordsForOperator(this.memoryRecordQuery(url)))
     }
+    // One memory by its id. A memory that is not in force, an id that was never given and an id that was deleted are
+    // answered in exactly the same way: the answer does not say whether the id ever existed.
+    const memoryRoute = /^\/v1\/console\/memory\/memories\/([^/]+)$/.exec(path)
+    if (method === 'GET' && memoryRoute !== null) {
+      const memory = this.control.memoryRecordForOperator(decodeURIComponent(memoryRoute[1] ?? ''))
+      if (memory === undefined) throw new HttpError(404, MEMORY_NOT_FOUND_MESSAGE)
+      return json(res, 200, { memory })
+    }
 
     // The search of the long-term memory: the memories that answer a question, ranked, each with the reasons why it is
     // where it is. It is a read like every other one, and the operator may read every scope this control plane holds.
@@ -760,6 +799,48 @@ export class ControlPlaneServer {
       })
       if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
       return json(res, 200, { memory: result.memory })
+    }
+
+    // The governance of a memory that is in force. All three belong to the operator alone, and all three name the version
+    // they were made on: a memory that changed in the meantime is a 409, so two people never overwrite each other.
+    //
+    // An edit is a new version, not a rewrite: the old memory keeps its history and leaves the recall. A pin changes the
+    // order and nothing else. A delete is a deletion: the body goes away with the row that held it, together with the
+    // copies of those words that wait in the queue and the entries the keyword index holds. The answer names what is gone
+    // and never what it said.
+    const editRoute = /^\/v1\/console\/memory\/memories\/([^/]+)\/edit$/.exec(path)
+    if (method === 'POST' && editRoute !== null) {
+      const body = await readJson(req)
+      const result = this.control.memoryEditByOperator({
+        memoryId: decodeURIComponent(editRoute[1] ?? ''),
+        content: text(body.content),
+        checksum: text(body.checksum),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      return json(res, 200, { memory: result.memory,
+        ...(result.replaced === undefined ? {} : { replaced: result.replaced }) })
+    }
+    const pinRoute = /^\/v1\/console\/memory\/memories\/([^/]+)\/pin$/.exec(path)
+    if (method === 'POST' && pinRoute !== null) {
+      const body = await readJson(req)
+      const result = this.control.memoryPinByOperator({
+        memoryId: decodeURIComponent(pinRoute[1] ?? ''),
+        pinned: body.pinned !== false,
+        checksum: text(body.checksum),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      return json(res, 200, { memory: result.memory })
+    }
+    const deleteRoute = /^\/v1\/console\/memory\/memories\/([^/]+)\/delete$/.exec(path)
+    if (method === 'POST' && deleteRoute !== null) {
+      const body = await readJson(req)
+      const result = this.control.memoryDeleteByOperator({
+        memoryId: decodeURIComponent(deleteRoute[1] ?? ''),
+        checksum: text(body.checksum),
+        ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
+      })
+      if (!result.ok) throw new HttpError(memoryRefusalStatus(result.code), result.reason)
+      return json(res, 200, { deleted: result.deleted })
     }
 
     // The memory manager's own record: the reviews it was woken for and the daily inspection it ran. Both are read
@@ -1389,17 +1470,28 @@ export class ControlPlaneServer {
    *
    * The list holds the memories that are in force. A status may ask for another one — the ones that were superseded
    * keep their history — and the limit bounds the page.
+   *
+   * **`includeInactive` is the option that shows the rows that are not in force.** It is off by default: a person who
+   * opens the list sees the memories that are in force. It may be turned on, and then the history versions and the
+   * memories that wait for a review are shown beside them — they are still in the running library, and a person has to
+   * be able to see what is there to govern it. The value is read as a word, not as a presence: a parameter that is there
+   * but empty, or that says something else, is refused rather than guessed at.
    */
   private memoryRecordQuery(url: URL): { status?: string; limit?: number; includeInactive?: boolean } {
     const status = url.searchParams.get('status')
+    const includeInactive = url.searchParams.get('includeInactive')
     const limit = this.limit(url.searchParams.get('limit'))
     if (limit !== undefined && limit > MEMORY_LIST_LIMIT) {
       throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_LIST_LIMIT}`)
+    }
+    if (includeInactive !== null && includeInactive !== 'true' && includeInactive !== 'false') {
+      throw new HttpError(400, 'includeInactive must be true or false')
     }
     return {
       ...(status === null || status === '' ? {} : { status }),
       ...(limit === undefined ? {} : { limit }),
       ...(status === null || status === '' ? {} : { includeInactive: true }),
+      ...(includeInactive === 'true' ? { includeInactive: true } : {}),
     }
   }
 
@@ -1560,7 +1652,13 @@ export class ControlPlaneServer {
       if (kind !== undefined && !PROJECT_REPORT_KINDS.includes(kind)) {
         throw new ToolCallError('invalid', `kind must be one of ${PROJECT_REPORT_KINDS.join(', ')}`)
       }
-      return json(res, 200, this.control.pmReportProject(claims.sid, summary, kind as PmProjectReportKind | undefined))
+      // The memories this Project turn really used. The control plane checks every one of them against the ledger of the
+      // injection it wrote itself, so a name that was never in front of that turn counts for nothing. The Ticket the
+      // report is about names the work the claim is bound to; the control plane checks that it is one of the PM's own.
+      const appliedMemoryIds = parseAppliedMemoryIds(body.appliedMemoryIds)
+      const ticketId = body.ticketId === undefined ? undefined : stringValue(body.ticketId, 'ticketId', true)!
+      return json(res, 200, this.control.pmReportProject(claims.sid, summary, kind as PmProjectReportKind | undefined,
+        appliedMemoryIds, ticketId))
     }
 
     // The PM's coordination message to the Worker of one of its own Tickets. The Ticket is checked against the
@@ -1664,9 +1762,30 @@ export class ControlPlaneServer {
     // The token decides who acts and what may be read: the scope comes from the Session's own record and the work it
     // owns, never from the request. A Worker reads the Project of the Ticket it works on, a PM the Project it was really
     // delegated, the Router the pool it manages; nothing of another Project is read, counted or shown.
+    //
+    // **The search may also name one memory by its id.** The id is the only thing such a request carries, and the answer
+    // is that memory or nothing at all: an id that was never given, an id that was deleted and a memory the Session may
+    // not see are answered in exactly the same way. The search itself never answers with a memory that is not in force,
+    // so a deleted id is not there to be found.
     if (method === 'GET' && url.pathname === '/v1/tools/memory/search') {
       this.control.requireTool(claims.sid, 'control_memory_search', ['pm', 'worker', 'router'], callId)
-      const query = text(url.searchParams.get('q'))
+      // **The id and the query are two ways to ask, and a request names at most one of them.** A request that names a
+      // memory id asks for that one memory; a request that names no id asks for the search. Both are read as raw
+      // parameters first, because a parameter that is not there is not a word that is empty: the search of the past
+      // (`q` alone) must not be refused as if it had named an empty id. A request that names both asks for two different
+      // things at once and is refused as such; a parameter that is there but empty is refused too, because it is not a way
+      // to ask for nothing.
+      const rawMemoryId = url.searchParams.get('memoryId')
+      const rawQuery = url.searchParams.get('q')
+      if (rawMemoryId !== null && rawQuery !== null) {
+        throw new HttpError(400, 'A search names either a memory id or a query, not both.')
+      }
+      if (rawMemoryId !== null) {
+        const memory = this.control.memoryReadForSession(claims.sid, text(rawMemoryId))
+        if (memory === undefined) throw new HttpError(404, MEMORY_NOT_FOUND_MESSAGE)
+        return json(res, 200, { memory })
+      }
+      const query = text(rawQuery)
       const limit = this.limit(url.searchParams.get('limit'))
       if (limit !== undefined && limit > MEMORY_SEARCH_LIMIT) {
         throw new HttpError(400, `limit must be an integer between 1 and ${MEMORY_SEARCH_LIMIT}`)
@@ -1824,8 +1943,12 @@ export class ControlPlaneServer {
       // The call's own id: the node sends the tool invocation's id, so a replayed call is recognised as the same call.
       // A node that sends none keeps the older behaviour, which never suppresses a new fact.
       const callKey = body.callKey === undefined ? undefined : stringValue(body.callKey, 'callKey', true)!
+      // The memories the report names are the model's own claim about what it used. The control plane checks every one of
+      // them against the ledger of the injection it wrote itself, so a name that was never in front of this task counts
+      // for nothing.
+      const appliedMemoryIds = parseAppliedMemoryIds(body.appliedMemoryIds)
       const ticket = this.control.workerReport(claims.sid, ticketId, assignmentId, parseWorkerReport(body.report), callKey,
-        callId)
+        callId, appliedMemoryIds)
       return json(res, 200, { ticket })
     }
 

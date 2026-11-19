@@ -7,6 +7,7 @@ import { ControlPlane } from '../src/control/control-plane.ts'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { NODE_PROTOCOL_VERSION, type NodeCommand, type NodeEvent } from '../src/shared/protocol.ts'
 
 const NODE_TOKEN = 'node-http-test-token'
@@ -81,7 +82,9 @@ describe('node HTTP transport', () => {
     expect(node.sessions.get(pm.sessionId)?.workspace).toBe(pm.workspace)
 
     await control.sendMessage(pm.sessionId, 'hello over HTTP')
-    expect(node.messages.get(pm.sessionId)).toEqual(['hello over HTTP'])
+    // The words travel whole; the reference material that was assembled for this turn travels beside them, in a fence
+    // of its own. What the Session really received is the words.
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toEqual(['hello over HTTP'])
 
     const worker = await control.createWorkerSession(project.id, 'assignment-1', 'ticket-1', 'Do the work')
     expect(node.sessions.get(worker.sessionId)).toMatchObject({ role: 'worker', assignmentId: 'assignment-1', status: 'idle' })
@@ -98,8 +101,10 @@ describe('node HTTP transport', () => {
 
     expect(events).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'session.status', sessionId: pm.sessionId, status: 'running' }),
+      // The SSE body carries the words whole, with the reference material that was assembled for this turn behind
+      // them in a fence of its own: exactly one fence, and it is closed.
       expect.objectContaining({ type: 'session.event', sessionId: pm.sessionId, kind: 'message',
-        data: { text: 'hello over HTTP' } }),
+        data: { text: expect.stringMatching(/^hello over HTTP\n\n<context_reference_data>\n[\s\S]*\n<\/context_reference_data>$/) } }),
       expect.objectContaining({ type: 'session.status', sessionId: worker.sessionId, status: 'stopped' }),
       expect.objectContaining({ type: 'session.status', sessionId: worker.sessionId, status: 'archived' }),
     ]))

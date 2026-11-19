@@ -107,6 +107,16 @@ export function pmReportMessage(facts: PmReportFacts): string {
   if (standalone) {
     lines.push('', 'Tell the person what the Worker reported, including any blocker or question. '
       + 'Use control_router_summary to check the current Ticket state.')
+    // The result is a fact the control plane holds, so it may be offered for remembrance — and the Assignment above is
+    // the record it came from. The hint names the source and nothing else: it grants no trust, and the trust of a fact is
+    // derived from the record itself, not from this line.
+    if (facts.reportState === 'ready') {
+      lines.push('',
+        'If this result says something that is worth remembering across tasks — an arrangement of this machine, a habit of '
+          + 'the work, a conclusion about this code — you may offer it once with control_memory_propose, naming the '
+          + 'Assignment above as its source. The proposal waits for a decision and never becomes a memory on its own. '
+          + 'Offer at most one, and only a fact that another task would really use: a one-off file operation is not one.')
+    }
     return lines.join('\n')
   }
   if (facts.reportState === 'ready') {

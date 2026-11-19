@@ -188,7 +188,9 @@ export interface ReportCoordinatorHost {
    * out any more. The check belongs to the caller, because only the caller knows the moment the transport is about to
    * happen.
    */
-  deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void): Promise<void>
+  deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void,
+    context?: { readonly ticketId: string; readonly assignmentId: string; readonly projectId: string },
+    kind?: CoordinationDeliveryKind): Promise<void>
   /** The latest report of an Assignment, read from the domain. */
   reportOf(ticketId: string, assignmentId: string):
     { state: ReportState; summary: string; at: string; projectId: string; assignmentEpoch: number } | undefined
@@ -678,7 +680,7 @@ export class ReportCoordinator {
       // moment, so a target that was replaced or stopped while the ensure was on its way does not receive the message.
       await this.host.deliver(current.targetSessionId, current.payload, current.idempotencyKey, () => {
         this.assertSendable(current)
-      })
+      }, { ticketId: current.ticketId, assignmentId: current.assignmentId, projectId: current.projectId }, current.kind)
     } catch (error) {
       // A missing receipt is not a refusal: the message may have arrived, so it is neither a failure nor to be repeated.
       const unconfirmed = error instanceof NodeUnconfirmedError

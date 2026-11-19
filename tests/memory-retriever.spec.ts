@@ -178,8 +178,8 @@ describe('the retriever, on its own', () => {
     bench.remember('pnpm pnpm pnpm pnpm pnpm 是另一个项目的包管理器 pnpm pnpm pnpm pnpm pnpm pnpm',
       { scopeType: 'project', scopeId: 'project:p2' })
     // A memory of this very Project that is no longer in force: it says the word too, and it is short.
-    const forgotten = bench.remember('pnpm 这条已经被遗忘了。', { scopeType: 'project', scopeId: 'project:p1' })
-    bench.db.prepare("UPDATE long_term_memories SET status = 'forgotten' WHERE memory_id = ?").run(forgotten)
+    const stale = bench.remember('pnpm 这条已经不再生效了。', { scopeType: 'project', scopeId: 'project:p1' })
+    bench.db.prepare("UPDATE long_term_memories SET status = 'needs_reverify' WHERE memory_id = ?").run(stale)
     // A proposal that waits for a decision: it is not a memory at all, and it says the word as well.
     bench.service.submit({ caller: operator, content: 'pnpm 这条还在队列里。',
       scope: { scopeType: 'project', scopeId: 'project:p1' } })
@@ -472,10 +472,10 @@ describe('the retriever, on its own', () => {
     bench.service.submit({ caller: operator, content: '这条还在队列里。',
       scope: { scopeType: 'project', scopeId: 'project:p1' } })
     const active = bench.remember('这个项目统一用 pnpm。', { scopeType: 'project', scopeId: 'project:p1' })
-    const forgotten = bench.remember('这条已经被遗忘了。', { scopeType: 'project', scopeId: 'project:p1' })
+    const stale = bench.remember('这条已经不再生效了。', { scopeType: 'project', scopeId: 'project:p1' })
     const superseded = bench.remember('这条已经被新版本取代了。', { scopeType: 'project', scopeId: 'project:p1' })
     const foreign = bench.remember('这是别的项目的事实。', { scopeType: 'project', scopeId: 'project:p2' })
-    bench.db.prepare("UPDATE long_term_memories SET status = 'forgotten' WHERE memory_id = ?").run(forgotten)
+    bench.db.prepare("UPDATE long_term_memories SET status = 'needs_reverify' WHERE memory_id = ?").run(stale)
     bench.db.prepare("UPDATE long_term_memories SET status = 'superseded' WHERE memory_id = ?").run(superseded)
 
     const result = await bench.retriever!.search({ caller: pmOfP1, query: '项目' })
@@ -483,9 +483,9 @@ describe('the retriever, on its own', () => {
     expect(result.hits.map(hit => hit.memoryId)).toEqual([active])
     expect(result.considered).toBe(1)
     expect(JSON.stringify(result)).not.toContain('别的项目')
-    // An id that was never given and an id that was forgotten answer in exactly the same way.
+    // An id that was never given and an id that is not in force answer in exactly the same way.
     expect(bench.retriever!.read(pmOfP1, 'mem_000000000999').found).toBe(false)
-    expect(bench.retriever!.read(pmOfP1, forgotten).found).toBe(false)
+    expect(bench.retriever!.read(pmOfP1, stale).found).toBe(false)
     expect(bench.retriever!.read(pmOfP1, foreign).found).toBe(false)
     expect(bench.retriever!.read(pmOfP1, active).found).toBe(true)
   })

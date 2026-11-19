@@ -30,20 +30,35 @@
  * table; a body that carries one is refused rather than masked, because a masked secret is still a secret in a file
  * somebody may read.
  *
- * **The forgetting of a memory is not decided yet.** The contract leaves two ways open — a fingerprint that keeps
- * suppressing the fact, or a deletion that takes the text with it — and the user has not chosen. So no tombstone table
- * is created, no memory is deleted, and there is no action here that would forget anything.
+ * **The deleting of a memory is a deletion, not a suppression.** The user decided: the body of the memory goes away with
+ * the record that named it — the row itself, the copies of the same words in the same scope that wait in the queue, the
+ * entries the keyword index holds and the references that still point at it. Nothing of the deleted fact is kept: no
+ * fingerprint, no archived copy, no tombstone that would stop it from being proposed again. What the deletion does not
+ * touch is the history around it — the Tickets, the Sessions and the durable event history keep their own rules, and a
+ * fact that is extracted again later is a new fact with a new id.
+ *
+ * **Only the person may delete, and only the person may read what is left.** The authority is the credential the request
+ * carried and never a field of the body: a model, an API and a console body that merely claims to be the operator change
+ * nothing. An id that was never given and an id that was deleted are answered in exactly the same way, so the answer never
+ * says whether the thing it was asked about was ever there.
+ *
+ * **What was injected and what was really used are two records.** The injection ledger says which memories a turn really
+ * carried, bound to the Session, the Assignment, the generation and the scope they were read for. The claims say which of
+ * them a report named back, and a claim only counts when the memory was really in front of that task: a model that names
+ * an id it was never given, a memory of another Project or a credential changes nothing, because the service compares the
+ * claim with the ledger it wrote itself.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { redact } from '../infra/redact.ts'
 import {
   allowedScopes, candidateIdempotencyKey, contentFingerprint, containsAbsolutePath, containsSecret, mayPropose,
-  maySeeCandidate, nodeIdOf, parseSourceRefs, proposalAuthority, projectIdOf, projectScope, recordWithinCaller, scopeOf,
-  validateSourceRefs,
+  maySeeCandidate, nodeIdOf, nodeScope, parseSourceRefs, proposalAuthority, projectIdOf, projectScope, recordWithinCaller,
+  scopeOf, validateSourceRefs,
   type MemoryCaller, type MemoryScope, type MemoryScopeSet, type MemorySourceRecord, type MemorySourceRef,
   type SourceRefInput, type SourceRefKind, type SourceTrust,
 } from './memory-scope.ts'
+import { withSecureDelete } from './secure-delete.ts'
 
 /** The states a candidate may be in. */
 export type MemoryCandidateStatus =
@@ -70,7 +85,7 @@ export const MEMORY_RETURN_LIMIT = 1
 export const MEMORY_REEVALUATION_LIMIT = 1
 
 /** The states a memory may be in. */
-export type MemoryStatus = 'active' | 'superseded' | 'forgotten' | 'needs_reverify' | 'conflict_pending'
+export type MemoryStatus = 'active' | 'superseded' | 'needs_reverify' | 'conflict_pending'
 
 /** The states a conflict may be in. */
 export type MemoryConflictState = 'open' | 'resolved_merge' | 'resolved_supersede' | 'resolved_human' | 'expired'
@@ -123,8 +138,8 @@ export const MEMORY_CONFIDENCE_FLOOR = 0.3
  * them the first time it is opened after; a database that already has them keeps them.
  *
  * The `ticket` scope is absent by design: a Ticket's own detail is not a memory, and the write path refuses it before
- * it reaches a row. The `memory_tombstones` table is absent by decision: the contract leaves the forgetting of a memory
- * open, and a table that exists before the question is answered would be a table built on a guess.
+ * it reaches a row. There is no tombstone table either: a memory that is deleted leaves nothing behind that could
+ * bring it back — no fingerprint, no archived copy, no row that says "do not say this again".
  *
  * The live fingerprint index is partial: it covers the states in which a memory may still be recalled, so a superseded
  * or a rejected row may not stand in the way of a new fact with the same words.
@@ -237,6 +252,46 @@ CREATE TABLE IF NOT EXISTS memory_disputes (
   at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS memory_disputes_memory ON memory_disputes(memory_id, at);
+CREATE TABLE IF NOT EXISTS memory_context_injections (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  injection_id TEXT NOT NULL UNIQUE,
+  session_id TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT '',
+  assignment_id TEXT NOT NULL DEFAULT '',
+  ticket_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
+  node_id TEXT NOT NULL DEFAULT '',
+  generation TEXT NOT NULL DEFAULT '',
+  delivery_id TEXT NOT NULL DEFAULT '',
+  delivered_at TEXT NOT NULL DEFAULT '',
+  failed_at TEXT NOT NULL DEFAULT '',
+  block TEXT NOT NULL DEFAULT '',
+  memory_ids TEXT NOT NULL DEFAULT '[]',
+  provisional_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_context_injections_task
+  ON memory_context_injections(session_id, assignment_id, created_at);
+CREATE TABLE IF NOT EXISTS memory_applied_claims (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  claim_id TEXT NOT NULL UNIQUE,
+  memory_id TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT '',
+  assignment_id TEXT NOT NULL DEFAULT '',
+  ticket_id TEXT NOT NULL DEFAULT '',
+  project_id TEXT NOT NULL DEFAULT '',
+  node_id TEXT NOT NULL DEFAULT '',
+  generation TEXT NOT NULL DEFAULT '',
+  scope_type TEXT NOT NULL DEFAULT '',
+  scope_id TEXT NOT NULL DEFAULT '',
+  delivery_id TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT 'confirmed',
+  evidence_kind TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_applied_claims_pair
+  ON memory_applied_claims(memory_id, evidence_kind, evidence_id);
 `
 
 /**
@@ -366,6 +421,7 @@ export type MemoryRefusalCode =
   | 'REEVALUATION_LIMIT_REACHED'
   | 'DUPLICATE_CONTENT'
   | 'EVIDENCE_NOT_VERIFIED'
+  | 'STALE_MEMORY'
   | 'NOT_PERMITTED'
 
 /**
@@ -373,11 +429,15 @@ export type MemoryRefusalCode =
  *
  * The evidence is a record the control plane holds: a review that was accepted or an Assignment that ended. It is never
  * a sentence an Agent wrote about itself — a claim of use is not a use.
+ *
+ * **The two are one task.** The review says that the PM accepted the result of an Assignment, and the Assignment says
+ * which piece of work it was. When both are named, the credit is written once for the task and never again: a second
+ * review of the same Assignment does not make the same memory twice as useful.
  */
 export interface MemoryUseEvidence {
   /** The review the PM accepted. */
   readonly reviewId?: string
-  /** The Assignment that ended. */
+  /** The Assignment that ended, or the one the accepted review was about. */
   readonly assignmentId?: string
 }
 
@@ -401,6 +461,147 @@ export type MemoryUseResult =
 export type MemoryDisputeResult =
   | { readonly ok: true; readonly memory: MemoryRecordView }
   | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
+
+/**
+ * The answer of a governance act: an edit or a pin.
+ *
+ * An edit replaces a memory with a new version and hands both back: the new one is in force, the old one keeps its
+ * history. The other hands back the memory as it stands.
+ */
+export type MemoryGovernanceResult =
+  | { readonly ok: true; readonly memory: MemoryRecordView; readonly replaced?: MemoryRecordView }
+  | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
+
+/**
+ * The answer of a deletion.
+ *
+ * The answer names what is gone and never what it said: the body and the fingerprint of a deleted memory are not
+ * repeated to the caller, and the ids that are named are the ones the caller already held.
+ */
+export type MemoryDeleteResult =
+  | { readonly ok: true; readonly deleted: MemoryDeletionSummary }
+  | { readonly ok: false; readonly code: MemoryRefusalCode; readonly reason: string }
+
+/** What one deletion took away. */
+export interface MemoryDeletionSummary {
+  /** The memory the person named. */
+  readonly memoryId: string
+  readonly scopeType: string
+  readonly scopeId: string
+  /** How many rows of the memory table went with it — the memory itself and any copy of it. */
+  readonly removedMemories: number
+  /** How many proposals of the same body went with it. */
+  readonly removedCandidates: number
+  /** How many turn snapshots that carried it were withdrawn. */
+  readonly removedSnapshots: number
+}
+
+/** One request to change a memory that is in force. */
+export interface MemoryGovernanceRequest {
+  /** The caller, as the control plane authenticated it. */
+  readonly caller: MemoryCaller
+  /** The memory the act is about. */
+  readonly memoryId: string
+  /** The checksum of the memory as the caller read it; an act on an older version is refused. */
+  readonly expectedChecksum: string
+  /** The new body, for an edit. */
+  readonly content?: string
+  /** Whether the memory is pinned, for a pin. */
+  readonly pinned?: boolean
+  /** Why the person did it; it is redacted and kept with the memory. */
+  readonly reason?: string
+}
+
+/**
+ * One request to delete a memory for good.
+ *
+ * It names the version the person read: a memory that changed since they read it is refused, so that the deletion
+ * takes away the fact they were looking at and not another one.
+ */
+export interface MemoryDeleteRequest {
+  /** The caller, as the control plane authenticated it. */
+  readonly caller: MemoryCaller
+  /** The memory to delete. */
+  readonly memoryId: string
+  /** The checksum of the memory as the caller read it. */
+  readonly expectedChecksum: string
+  /** Why the person did it; it is redacted and kept with the audit. */
+  readonly reason?: string
+}
+
+/**
+ * One injection of context into one turn.
+ *
+ * It is the record of what a turn really carried: the memories that were in front of the model, the Session they were
+ * read for, the Assignment and the generation they belonged to, the scope they were read under and the delivery that
+ * carried them. The id is derived from those facts, so the same turn that is assembled twice is one injection — and an
+ * exposure is counted once.
+ *
+ * **The generation is not optional.** A row whose generation the control plane could not resolve says nothing about
+ * which life of the Session the block belonged to, so it is not written: an empty generation is never a verification.
+ */
+export interface MemoryInjectionRecord {
+  readonly injectionId: string
+  readonly sessionId: string
+  readonly role: string
+  readonly assignmentId: string
+  readonly ticketId: string
+  readonly projectId: string
+  readonly nodeId: string
+  readonly generation: string
+  /** The stable id of the delivery that carried the block. */
+  readonly deliveryId: string
+  /** The content the delivery really carried; a retry of the same delivery sends exactly this. */
+  readonly block: string
+  /** The ids of the memories that were in the block. */
+  readonly memoryIds: readonly string[]
+  /** The ids of the proposals of that Session that were in the block. */
+  readonly provisionalIds: readonly string[]
+}
+
+/**
+ * The binding one injection is read under.
+ *
+ * Every part of it is a fact the control plane holds: the Session the block was read for, the Assignment and the Ticket
+ * it belonged to, the Project and the machine it was read under, and the generation that life of the Session lived in.
+ * A claim is compared with the ledger on all of them at once, so a block that was read under another generation, for
+ * another Ticket, on another machine or in another Project is not the block a task really carried.
+ */
+export interface MemoryInjectionBinding {
+  readonly sessionId: string
+  readonly assignmentId: string
+  readonly ticketId: string
+  readonly projectId: string
+  readonly nodeId: string
+  readonly generation: string
+}
+
+/** One claim that a memory was really used by a task. */
+export interface MemoryAppliedClaim {
+  readonly memoryId: string
+  readonly sessionId: string
+  readonly assignmentId: string
+  readonly ticketId: string
+  readonly projectId: string
+  readonly nodeId: string
+  readonly generation: string
+  readonly scopeType: string
+  readonly scopeId: string
+  /** `assignment` for the work of one Assignment, `ticket` for the PM's own turn about one Ticket. */
+  readonly evidenceKind: string
+  readonly evidenceId: string
+  readonly at: string
+}
+
+/** The answer of a claim. */
+export interface MemoryAppliedResult {
+  /** The ids that were really in front of the task, in a block that was delivered; they are counted. */
+  readonly accepted: readonly string[]
+  /** The ids that were in front of the task, in a block whose delivery is still on its way; they count when it lands. */
+  readonly waiting: readonly string[]
+  /** The ids the report named that the task never carried; they are not counted. */
+  readonly refused: readonly string[]
+}
 
 /**
  * The answer of a proposal.
@@ -463,6 +664,13 @@ export interface MemoryReevaluationRequest {
   readonly expectedChecksum: string
   /** The body the proposer says now; the old one stays when it says nothing. */
   readonly content?: string
+  /**
+   * The records the new body came from.
+   *
+   * They are read against the body the proposer says now, exactly as they were read against the body before it: saying a
+   * candidate once more is not a way around the source rules. Without them the candidate's own sources are read again.
+   */
+  readonly sourceRefs?: readonly SourceRefInput[]
 }
 
 /** One proposal: what somebody offered to be remembered. */
@@ -521,6 +729,16 @@ export class MemoryService {
   private migrate(): void {
     this.db.exec(SCHEMA)
     this.ensureColumn('memory_candidates', 'reevaluations', 'INTEGER NOT NULL DEFAULT 0')
+    // The columns `P5-6` added after the tables were first made: the ledger remembers the delivery that carried the
+    // block and the moment it went out.
+    this.ensureColumn('memory_context_injections', 'delivery_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('memory_context_injections', 'delivered_at', "TEXT NOT NULL DEFAULT ''")
+    // The three columns the second round of `P5-6` added: the block is the content the delivery really carried, the
+    // failure says that the delivery never went out, and the claim remembers the delivery it waits for.
+    this.ensureColumn('memory_context_injections', 'failed_at', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('memory_context_injections', 'block', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('memory_applied_claims', 'delivery_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('memory_applied_claims', 'state', "TEXT NOT NULL DEFAULT 'confirmed'")
   }
 
   /**
@@ -577,13 +795,16 @@ export class MemoryService {
     }
 
     const validated = validateSourceRefs(request.sourceRefs ?? [], (kind, id) => this.host.source(kind, id),
-      { operator: request.caller.role === 'operator', scope })
+      { operator: request.caller.role === 'operator', scope, content })
     const foreign = this.foreignSource(validated.refs, request.caller)
     if (foreign !== undefined) {
       return { ok: false, code: 'SCOPE_NOT_PERMITTED', reason: foreign }
     }
     const body = redact(content)
     const fingerprint = contentFingerprint(body, scope)
+    // The key is built from the sources, the body and the scope: the same proposal, offered again by a retry or after a
+    // restart, is one row. A fact that was deleted leaves nothing behind, so the very same words may be proposed again
+    // afterwards — as a new proposal, under the ordinary rules.
     const idempotencyKey = candidateIdempotencyKey(validated.refs, fingerprint, scope)
     const now = this.host.now()
     const status = this.statusOfSubmission(scope, validated.trust)
@@ -1040,7 +1261,8 @@ export class MemoryService {
    * One memory, read by its id.
    *
    * A memory that is not in force is not there as far as this read is concerned, and an id that was never given is
-   * answered in exactly the same way: the answer does not say whether the id ever existed.
+   * answered in exactly the same way: the answer does not say whether the id ever existed. A memory that was deleted is
+   * not in the table at all, so it is answered the same way too.
    */
   readMemory(caller: MemoryCaller, memoryId: string, options: { includeInactive?: boolean } = {}): MemoryReadResult {
     const row = this.memoryById(memoryId)
@@ -1186,6 +1408,8 @@ export class MemoryService {
         let body = candidate.row.content
         let fingerprint = candidate.row.content_fingerprint
         let idempotencyKey = candidate.row.idempotency_key
+        let refs = parseSourceRefs(candidate.row.source_refs)
+        let trust = candidate.row.source_trust as SourceTrust
         if (request.content !== undefined) {
           const text = request.content.trim()
           if (text === '') return { ok: false, code: 'EMPTY_CONTENT', reason: 'A memory says something.' }
@@ -1198,11 +1422,20 @@ export class MemoryService {
             return { ok: false, code: 'REDACTION_REJECTED',
               reason: `The body carries ${leak === 'path' ? 'a path on a machine' : 'a secret'}; a memory may not keep it.` }
           }
+          // **The sources are read again against the body the proposer says now.** Saying a candidate once more is not a
+          // way around the source rules: the sources the proposer names are the ones that count, and without them the
+          // candidate's own sources are read again. A body that is not in the words the sources carry loses the trust of
+          // them — it waits for a person instead of the manager.
+          const stated = request.sourceRefs ?? refs.map(ref => ({ kind: ref.kind, id: ref.id, summary: ref.summary }))
+          const validated = validateSourceRefs(stated, (kind, id) => this.host.source(kind, id),
+            { operator: request.caller.role === 'operator', scope, content: text })
+          refs = validated.refs
+          trust = validated.trust
           const redacted = redact(text)
           if (redacted !== candidate.row.content) {
             body = redacted
             fingerprint = contentFingerprint(body, scope)
-            idempotencyKey = candidateIdempotencyKey(parseSourceRefs(candidate.row.source_refs), fingerprint, scope)
+            idempotencyKey = candidateIdempotencyKey(refs, fingerprint, scope)
             // The same words are one row: another candidate of this scope that already says them, and another row that
             // already answers to them, both refuse the second writing.
             const same = this.liveCandidateOfFingerprint(scope, fingerprint)
@@ -1220,13 +1453,13 @@ export class MemoryService {
         const now = this.host.now()
         // The candidate goes back into the queue it came from: a fact about the person, or one nobody could check, waits
         // for a person again — saying it once more does not make it a fact the manager may judge.
-        const status = this.statusOfSubmission(scope, candidate.row.source_trust as SourceTrust)
+        const status = this.statusOfSubmission(scope, trust)
         this.db.prepare(`
           UPDATE memory_candidates
-            SET content = ?, content_fingerprint = ?, idempotency_key = ?, status = ?,
+            SET content = ?, content_fingerprint = ?, idempotency_key = ?, status = ?, source_trust = ?, source_refs = ?,
                 reevaluations = reevaluations + 1, updated_at = ?
             WHERE candidate_id = ?
-        `).run(body, fingerprint, idempotencyKey, status, now, candidate.row.candidate_id)
+        `).run(body, fingerprint, idempotencyKey, status, trust, JSON.stringify(refs), now, candidate.row.candidate_id)
         const updated = this.candidateById(candidate.row.candidate_id)!
         return { ok: true, duplicate: false, candidate: this.candidateView(updated) }
       })
@@ -1403,26 +1636,804 @@ export class MemoryService {
     return { ok: true, memory: this.memoryView(this.memoryById(request.memoryId)!) }
   }
 
+  // ─── the governance of a memory that is in force ───────────────────────────────────────────────────────────
+
+  /**
+   * Replace a memory with a new version of it.
+   *
+   * An edit is a new version, never a rewrite of the old one: the new row names the one it replaces, the old row keeps
+   * its history and leaves the recall, and both change in one transaction. The act names the version it was made on, so
+   * two people editing the same memory do not overwrite each other: the second one is told to read it again.
+   *
+   * **The version is checked before the state.** An act that was made on an older version is refused as a conflict
+   * (409), whatever the memory has become since: the person is told that the version they read is gone, not that the
+   * memory is in some state they may act on. A memory that was forgotten is not there at all — an id that names one is
+   * answered exactly like an id that was never given, so the write does not tell the caller that the id ever existed.
+   *
+   * The trust of the fact does not change: a person who fixes a wording does not turn an unverified fact into a verified
+   * one, and the new version starts with no exposure and no usefulness — it has to earn them again.
+   */
+  editMemory(request: MemoryGovernanceRequest): MemoryGovernanceResult {
+    if (request.caller.role !== 'operator') {
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'Only a person at the console may edit a memory.' }
+    }
+    const content = request.content?.trim() ?? ''
+    if (content === '') return { ok: false, code: 'EMPTY_CONTENT', reason: 'A memory says something.' }
+    if (content.length > MEMORY_CONTENT_LIMIT) {
+      return { ok: false, code: 'CONTENT_TOO_LONG', reason: `A memory holds at most ${MEMORY_CONTENT_LIMIT} characters.` }
+    }
+    const leak = leakOf(content)
+    if (leak !== undefined) {
+      return { ok: false, code: 'REDACTION_REJECTED',
+        reason: `The body carries ${leak === 'path' ? 'a path on a machine' : 'a secret'}; a memory may not keep it.` }
+    }
+    try {
+      return this.transaction((): MemoryGovernanceResult => {
+        const target = this.memoryById(request.memoryId)
+        if (target === undefined) return { ok: false, code: 'MEMORY_NOT_FOUND', reason: 'There is no such memory.' }
+        if (target.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_MEMORY',
+            reason: 'This memory changed since it was read; read it again before changing it.' }
+        }
+        if (target.row.status !== 'active') {
+          return { ok: false, code: 'MEMORY_NOT_ACTIVE',
+            reason: `This memory is ${target.row.status} and takes no new version.` }
+        }
+        const scope = this.scopeOfRow(target.row.scope_type, target.row.scope_id)
+        const body = redact(content)
+        const fingerprint = contentFingerprint(body, scope)
+        if (fingerprint !== target.row.content_fingerprint) {
+          const same = this.liveMemoryOfFingerprint(scope, fingerprint)
+          if (same !== undefined && same.row.memory_id !== target.row.memory_id) {
+            return { ok: false, code: 'DUPLICATE_CONTENT',
+              reason: 'Another memory of this scope already says that; it is not written twice.' }
+          }
+        }
+        const now = this.host.now()
+        const memoryId = this.nextId('memory', 'mem')
+        // The old row leaves the recall first, so the new one may take its place without two rows of the same scope and
+        // the same words being in force at once. Both are one transaction: either both change or neither does.
+        this.db.prepare(
+          "UPDATE long_term_memories SET status = 'superseded', deprecated_at = ?, superseded_by_id = ?, updated_at = ? "
+          + 'WHERE memory_id = ?').run(now, memoryId, now, target.row.memory_id)
+        this.db.prepare(`
+          INSERT INTO long_term_memories
+            (memory_id, scope_type, scope_id, content, content_fingerprint, status, source_trust, source_refs,
+             supersedes_id, superseded_by_id, conflict_with_id, pinned, importance, confidence, utility,
+             exposure_count, effective_use_count, disputed_count, valid_from, last_verified_at, deprecated_at,
+             created_at, updated_at, node_id, backend_id)
+          VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, '', '', ?, ?, ?, 0, 0, 0, 0, ?, ?, '', ?, ?, ?, ?)
+        `).run(
+          memoryId, target.row.scope_type, target.row.scope_id, body, fingerprint, target.row.source_trust,
+          target.row.source_refs, target.row.memory_id, target.row.pinned, target.row.importance,
+          target.row.confidence, now, now, now, now, target.row.node_id, this.host.backendId(),
+        )
+        const memory = this.memoryById(memoryId)!
+        const replaced = this.memoryById(target.row.memory_id)!
+        return { ok: true, memory: this.memoryView(memory), replaced: this.memoryView(replaced) }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The new version could not be written.' }
+    }
+  }
+
+  /**
+   * Pin a memory, or let it go.
+   *
+   * A pinned memory comes before an unpinned one when the ranking ties, and nothing else changes about it. The act names
+   * the version it was made on, so it never overwrites a change somebody else made in the meantime.
+   */
+  pinMemory(request: MemoryGovernanceRequest): MemoryGovernanceResult {
+    if (request.caller.role !== 'operator') {
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'Only a person at the console may pin a memory.' }
+    }
+    const pinned = request.pinned !== false
+    try {
+      return this.transaction((): MemoryGovernanceResult => {
+        const target = this.memoryById(request.memoryId)
+        if (target === undefined) return { ok: false, code: 'MEMORY_NOT_FOUND', reason: 'There is no such memory.' }
+        if (target.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_MEMORY',
+            reason: 'This memory changed since it was read; read it again before changing it.' }
+        }
+        if (target.row.status !== 'active') {
+          return { ok: false, code: 'MEMORY_NOT_ACTIVE', reason: `This memory is ${target.row.status} and takes no pin.` }
+        }
+        const now = this.host.now()
+        this.db.prepare('UPDATE long_term_memories SET pinned = ?, updated_at = ? WHERE memory_id = ?')
+          .run(pinned ? 1 : 0, now, target.row.memory_id)
+        return { ok: true, memory: this.memoryView(this.memoryById(target.row.memory_id)!) }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The pin could not be written.' }
+    }
+  }
+
+  /**
+   * Delete a memory for good.
+   *
+   * The deletion is a deletion: the body of the memory goes away with the row that held it, together with everything
+   * that would let the same words be read back — the copies of those words in the same scope that wait in the queue, the
+   * entries the keyword index holds, the claims and the conflicts that name it, and the references that still point at
+   * it. Nothing of the deleted fact is kept: no fingerprint, no archived copy, no row that says "do not say this
+   * again". What the deletion does not touch is the history around it — the Tickets, the Sessions and the durable event
+   * history keep their own rules, and a fact that is extracted again later is a new fact with a new id.
+   *
+   * **The copies that go with it are the copies of the same words.** A candidate is a copy of the body only when it
+   * carries that body in that scope; a proposal that happens to come from the same record is another fact and stays. A
+   * memory of another scope, and a memory of another body, are two facts and stay as well.
+   *
+   * **A memory that is not in force may be deleted as well.** The rows that wait for a review (`needs_reverify`), the
+   * versions a newer one replaced (`superseded`) and the ones a conflict holds (`conflict_pending`) are still in the
+   * running library, and their bodies are still there. A person who wants a fact gone must be able to make it gone, so
+   * the deletion takes any row whose version matches the one they read, whatever state that row is in. The rule about the
+   * copies is the very same one: the rows that carry the same words in the same scope go with it. What stays in force is
+   * unaffected — the recall, the search of a Session and the read by id still answer with the memories that are in
+   * force and with nothing else.
+   *
+   * **One transaction, or nothing.** The row, the copies, the index entries and the claims around them are one fact:
+   * they go together or they stay. A delete that failed halfway would leave a body behind with no row that names it.
+   *
+   * Only the person may do this, and only after a second, explicit confirmation that names the version they read. The
+   * authority is the credential the request carried: a body that names itself the operator changes nothing.
+   */
+  deleteMemory(request: MemoryDeleteRequest): MemoryDeleteResult {
+    if (request.caller.role !== 'operator') {
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'Only a person at the console may delete a memory.' }
+    }
+    try {
+      // The running library overwrites what it deletes: the content of the deleted rows is zeroed rather than left in
+      // the free space of the page, so the body of a deleted memory is not readable out of the file afterwards.
+      return withSecureDelete(this.db, (): MemoryDeleteResult => this.transaction((): MemoryDeleteResult => {
+        const target = this.memoryById(request.memoryId)
+        if (target === undefined) return { ok: false, code: 'MEMORY_NOT_FOUND', reason: 'There is no such memory.' }
+        if (target.checksum !== request.expectedChecksum) {
+          return { ok: false, code: 'STALE_MEMORY',
+            reason: 'This memory changed since it was read; read it again before deleting it.' }
+        }
+        // A row that is not in force is deleted as well: a memory that waits for a review and a version a newer one
+        // replaced are still in the running library, and their bodies are still there. The version the person read is the
+        // version this act is made on, and that is the only thing that decides whether it may happen.
+        const scopeType = target.row.scope_type
+        const scopeId = target.row.scope_id
+        const fingerprint = target.row.content_fingerprint
+        const now = this.host.now()
+
+        // The rows that carry these very words in this very scope: the memory itself, any copy of it that is still
+        // there, and the proposals that carry the same body. Nothing else is touched.
+        const memoryIds = this.idsOf(
+          'SELECT memory_id FROM long_term_memories WHERE scope_type = ? AND scope_id = ? AND content_fingerprint = ?',
+          scopeType, scopeId, fingerprint)
+        const candidateIds = this.idsOf(
+          'SELECT candidate_id FROM memory_candidates WHERE scope_type = ? AND scope_id = ? AND content_fingerprint = ?',
+          scopeType, scopeId, fingerprint)
+
+        // The claims, the conflicts and the accounting that name the deleted rows: they belong to the deleted fact and
+        // go with it, or they would keep an id alive that no longer names anything. The review jobs and the returns of
+        // the memory manager name the deleted proposals too — a job that was already dispatched would otherwise read a
+        // candidate that is gone — and they live in this very file, so they go in this very transaction.
+        this.deleteWhere('memory_applied_claims', 'memory_id', memoryIds)
+        this.deleteWhere('memory_use_credits', 'memory_id', memoryIds)
+        this.deleteWhere('memory_disputes', 'memory_id', memoryIds)
+        this.deleteWhere('memory_review_runs', 'candidate_id', candidateIds)
+        this.deleteWhere('memory_candidate_returns', 'candidate_id', candidateIds)
+        for (const column of ['memory_id', 'candidate_id', 'other_memory_id']) {
+          this.deleteWhere('memory_conflicts', column, memoryIds.concat(candidateIds))
+        }
+        // The references that still point at the deleted rows: a version that replaced it and a conflict it was part
+        // of may not keep an id that names nothing.
+        for (const column of ['supersedes_id', 'superseded_by_id', 'conflict_with_id']) {
+          this.clearWhere('long_term_memories', column, memoryIds)
+        }
+        this.clearWhere('long_term_memories', 'conflict_with_id', candidateIds)
+        this.clearWhere('memory_candidates', 'conflict_with_id', memoryIds.concat(candidateIds))
+
+        // The rows themselves. The keyword index is kept in step by the trigger of the memory table, so the entries go
+        // with the row in this very transaction.
+        this.deleteWhere('long_term_memories', 'memory_id', memoryIds)
+        this.deleteWhere('memory_candidates', 'candidate_id', candidateIds)
+
+        // The ledger of what a turn carried: a snapshot that still holds the deleted body may not go out again.
+        const withdrawn = this.withdrawInjectionSnapshots(memoryIds, candidateIds, now)
+        return {
+          ok: true,
+          deleted: {
+            memoryId: target.row.memory_id,
+            scopeType,
+            scopeId,
+            removedMemories: memoryIds.length,
+            removedCandidates: candidateIds.length,
+            removedSnapshots: withdrawn,
+          },
+        }
+      }), this.onError)
+    } catch (error) {
+      this.onError(error)
+      return { ok: false, code: 'NOT_PERMITTED', reason: 'The deletion could not be written.' }
+    }
+  }
+
+  /**
+   * The ids of one query, as a list.
+   *
+   * A list that is empty is a list of ids that is empty: the caller decides what an empty answer means.
+   */
+  private idsOf(sql: string, ...params: (string | number)[]): string[] {
+    const rows = this.db.prepare(sql).all(...params) as Record<string, SQLInputValue>[]
+    return rows.map(row => String(Object.values(row)[0] ?? '')).filter(id => id !== '')
+  }
+
+  /**
+   * Delete the rows of one table whose column names one of the given ids.
+   *
+   * A table that this control plane does not hold is not an error: the rows of the review queue live in the manager's
+   * own tables, and a control plane that never woke a manager has none of them.
+   */
+  private deleteWhere(table: string, column: string, ids: readonly string[]): number {
+    if (ids.length === 0) return 0
+    if (!this.holdsTable(table)) return 0
+    const placeholders = ids.map(() => '?').join(', ')
+    const result = this.db.prepare(`DELETE FROM ${table} WHERE ${column} IN (${placeholders})`).run(...ids)
+    return Number(result.changes)
+  }
+
+  /**
+   * Clear the references that point at the given ids.
+   *
+   * A row that was not deleted keeps its own content; only the pointer to what is gone is emptied, so that nothing
+   * points at an id that no longer names anything.
+   */
+  private clearWhere(table: string, column: string, ids: readonly string[]): void {
+    if (ids.length === 0) return
+    if (!this.holdsTable(table)) return
+    const placeholders = ids.map(() => '?').join(', ')
+    this.db.prepare(`UPDATE ${table} SET ${column} = '' WHERE ${column} IN (${placeholders})`).run(...ids)
+  }
+
+  /** Whether this database holds a table of that name. */
+  private holdsTable(table: string): boolean {
+    const row = this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) as
+      { name: string } | undefined
+    return row !== undefined
+  }
+
+  /**
+   * Withdraw the snapshots of the turns that carried the deleted body.
+   *
+   * The ledger of an injection holds the block a turn really carried, so a snapshot that still holds the deleted words
+   * is a copy of them. A delivery that is still on its way is invalidated with it — the block it was going to carry no
+   * longer exists, and the claims that waited for it are refused rather than settled on a block that was never sent.
+   * A delivery that already happened keeps its record: what it carried is a fact of the past, and the evidence of the
+   * other memories it carried stays as it is.
+   */
+  private withdrawInjectionSnapshots(memoryIds: readonly string[], candidateIds: readonly string[], now: string): number {
+    if (memoryIds.length === 0 && candidateIds.length === 0) return 0
+    const rows = this.db.prepare(
+      'SELECT injection_id, session_id, generation, delivery_id, memory_ids, provisional_ids, delivered_at, failed_at '
+      + 'FROM memory_context_injections').all() as Record<string, SQLInputValue>[]
+    let withdrawn = 0
+    for (const row of rows) {
+      const memories = parseIdList(String(row.memory_ids ?? ''))
+      const provisional = parseIdList(String(row.provisional_ids ?? ''))
+      const keptMemories = memories.filter(id => !memoryIds.includes(id))
+      const keptProvisional = provisional.filter(id => !candidateIds.includes(id))
+      if (keptMemories.length === memories.length && keptProvisional.length === provisional.length) continue
+      this.db.prepare(
+        'UPDATE memory_context_injections SET block = ?, memory_ids = ?, provisional_ids = ? WHERE injection_id = ?')
+        .run('', JSON.stringify(keptMemories), JSON.stringify(keptProvisional), String(row.injection_id))
+      if (String(row.delivered_at ?? '') === '' && String(row.failed_at ?? '') === '') {
+        this.db.prepare('UPDATE memory_context_injections SET failed_at = ? WHERE injection_id = ?')
+          .run(now, String(row.injection_id))
+        this.db.prepare("UPDATE memory_applied_claims SET state = 'refused' WHERE delivery_id = ? AND session_id = ? "
+          + 'AND generation = ? AND state = ?')
+          .run(String(row.delivery_id ?? ''), String(row.session_id ?? ''), String(row.generation ?? ''), 'pending')
+      }
+      withdrawn += 1
+    }
+    return withdrawn
+  }
+
+  /**
+   * Whether the snapshot of one delivery may still go out.
+   *
+   * The check is synchronous and it is made at the last moment before the transport, and it asks two things: whether
+   * the ledger still holds the block that was assembled, and whether every memory and every proposal the block names is
+   * still there. The second question is the one that matters: a deletion that happened while the block was on its way
+   * removed the row, and a block that names a row that is gone may not be sent.
+   *
+   * A delivery that was never written down is not stale in the first sense — there is nothing in the ledger that
+   * contradicts it — but its memories are still read from the table, and a memory that is gone is gone.
+   */
+  snapshotIsCurrent(input: { readonly deliveryId: string; readonly sessionId: string; readonly generation: string;
+    readonly block: string; readonly memoryIds: readonly string[]; readonly provisionalIds: readonly string[] }): boolean {
+    if (input.memoryIds.length > 0) {
+      const placeholders = input.memoryIds.map(() => '?').join(', ')
+      const found = this.db.prepare(
+        `SELECT memory_id FROM long_term_memories WHERE memory_id IN (${placeholders})`).all(...input.memoryIds) as
+        { memory_id: string }[]
+      if (found.length !== input.memoryIds.length) return false
+    }
+    if (input.provisionalIds.length > 0) {
+      const placeholders = input.provisionalIds.map(() => '?').join(', ')
+      const found = this.db.prepare(
+        `SELECT candidate_id FROM memory_candidates WHERE candidate_id IN (${placeholders})`).all(...input.provisionalIds) as
+        { candidate_id: string }[]
+      if (found.length !== input.provisionalIds.length) return false
+    }
+    if (input.block === '') return true
+    if (input.deliveryId === '' || input.sessionId === '' || input.generation === '') return true
+    const row = this.db.prepare(
+      'SELECT block FROM memory_context_injections WHERE delivery_id = ? AND session_id = ? AND generation = ? '
+      + 'ORDER BY seq DESC LIMIT 1').get(input.deliveryId, input.sessionId, input.generation) as { block: string } | undefined
+    if (row === undefined) return true
+    return row.block === input.block
+  }
+
+  /**
+   * Withdraw the snapshot of one delivery: the block it carried may not go out any more.
+   *
+   * The claims that waited for that delivery are refused with it: the block they were about is not the block that went
+   * out, so nothing may be counted on it.
+   */
+  withdrawInjectionSnapshot(deliveryId: string, sessionId: string, generation: string): boolean {
+    if (deliveryId === '' || sessionId === '' || generation === '') return false
+    const now = this.host.now()
+    try {
+      return this.transaction((): boolean => {
+        const row = this.db.prepare(
+          'SELECT injection_id FROM memory_context_injections WHERE delivery_id = ? AND session_id = ? AND generation = ? '
+          + 'ORDER BY seq DESC LIMIT 1').get(deliveryId, sessionId, generation) as { injection_id: string } | undefined
+        if (row === undefined) return false
+        this.db.prepare(
+          'UPDATE memory_context_injections SET block = ?, memory_ids = ?, provisional_ids = ? WHERE injection_id = ?')
+          .run('', '[]', '[]', row.injection_id)
+        this.db.prepare("UPDATE memory_applied_claims SET state = 'refused' WHERE delivery_id = ? AND session_id = ? "
+          + 'AND generation = ? AND state = ?')
+          .run(deliveryId, sessionId, generation, 'pending')
+        return true
+      })
+    } catch (error) {
+      this.onError(error)
+      return false
+    }
+  }
+
+  /**
+   * Take the usefulness away from memories that misled a task.
+   *
+   * This is the negative side of the accounting: a result a PM sent back, or a fact a person called misleading, lowers
+   * the confidence of the memories that were in front of that task. The caller is the control plane's own authority — the
+   * decision it took — and not a request that may name a memory of its own.
+   */
+  penalizeMemories(memoryIds: readonly string[], reason: string): number {
+    let penalized = 0
+    try {
+      this.transaction(() => {
+        for (const memoryId of memoryIds) {
+          const row = this.memoryById(memoryId)
+          if (row === undefined || row.row.status !== 'active') continue
+          const confidence = Math.max(0, row.row.confidence - MEMORY_DISPUTE_STEP)
+          const status = confidence < MEMORY_CONFIDENCE_FLOOR ? 'needs_reverify' : row.row.status
+          const now = this.host.now()
+          this.db.prepare(
+            'UPDATE long_term_memories SET disputed_count = disputed_count + 1, confidence = ?, status = ?, updated_at = ? '
+            + 'WHERE memory_id = ?').run(confidence, status, now, memoryId)
+          this.db.prepare('INSERT INTO memory_disputes (dispute_id, memory_id, reason, confidence, at) VALUES (?, ?, ?, ?, ?)')
+            .run(`dispute-${randomUUID()}`, memoryId, bounded(reason), confidence, now)
+          penalized += 1
+        }
+      })
+    } catch (error) {
+      this.onError(error)
+    }
+    return penalized
+  }
+
+  // ─── what was injected and what was really used ───────────────────────────────────────────────────────────
+
+  /**
+   * Write down what one turn really carried.
+   *
+   * The row is the ledger of the injection: the Session, the Assignment, the Ticket, the Project, the machine, the
+   * generation and the delivery it was read for, the content of the block and the ids of the memories that were in it.
+   *
+   * **One delivery is one row.** The id of the row is derived from the delivery alone, so a delivery that is assembled
+   * again — a retry under the same key, a Worker that is re-ensured — is not a second set of memories: the ledger
+   * follows the attempt that is on the wire, and a delivery that is already confirmed keeps the content it really
+   * carried, because the node executes a key at most once. A retry therefore never shares a different set of memories
+   * with the attempt it repeats, and the content the ledger keeps is the content that went out.
+   *
+   * **A row whose generation is unknown is not written.** The generation says which life of the Session the block
+   * belonged to; a row without one says nothing, and a claim that leaned on it would lean on nothing. An empty
+   * generation is never a verification.
+   *
+   * The answer says whether the row was written: a delivery that is already confirmed is not written again, and nothing
+   * is counted for it again.
+   */
+  recordInjection(record: MemoryInjectionRecord): boolean {
+    if (record.generation === '') return false
+    try {
+      return this.transaction(() => {
+        this.db.prepare(
+          'INSERT OR IGNORE INTO memory_context_injections '
+          + '(injection_id, session_id, role, assignment_id, ticket_id, project_id, node_id, generation, delivery_id, '
+          + 'delivered_at, failed_at, block, memory_ids, provisional_ids, created_at) '
+          + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(record.injectionId, record.sessionId, record.role, record.assignmentId, record.ticketId,
+            record.projectId, record.nodeId, record.generation, record.deliveryId, '', '', record.block,
+            JSON.stringify(record.memoryIds), JSON.stringify(record.provisionalIds), this.host.now())
+        const row = this.db.prepare(
+          'SELECT delivered_at FROM memory_context_injections WHERE injection_id = ?').get(record.injectionId) as
+          { delivered_at: string } | undefined
+        if (row === undefined) return false
+        // The delivery already happened: the node executed this key at most once, and what it executed is what the
+        // ledger keeps. A later attempt under the same key carries nothing new.
+        if (row.delivered_at !== '') return false
+        // The attempt that is on the wire now is the one that will be sent: the ledger follows it, and the failure of an
+        // earlier attempt under the same key is forgotten.
+        this.db.prepare('UPDATE memory_context_injections SET memory_ids = ?, provisional_ids = ?, block = ?, '
+          + 'failed_at = ? WHERE injection_id = ? AND delivered_at = ?')
+          .run(JSON.stringify(record.memoryIds), JSON.stringify(record.provisionalIds), record.block, '',
+            record.injectionId, '')
+        return true
+      })
+    } catch (error) {
+      this.onError(error)
+      return false
+    }
+  }
+
+  /**
+   * Write down that the delivery of one context really happened.
+   *
+   * The ledger row is written before the delivery goes out — a Worker that reports as soon as it starts must find its own
+   * block there — and the confirmation is written on the path that carried it, once the node has taken the message or the
+   * create.
+   *
+   * **The confirmation is the gate.** A block that was assembled and never delivered was in front of nobody, so the
+   * memories it carried may not be claimed by anybody. The confirmation is a fact about the transport, never about what
+   * an Agent wrote about itself.
+   *
+   * **The claims that waited for this delivery are settled here.** A Worker that reports before the transport has
+   * answered is not a liar and not a mistake: its claim is written down as it is, it waits for the delivery that is on
+   * its way, and it counts when the delivery is confirmed. No extra turn is spent on it and nothing is asked of a model.
+   *
+   * An exposure is counted here and not when the block was assembled: a memory that was assembled and never delivered
+   * was in front of nobody.
+   */
+  confirmInjectionDelivery(input: { readonly deliveryId: string; readonly sessionId: string;
+    readonly generation: string; readonly caller?: MemoryCaller }): void {
+    if (input.deliveryId === '' || input.generation === '') return
+    try {
+      this.transaction(() => {
+        const result = this.db.prepare('UPDATE memory_context_injections SET delivered_at = ? '
+          + 'WHERE delivery_id = ? AND session_id = ? AND generation = ? AND delivered_at = ?')
+          .run(this.host.now(), input.deliveryId, input.sessionId, input.generation, '')
+        if (Number(result.changes) === 0) return
+        // The claims that waited for this delivery are claims now.
+        this.db.prepare('UPDATE memory_applied_claims SET state = ? WHERE delivery_id = ? AND session_id = ? '
+          + 'AND generation = ? AND state != ?')
+          .run('confirmed', input.deliveryId, input.sessionId, input.generation, 'confirmed')
+        // An exposure is a count and nothing else: it is counted when the memory really was in front of somebody.
+        if (input.caller === undefined) return
+        const row = this.db.prepare('SELECT memory_ids FROM memory_context_injections WHERE delivery_id = ? '
+          + 'AND session_id = ? AND generation = ?')
+          .get(input.deliveryId, input.sessionId, input.generation) as { memory_ids: string } | undefined
+        if (row === undefined) return
+        const ids = parseIdList(row.memory_ids)
+        if (ids.length > 0) this.recordExposure(input.caller, ids)
+      })
+    } catch (error) {
+      this.onError(error)
+    }
+  }
+
+  /**
+   * Write down that the node itself says the delivery happened.
+   *
+   * The node's own answer is a proof: it says the message is in its inbox, or that a turn of the target read it. This is
+   * the one case in which the transport's receipt may be missing and the delivery still counts — the question was asked of
+   * the node the delivery was made to, and the node answered.
+   *
+   * The row it settles is the newest one of that delivery, and the claims it settles are the ones that wait for that row's
+   * generation: a claim of another life is never settled by this.
+   */
+  confirmInjectionDeliveryByNode(input: { readonly deliveryId: string; readonly sessionId: string;
+    readonly caller?: MemoryCaller }): void {
+    if (input.deliveryId === '' || input.sessionId === '') return
+    try {
+      this.transaction(() => {
+        const row = this.db.prepare(
+          'SELECT injection_id, generation, memory_ids FROM memory_context_injections WHERE delivery_id = ? '
+          + 'AND session_id = ? ORDER BY seq DESC LIMIT 1')
+          .get(input.deliveryId, input.sessionId) as
+          { injection_id: string; generation: string; memory_ids: string } | undefined
+        if (row === undefined) return
+        const written = this.db.prepare('UPDATE memory_context_injections SET delivered_at = ? WHERE injection_id = ? '
+          + 'AND delivered_at = ?').run(this.host.now(), row.injection_id, '')
+        if (Number(written.changes) === 0) return
+        this.db.prepare('UPDATE memory_applied_claims SET state = ? WHERE delivery_id = ? AND session_id = ? '
+          + 'AND generation = ? AND state != ?')
+          .run('confirmed', input.deliveryId, input.sessionId, row.generation, 'confirmed')
+        if (input.caller === undefined) return
+        const ids = parseIdList(row.memory_ids)
+        if (ids.length > 0) this.recordExposure(input.caller, ids)
+      })
+    } catch (error) {
+      this.onError(error)
+    }
+  }
+
+  /**
+   * Write down that the delivery of one context did not go out.
+   *
+   * A missing receipt is not a failure: the message may have arrived, and a delivery is never repeated on a guess. A
+   * refusal is a failure: the block never reached anybody, and the claims that waited for it are refused with it.
+   */
+  failInjectionDelivery(input: { readonly deliveryId: string; readonly sessionId: string;
+    readonly generation: string }): void {
+    if (input.deliveryId === '' || input.generation === '') return
+    try {
+      this.transaction(() => {
+        this.db.prepare('UPDATE memory_context_injections SET failed_at = ? WHERE delivery_id = ? AND session_id = ? '
+          + 'AND generation = ? AND delivered_at = ?')
+          .run(this.host.now(), input.deliveryId, input.sessionId, input.generation, '')
+        // The claims that waited for this delivery wait no longer: the block never reached the task.
+        this.db.prepare('UPDATE memory_applied_claims SET state = ? WHERE delivery_id = ? AND session_id = ? '
+          + 'AND generation = ? AND state = ?')
+          .run('refused', input.deliveryId, input.sessionId, input.generation, 'pending')
+      })
+    } catch (error) {
+      this.onError(error)
+    }
+  }
+
+  /**
+   * The block one delivery already carried, as the ledger wrote it down.
+   *
+   * A delivery that is assembled again carries the same content: the ledger holds what it carried the first time, and a
+   * retry of the same key never shares a different set of memories with the attempt it repeats. A delivery that was never
+   * written down is nothing here, and the block is assembled as it always was.
+   */
+  injectionOf(input: { readonly deliveryId: string; readonly sessionId: string; readonly generation: string }):
+    { readonly block: string; readonly memoryIds: readonly string[]; readonly provisionalIds: readonly string[];
+      readonly delivered: boolean } | undefined {
+    if (input.deliveryId === '' || input.generation === '') return undefined
+    const row = this.db.prepare(
+      'SELECT block, memory_ids, provisional_ids, delivered_at FROM memory_context_injections '
+      + 'WHERE delivery_id = ? AND session_id = ? AND generation = ? ORDER BY seq DESC LIMIT 1')
+      .get(input.deliveryId, input.sessionId, input.generation) as
+      { block: string; memory_ids: string; provisional_ids: string; delivered_at: string } | undefined
+    if (row === undefined || row.block === '') return undefined
+    return {
+      block: row.block,
+      memoryIds: parseIdList(row.memory_ids),
+      provisionalIds: parseIdList(row.provisional_ids),
+      delivered: row.delivered_at !== '',
+    }
+  }
+
+  /**
+   * The memories one task really carried, as the ledger wrote them down.
+   *
+   * The lookup is on the whole binding at once — the Session, the Assignment, the Ticket, the Project, the machine and
+   * the generation — so a block that was read under another generation, for another Ticket, in another Project or on
+   * another machine is not the block this task carried. A binding without a generation matches nothing: an unknown
+   * generation is not a verification.
+   *
+   * **Only a delivery that really happened counts.** These are the ids of the blocks whose delivery was confirmed, so a
+   * memory that was assembled and never delivered is not among them.
+   */
+  injectedMemoryIds(binding: MemoryInjectionBinding): readonly string[] {
+    return this.injectedIdsOf(binding, true)
+  }
+
+  /**
+   * The memories one task was given, whose delivery is still on its way.
+   *
+   * These are the ids of the blocks that are in front of the task but whose delivery the transport has not confirmed
+   * yet. A report may name them before the answer arrives: the claim waits for the delivery instead of being refused.
+   */
+  pendingInjectedMemoryIds(binding: MemoryInjectionBinding): readonly string[] {
+    return this.injectedIdsOf(binding, false)
+  }
+
+  /** The ids of the blocks of one binding, the delivered ones or the ones that are on their way. */
+  private injectedIdsOf(binding: MemoryInjectionBinding, delivered: boolean): readonly string[] {
+    if (binding.generation === '') return []
+    const sql = delivered
+      ? 'SELECT memory_ids FROM memory_context_injections WHERE session_id = ? AND assignment_id = ? AND ticket_id = ? '
+        + 'AND project_id = ? AND node_id = ? AND generation = ? AND delivered_at != ? AND failed_at = ?'
+      : 'SELECT memory_ids FROM memory_context_injections WHERE session_id = ? AND assignment_id = ? AND ticket_id = ? '
+        + 'AND project_id = ? AND node_id = ? AND generation = ? AND delivered_at = ? AND failed_at = ?'
+    const rows = this.db.prepare(sql)
+      .all(binding.sessionId, binding.assignmentId, binding.ticketId, binding.projectId, binding.nodeId,
+        binding.generation, '', '') as { memory_ids: string }[]
+    const ids: string[] = []
+    for (const row of rows) {
+      for (const id of parseIdList(row.memory_ids)) if (!ids.includes(id)) ids.push(id)
+    }
+    return ids
+  }
+
+  /** The delivery that carried one memory of one binding, as the ledger wrote it down. */
+  private deliveryOfMemory(binding: MemoryInjectionBinding, memoryId: string): string {
+    const rows = this.db.prepare(
+      'SELECT delivery_id, memory_ids, delivered_at FROM memory_context_injections WHERE session_id = ? '
+      + 'AND assignment_id = ? AND ticket_id = ? AND project_id = ? AND node_id = ? AND generation = ? ORDER BY seq DESC')
+      .all(binding.sessionId, binding.assignmentId, binding.ticketId, binding.projectId, binding.nodeId,
+        binding.generation) as { delivery_id: string; memory_ids: string; delivered_at: string }[]
+    let waiting = ''
+    for (const row of rows) {
+      if (!parseIdList(row.memory_ids).includes(memoryId)) continue
+      if (row.delivered_at !== '') return row.delivery_id
+      if (waiting === '') waiting = row.delivery_id
+    }
+    return waiting
+  }
+
+  /**
+   * Write down that a task really used some memories.
+   *
+   * A report may name the memories it used, and only the ones that were really in front of that task count: the ids are
+   * compared with the ledger the service wrote itself, on the whole binding at once, so an id the task never carried, a
+   * memory of another Project and a credential change nothing. What is left is bound to the Session, the Assignment, the
+   * Ticket, the Project, the machine, the generation and the scope, and it is written once per piece of evidence — a
+   * retried report does not claim the same memory twice.
+   *
+   * **Only a delivered block counts.** An id that was in a block whose delivery was confirmed counts now. An id that is
+   * in a block that is still on its way waits: the report arrived before the transport answered, and the claim is
+   * written down as it is and settled when the delivery is confirmed. An id that was in no block of this binding at all —
+   * or in a block whose delivery failed — is refused, and it is never counted.
+   *
+   * **A claim without a generation is not a claim.** The generation says which life of the Session really carried the
+   * block; a claim that cannot name it leans on nothing, and a Worker that was replaced cannot claim the work of the
+   * Worker it replaced.
+   */
+  claimApplied(input: {
+    readonly caller: MemoryCaller
+    readonly memoryIds: readonly string[]
+    readonly sessionId: string
+    readonly assignmentId: string
+    readonly ticketId: string
+    readonly projectId: string
+    readonly nodeId: string
+    readonly generation: string
+    readonly evidenceKind: 'assignment' | 'ticket'
+    readonly evidenceId: string
+  }): MemoryAppliedResult {
+    const accepted: string[] = []
+    const waiting: string[] = []
+    const refused: string[] = []
+    if (input.generation === '') {
+      return { accepted, waiting, refused: [...input.memoryIds] }
+    }
+    const binding: MemoryInjectionBinding = {
+      sessionId: input.sessionId,
+      assignmentId: input.assignmentId,
+      ticketId: input.ticketId,
+      projectId: input.projectId,
+      nodeId: input.nodeId,
+      generation: input.generation,
+    }
+    const injected = new Set(this.injectedMemoryIds(binding))
+    const onItsWay = new Set(this.pendingInjectedMemoryIds(binding))
+    const scopes = allowedScopes(input.caller)
+    try {
+      this.transaction(() => {
+        for (const memoryId of input.memoryIds) {
+          if (memoryId === '') { refused.push(memoryId); continue }
+          const delivered = injected.has(memoryId)
+          const travelling = !delivered && onItsWay.has(memoryId)
+          if (!delivered && !travelling) { refused.push(memoryId); continue }
+          const row = this.memoryById(memoryId)
+          if (row === undefined || row.row.status !== 'active') { refused.push(memoryId); continue }
+          if (!this.withinScopes(row.row, scopes)) { refused.push(memoryId); continue }
+          // The delivery the memory was carried by: the claim waits for it, and it is settled on the path that carried it.
+          const deliveryId = this.deliveryOfMemory(binding, memoryId)
+          this.db.prepare(
+            'INSERT OR IGNORE INTO memory_applied_claims (claim_id, memory_id, session_id, assignment_id, ticket_id, '
+            + 'project_id, node_id, generation, scope_type, scope_id, delivery_id, state, evidence_kind, evidence_id, at) '
+            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(`claim-${randomUUID()}`, memoryId, input.sessionId, input.assignmentId, input.ticketId, input.projectId,
+              input.nodeId, input.generation, row.row.scope_type, row.row.scope_id, deliveryId,
+              delivered ? 'confirmed' : 'pending', input.evidenceKind, input.evidenceId, this.host.now())
+          // A claim that was written before the delivery was confirmed is confirmed now, if it is the same one.
+          if (delivered) {
+            this.db.prepare('UPDATE memory_applied_claims SET state = ? WHERE memory_id = ? AND evidence_kind = ? '
+              + 'AND evidence_id = ?').run('confirmed', memoryId, input.evidenceKind, input.evidenceId)
+          }
+          if (delivered) accepted.push(memoryId)
+          else waiting.push(memoryId)
+        }
+      })
+    } catch (error) {
+      this.onError(error)
+      return { accepted: [], waiting: [], refused: [...input.memoryIds] }
+    }
+    return { accepted, waiting, refused }
+  }
+
+  /**
+   * The memories one piece of evidence really used, as the claims wrote them down.
+   *
+   * The Assignment of the evidence is part of the question when the caller names one: a claim about a Ticket that was
+   * made in an earlier round of that Ticket is not a claim about the round that runs now.
+   *
+   * **Only a confirmed claim counts.** A claim that waits for a delivery that is still on its way is written down and
+   * not counted: the memory was in front of the task, but nobody has shown that it reached it.
+   */
+  claimedMemoryIds(input: { readonly evidenceKind: string; readonly evidenceId: string;
+    readonly assignmentId?: string }): readonly string[] {
+    const rows = input.assignmentId === undefined
+      ? this.db.prepare(
+        'SELECT memory_id FROM memory_applied_claims WHERE evidence_kind = ? AND evidence_id = ? AND state = ? ORDER BY seq')
+        .all(input.evidenceKind, input.evidenceId, 'confirmed') as { memory_id: string }[]
+      : this.db.prepare(
+        'SELECT memory_id FROM memory_applied_claims WHERE evidence_kind = ? AND evidence_id = ? AND assignment_id = ? '
+        + 'AND state = ? ORDER BY seq').all(input.evidenceKind, input.evidenceId, input.assignmentId, 'confirmed') as
+        { memory_id: string }[]
+    return rows.map(row => row.memory_id)
+  }
+
+  /** The claims of one piece of evidence, as they were written down. */
+  appliedClaims(input: { readonly evidenceKind: string; readonly evidenceId: string }): readonly MemoryAppliedClaim[] {
+    const rows = this.db.prepare(
+      'SELECT memory_id, session_id, assignment_id, ticket_id, project_id, node_id, generation, scope_type, scope_id, '
+      + 'evidence_kind, evidence_id, at FROM memory_applied_claims WHERE evidence_kind = ? AND evidence_id = ? ORDER BY seq')
+      .all(input.evidenceKind, input.evidenceId) as Record<string, SQLInputValue>[]
+    return rows.map(row => ({
+      memoryId: String(row.memory_id),
+      sessionId: String(row.session_id),
+      assignmentId: String(row.assignment_id),
+      ticketId: String(row.ticket_id),
+      projectId: String(row.project_id),
+      nodeId: String(row.node_id),
+      generation: String(row.generation),
+      scopeType: String(row.scope_type),
+      scopeId: String(row.scope_id),
+      evidenceKind: String(row.evidence_kind),
+      evidenceId: String(row.evidence_id),
+      at: String(row.at),
+    }))
+  }
+
   /**
    * The evidence a credit leans on, when the control plane really holds it.
    *
    * A review that was accepted and an Assignment that ended are conclusions; a review that is still waiting and an
    * Assignment that is still running are not. The record itself is the authority — never a sentence anybody wrote
    * about the work.
+   *
+   * **The key names the task, not the paper.** When the caller names the Assignment the review was about, the credit
+   * is written under that Assignment: the same work is counted once, however many reviews of it are accepted and
+   * however many times the report that carried it is retried.
    */
   private evidenceOf(evidence: MemoryUseEvidence):
-    { readonly key: string; readonly kind: string; readonly id: string; readonly projectId: string } | undefined {
+    { readonly key: string; readonly kind: string; readonly id: string; readonly projectId: string;
+      readonly nodeId: string } | undefined {
+    const taskId = evidence.assignmentId !== undefined && evidence.assignmentId !== '' ? evidence.assignmentId : ''
     if (evidence.reviewId !== undefined && evidence.reviewId !== '') {
-      const record = this.host.source('review', evidence.reviewId)
-      if (record === undefined || !record.authoritative) return undefined
-      return { key: `review:${evidence.reviewId}`, kind: 'review', id: evidence.reviewId,
-        projectId: record.projectId ?? '' }
+      const review = this.host.source('review', evidence.reviewId)
+      if (review === undefined || !review.authoritative) return undefined
+      // The task's own record says which Project and which machine the work was really about; the review only says
+      // that the PM accepted it.
+      const task = taskId === '' ? undefined : this.host.source('assignment', taskId)
+      return {
+        key: taskId === '' ? `review:${evidence.reviewId}` : `assignment:${taskId}`,
+        kind: 'review',
+        id: evidence.reviewId,
+        projectId: task?.projectId ?? review.projectId ?? '',
+        nodeId: task?.nodeId ?? review.nodeId ?? '',
+      }
     }
-    if (evidence.assignmentId !== undefined && evidence.assignmentId !== '') {
-      const record = this.host.source('assignment', evidence.assignmentId)
+    if (taskId !== '') {
+      const record = this.host.source('assignment', taskId)
       if (record === undefined || !record.authoritative) return undefined
-      return { key: `assignment:${evidence.assignmentId}`, kind: 'assignment', id: evidence.assignmentId,
-        projectId: record.projectId ?? '' }
+      return { key: `assignment:${taskId}`, kind: 'assignment', id: taskId,
+        projectId: record.projectId ?? '', nodeId: record.nodeId ?? '' }
     }
     return undefined
   }
@@ -1430,13 +2441,21 @@ export class MemoryService {
   /**
    * Whether a memory may be credited by a piece of evidence.
    *
-   * A fact about the person may be credited by any work; a fact about a Project only by the work of that Project.
+   * A fact about the person may be credited by any work. A fact about a Project only by the work of that Project, and
+   * a fact about a machine only by the work that really ran on that machine: the machine of the evidence is the one the
+   * control plane holds, never one the report named.
    */
-  private withinEvidence(row: MemoryFields, evidence: { readonly projectId: string }): boolean {
+  private withinEvidence(row: MemoryFields, evidence: { readonly projectId: string; readonly nodeId: string }): boolean {
     if (row.scope_type === 'user_global') return true
-    if (evidence.projectId === '') return false
-    if (row.scope_type !== 'project') return false
-    return row.scope_id === projectScope(evidence.projectId).scopeId
+    if (row.scope_type === 'project') {
+      if (evidence.projectId === '') return false
+      return row.scope_id === projectScope(evidence.projectId).scopeId
+    }
+    if (row.scope_type === 'node_env') {
+      if (evidence.nodeId === '') return false
+      return row.scope_id === nodeScope(evidence.nodeId).scopeId
+    }
+    return false
   }
 
   /** Whether a row belongs to one of the scopes a reader may read. */
@@ -1639,6 +2658,8 @@ export class MemoryService {
 
 /** The fields of one row of the candidate table. */
 interface CandidateFields {
+  /** The row's own number in the queue: it says when the proposal was made, whatever the clock said. */
+  readonly seq: number
   readonly candidate_id: string
   readonly idempotency_key: string
   readonly scope_type: string
@@ -1710,6 +2731,7 @@ interface MemoryRow {
 /** One row of the candidate table, read from the table. */
 function candidateOf(row: Record<string, SQLInputValue>): CandidateRow {
   const read: CandidateFields = {
+    seq: Number(row.seq ?? 0),
     candidate_id: String(row.candidate_id),
     idempotency_key: String(row.idempotency_key),
     scope_type: String(row.scope_type),
@@ -1736,7 +2758,8 @@ function candidateOf(row: Record<string, SQLInputValue>): CandidateRow {
     reviewed_at: String(row.reviewed_at),
     expires_at: String(row.expires_at),
   }
-  return { row: read, checksum: checksumOf(read.candidate_id, read.status, read.updated_at, read.content_fingerprint) }
+  return { row: read, checksum: checksumOf(read.candidate_id, read.status, read.updated_at, read.content_fingerprint,
+    `${read.revision_count}/${read.reevaluations}/${read.returned_to_session_id}`) }
 }
 
 /** One row of the memory table, read from the table. */
@@ -1768,12 +2791,21 @@ function memoryOf(row: Record<string, SQLInputValue>): MemoryRow {
     node_id: String(row.node_id),
     backend_id: String(row.backend_id),
   }
-  return { row: read, checksum: checksumOf(read.memory_id, read.status, read.updated_at, read.content_fingerprint) }
+  return { row: read, checksum: checksumOf(read.memory_id, read.status, read.updated_at, read.content_fingerprint,
+    `${read.pinned}/${read.confidence}/${read.superseded_by_id}/${read.conflict_with_id}`) }
 }
 
-/** The checksum of one row: it names the version a decision was made on. */
-function checksumOf(id: string, status: string, updatedAt: string, fingerprint: string): string {
-  return createHash('sha256').update(`${id} ${status} ${updatedAt} ${fingerprint}`).digest('hex').slice(0, 32)
+/**
+ * The checksum of one row: it names the version a decision was made on.
+ *
+ * **It covers the fields a governance act changes, not only the moment it happened.** A clock that does not move — a
+ * test that writes at one fixed moment, a control plane whose clock is coarse — would let two genuinely different
+ * versions share one checksum, and an act made on the older one would be carried out over the newer one. So the pin, the
+ * confidence, the successor and the open conflict are part of the version: a pinned memory is a different version from
+ * an unpinned one, whatever the clock says.
+ */
+function checksumOf(id: string, status: string, updatedAt: string, fingerprint: string, governance: string): string {
+  return createHash('sha256').update(`${id} ${status} ${updatedAt} ${fingerprint} ${governance}`).digest('hex').slice(0, 32)
 }
 
 /** The source references of two rows, kept apart by what they name. */
@@ -1784,6 +2816,23 @@ function mergeRefs(left: readonly MemorySourceRef[], right: readonly MemorySourc
     merged.push(ref)
   }
   return merged
+}
+
+/**
+ * A list of ids, read back from the column it was written in.
+ *
+ * A column that holds something else holds no ids rather than broken ones: a reader that cannot make sense of it is told
+ * nothing, and a broken id never becomes the name of a memory.
+ */
+function parseIdList(value: string): readonly string[] {
+  if (value === '') return []
+  try {
+    const parsed = JSON.parse(value) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((entry): entry is string => typeof entry === 'string' && entry !== '')
+  } catch {
+    return []
+  }
 }
 
 /** The confidence a memory starts with, by the trust of its source. */

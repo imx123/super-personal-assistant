@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { Assignment, ProjectProfile, Ticket, Trigger } from '../src/core/index.ts'
 import { ControlPlane, DEFAULT_TOKEN_REFRESH_GRACE_SECONDS } from '../src/control/control-plane.ts'
 import { FetchControlPlaneServer, startFetchControlPlane } from './fixtures/fetch-servers.ts'
+import { withoutContextFence } from './fixtures/context.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { issueSessionToken, SessionTokenError, verifySessionToken } from '../src/shared/session-token.ts'
 
@@ -220,8 +221,10 @@ describe('Session token refresh', () => {
     const body = (await response.json()) as { token: string }
 
     await control!.sendMessage(pm.sessionId, 'carry the current token')
-    expect(node.commands.at(-1)).toMatchObject({ type: 'session.message', sessionId: pm.sessionId,
-      text: 'carry the current token', sessionToken: body.token })
+    const sent = node.commands.at(-1)
+    expect(sent).toMatchObject({ type: 'session.message', sessionId: pm.sessionId, sessionToken: body.token })
+    // The words travel whole; the reference material travels beside them in its own fence.
+    expect(sent?.type === 'session.message' ? withoutContextFence(sent.text) : '').toBe('carry the current token')
   })
 
   it('refreshes a Worker token too: the route is role-agnostic', async () => {

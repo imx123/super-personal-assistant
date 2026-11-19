@@ -34,12 +34,19 @@ export interface ReportCallRecord {
 /**
  * The hash of one report's payload.
  *
- * It covers everything the call said about the work — the Ticket, the Assignment, the state, the summary and the question —
- * so two calls with the same key but a different payload are told apart from a replay of the same call.
+ * It covers everything the call said about the work — the Ticket, the Assignment, the state, the summary, the question and
+ * the memories the call named — so two calls with the same key but a different payload are told apart from a replay of the
+ * same call.
+ *
+ * **The memories are part of the payload, as a set.** The same memories in another order are the same claim, so the order
+ * does not make a new call; but a call that names another memory is another call, and it may not be carried out over the
+ * one that was recorded.
  */
-export function reportPayloadHash(ticketId: string, assignmentId: string, report: WorkerReport): string {
+export function reportPayloadHash(ticketId: string, assignmentId: string, report: WorkerReport,
+  appliedMemoryIds: readonly string[] = []): string {
+  const named = [...appliedMemoryIds].map(id => id.trim()).filter(id => id !== '').sort()
   return createHash('sha256').update(JSON.stringify([
-    ticketId, assignmentId, report.state, report.summary.trim(), report.question ?? null,
+    ticketId, assignmentId, report.state, report.summary.trim(), report.question ?? null, named,
   ])).digest('hex')
 }
 

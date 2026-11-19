@@ -443,6 +443,37 @@ describe('the escalation of the denials', () => {
     expect(node.messages.get('router')).toHaveLength(1)
   })
 
+  it('sends the review as the packet it is, and adds no other scope to it', async () => {
+    const { address } = await open()
+    const { ticket, worker } = await standalone()
+    // Another Project is really running a Ticket of its own while the review is made. The Router manages the pool, and
+    // the pool is not what the review is about: the review is about one refusal in one scope.
+    control!.store.triggers.save(trigger('trigger-foreign'))
+    const other = control!.createProject('trigger-foreign', 'Other', 'Other goal')
+    const otherPm = await control!.openProject(other.id)
+    const [foreign] = control!.engine.createProjectTickets(other.id, otherPm.sessionId,
+      [{ title: 'Foreign', goal: 'G' }])
+    await until(() => control!.store.tickets.get(foreign!.id)?.assignments.at(-1)?.state === 'running',
+      'the foreign Assignment did not start')
+
+    for (let index = 0; index < 3; index += 1) {
+      node.holdTurn(worker)
+      await refuse(address, tokenOf(worker), '/v1/tools/pm/tickets', `call-${index}`)
+      await control!.settleDenials()
+    }
+    await until(() => reviews().length > 0, 'no review was made')
+    await until(() => reviews()[0]?.status === 'notified', 'the Router was not told')
+
+    const message = denialReviewMessage('router')
+    // The review goes out exactly as it was written: it is a packet of one scope, and no reference material is added to it.
+    expect(message).not.toContain('<context_reference_data>')
+    expect(message).not.toContain('</context_reference_data>')
+    // The other Project's running Ticket is not in it: the packet names the work of the refusal and nothing else.
+    expect(message).not.toContain(foreign!.id)
+    // The work the review is about is still named: it says which Ticket and which Assignment it is about.
+    expect(message).toContain(ticket.id)
+  })
+
   it('writes an operator alert for the Router itself and wakes nobody', async () => {
     const { address } = await open()
 

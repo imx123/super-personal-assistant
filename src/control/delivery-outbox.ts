@@ -55,6 +55,30 @@ export type CoordinationDeliveryKind =
   | 'external_wakeup'
 
 /**
+ * Whether the payload of one kind of coordination is a sealed packet.
+ *
+ * Three kinds are sealed. The external wake-up is an isolation envelope: it carries its own declaration, it is cut to a
+ * byte budget of its own, and the fence it closes has to stay the last thing in the message — a block of reference data
+ * appended to it would push the envelope past its budget and would put something behind its fence. The stream digest ends
+ * with the reference of the Session it is about, and that line has to stay the last one for the same reason.
+ *
+ * **The denial review is sealed as well, and it is a boundary of its own.** The review is the packet of one refusal: it
+ * carries its own bounded projection of the governed work and nothing else, and the work it names is the work of one
+ * scope. A block of reference data appended to it would put the live state of the whole control plane in front of the
+ * Session that reads the review — another Project's running Ticket among them — and the packet would no longer be the one
+ * packet it was. The ordinary talk of the Router is a different road and keeps its reference material.
+ *
+ * The other three kinds are ordinary turns: a handoff, a report of a Worker and a report of a PM are all addressed to a
+ * Session that may read the reference material beside them.
+ *
+ * **The kind is the only thing that decides this.** It is a fact of the coordination, not of the words: the text of a
+ * message never says whether it may carry a block, because a message cannot be trusted to say so about itself.
+ */
+export function isSealedDelivery(kind: CoordinationDeliveryKind | undefined): boolean {
+  return kind === 'stream_digest' || kind === 'external_wakeup' || kind === 'denial_review'
+}
+
+/**
  * The states of one coordination delivery.
  *
  * They are facts about different moments, and the record keeps them apart: `accepted_pending` is a delivery that was
@@ -365,9 +389,12 @@ export interface DeliveryOutboxHost {
    * immediately before the transport. The ensure takes time, and the life the delivery was planned for may end while it
    * is on its way, so a target that was stopped, revoked or replaced in the meantime is never re-ensured and never
    * reached.
+   *
+   * `kind` is the kind of coordination this delivery is. It is the fact the transport needs: the two sealed kinds go out
+   * exactly as they are, and the others may carry the bounded reference material beside their words.
    */
   deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void,
-    validateBeforeEnsure?: () => void): Promise<void>
+    validateBeforeEnsure?: () => void, kind?: CoordinationDeliveryKind): Promise<void>
   /**
    * Ask the node what it can prove about one delivery.
    *
@@ -1021,7 +1048,7 @@ export class DeliveryOutbox {
         }
         throw new CoordinationDeliveryStaleError(verdict.reason, verdict.status)
       }
-      await this.host.deliver(row.targetSessionId, payload, row.idempotencyKey, revalidate, revalidate)
+      await this.host.deliver(row.targetSessionId, payload, row.idempotencyKey, revalidate, revalidate, row.kind)
     } catch (error) {
       if (error instanceof CoordinationDeliveryStaleError) {
         // A delivery that was refused before the wire never went out: it is skipped, not failed, and it is no lost receipt.

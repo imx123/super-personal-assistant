@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { verifySessionToken } from '../src/shared/session-token.ts'
 
@@ -78,7 +79,9 @@ describe('control-plane kernel', () => {
     expect(verifySessionToken(node.tokens.get(worker.sessionId)!, SECRET)).toMatchObject({ aid: 'assignment-1', role: 'worker' })
 
     await control.sendMessage(pm.sessionId, 'hello')
-    expect(node.messages.get(pm.sessionId)).toEqual(['hello'])
+    // The person's own words travel whole; the reference material that was assembled for this turn travels beside them,
+    // in a fence of its own. What the Session really received is the words.
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toEqual(['hello'])
     expect(node.sessions.get(pm.sessionId)?.status).toBe('idle')
 
     await control.setPermission(worker.sessionId, 'read-only')
@@ -116,7 +119,7 @@ describe('control-plane kernel', () => {
     const sent = await fetch(`${address.url}/v1/sessions/${pm.sessionId}/message`, { method: 'POST', headers: { ...auth,
       'content-type': 'application/json' }, body: JSON.stringify({ text: 'over HTTP' }) })
     expect(sent.status).toBe(200)
-    expect(node.messages.get(pm.sessionId)).toContain('over HTTP')
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toContain('over HTTP')
 
     // The low-level archive of a PM Session keeps the semantics it always had: the Session is archived, whatever its
     // Project is doing. The operator's own archive lives under the console's namespace and has its own rules.

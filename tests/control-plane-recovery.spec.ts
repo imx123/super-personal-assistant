@@ -10,6 +10,7 @@ import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { HttpNodePort } from '../src/control/http-node.ts'
 import { startFetchControlPlane, startFetchNodeServer as startNodeHttpServer } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { KV } from '../src/kv.ts'
 import { DshNodePort, type DshPortEvent, type DshPortHost } from '../src/node/dsh-port.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
@@ -444,7 +445,7 @@ describe('message delivery re-ensures a stale Session', () => {
     expect(pmEnsures(node).at(-1)?.sessionId).toBe(pm.sessionId)
     const messageAt = node.commands.findIndex(command => command.type === 'session.message')
     expect(messageAt).toBeGreaterThan(node.commands.findLastIndex(command => command.type === 'pm.ensure'))
-    expect(node.messages.get(pm.sessionId)).toEqual(['hello'])
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toEqual(['hello'])
     expect(control.session(pm.sessionId)?.nodeGeneration).not.toBe(generation)
   })
 
@@ -505,7 +506,7 @@ describe('node generation on event-stream reconnect', () => {
 
       // The restarted node had no such Session; the delivery first re-ensured it on that node.
       expect(restarted.sessions.get(pm.sessionId)).toBeDefined()
-      expect(restarted.messages.get(pm.sessionId)).toEqual(['after the restart'])
+      expect(messagesWithoutContext(restarted.messages.get(pm.sessionId))).toEqual(['after the restart'])
       const ensureAt = restarted.commands.findIndex(command => command.type === 'pm.ensure')
       const messageAt = restarted.commands.findIndex(command => command.type === 'session.message')
       expect(ensureAt).toBeGreaterThanOrEqual(0)

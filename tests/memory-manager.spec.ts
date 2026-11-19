@@ -351,9 +351,15 @@ describe('the memory manager, through the control plane', () => {
     reevaluations: number
   }
 
-  /** The person's own words, which the Router may quote. */
+  /**
+   * The person's own words, which the Router may quote.
+   *
+   * The words are the ones the proposals quote: a fact that claims to be the person's own has to be found in the message
+   * the person wrote, and the summary a proposer writes about that message is not the message.
+   */
   async function personSays(): Promise<void> {
-    await control!.sendToRouter('以后这个项目统一用 pnpm 作为包管理器。', [], undefined, { id: PERSON_REQUEST })
+    await control!.sendToRouter('以后这个项目统一用 pnpm。这个项目统一用 pnpm，不要用 npm。', [], undefined,
+      { id: PERSON_REQUEST })
     await until(() => (control!.routerState().queue ?? []).some(row => row.id === PERSON_MESSAGE),
       'the person\'s message was not recorded')
   }
@@ -479,6 +485,24 @@ describe('the memory manager, through the control plane', () => {
     expect(decided.status).toBe(200)
   })
 
+  it('does not take the person\'s own words out of the summary of a source', async () => {
+    const { url, scopeId } = await open()
+    await personSays()
+    const routerToken = node!.tokens.get('router')!
+    // The words are only in the line the proposer wrote about the record: they are not in the person's message, so they
+    // are not the person's own words.
+    const proposed = await post(url, '/v1/tools/memory/propose', routerToken,
+      { content: '这个项目统一用 yarn，不要用 npm。', scopeType: 'project', scopeId,
+        sourceRefs: [{ kind: 'operator_message', id: PERSON_MESSAGE, summary: '这个项目统一用 yarn，不要用 npm。' }] })
+    expect(proposed.status).toBe(201)
+    const candidate = (await proposed.json()) as { candidate: CandidateAnswer }
+    expect(candidate.candidate.sourceTrust).toBe('external_tainted')
+    expect(candidate.candidate.status).toBe('pending_human_confirm')
+
+    // And the manager is not woken for it: it is not a fact it may judge.
+    expect(node!.commands.some(command => command.type === 'memory_manager.ensure')).toBe(false)
+  })
+
   it('refuses a proposal about another Project, and one that leans on another Project\'s record', async () => {
     const { url, scopeId } = await open()
     await personSays()
@@ -595,9 +619,11 @@ describe('the memory manager, through the control plane', () => {
     const version = row.checksum
     expect(version).not.toBe(candidate.candidate.checksum)
 
-    // The proposer says it once more: the same candidate goes back into the queue.
+    // The proposer says it once more: the same candidate goes back into the queue. It names the record the new words
+    // came from, and the words are checked against it exactly as they were the first time.
     const again = await post(url, '/v1/tools/memory/propose', routerToken,
       { content: '这个项目统一用 pnpm，不要用 npm。', scopeType: 'project', scopeId,
+        sourceRefs: [{ kind: 'operator_message', id: PERSON_MESSAGE, summary: '主窗口的原话' }],
         candidateId: row.candidateId, checksum: version })
     expect(again.status).toBe(201)
     const reevaluated = (await again.json()) as { candidate: CandidateAnswer }

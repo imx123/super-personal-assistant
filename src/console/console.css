@@ -331,8 +331,12 @@ svg{width:18px;height:18px;flex:none}
 /* The two decisions of a proposal keep their words on one line; the text beside them wraps instead. */
 .memory-action{display:inline-flex;flex:none;gap:6px;flex-wrap:wrap}
 .memory-action .action{white-space:nowrap}
-/* The search of the memory: the words, the two buttons and the answer. The answer wraps; the buttons keep their words. */
+/* The search of the memory: the words, the scope, the two buttons and the answer. The answer wraps; the buttons keep their words. */
 .memory-search .detail-actions{margin-top:0}
+/* The governance of one memory: the editor of a new version and the second confirmation of a deletion. */
+.memory-edit{display:grid;gap:4px;min-width:0;font-size:12px;color:var(--muted)}
+.memory-edit textarea{width:100%;max-width:100%;box-sizing:border-box;border:1px solid var(--edge);border-radius:8px;padding:8px;background:var(--white);font:inherit;color:var(--ink);min-width:0;resize:vertical;overflow-wrap:anywhere}
+.memory-confirm{display:grid;gap:6px;min-width:0;margin-top:4px}
 @media(max-width:420px){.memory-block{padding:10px 11px}.memory-rows .setting{flex-wrap:wrap;align-items:flex-start}.memory-action{flex:1 1 100%}.memory-action .action{flex:1 1 auto}}
 @media(max-width:1050px){.app{grid-template-columns:194px minmax(0,1fr)}.brand{font-size:16px}}
 @media(width > 800px){

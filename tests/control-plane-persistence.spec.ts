@@ -7,6 +7,7 @@ import { ControlPlane } from '../src/control/control-plane.ts'
 import { KV } from '../src/kv.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import { verifySessionToken } from '../src/shared/session-token.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 
 const SECRET = 'control-persistence-secret'
 
@@ -97,7 +98,7 @@ describe('control-plane Session persistence', () => {
     expect(second.session(pm.sessionId)?.status).toBe('idle')
     expect(memoryTokens(second).size).toBe(0)
     await second.sendMessage(pm.sessionId, 'after restart')
-    expect(node.messages.get(pm.sessionId)).toEqual(['after restart'])
+    expect(messagesWithoutContext(node.messages.get(pm.sessionId))).toEqual(['after restart'])
     const token = memoryTokens(second).get(pm.sessionId)
     expect(token).toBeTruthy()
     expect(verifySessionToken(token!, SECRET)).toMatchObject({ sid: pm.sessionId, pid: project.id, role: 'pm' })

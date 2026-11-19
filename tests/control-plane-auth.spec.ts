@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Trigger } from '../src/core/index.ts'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { FetchControlPlaneServer as ControlPlaneServer, startFetchControlPlane } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 
 const OPERATOR_TOKEN = 'control-operator-token'
@@ -211,7 +212,7 @@ describe('control-plane read-only viewer', () => {
       const response = await send(url, write, fixture, OPERATOR)
       expect(response.status, `${write.name} must be allowed for the operator`).toBe(write.status ?? 200)
     }
-    expect(node.messages.get(fixture.pm.sessionId)).toContain('hello')
+    expect(messagesWithoutContext(node.messages.get(fixture.pm.sessionId))).toContain('hello')
     expect(node.permissions.get(fixture.worker.sessionId)).toBe('read-only')
     expect(control.session(fixture.pm.sessionId)).toMatchObject({ status: 'archived' })
   })

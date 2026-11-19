@@ -29,9 +29,9 @@
  * rest of Phase 5 is the same panel: the retrieval of `P5-5` fills it without the page changing shape.
  */
 import { useEffect, useRef, useState, type ReactElement } from 'react'
-import { decideMemoryCandidate, disputeMemory, messageOf, read, readEventHistory, readLiveState, readLongTermMemories,
-  readMemoryCandidates, readMemoryMaintenance, readMemoryReviews, runMemoryMaintenance, searchMemories,
-  submitMemoryCandidate,
+import { decideMemoryCandidate, deleteMemory, disputeMemory, editMemory, messageOf, pinMemory, read, readEventHistory,
+  readLiveState, readLongTermMemories, readMemoryCandidates, readMemoryMaintenance, readMemoryReviews, runMemoryMaintenance,
+  searchMemories, submitMemoryCandidate,
   type ConsoleProject, type ConsoleTicket, type EventHistoryCoverage, type EventHistoryEntry, type LiveStateList,
   type LiveStateNode, type LiveStateSnapshot, type MemoryCandidateView, type MemoryMaintenanceRunView,
   type MemoryRecordView, type MemoryReviewRunView, type MemorySearchHitView, type MemorySearchPage, type Overview,
@@ -893,8 +893,8 @@ function historyCoverageText(coverage: EventHistoryCoverage): string {
  * The long-term memory: the queue of proposals, the memories that are in force, and the decision a person takes.
  *
  * The service exists now (`P5-3`), so the panel says what it really is: a proposal enters the queue and waits, and it
- * becomes a memory only when a decision says so. There is no action here that writes a memory directly, and there is no
- * action that forgets one — the forgetting of a memory is still undecided, so the panel does not offer it.
+ * becomes a memory only when a decision says so. There is no action here that writes a memory directly. The dangerous one
+ * is a permanent deletion, and it asks twice: the button opens the confirmation, and the confirmation is what deletes.
  *
  * The loader reads; the view beside it shows. The loader holds the rows, the flags of the read and the words of the
  * form; the view turns them into the panel a person reads. That is what lets the panel be rendered on its own, without
@@ -908,10 +908,18 @@ export function LongTermMemoryPanel(props: {
   onOpenProjects: () => void
 }): ReactElement {
   const queue = useLoaded(() => readMemoryCandidates(), props.revision)
-  const saved = useLoaded(() => readLongTermMemories(), props.revision)
+  // **The list of the memories.** It holds the ones that are in force, and — when the person asks for it — the rows that
+  // are not: the history versions and the memories that wait for a review are still in the running library, and a person
+  // has to be able to see them to govern them. The key says which of the two the list is, so the list is read again when
+  // the person changes it.
+  const [includeInactive, setIncludeInactive] = useState(false)
+  const saved = useLoaded(() => readLongTermMemories(includeInactive ? { includeInactive: true } : {}), props.revision,
+    includeInactive ? 'all' : 'active')
   const reviews = useLoaded(() => readMemoryReviews(), props.revision)
   const maintenance = useLoaded(() => readMemoryMaintenance(), props.revision)
   const projects = useLoaded(() => read<{ projects: ConsoleProject[] }>('/v1/console/projects'), props.revision)
+  // The machines of this control plane: the scope filter offers the devices it really holds, beside the projects.
+  const live = useLoaded(() => readLiveState(), props.revision)
   const [content, setContent] = useState('')
   const [scope, setScope] = useState('user_global|global')
   const action = useAction(() => props.refresh())
@@ -921,7 +929,13 @@ export function LongTermMemoryPanel(props: {
   const [search, setSearch] = useState<MemorySearchPage | undefined>(undefined)
   const [searchError, setSearchError] = useState('')
   const [searching, setSearching] = useState(false)
+  // The scope the search was asked in: the empty string is the whole control plane, and anything else names one owner.
+  const [searchScope, setSearchScope] = useState('')
   const searchGeneration = useRef(0)
+  // The governance of one memory: which row is being edited, and which one waits for its second confirmation.
+  const [editing, setEditing] = useState('')
+  const [editText, setEditText] = useState('')
+  const [deleting, setDeleting] = useState('')
 
   /** One decision about one proposal, and the words that say what it did. */
   const decide = (candidate: MemoryCandidateView, decision: 'approve' | 'reject'): void => {
@@ -953,14 +967,18 @@ export function LongTermMemoryPanel(props: {
    * Every search carries a generation of its own. A person who asks a second question before the first answer arrives
    * gets the newer answer only: the older one is dropped when it comes back, so a slow answer never overwrites a
    * newer one and a result of one question never stands under another.
+   *
+   * The scope is part of the generation: an answer to a search of one scope never lands under another scope, and the
+   * results on the screen always belong to the scope the filter names.
    */
   const runSearch = (): void => {
     const query = searchQuery.trim()
     if (query === '') return
     const mine = ++searchGeneration.current
+    const filter = searchScopeOf(searchScope)
     setSearching(true)
     setSearchError('')
-    void searchMemories({ query, limit: 10 }).then(result => {
+    void searchMemories({ query, limit: 10, ...filter }).then(result => {
       if (mine !== searchGeneration.current) return
       setSearch(result)
       setSearching(false)
@@ -980,6 +998,21 @@ export function LongTermMemoryPanel(props: {
     setSearching(false)
   }
 
+  /**
+   * Leave the scope the search was asked in.
+   *
+   * The generation ends at once, so an answer that is still on its way belongs to a scope the person has already left and
+   * is dropped before it can answer. The results go with it: they are not the results of the scope that is chosen now.
+   */
+  const changeSearchScope = (value: string): void => {
+    if (value === searchScope) return
+    searchGeneration.current += 1
+    setSearchScope(value)
+    setSearch(undefined)
+    setSearchError('')
+    setSearching(false)
+  }
+
   /** One memory that the person says misled somebody. */
   const dispute = (hit: MemorySearchHitView): void => {
     action.run(
@@ -987,10 +1020,42 @@ export function LongTermMemoryPanel(props: {
       () => '已记录：这条记忆的置信度下降，等待再次核验。')
   }
 
+  /** A new version of one memory: the old one keeps its history and leaves the recall. */
+  const saveEdit = (memory: MemoryRecordView): void => {
+    const body = editText.trim()
+    if (body === '') return
+    action.run(
+      () => editMemory({ memoryId: memory.memoryId, content: body, checksum: memory.checksum }),
+      () => { setEditing(''); setEditText(''); return '已保存为新版本：旧版本保留溯源，不再参与召回。' })
+  }
+
+  /** Pin a memory, or let it go. */
+  const togglePin = (memory: MemoryRecordView): void => {
+    action.run(
+      () => pinMemory({ memoryId: memory.memoryId, pinned: !memory.pinned, checksum: memory.checksum }),
+      () => memory.pinned ? '已取消置顶。' : '已置顶：同分时它排在前面。')
+  }
+
+  /** Delete a memory for good. The second confirmation happened in the view; this is the act itself. */
+  const remove = (memory: MemoryRecordView): void => {
+    action.run(
+      () => deleteMemory({ memoryId: memory.memoryId, checksum: memory.checksum, reason: '操作员在控制台显式永久删除。' }),
+      () => { setDeleting(''); return '已永久删除：这条记忆的正文、同内容的待审副本和索引条目都已经抹去。' })
+  }
+
   const options = [
     { value: 'user_global|global', label: '全局偏好（跨项目）' },
     ...(projects.data?.projects ?? []).map(project =>
       ({ value: `project|project:${project.id}`, label: `项目：${project.title}` })),
+  ]
+
+  const searchScopes = [
+    { value: '', label: '全部作用域' },
+    { value: 'user_global|global', label: '全局偏好' },
+    ...(projects.data?.projects ?? []).map(project =>
+      ({ value: `project|project:${project.id}`, label: `项目：${project.title}` })),
+    ...(live.data?.nodes.rows ?? []).map(node =>
+      ({ value: `node_env|node:${node.nodeId}`, label: `机器：${node.displayName ?? node.nodeId}` })),
   ]
 
   return (
@@ -1012,8 +1077,15 @@ export function LongTermMemoryPanel(props: {
       scopeOptions={options}
       searchQuery={searchQuery}
       search={search}
+      searchScope={searchScope}
+      searchScopeOptions={searchScopes}
       searchState={searchError !== '' ? 'error' : searching ? 'pending' : search === undefined ? 'idle' : 'ready'}
       searchError={searchError}
+      editing={editing}
+      editText={editText}
+      deleting={deleting}
+      includeInactive={includeInactive}
+      onIncludeInactiveChange={setIncludeInactive}
       onContentChange={setContent}
       onScopeChange={setScope}
       onSubmit={propose}
@@ -1022,10 +1094,27 @@ export function LongTermMemoryPanel(props: {
       onInspect={inspect}
       onSearchQueryChange={setSearchQuery}
       onSearch={runSearch}
+      onSearchScopeChange={changeSearchScope}
       onClearSearch={clearSearch}
       onDispute={dispute}
+      onEditStart={(memory) => { setEditing(memory.memoryId); setEditText(memory.content); setDeleting('') }}
+      onEditTextChange={setEditText}
+      onEditCancel={() => { setEditing(''); setEditText('') }}
+      onEditSave={saveEdit}
+      onTogglePin={togglePin}
+      onDeleteStart={(memory) => { setDeleting(memory.memoryId); setEditing('') }}
+      onDeleteCancel={() => setDeleting('')}
+      onDelete={remove}
       onOpenProjects={props.onOpenProjects} />
   )
+}
+
+/** The scope a search filter names, as the search endpoint takes it. */
+function searchScopeOf(value: string): { scopeType?: string; scopeId?: string } {
+  if (value === '') return {}
+  const [scopeType = '', scopeId = ''] = value.split('|')
+  if (scopeType === '' || scopeId === '') return {}
+  return { scopeType, scopeId }
 }
 
 /**
@@ -1038,7 +1127,7 @@ export function LongTermMemoryPanel(props: {
 export function LongTermMemoryView(props: {
   /** The proposals that wait for a decision. */
   candidates: MemoryCandidateView[]
-  /** The memories that are in force. */
+  /** The memories that are in force, and the rows that are not when the person asks for them. */
   memories: MemoryRecordView[]
   /** The reviews the memory manager was woken for. */
   reviews: MemoryReviewRunView[]
@@ -1070,10 +1159,22 @@ export function LongTermMemoryView(props: {
   searchQuery: string
   /** The answer of the last search, when there was one. */
   search: MemorySearchPage | undefined
+  /** The scope the search was asked in; the empty string is the whole control plane. */
+  searchScope: string
+  /** The scopes the person may choose from. */
+  searchScopeOptions: { value: string; label: string }[]
   /** What the search knows: nothing yet, waiting, failed or answered. */
   searchState: 'idle' | 'pending' | 'error' | 'ready'
   /** Why the search failed, when it did. */
   searchError: string
+  /** The memory that is being edited, when one is. */
+  editing: string
+  /** The words of the edit that is under way. */
+  editText: string
+  /** The memory that waits for its second confirmation, when one does. */
+  deleting: string
+  /** Whether the list shows the rows that are not in force as well. */
+  includeInactive: boolean
   onContentChange: (value: string) => void
   onScopeChange: (value: string) => void
   /** The person offered a proposal. */
@@ -1086,12 +1187,32 @@ export function LongTermMemoryView(props: {
   onSearchQueryChange: (value: string) => void
   /** The person asked for the search. */
   onSearch: () => void
+  /** The person chose another scope for the search. */
+  onSearchScopeChange: (value: string) => void
   /** The person cleared the search. */
   onClearSearch: () => void
   /** The person says that a memory misled somebody. */
   onDispute: (hit: MemorySearchHitView) => void
+  /** The person began an edit of one memory. */
+  onEditStart: (memory: MemoryRecordView) => void
+  /** The person changed the words of the edit. */
+  onEditTextChange: (value: string) => void
+  /** The person gave the edit up. */
+  onEditCancel: () => void
+  /** The person saved the edit as a new version. */
+  onEditSave: (memory: MemoryRecordView) => void
+  /** The person pinned a memory, or let it go. */
+  onTogglePin: (memory: MemoryRecordView) => void
+  /** The person began the deletion of one memory. */
+  onDeleteStart: (memory: MemoryRecordView) => void
+  /** The person gave the deletion up. */
+  onDeleteCancel: () => void
+  /** The person confirmed the deletion. */
+  onDelete: (memory: MemoryRecordView) => void
   /** The person asked for an inspection now. */
   onInspect: () => void
+  /** The person turned the rows that are not in force on or off. */
+  onIncludeInactiveChange: (value: boolean) => void
   onOpenProjects: () => void
 }): ReactElement {
   const waiting = props.candidates.filter(candidate => REVIEWABLE_STATES.includes(candidate.status))
@@ -1118,10 +1239,7 @@ export function LongTermMemoryView(props: {
           <span className="memory-tag">按相关度排序</span>
         </div>
         <p className="quiet">
-          检索先在存储层按作用域与状态硬过滤，再打分：只有调用方有权读取、且处于生效状态的记忆才会进入候选集，
-          别的项目的内容不会出现在候选集、结果、计数或理由里。打分用的统计量同样只算调用方自己那批行，
-          所以别处的记忆动不了这里的分数与顺序。中文问题同样能命中——关键词索引读不出中文时会退回
-          逐词比对；语义向量通道未配置或不可用时也退回关键词通道，并在下面写明。
+          先按作用域与状态过滤，再按相关度排序；每条命中的评分依据写在结果里。
         </p>
         <div className="memory-form">
           <label htmlFor="memory-search-query">
@@ -1130,6 +1248,15 @@ export function LongTermMemoryView(props: {
               placeholder="例如：包管理器 / pnpm"
               onChange={event => props.onSearchQueryChange(event.target.value)}
               onKeyDown={event => { if (event.key === 'Enter') props.onSearch() }} />
+          </label>
+          <label htmlFor="memory-search-scope">
+            <span>作用域</span>
+            <select id="memory-search-scope" value={props.searchScope}
+              onChange={event => props.onSearchScopeChange(event.target.value)}>
+              {props.searchScopeOptions.map(option => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
           </label>
           <div className="detail-actions">
             <button type="button" className="action" onClick={props.onSearch}
@@ -1400,22 +1527,41 @@ export function LongTermMemoryView(props: {
       <div className="memory-block">
         <div className="memory-block-head">
           <h3>已保存的长期记忆</h3>
-          <span className="memory-tag">生效中</span>
+          <span className="memory-tag">{props.includeInactive ? '含历史版本' : '生效中'}</span>
+        </div>
+        <p className="quiet">
+          这里可以改写、置顶和永久删除。改写会存成新版本，旧版本保留溯源但不再参与召回；永久删除会真的抹掉
+          这条记忆的正文、同一作用域下同内容的待审副本和关键词索引里的词项，不留指纹、不留归档副本。
+        </p>
+        <div className="detail-actions">
+          <button type="button" className="action" aria-pressed={props.includeInactive}
+            onClick={() => props.onIncludeInactiveChange(!props.includeInactive)}>
+            {props.includeInactive ? '只看生效中的记忆' : '显示历史版本与待复核记忆'}
+          </button>
         </div>
         {props.listState === 'error'
           ? <p className="empty">{`读取长期记忆失败：${props.error}`}</p>
           : props.listState === 'pending'
             ? <p className="empty">正在读取长期记忆……</p>
             : props.memories.length === 0
-              ? <p className="empty">还没有生效的长期记忆。</p>
+              ? <p className="empty">{props.includeInactive ? '还没有任何长期记忆。' : '还没有生效的长期记忆。'}</p>
               : <div className="memory-rows">
                 {props.memories.map(memory => (
                   <div className="setting" key={memory.memoryId}>
                     <span>
-                      <b>{memory.content}</b>
+                      {props.editing === memory.memoryId
+                        ? <label className="memory-edit">
+                          <span>新版本正文</span>
+                          <textarea rows={3} value={props.editText} maxLength={1000}
+                            onChange={event => props.onEditTextChange(event.target.value)} />
+                        </label>
+                        : <b>{memory.content}</b>}
                       <span className="quiet">
-                        {`${scopeWording(memory.scopeType, memory.scopeId)} · ${trustWording(memory.sourceTrust)} · 置信度 ${memory.confidence.toFixed(2)}`}
+                        {`${scopeWording(memory.scopeType, memory.scopeId)} · ${trustWording(memory.sourceTrust)} · 置信度 ${memory.confidence.toFixed(2)}${memory.pinned ? ' · 已置顶' : ''}`}
                       </span>
+                      {memory.status === 'active'
+                        ? null
+                        : <span className="quiet">{`状态：${memoryStatusWording(memory.status)}`}</span>}
                       <span className="quiet">
                         {`${memory.memoryId} · 最后核验 ${stampOf(memory.lastVerifiedAt)}`}
                       </span>
@@ -1425,12 +1571,53 @@ export function LongTermMemoryView(props: {
                           {`来源：${memory.sourceRefs.map(ref =>
                             `${ref.kind}:${ref.id}${ref.verified ? '' : '（未核验）'}`).join('、')}`}
                         </span>}
+                      {props.deleting === memory.memoryId
+                        ? <span className="memory-confirm">
+                          <span className="quiet">
+                            永久删除：这条记忆的正文、同一作用域下同内容的待审副本，以及关键词索引里的词项
+                            都会被抹去，不留指纹、不留归档副本。旧工单与会话按各自规则保留，已有备份不被改写；
+                            同样的事实以后仍可能从原始来源再次被提取出来，那时它是一条新的记忆。
+                          </span>
+                          <span className="memory-action">
+                            <button type="button" className="action" onClick={() => props.onDelete(memory)}
+                              aria-label={`确认永久删除记忆 ${memory.memoryId}`}
+                              disabled={props.busy}>确认永久删除</button>
+                            <button type="button" className="action" onClick={props.onDeleteCancel}
+                              aria-label={`取消永久删除记忆 ${memory.memoryId}`}
+                              disabled={props.busy}>取消</button>
+                          </span>
+                        </span>
+                        : null}
+                    </span>
+                    <span className="memory-action">
+                      {props.editing === memory.memoryId
+                        ? <>
+                          <button type="button" className="action" onClick={() => props.onEditSave(memory)}
+                            aria-label={`保存记忆 ${memory.memoryId} 的新版本`}
+                            disabled={props.busy || props.editText.trim() === ''}>保存为新版本</button>
+                          <button type="button" className="action" onClick={props.onEditCancel}
+                            aria-label={`取消编辑记忆 ${memory.memoryId}`}
+                            disabled={props.busy}>取消</button>
+                        </>
+                        : <>
+                          <button type="button" className="action" onClick={() => props.onEditStart(memory)}
+                            aria-label={`编辑记忆 ${memory.memoryId}`}
+                            disabled={props.busy || memory.status !== 'active'}>编辑</button>
+                          <button type="button" className="action" onClick={() => props.onTogglePin(memory)}
+                            aria-label={memory.pinned ? `取消置顶记忆 ${memory.memoryId}` : `置顶记忆 ${memory.memoryId}`}
+                            disabled={props.busy || memory.status !== 'active'}>{memory.pinned ? '取消置顶' : '置顶'}</button>
+                          <button type="button" className="action" onClick={() => props.onDeleteStart(memory)}
+                            aria-label={`永久删除记忆 ${memory.memoryId}`}
+                            disabled={props.busy}>永久删除</button>
+                        </>}
                     </span>
                   </div>
                 ))}
               </div>}
         {props.listState === 'ready' && props.memories.length > 0
-          ? <p className="quiet">{`共 ${props.memories.length} 条生效中的长期记忆。`}</p>
+          ? <p className="quiet">{props.includeInactive
+              ? `共 ${props.memories.length} 条长期记忆（含历史版本与待复核）。`
+              : `共 ${props.memories.length} 条生效中的长期记忆。`}</p>
           : null}
       </div>
 
@@ -1438,8 +1625,8 @@ export function LongTermMemoryView(props: {
         <button type="button" className="action" onClick={props.onOpenProjects}>去项目页记一笔</button>
       </div>
       <p className="quiet">
-        「项目 › 项目备忘」里的便签由人维护，不进入候选队列，也不参与这里的检索。遗忘一条记忆的做法还没有定，
-        这一页因此不提供删除。
+        「项目 › 项目备忘」里的便签由人维护，不进入候选队列，也不参与这里的检索。永久删除一条记忆是操作员自己的动作：
+        只有控制台连接密钥能做，只读密钥只能查看。
       </p>
     </section>
   )
@@ -1460,6 +1647,20 @@ function candidateStatusWording(status: string): string {
   if (status === 'expired_candidate') return '已过期冷置'
   if (status === 'needs_reverify') return '需要复核'
   if (status === 'rejected') return '未被采纳'
+  return status
+}
+
+/**
+ * How a memory's own state reads in the console.
+ *
+ * The words say what the row really is: a version a newer one replaced keeps its history, a memory that waits for a
+ * review is not in force, and both of them are still in the running library.
+ */
+function memoryStatusWording(status: string): string {
+  if (status === 'active') return '生效中'
+  if (status === 'superseded') return '历史版本，已被新版本取代'
+  if (status === 'needs_reverify') return '需要复核，未参与召回'
+  if (status === 'conflict_pending') return '存在冲突，等待确认'
   return status
 }
 

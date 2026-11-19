@@ -1,5 +1,5 @@
 /** Standalone control-plane kernel: domain state, PM/Worker Session records, and a NodePort. No DSH imports. */
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { lockSync } from 'proper-lockfile'
@@ -12,13 +12,17 @@ import { key } from '../core/ids.ts'
 import { KV, type Key } from '../kv.ts'
 import { EventHistoryService, type EventHistoryPage, type EventHistoryQuery } from '../memory/event-history.ts'
 import { LiveStateService, type LiveStateSnapshot } from '../memory/live-state.ts'
-import { MemoryRetriever, type EmbeddingProvider, type MemoryRetrievalConfig, type MemorySearchResult } from '../memory/retriever.ts'
+import { MemoryRetriever, type EmbeddingProvider, type MemoryRetrievalConfig, type MemoryReadView,
+  type MemorySearchResult } from '../memory/retriever.ts'
 import { MemoryManager, MEMORY_MAINTENANCE_MAX_REVIEWS, MEMORY_MANAGER_PROFILE_NAME, MEMORY_REVIEW_JOB_TIMEOUT_MS,
   currentMaintenanceSlot, nextMaintenanceSlot, sourceKeysOf, type MemoryMaintenanceRunView, type MemoryManagerCaller,
   type MemoryManagerRefusalCode, type MemoryReturnCaller, type MemoryReviewRunView } from '../memory/memory-manager.ts'
 import { MemoryService, type MemoryCandidatePage, type MemoryCandidateView, type MemoryDecisionKind, type MemoryDecisionRequest,
-  type MemoryDecisionResult, type MemoryDisputeResult, type MemoryRecordPage, type MemorySubmitRequest,
-  type MemorySubmitResult, type MemoryUseResult } from '../memory/memory-service.ts'
+  type MemoryDecisionResult, type MemoryDeleteResult, type MemoryDisputeResult, type MemoryGovernanceResult,
+  type MemoryRecordPage, type MemoryRecordView, type MemorySubmitRequest, type MemorySubmitResult, type MemoryUseResult } from '../memory/memory-service.ts'
+import { CONTEXT_MEMO_LIMIT, CONTEXT_MEMORY_LIMIT, CONTEXT_TOKEN_BUDGETS, assembleContext, estimateTokens,
+  type ContextAssembly, type ContextMemoryItem, type ContextRole } from '../memory/context-assembly.ts'
+import { statedPreferenceOf } from '../memory/stated-preference.ts'
 import { scopeOf, type MemoryCaller, type MemorySourceRecord, type SourceRefInput, type SourceRefKind } from '../memory/memory-scope.ts'
 import { redact } from '../infra/redact.ts'
 import { dataFence } from '../infra/text.ts'
@@ -33,7 +37,7 @@ import { AuditRecorder, type AuditActor } from './console-audit.ts'
 import { ConsoleStore, type ConsoleAuditRow, type ConsoleEventRow, type FastRouteRow, type ProjectGateRow,
   type ProjectMemoryRow, type RouterHandoffRow, type RouterQueueRow, type StopNoticeRow } from './console-store.ts'
 import { createKernelDomain, type KernelDomain } from './domain.ts'
-import { DeliveryOutbox, readContext as readDeliveryContext, type CoordinationDeliveryKind,
+import { DeliveryOutbox, isSealedDelivery, readContext as readDeliveryContext, type CoordinationDeliveryKind,
   type DeliveryContext, type DeliveryKindHandler, type DeliveryRevalidation } from './delivery-outbox.ts'
 import { DenialEscalator, denialCallId, DenialAuthorizationError, type DenialAuthorizationView, type DenialCounterView,
   type DenialFact, type DenialReviewView } from './denial-escalator.ts'
@@ -490,6 +494,97 @@ function refreshGraceSeconds(value: number | undefined): number {
   return value
 }
 
+/**
+ * The budget of one role's turn, when a deployment named one.
+ *
+ * A number that is not a whole positive number is a deployment error and keeps the default: a budget of zero would leave
+ * every turn without any reference material, and a budget that is not a number is a typo, not a request.
+ */
+function budgetOf(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback
+  return Math.trunc(value)
+}
+
+/**
+ * The role a Session's record plays in the bounded context, when it plays one.
+ *
+ * The memory manager is not one of them: it reviews candidates and holds no work of its own, so it gets no context of
+ * this kind.
+ */
+function contextRoleOf(role: string): ContextRole | undefined {
+  if (role === 'router') return 'router'
+  if (role === 'pm') return 'pm'
+  if (role === 'worker') return 'worker'
+  return undefined
+}
+
+/** An assembly that says nothing: the block is empty and nothing was injected. */
+function emptyContext(): ContextAssembly {
+  return { block: '', memoryIds: [], provisionalIds: [], tokens: 0, budget: 0, omitted: 0 }
+}
+
+/**
+ * The name of one injection.
+ *
+ * It is derived from the facts that make the injection what it is: the delivery that carried the block, the Session it
+ * was read for and the generation it belonged to. The delivery's own id is the anchor, not the words of the turn and not
+ * the memories that answered: two real turns that ask the same question are two deliveries and two injections, while the
+ * same delivery that is assembled again — a retry, a lost receipt that is sent once more under the same key — is one
+ * injection, and it carries the one set of memories it carried the first time.
+ */
+function contextInjectionId(deliveryId: string, sessionId: string, generation: string): string {
+  return createHash('sha256')
+    .update(`${deliveryId}|${sessionId}|${generation}`)
+    .digest('hex').slice(0, 32)
+}
+
+/**
+ * The scope one turn's context is read under.
+ *
+ * The Ticket and the Assignment are the ones the turn is really about; the Project comes from the Session that proved
+ * itself, never from the request. A handoff from the Router is about a Project and names no Ticket; the wake-up of a
+ * report is about the Ticket the report is about, and says so.
+ *
+ * The delivery is named by its own stable id, so a turn that is assembled twice under the same delivery is one turn.
+ */
+interface TurnScope {
+  /** The stable id of the delivery that carries the turn. */
+  readonly deliveryId: string
+  /** The Ticket the turn is about, when it is about one. */
+  readonly ticketId: string
+  /** The Assignment the turn is about, when it is about one. */
+  readonly assignmentId: string
+  /** The Project the turn is about, when the caller named one. */
+  readonly projectId: string
+  /** The words the recall is asked with. */
+  readonly query: string
+  /**
+   * The life of the Session the turn is read under.
+   *
+   * It is read once, before the block is assembled, and the same answer names the ledger row, the confirmation of the
+   * delivery and the claims that wait for it: a turn that is assembled and sent is one row under one life.
+   */
+  readonly generation: string
+}
+
+/**
+ * What one turn carries: the message that goes out and the reference material that was assembled with it.
+ *
+ * The two are kept apart because they are checked apart: the message is the work, and the block is a snapshot of what
+ * was recalled. A snapshot that is no longer true is dropped; the work is not.
+ */
+interface ContextDelivery {
+  /** The message as it goes out. */
+  readonly message: string
+  /** The reference material that was assembled with it, empty when there was none. */
+  readonly block: string
+  /** The memories the block names. */
+  readonly memoryIds: readonly string[]
+  /** The proposals of the Session that the block names. */
+  readonly provisionalIds: readonly string[]
+}
+
 /** A failed Session creation or role installation; the HTTP facade reports it as 502, not as a server bug. */
 export class SessionEnsureError extends Error {
   constructor(message: string) {
@@ -674,6 +769,14 @@ export interface ControlPlaneOptions {
    * may see what the control plane was told to do.
    */
   memoryRetrieval?: Partial<MemoryRetrievalConfig>
+  /**
+   * The tokens one role's turn may carry as reference material.
+   *
+   * The default is the contract's own: a Router's turn 600 tokens, a PM's 800 and a Worker's 500. A deployment that
+   * works on a smaller model may lower them; what is not given keeps the default, and the control plane answers with the
+   * budgets it actually ran with.
+   */
+  contextBudgets?: Partial<Record<ContextRole, number>>
   /**
    * The optional semantic path: a provider that turns text into numbers and nothing else.
    *
@@ -1895,6 +1998,14 @@ export class ControlPlane {
    */
   private readonly manager: MemoryManager
   /**
+   * The tokens one role's turn may carry as reference material.
+   *
+   * The budgets are the contract's own unless a deployment named others: a Router's turn 600 tokens, a PM's 800 and a
+   * Worker's 500. They bound the reference material only — the person's own words and the task's own constraints are
+   * never shortened by them.
+   */
+  private readonly contextBudgets: Readonly<Record<ContextRole, number>>
+  /**
    * The durable outbox of the coordination deliveries.
    *
    * It owns the table every coordination writes into, the vocabulary of the states a delivery reaches and the recovery
@@ -2167,6 +2278,12 @@ export class ControlPlane {
       })
       this.manager.interruptUnfinishedMaintenance()
       this.manager.interruptUnfinishedReviews()
+      // The budgets of the bounded context: the contract's own unless a deployment named others.
+      this.contextBudgets = {
+        router: budgetOf(options.contextBudgets?.router, CONTEXT_TOKEN_BUDGETS.router),
+        pm: budgetOf(options.contextBudgets?.pm, CONTEXT_TOKEN_BUDGETS.pm),
+        worker: budgetOf(options.contextBudgets?.worker, CONTEXT_TOKEN_BUDGETS.worker),
+      }
       // The durable outbox of the coordination deliveries: one table for the six kinds, one vocabulary of the states a
       // delivery reaches and one recovery. It is created before the coordination that writes into it, and before the
       // startup reconciliation that reads it.
@@ -2176,8 +2293,9 @@ export class ControlPlane {
         backendId: () => CONTROL_BACKEND,
         // The recovery sends through the same door as every other coordination, and it carries the same check twice: once
         // before the target is ensured and once immediately before the transport.
-        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
-          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure, kind) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure,
+            undefined, kind),
         evidence: (sessionId, deliveryKey) => this.askNodeForEvidence(sessionId, deliveryKey),
         evidenceSupported: () => this.nodeAnswersDeliveries(),
       })
@@ -2308,8 +2426,8 @@ export class ControlPlane {
         routerSessionId: () => ROUTER_SESSION_ID,
         resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
         resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
-        deliver: (sessionId, text, idempotencyKey, validateForSend) =>
-          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, context, kind) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, undefined, context, kind),
         reportOf: (ticketId, assignmentId) => {
           // Only the Assignment that is still the Ticket's current one answers: a report of a replaced Worker is no
           // longer a fact about the work that runs now.
@@ -2343,8 +2461,8 @@ export class ControlPlane {
         targetEpochs: sessionId => this.targetEpochs(sessionId),
         resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
         resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
-        deliver: (sessionId, text, idempotencyKey, validateForSend) =>
-          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, kind) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, undefined, undefined, kind),
         interruptTurn: (sessionId, reason, turn) => this.interruptTurn(sessionId, reason, turn),
         audit: input => { this.audit.record(input) },
       }, {
@@ -2370,8 +2488,9 @@ export class ControlPlane {
         targetEpochs: sessionId => this.targetEpochs(sessionId),
         resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
         resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
-        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
-          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure, kind) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure,
+            undefined, kind),
         audit: input => { this.audit.record(input) },
       }, { ...(options.streamIntervalSeconds === undefined ? {} : { intervalSeconds: options.streamIntervalSeconds }) })
       // The external observation events an operator watches for: the subscriptions and their dispositions live in this
@@ -2391,8 +2510,9 @@ export class ControlPlane {
         targetEpochs: sessionId => this.targetEpochs(sessionId),
         resolveTarget: (sessionId, op) => this.resolver.resolveForSession(sessionId, op),
         resolveTargetNow: (sessionId, op) => this.resolver.resolveSessionNow(sessionId, op),
-        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure) =>
-          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure),
+        deliver: (sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure, kind) =>
+          this.deliverCoordinationMessage(sessionId, text, idempotencyKey, validateForSend, validateBeforeEnsure,
+            undefined, kind),
         // There is no semantic evaluator in this build: a subscription that carries a semantic condition therefore
         // fails closed. A deployment that has one hands it over here.
         semanticEvaluator: options.externalSemanticEvaluator,
@@ -2517,9 +2637,16 @@ export class ControlPlane {
    * The ensure takes time, and the life of the target may end while it is on its way. The check the coordination brings
    * along is therefore carried through the ensure and run again immediately before the transport: a target that was
    * revoked, replaced or stopped in the meantime does not receive the message.
+   *
+   * **The kind decides what may be added to the message.** The sealed kinds carry their own fence and their own
+   * reference, so they go out exactly as they are; the others are ordinary turns and may carry the bounded reference
+   * material beside their words. The kind is a fact of the coordination, never something read out of the words: a
+   * message cannot be trusted to say about itself whether it may carry a block.
    */
   private async deliverCoordinationMessage(sessionId: string, text: string, idempotencyKey: string,
-    validateForSend?: () => void, validateBeforeEnsure?: () => void): Promise<void> {
+    validateForSend?: () => void, validateBeforeEnsure?: () => void,
+    context?: { readonly ticketId: string; readonly assignmentId: string; readonly projectId: string },
+    kind?: CoordinationDeliveryKind): Promise<void> {
     const record = this.requireSession(sessionId)
     // The check that has to run before anything leaves this control plane: a subscription that is over, or a target whose
     // life ended while the delivery was on its way, must not even re-ensure the Session it was planned for.
@@ -2538,7 +2665,26 @@ export class ControlPlane {
     // The check the coordination brings along runs here as well: the ensure took time, and the authority of the target
     // may have ended while it was on its way. It runs again right before the transport.
     validateForSend?.()
-    await this.sendMessage(sessionId, text, undefined, 'system', { idempotencyKey, validateForSend })
+    // The kind of the delivery, as the coordination that produced it states it — and as the outbox's own record says it
+    // when the producer did not: the outbox row is the authority on what a delivery is.
+    const sealed = isSealedDelivery(this.coordinationKindOf(idempotencyKey, kind))
+    // The work the delivery is about travels with it: the turn that receives it is read under the Ticket and the
+    // Assignment it is about, so the memories it may name are the ones it really was given.
+    await this.sendMessage(sessionId, text, undefined, 'system', { idempotencyKey, validateForSend, sealed,
+      ...(context === undefined ? {} : { context: { ticketId: context.ticketId, assignmentId: context.assignmentId } }) })
+  }
+
+  /**
+   * The kind of one coordination delivery, as the outbox knows it.
+   *
+   * The producer of a delivery states its kind, and the outbox's own record says it too: a delivery that reached the
+   * door without saying what it is is looked up by its own key, because the outbox row is the authority on what a
+   * delivery is. A delivery that is in no record at all is an ordinary turn: it may carry the reference material.
+   */
+  private coordinationKindOf(idempotencyKey: string,
+    kind?: CoordinationDeliveryKind): CoordinationDeliveryKind | undefined {
+    if (kind !== undefined) return kind
+    return this.outbox.byIdempotencyKey(idempotencyKey)?.kind
   }
 
   /**
@@ -2595,6 +2741,11 @@ export class ControlPlane {
    * The question names the Session and the exact key, and it goes to the node the delivery was made to. A transport that
    * cannot ask answers `unknown`, and so does a node that refuses the question: neither is a proof that the message never
    * arrived, and a delivery may not be repeated on one.
+   *
+   * **An answer that says the message is there is a proof of the delivery.** The node says the message is in its inbox, or
+   * that a turn of the target read it: the block really was in front of the target after all, and the ledger of the
+   * injection says so even though the transport's receipt was lost. Nothing is asked of a model, and no extra turn is
+   * spent on it.
    */
   private async askNodeForEvidence(sessionId: string, deliveryKey: string): Promise<DeliveryEvidence> {
     const node = this.options.node
@@ -2602,7 +2753,16 @@ export class ControlPlane {
       return { state: 'unknown', reason: 'this transport cannot ask the node about a delivery' }
     }
     try {
-      return await node.evidence(sessionId, deliveryKey)
+      const evidence = await node.evidence(sessionId, deliveryKey)
+      if (evidence.state === 'inbox' || evidence.state === 'consumed_turn') {
+        const record = this.sessions.get(sessionId)
+        // A control plane that is closing does not write: its file is about to be closed.
+        if (!this.closed) {
+          this.memory.confirmInjectionDeliveryByNode({ deliveryId: deliveryKey, sessionId,
+            ...(record === undefined ? {} : { caller: this.memoryReaderCaller(sessionId, record) }) })
+        }
+      }
+      return evidence
     } catch {
       return { state: 'unknown', reason: 'the node could not be asked about this delivery' }
     }
@@ -3821,9 +3981,13 @@ export class ControlPlane {
       throw new OperatorError(409, `The PM Session of this Project is not running: ${stopped}`)
     }
     const instruction = decision.instruction ?? text
-    // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once.
-    await this.sendMessage(project.pmSessionId, routerAutoInstructionMessage(requestId, instruction, project.title),
-      undefined, 'system', { idempotencyKey: `fast-relay:${requestId}` })
+    // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once. The
+    // reference material of the control plane travels beside the instruction, in its own fence: the PM reads its own
+    // Project's live state, its own memo and the memories that answered the instruction.
+    const message = routerAutoInstructionMessage(requestId, instruction, project.title)
+    await this.sendMessage(project.pmSessionId, message,
+      undefined, 'system', { idempotencyKey: `fast-relay:${requestId}`,
+        context: { query: instruction } })
     this.consoleStore.updateFastRoute(requestId, { stage: 'assigned', error: '' })
     this.audit.record({ actor: 'system', kind: 'session', action: 'routed', targetKind: 'project', targetId: project.id,
       detail: `${project.title} · ${decision.detail}` })
@@ -4135,18 +4299,26 @@ export class ControlPlane {
     const attachments = parseRouterAttachments(entry.attachments)
     const model = parseRouterModel(entry.model)
     const request = { id: entry.requestId, at: entry.at, text: entry.text }
+    // The setting the person stated in this very message is read out of the message itself, so it does not depend on the
+    // model offering it in its first turn. It is a proposal like every other: it waits for a decision, and the Session
+    // that heard it may read it back while it waits.
+    this.proposeStatedPreference(entry.requestId, entry.text, attachments.length > 0)
     // The request the Router may act for: it is the one the message was written with, restored with the time it was
     // written, so the window it may act in is the one it was given.
     if (this.routerRequests.get(entry.requestId) === undefined) {
       this.routerRequests.record(entry.text, entry.requestId, entry.at)
     }
+    // The person's own words travel whole; the reference material of the control plane travels beside them, in its own
+    // fence. The assembly costs no model turn, so the Router's own turn is the only one this message causes.
+    const message = routerRequestMessage(request, attachments)
     // The message is on its way: the state says so before the node answers, so a restart in the middle leaves an honest
     // record behind instead of a message that looks as if it never left.
     this.consoleStore.updateRouterMessage(entry.id, { state: 'sending', error: '' })
     try {
-      await this.sendMessage(ROUTER_SESSION_ID, routerRequestMessage(request, attachments), [entry.id], 'operator', {
+      await this.sendMessage(ROUTER_SESSION_ID, message, [entry.id], 'operator', {
         idempotencyKey: `router-msg:${entry.id}`,
         ...(model === undefined ? {} : { routerModel: model }),
+        context: { query: request.text },
       })
     } catch (error) {
       if (this.closed) return 'unconfirmed'
@@ -4556,7 +4728,10 @@ export class ControlPlane {
       projectId: project.id, projectTitle: project.title, pmSessionId: project.pmSessionId, instruction,
       rationale: decision.rationale, stage: 'routing', reason: verdict.reason, detail: verdict.detail, error: '' })
     request.handoff = { projectId: project.id, instruction }
-    const message = kind === 'brief'
+    // The reference material of the control plane travels beside the instruction, in its own fence — the PM reads its own
+    // Project's live state, its own memo and the memories that answered the instruction, and nothing of another Project.
+    // The fence is added where the message goes out, so the delivery carries exactly what the PM is to read.
+    const brief = kind === 'brief'
       ? routerProjectBriefMessage(request.id, instruction, project.title)
       : routerAutoInstructionMessage(request.id, instruction, project.title, 'work')
     // The handoff is written down before it goes out: the outbox holds the record of what happened to it, so a restart
@@ -4579,7 +4754,7 @@ export class ControlPlane {
         expectedAssignmentEpoch: this.targetEpochs(project.pmSessionId).assignmentEpoch,
         expectedToolTokenVersion: this.targetEpochs(project.pmSessionId).toolTokenVersion,
         expectedNodeTrustEpoch: this.trustEpoch,
-        payload: message,
+        payload: brief,
         context: { kind: 'auto_handoff', requestId: request.id, projectId: project.id, handoffKind: kind },
       })
       // The handoff and the delivery that carries it are one fact, written in one transaction: the history names a
@@ -4599,8 +4774,8 @@ export class ControlPlane {
         return this.handoffOutcomeOf(this.consoleStore.routerHandoff(request.id)!)
       }
       // The key names the delivery, so a repeated attempt of the same request is executed by the node at most once.
-      await this.sendMessage(project.pmSessionId, message, undefined, 'system',
-        { idempotencyKey: key })
+      await this.sendMessage(project.pmSessionId, brief, undefined, 'system',
+        { idempotencyKey: key, context: { query: instruction } })
     } catch (error) {
       const reason = redact(messageOf(error)).slice(0, 300)
       // A missing receipt is not a refusal: the work may have arrived, so it is neither "failed" nor to be repeated.
@@ -5101,14 +5276,59 @@ export class ControlPlane {
    * other — and never a blocker by accident. A blocker and a final go out at once: the Router has to see them without
    * waiting for the interval.
    *
+   * **The Ticket the report is about.** A report that names one is bound to that Ticket and to the Assignment it runs
+   * now, and only such a report may say which memories it used. The Ticket is checked here: it must be one of the PM's
+   * own, or the call is refused. A report that names no Ticket says nothing about any work, so it claims nothing — there
+   * is no task to bind the claim to, and a claim that was bound to the Project as a whole would be counted again by every
+   * later review of that Project.
+   *
    * The report and the work of delivering it are written in one transaction: a report that was written always has its
    * delivery work, and a delivery work always names a report that exists.
    */
-  pmReportProject(sessionId: string, summary: string, kind: PmProjectReportKind = 'progress'):
+  pmReportProject(sessionId: string, summary: string, kind: PmProjectReportKind = 'progress',
+    appliedMemoryIds?: readonly string[], ticketId?: string):
     { projectId: string; report: ProjectReport } {
     const { project } = this.requireProject(sessionId)
     if (project.status === 'archived' || project.status === 'ended') {
       throw new ToolCallError('invalid', `This Project is ${project.status}`)
+    }
+    // The memories the PM names are the ones its own turn really used. They are bound to the Ticket the report is about:
+    // the service compares the names with the ledger of the injection it wrote itself, on the whole binding, so only the
+    // memories that were really in front of that turn about that Ticket count.
+    const named = ticketId === undefined || ticketId.trim() === '' ? undefined : ticketId.trim()
+    let assignmentId = ''
+    if (named !== undefined) {
+      const ticket = this.requireProjectTicket(project, named)
+      const current = latestAssignment(ticket)
+      if (current === undefined) {
+        throw new ToolCallError('invalid', `The Ticket ${named} has no Assignment of its own to report about`)
+      }
+      assignmentId = current.id
+    }
+    if (appliedMemoryIds !== undefined && appliedMemoryIds.length > 0 && named !== undefined) {
+      const record = this.sessions.get(sessionId)
+      if (record !== undefined) {
+        const caller = this.memoryReaderCaller(sessionId, record)
+        if (caller !== undefined) {
+          const claimed = this.memory.claimApplied({
+            caller,
+            memoryIds: appliedMemoryIds,
+            sessionId,
+            assignmentId,
+            ticketId: named,
+            projectId: project.id,
+            nodeId: record.nodeId,
+            generation: this.generationOf(sessionId),
+            evidenceKind: 'ticket',
+            evidenceId: named,
+          })
+          if (claimed.refused.length > 0) {
+            this.audit.record({ actor: 'pm', kind: 'memory', action: 'applied-refused', targetKind: 'ticket',
+              targetId: named, outcome: 'skipped',
+              detail: `${claimed.refused.length} 个记忆 id 不在本次工单回合的注入集合里，没有计入。` })
+          }
+        }
+      }
     }
     const duplicate = project.latestReport?.summary === summary
     const planned = this.store.atomic(() => {
@@ -5669,12 +5889,17 @@ export class ControlPlane {
         const ticket = this.engine.acceptProjectReview(project.id, sessionId, ticketId, assignmentId, reviewId)
         this.audit.record({ actor: 'pm', kind: 'review', action: 'accepted', targetKind: 'ticket', targetId: ticketId,
           detail: `${project.title} · ${ticket.title}` })
+        // The review is the evidence: the memories the Assignment and the PM's own turn about this Ticket really used
+        // are counted once, under this task.
+        this.creditReviewedMemories(ticketId, assignmentId, reviewId)
         return { ticket, review: this.reviewOf(ticket, reviewId) }
       }
       const rejected = this.engine.rejectProjectReview(project.id, sessionId, ticketId, assignmentId, reviewId,
         decision.reason!.trim())
       this.audit.record({ actor: 'pm', kind: 'review', action: 'rejected', targetKind: 'ticket', targetId: ticketId,
         detail: `${project.title} · ${rejected.ticket.title}` })
+      // A result that was sent back is a negative fact about the memories that were in front of it.
+      this.penalizeReviewedMemories(assignmentId, decision.reason!.trim())
       // The revision request goes out to the node; a node that refused it is reported, never hidden.
       const error = await this.revisionFailure(ticketId, assignmentId, rejected.revisionInputId)
       return { ticket: rejected.ticket, review: this.reviewOf(rejected.ticket, reviewId),
@@ -6095,7 +6320,7 @@ export class ControlPlane {
    * the report and never fails the Worker's own call.
    */
   workerReport(sessionId: string, ticketId: string, assignmentId: string | undefined, report: WorkerReport,
-    callKey?: string, toolCallId?: string): Ticket {
+    callKey?: string, toolCallId?: string, appliedMemoryIds?: readonly string[]): Ticket {
     const record = this.requireToolSession(sessionId, 'worker')
     const own = record.assignmentId
     if (!own) throw new ToolCallError('forbidden', 'This Worker Session has no Assignment')
@@ -6116,7 +6341,7 @@ export class ControlPlane {
     if (!current || current.id !== own) {
       throw new ToolCallError('invalid', `Assignment ${own} is not current for Ticket ${ticketId}`)
     }
-    const payloadHash = reportPayloadHash(ticketId, own, report)
+    const payloadHash = reportPayloadHash(ticketId, own, report, appliedMemoryIds ?? [])
     const key = callKey !== undefined && callKey.trim() !== ''
       ? reportCallKey(sessionId, own, callKey.trim())
       : undefined
@@ -6152,6 +6377,12 @@ export class ControlPlane {
         }
       }
       const written = this.engine.report(ticketId, report)
+      // The memories the report names are the ones the task really used — but only the ones that were really in front of
+      // it. The service compares the names with the ledger of the injection it wrote itself, so an id the task never
+      // carried, a memory of another Project and a credential change nothing.
+      if (appliedMemoryIds !== undefined && appliedMemoryIds.length > 0) {
+        this.claimAppliedMemories(record, own, written, appliedMemoryIds)
+      }
       // The row of the durable history is written in the same transaction as the report. Only the state of the report is
       // kept: its text is the Worker's own words and stays in the Ticket. A write that fails is reported on stderr and
       // the fact is lost; the report itself stays written.
@@ -6187,6 +6418,8 @@ export class ControlPlane {
     // throws into this call: a PM that cannot be reached is a diagnostic, not a failed report.
     this.audit.record({ actor: 'worker', kind: 'report', action: report.state, targetKind: 'assignment',
       targetId: own, detail: `${ticket.title} · ${report.summary}` })
+    // The work is over, so the memories it really used are counted — and only then: a progress report adds nothing.
+    this.creditAppliedMemories(outcome.ticket, own)
     this.carryOutReportDelivery(outcome.ticket, own, outcome.plan, key)
     return outcome.ticket
   }
@@ -7149,6 +7382,21 @@ export class ControlPlane {
   }
 
   /**
+   * The words the memory of a task is looked up with.
+   *
+   * They are the task's own: its goal, and its title when it has no goal of its own. The whole brief is not used — it
+   * carries the Assignment, the source and the note, and every extra word makes a good memory look less like an answer,
+   * because the relevance of a hit is measured against the share of the question's terms that its body carries.
+   */
+  private taskQuery(ticket: Ticket): string {
+    const trigger = this.store.triggers.get(ticket.origin.triggerId)
+    const meta = trigger?.meta ?? {}
+    const goal = meta.goal
+    if (typeof goal === 'string' && goal.trim() !== '') return goal.trim()
+    return ticket.title
+  }
+
+  /**
    * The text one Ticket Input contributes to a delivery.
    *
    * A `text` or `note` Input already carries its message. A Trigger Input names only its Trigger, so the Trigger's `text`
@@ -7296,11 +7544,68 @@ export class ControlPlane {
     this.persist(record)
     // Same rule as `openProject`: only the first attempt may reuse a stable key.
     const createKey = retry ? this.uniqueKey('worker-create-confirm', assignmentId) : `worker-create:${assignmentId}`
+    // The brief a Worker starts from carries the bounded reference material beside the task: the live state of the work,
+    // the Project's own memo and the memories that answered the task's words. The task itself is never shortened by it,
+    // and the assembly costs no model turn — so a fast-routed Worker sees all of it in its very first local turn.
+    //
+    // The block is assembled *before* the Worker is created, so the brief that goes out is the one that carries it, and
+    // the ledger is written before the create as well: a Worker that reports as soon as it starts finds its own block in
+    // the ledger and loses nothing.
+    const task = this.ticketOfAssignment(assignmentId)
+    // The life the brief is read under: the Assignment the Worker is created for, as its Ticket counts it now.
+    const epochBefore = task === undefined ? undefined : assignmentEpochOf(task, assignmentId)
+    const generation = this.generationOf(sessionId)
+    const scope: TurnScope = {
+      deliveryId: `worker-create:${assignmentId}`,
+      ticketId: task?.id ?? '',
+      assignmentId,
+      projectId: task?.projectId ?? '',
+      query: task === undefined ? '' : this.taskQuery(task),
+      generation,
+    }
+    let brief: ContextDelivery = task === undefined
+      ? { message: prompt, block: '', memoryIds: [], provisionalIds: [] }
+      : await this.withContext(sessionId, prompt, scope)
+    // The brief waits for the recall, and the Assignment may have been replaced or ended in the meantime: a Worker that
+    // was created for the work of its predecessor would take the place of the Worker that replaced it. The check is read
+    // now, without waiting, and the create goes out only while the Assignment still holds.
+    try {
+      this.assertAssignmentDispatchable(assignmentId, epochBefore)
+    } catch (error) {
+      // The create did not go out: the block never reached a Worker, and the claims that wait for it are refused with it.
+      if (!this.closed) {
+        this.memory.failInjectionDelivery({ deliveryId: `worker-create:${assignmentId}`, sessionId, generation })
+      }
+      throw error
+    }
+    // The memory the brief carries must still be there: a Worker that starts with a deleted body in front of it would be
+    // given a fact that is gone. A brief that names a deleted memory loses its reference material and keeps its task: the
+    // Worker still starts, and it starts without the fact that is gone.
+    const staleBrief = !this.contextIsCurrent(scope, sessionId, brief)
+    if (staleBrief) brief = { message: prompt, block: '', memoryIds: [], provisionalIds: [] }
     try {
       await this.options.node.send({ ...this.base(createKey), type: 'worker.create', sessionId, projectId: workspaceId,
         assignmentId, ticketId, workspace: path, profile: this.workerProfileFor(assignmentId, ticketId),
-        sessionToken: token, prompt })
+        sessionToken: token, prompt: brief.message })
+      // The node took the create: the delivery of the block is confirmed on the path that carried it. A Worker that
+      // reports as soon as it starts finds its block in the ledger either way — it was written before the create. A
+      // control plane that is closing does not write: its file is about to be closed.
+      if (!this.closed) {
+        if (staleBrief) {
+          // The context did not go out: the claims that waited for it are refused with it, and nothing is counted as
+          // having been in front of anybody.
+          this.memory.failInjectionDelivery({ deliveryId: `worker-create:${assignmentId}`, sessionId, generation })
+        } else {
+          this.memory.confirmInjectionDelivery({ deliveryId: `worker-create:${assignmentId}`, sessionId, generation,
+            caller: this.memoryReaderCaller(sessionId, record) })
+        }
+      }
     } catch (error) {
+      // The create did not go out: the block never reached the Worker, and the claims that wait for it are refused with
+      // it. A missing receipt is not a refusal — the Worker may have been created, and it is never repeated on a guess.
+      if (!(error instanceof NodeUnconfirmedError) && !this.closed) {
+        this.memory.failInjectionDelivery({ deliveryId: `worker-create:${assignmentId}`, sessionId, generation })
+      }
       // An ensure that failed on an abnormal receipt must not answer with a Session an operator stopped either.
       const failed = await this.recoverEnsureFailure(record, error, 'Worker')
       await this.enforceOperatorStop(failed)
@@ -7310,6 +7615,28 @@ export class ControlPlane {
     // An ensure that was already in flight when the operator stopped the Worker would bring it back.
     await this.enforceOperatorStop(settled)
     return settled
+  }
+
+  /**
+   * The check that a Worker may still be created for its Assignment.
+   *
+   * It runs after the brief was assembled, because the assembly waits: an Assignment that was replaced or ended while
+   * the recall was running is not the work this brief is about, and a Worker created for it would stand in the place of
+   * the Worker that replaced it. The check reads the Assignment and its generation without waiting, and the create goes
+   * out only while the Assignment still holds.
+   */
+  private assertAssignmentDispatchable(assignmentId: string, epochBefore: number | undefined): void {
+    const ticket = this.ticketOfAssignment(assignmentId)
+    // An Assignment no Ticket owns has no authority to create a Worker for: nothing here is known about it.
+    if (ticket === undefined) return
+    if (!ticket.assignments.some(item => item.id === assignmentId)) {
+      throw new SessionEnsureError(`The Assignment ${assignmentId} is no longer part of the Ticket ${ticket.id}`)
+    }
+    const refused = this.workerRefusal(assignmentId)
+    if (refused !== undefined) throw new SessionEnsureError(refused)
+    if (epochBefore !== undefined && assignmentEpochOf(ticket, assignmentId) !== epochBefore) {
+      throw new SessionEnsureError(`The Assignment ${assignmentId} was replaced while its brief was assembled`)
+    }
   }
 
   /**
@@ -7324,12 +7651,14 @@ export class ControlPlane {
    * forbids the re-ensure below: a scheduled task never starts a Session on its own, so a Session the node may have
    * forgotten is a failure and not something to bring back. `options.validateForSend` is the check that runs immediately
    * before the message goes on the wire: the caller knows which life the message was meant for, and the message leaves
-   * this control plane only while that life still holds.
+   * this control plane only while that life still holds. `options.sealed` says that the payload is a sealed packet: it
+   * carries its own fence and its own reference, so it goes out exactly as it is and nothing is added to it.
    */
   async sendMessage(sessionId: string, text: string, inputIds?: readonly string[],
     origin: 'operator' | 'system' = 'operator',
     options: { idempotencyKey?: string; allowEnsure?: boolean; routerModel?: RouterModel;
-      validateForSend?: () => void } = {}): Promise<void> {
+      validateForSend?: () => void; sealed?: boolean;
+      context?: { readonly ticketId?: string; readonly assignmentId?: string; readonly query?: string } } = {}): Promise<void> {
     let record = this.requireSession(sessionId)
     // A candidate that was sent back waits in the queue of the Session that proposed it, and is handed over with the
     // next message that Session takes. Nothing is woken for it: a Session that may not take a message keeps it waiting.
@@ -7383,17 +7712,95 @@ export class ControlPlane {
     const token = this.tokens.get(sessionId) ?? this.issueToken(record)
     this.tokens.set(sessionId, token)
     const key = options.idempotencyKey ?? this.uniqueKey('message', sessionId)
+    // **Every ordinary message carries the bounded context, and it is assembled here and nowhere else.** The delivery's
+    // own key names the turn, so the ledger knows which delivery the block belonged to, and the scope says which Ticket
+    // and Assignment the turn is about — the facts the wake-up of a report and a handoff carry with them.
+    //
+    // The block is assembled *before* the last check and not after it: the assembly waits — the recall may reach the
+    // embedding provider — and a check that runs before a wait is a check that may already be outdated when the message
+    // goes out. A sealed packet is the exception: it carries its own fence and its own reference, so it goes out exactly
+    // as it is, and nothing is added to it and nothing is written down about it.
+    const scope = this.turnScopeOf(sessionId, record, key, text, options.context)
+    let delivery: ContextDelivery = options.sealed === true
+      ? { message: text, block: '', memoryIds: [], provisionalIds: [] }
+      : await this.withContext(sessionId, text, scope)
     // The last check before the transport. It runs here and not earlier: everything before this line may await, and a
     // check that waits is a check that may already be outdated when the message goes out.
-    options.validateForSend?.()
-    await this.options.node.send({ ...this.base(key), type: 'session.message', sessionId, text,
-      sessionToken: token, ...(inputIds && inputIds.length ? { inputIds } : {}),
-      ...(options.routerModel ? { routerModel: options.routerModel } : {}) })
+    this.assertDeliverableNow(sessionId, before.generation.assignmentEpoch, options.validateForSend)
+    // The memory the block names must still be there: a turn that goes out with a deleted body in front of it would
+    // hand a fact that is gone to the Session that reads it. The check waits for nothing and stands right here, at the
+    // edge of the transport. A block that is no longer true is left behind: the turn goes out with its own words.
+    const staleContext = options.sealed !== true && !this.contextIsCurrent(scope, sessionId, delivery)
+    if (staleContext) delivery = { message: text, block: '', memoryIds: [], provisionalIds: [] }
+    try {
+      await this.options.node.send({ ...this.base(key), type: 'session.message', sessionId, text: delivery.message,
+        sessionToken: token, ...(inputIds && inputIds.length ? { inputIds } : {}),
+        ...(options.routerModel ? { routerModel: options.routerModel } : {}) })
+    } catch (error) {
+      // The delivery did not go out. A missing receipt is not a refusal: the message may have arrived, so the block is
+      // left unconfirmed and the claims that wait for it keep waiting — the delivery is never repeated on a guess.
+      if (options.sealed !== true && !(error instanceof NodeUnconfirmedError) && !this.closed) {
+        this.memory.failInjectionDelivery({ deliveryId: key, sessionId, generation: scope.generation })
+      }
+      throw error
+    }
+    // The node took the message: the delivery of the block is confirmed on the path that carried it, and the memories it
+    // carried are counted as having been in front of somebody now. A control plane that is closing does not write: its
+    // file is about to be closed, and the write would fail for a fact nobody is waiting for any more.
+    if (options.sealed !== true && !this.closed) {
+      if (staleContext) {
+        // The context did not go out — only the message did. The claims that waited for it are refused with it, and
+        // nothing is counted as having been in front of anybody.
+        this.memory.failInjectionDelivery({ deliveryId: key, sessionId, generation: scope.generation })
+      } else {
+        this.memory.confirmInjectionDelivery({ deliveryId: key, sessionId, generation: scope.generation,
+          caller: this.memoryReaderCaller(sessionId, record) })
+      }
+    }
     if (origin === 'operator' && !this.closed) {
       // The message itself is not copied into the audit: its size and its target are the facts worth keeping.
       this.audit.record({ actor: 'operator', kind: 'session', action: 'message', targetKind: 'session',
         targetId: sessionId, detail: `${text.length} 字` })
     }
+  }
+
+  /**
+   * The last check before a message goes on the wire.
+   *
+   * It runs after everything that waits, and it waits for nothing: the Session, the generation it belongs to and the
+   * check the delivery itself brings are read at the very moment the message leaves this control plane. A Session that
+   * was revoked, stopped or paused in the meantime, an Assignment that was replaced in the meantime and a subscription
+   * whose lease ran out in the meantime all keep the message off the wire.
+   *
+   * **The liveness of the node is not this check's business.** A node that went offline is the transport's own failure
+   * and is reported as such; what this check holds is the life of the Session the message was meant for.
+   */
+  private assertDeliverableNow(sessionId: string, expectedAssignmentEpoch: number, validateForSend?: () => void): void {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) throw new Error(`Session ${sessionId} is not running: there is no such Session`)
+    if (record.revokedAt) throw new Error(`Session ${sessionId} was revoked`)
+    const stopped = this.operatorStopRefusal(record)
+    if (stopped !== undefined) throw new Error(`Session ${sessionId} is not running: ${stopped}`)
+    if (record.status === 'archived' || record.status === 'stopped' || record.status === 'stopping'
+      || this.stoppingSessions.has(sessionId)) {
+      throw new Error(`Session ${sessionId} is not running`)
+    }
+    if (record.role === 'worker' && record.assignmentId !== undefined) {
+      const refused = this.workerRefusal(record.assignmentId)
+      if (refused !== undefined) throw new Error(`Session ${sessionId} is not running: ${refused}`)
+    }
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'message')
+    if (!resolved.ok) {
+      // An offline node fails on the wire, not here: the message is not refused for a reason the transport will report
+      // better, and the delivery keeps the receipt it may still get.
+      if (resolved.code !== 'NODE_OFFLINE') {
+        throw new Error(`Session ${sessionId} is not running: ${resolved.reason}`)
+      }
+    } else if (resolved.generation.assignmentEpoch !== expectedAssignmentEpoch) {
+      throw new Error(`Session ${sessionId} is not running: its Assignment was replaced while the message was on its way`)
+    }
+    // The check the delivery itself brings: the life it was planned for, read by the one that owns it.
+    validateForSend?.()
   }
 
   /**
@@ -8900,6 +9307,23 @@ export class ControlPlane {
   }
 
   /**
+   * One memory, read by its id, as one Session reads it.
+   *
+   * The id is the only thing the caller names, and the answer is the memory or nothing at all: an id that was never given
+   * and an id that was deleted are answered in exactly the same way, and so is a memory the Session may not see. The
+   * answer never says which of the three it was.
+   */
+  memoryReadForSession(sessionId: string, memoryId: string): MemoryReadView | undefined {
+    const { record } = this.requireSessionReader(sessionId, 'the long-term memory')
+    const caller = this.memoryReaderCaller(sessionId, record)
+    if (caller === undefined) {
+      throw new ToolCallError('forbidden', 'This Session may not read the long-term memory.')
+    }
+    const found = this.retriever.read(caller, memoryId)
+    return found.found ? found.memory : undefined
+  }
+
+  /**
    * The caller a search is made as.
    *
    * The fences are the ones every read of this control plane's own facts shares, and the work is the one the Session
@@ -8931,6 +9355,394 @@ export class ControlPlane {
   }
 
   /**
+   * The bounded context of one turn: what the control plane may put in front of a model, and nothing more.
+   *
+   * The three parts are the contract's own, in its order: the compact live state of the work, the Project's own handwritten
+   * memo, and the memories that passed the relevance floor. The scope of every part comes from the Session that proved
+   * itself — the role its record carries, the Project it was really delegated, the Assignment it really runs — and never
+   * from the request, so a Worker never reads another Project's facts and a PM never reads another Project's memo.
+   *
+   * **The assembly is a program, not a turn.** Nothing here asks a model anything: the live state is read from the
+   * records, the memo is read from the console's own table, and the memories are recalled by the deterministic retrieval
+   * of `P5-5`. A fast route therefore costs no extra Router turn at all, and the Worker of a fast-routed Ticket sees the
+   * context in its very first local turn.
+   *
+   * **What was injected is written down.** The ledger says which memories the turn really carried, bound to the Session,
+   * the Assignment, the generation and the scope. It is what the applied evidence of `P5-6` is checked against, so a
+   * report may only name the memories that were really in front of that task. The same turn assembled twice is one row,
+   * and an exposure is counted once.
+   *
+   * A missing part is not a failure: a node that is offline, a Project that has no memo and a memory that is not there
+   * simply make the block shorter.
+   */
+  private async assembleTurnContext(sessionId: string, scope: TurnScope): Promise<ContextAssembly> {
+    const record = this.sessions.get(sessionId)
+    if (record === undefined) return emptyContext()
+    const role = contextRoleOf(record.role)
+    if (role === undefined) return emptyContext()
+    const caller = this.memoryReaderCaller(sessionId, record)
+    if (caller === undefined) return emptyContext()
+    const generation = scope.generation
+    if (generation === '') return emptyContext()
+
+    // The delivery that is assembled again carries the same content. The ledger holds what it carried the first time,
+    // and a retry of the same key never shares a different set of memories with the attempt it repeats: what the ledger
+    // keeps is what goes out.
+    const persisted = this.memory.injectionOf({ deliveryId: scope.deliveryId, sessionId, generation })
+    if (persisted !== undefined) {
+      return {
+        block: persisted.block,
+        memoryIds: persisted.memoryIds,
+        provisionalIds: persisted.provisionalIds,
+        tokens: estimateTokens(persisted.block),
+        budget: this.contextBudgets[role],
+        omitted: 0,
+      }
+    }
+
+    const liveState = this.liveStateLines(role, sessionId)
+    const projectMemo = this.projectMemoLines(caller.projectId)
+    const recalled = await this.recalledMemories(caller, scope.query)
+    // The proposals of this very Session: the person's own words that wait for a decision. They are read here only inside
+    // the Session that made them, and they are not memories — they have no id in the memory table and take no part in any
+    // recall.
+    const provisional = role === 'router' ? this.provisionalPreferences(sessionId) : []
+
+    const assembly = assembleContext({
+      role,
+      liveState,
+      projectMemo,
+      memories: recalled,
+      provisional,
+      budget: this.contextBudgets[role],
+    })
+    this.recordContextInjection(sessionId, record, role, caller, scope, assembly, generation)
+    return assembly
+  }
+
+  /**
+   * The setting the person stated in the message they just wrote to the Router.
+   *
+   * The words are read out of the message by a narrow rule (`src/memory/stated-preference.ts`): an explicit marker in the
+   * person's own voice, not refused and not a discussion of a sentence. A message with files is not read at all — the words
+   * may then be about the attachment rather than about the person.
+   *
+   * **It is a proposal, never a memory.** It enters the queue, it waits for a decision by a person, and the Session that
+   * heard the person may read it back while it waits. The scope rules and the review are the ones that always were: this
+   * adds a way in, it does not loosen anything.
+   */
+  private proposeStatedPreference(requestId: string, text: string, hasAttachments: boolean): void {
+    if (hasAttachments) return
+    const content = statedPreferenceOf(text)
+    if (content === undefined) return
+    const result = this.memoryProposeFor(ROUTER_SESSION_ID, {
+      content,
+      scopeType: 'user_global',
+      scopeId: 'global',
+      sourceRefs: [{ kind: 'operator_message', id: requestId }],
+    })
+    if (!result.ok || result.candidate === undefined) return
+    this.audit.record({ actor: 'router', kind: 'memory', action: 'proposed', targetKind: 'candidate',
+      targetId: result.candidate.candidateId, detail: '人明确说出的偏好，已入队等待一次决定。' })
+  }
+
+  /**
+   * The message one turn carries: the raw text of the task, and the bounded reference material beside it.
+   *
+   * The two are kept apart on purpose. The raw text — the person's own words, the task's own constraints — is never
+   * shortened and never mixed into the reference material; the block is added after it, in a fence that calls it data.
+   *
+   * A context that cannot be assembled is no context at all: the turn goes on with the text it always had. A turn is
+   * never lost because a memory table was locked.
+   *
+   * The block is handed back beside the message, because the message that goes out has to be checked against it once
+   * more at the transport: what was assembled may no longer be what may be sent.
+   */
+  private async withContext(sessionId: string, text: string, scope: TurnScope): Promise<ContextDelivery> {
+    try {
+      const assembly = await this.assembleTurnContext(sessionId, scope)
+      if (assembly.block === '') return { message: text, block: '', memoryIds: [], provisionalIds: [] }
+      return {
+        message: `${text}\n\n${assembly.block}`,
+        block: assembly.block,
+        memoryIds: assembly.memoryIds,
+        provisionalIds: assembly.provisionalIds,
+      }
+    } catch (error) {
+      process.stderr.write(`superagent control-plane context assembly failed: ${messageOf(error)}\n`)
+      return { message: text, block: '', memoryIds: [], provisionalIds: [] }
+    }
+  }
+
+  /**
+   * The check that stands closest to the transport: the memory a turn carries must still be there.
+   *
+   * The assembly waits — for the recall, and for the embedding provider behind it — and a memory may be deleted while
+   * it waits. The check is synchronous and it runs after everything that waits and before the message goes out: a block
+   * that names a memory which is gone is a snapshot that may not be sent.
+   *
+   * **A stale snapshot is dropped, not shipped.** The task itself still goes out with its own words; only the reference
+   * material that named a deleted fact is left behind. The ledger row goes with it: the block that was assembled is not
+   * the block that went out, and nothing may be counted on a block that was never sent.
+   */
+  private contextIsCurrent(scope: TurnScope, sessionId: string, delivery: ContextDelivery): boolean {
+    if (delivery.block === '') return true
+    const current = this.memory.snapshotIsCurrent({
+      deliveryId: scope.deliveryId,
+      sessionId,
+      generation: scope.generation,
+      block: delivery.block,
+      memoryIds: delivery.memoryIds,
+      provisionalIds: delivery.provisionalIds,
+    })
+    if (current) return true
+    this.memory.withdrawInjectionSnapshot(scope.deliveryId, sessionId, scope.generation)
+    return false
+  }
+
+  /**
+   * The scope one turn's context is read under.
+   *
+   * The Session proves who it is: a Worker is about the Assignment and the Ticket it really runs, a PM about the Project
+   * it was really delegated, the Router about nothing but the pool it manages. The delivery may say more — the wake-up of
+   * a report knows the Ticket and the Assignment it is about — and what it says is checked against the Session's own
+   * record before it is used.
+   */
+  private turnScopeOf(sessionId: string, record: SessionRecord, deliveryId: string, text: string,
+    context?: { readonly ticketId?: string; readonly assignmentId?: string; readonly query?: string }): TurnScope {
+    const caller = this.memoryReaderCaller(sessionId, record)
+    const ticketId = context?.ticketId ?? caller?.ticketId ?? ''
+    const assignmentId = context?.assignmentId ?? record.assignmentId ?? ''
+    // The Project comes from the Session that proved itself: a delivery may say which Ticket and which Assignment a turn
+    // is about, but it never decides which Project a turn belongs to.
+    const projectId = caller?.projectId ?? ''
+    return { deliveryId, ticketId, assignmentId, projectId, query: context?.query ?? text,
+      generation: this.generationOf(sessionId) }
+  }
+
+  /**
+   * The compact live state of one turn: a few lines about the work that runs now.
+   *
+   * The snapshot is the one of `P5-1`, read for the Session that proved itself, and only its counts and states are kept:
+   * a Worker needs to know that its node is there and that its Assignment runs, a PM needs to know how much of its Project
+   * is in flight, and the Router needs to know what this control plane is doing. The list of everything is the console's
+   * business, not a turn's.
+   */
+  private liveStateLines(role: ContextRole, sessionId: string): readonly string[] {
+    const snapshot = this.liveState.forSession({ audience: role, sessionId })
+    if (!snapshot.ok) return []
+    const state = snapshot.snapshot
+    const lines: string[] = []
+    for (const node of state.nodes.rows) {
+      lines.push(`节点 ${node.nodeId}：${node.connection === 'online' ? '在线' : node.connection === 'offline' ? '离线' : '状态未知'}`)
+    }
+    lines.push(`项目 ${state.projects.total} 个 · 工单 ${state.tickets.total} 张 · 在跑的派工 ${state.assignments.total} 个`
+      + ` · 会话 ${state.sessions.total} 个`)
+    const running = state.assignments.rows.filter(row => row.state === 'running')
+    for (const assignment of running.slice(0, 3)) {
+      lines.push(`在跑：工单 ${assignment.ticketId} 的派工 ${assignment.assignmentId}（${assignment.state}）`)
+    }
+    return lines
+  }
+
+  /** The Project's own memo, as the lines of one turn may carry it. */
+  private projectMemoLines(projectId: string | undefined): readonly string[] {
+    if (projectId === undefined || projectId === '') return []
+    return this.projectMemory(projectId, CONTEXT_MEMO_LIMIT).map(entry => entry.text)
+  }
+
+  /** The memories that answered the question, as the block may carry them. */
+  private async recalledMemories(caller: MemoryCaller, query: string): Promise<readonly ContextMemoryItem[]> {
+    if (query.trim() === '') return []
+    try {
+      const found = await this.retriever.search({ caller, query, limit: CONTEXT_MEMORY_LIMIT })
+      return found.hits.map(hit => ({
+        memoryId: hit.memoryId,
+        scopeType: hit.scopeType,
+        scopeId: hit.scopeId,
+        content: hit.content,
+        sourceTrust: hit.sourceTrust,
+        sourceRefs: hit.sourceRefs.map(ref => ({ kind: ref.kind, id: ref.id, verified: ref.verified })),
+        lastVerifiedAt: hit.lastVerifiedAt,
+        staleWarning: hit.staleWarning,
+        conflictWarning: hit.conflictWarning,
+        tainted: hit.tainted,
+        provisional: false,
+      }))
+    } catch (error) {
+      // A recall that fails is a turn without memories, not a turn that fails: the raw text is still there.
+      process.stderr.write(`superagent control-plane memory recall failed: ${messageOf(error)}\n`)
+      return []
+    }
+  }
+
+  /** The proposals of one Router Session that wait for a decision. */
+  private provisionalPreferences(sessionId: string): readonly ContextMemoryItem[] {
+    return this.memory.provisionalFor(sessionId).map(candidate => ({
+      memoryId: candidate.candidateId,
+      scopeType: candidate.scopeType,
+      scopeId: candidate.scopeId,
+      content: candidate.content,
+      sourceTrust: candidate.sourceTrust,
+      sourceRefs: candidate.sourceRefs.map(ref => ({ kind: ref.kind, id: ref.id, verified: ref.verified })),
+      lastVerifiedAt: candidate.updatedAt,
+      staleWarning: false,
+      conflictWarning: false,
+      tainted: candidate.sourceTrust === 'external_tainted',
+      provisional: true,
+    }))
+  }
+
+  /**
+   * Write down what one turn really carried.
+   *
+   * The row is the ledger of the injection, and it is written before the delivery goes out: the block is what the turn
+   * carries, and the delivery is only its confirmation.
+   *
+   * **The whole binding is written down**: the Session, the Assignment, the Ticket, the Project, the machine and the
+   * generation the block was read under. A claim is compared with all of it at once, so a block that was read under
+   * another generation, for another Ticket, in another Project or on another machine is not the block that task carried.
+   *
+   * **The content is written down with it.** The ledger holds the block itself, so a delivery that is assembled again
+   * carries the same content: the snapshot and the wire say the same thing.
+   *
+   * **An exposure is not counted here.** A memory that was assembled and never delivered was in front of nobody; the
+   * exposure is counted on the path that carried it, when the delivery is confirmed.
+   */
+  private recordContextInjection(sessionId: string, record: SessionRecord, role: ContextRole, caller: MemoryCaller,
+    scope: TurnScope, assembly: ContextAssembly, generation: string): void {
+    if (assembly.block === '') return
+    const assignmentId = scope.assignmentId !== '' ? scope.assignmentId : (record.assignmentId ?? '')
+    if (generation === '') return
+    // A control plane that is closing does not write: its file is about to be closed.
+    if (this.closed) return
+    const injectionId = contextInjectionId(scope.deliveryId, sessionId, generation)
+    this.memory.recordInjection({
+      injectionId,
+      sessionId,
+      role,
+      assignmentId,
+      ticketId: scope.ticketId !== '' ? scope.ticketId : (caller.ticketId ?? ''),
+      projectId: scope.projectId !== '' ? scope.projectId : (caller.projectId ?? ''),
+      nodeId: record.nodeId,
+      generation,
+      deliveryId: scope.deliveryId,
+      block: assembly.block,
+      memoryIds: assembly.memoryIds,
+      provisionalIds: assembly.provisionalIds,
+    })
+  }
+
+  /**
+   * The generation one Session was read under, as the ledger names it.
+   *
+   * It names the life of the Session and not its credential: a refreshed token replaces the credential and nothing else,
+   * and a ledger that changed its name on every refresh would forget the block it wrote a moment earlier. The node's trust
+   * generation and the lifecycle generation of the Assignment are the two facts that say which life this is.
+   *
+   * An empty answer means the control plane could not resolve the life of that Session: the caller may not treat it as
+   * a generation that matched, and nothing may be claimed under it.
+   */
+  private generationOf(sessionId: string): string {
+    const resolved = this.resolver.resolveSessionNow(sessionId, 'message')
+    if (!resolved.ok) return ''
+    const generation = resolved.generation
+    return `${generation.nodeTrustEpoch}.${generation.assignmentEpoch}`
+  }
+
+  /**
+   * Write down that a task really used some memories.
+   *
+   * The names the report carries are checked against the ledger of the injection the control plane wrote itself: a memory
+   * that was really in front of that task counts, and anything else does not — not an id the task never carried, not a
+   * memory of another Project, not a credential. What counts is bound to the Session, the Assignment, the Ticket, the
+   * Project, the machine and the generation, so a retry of the same report claims the same memory once and a Worker that
+   * was replaced claims nothing of its predecessor's work.
+   */
+  private claimAppliedMemories(record: SessionRecord, assignmentId: string, ticket: Ticket,
+    memoryIds: readonly string[]): void {
+    const caller = this.memoryReaderCaller(record.sessionId, record)
+    if (caller === undefined) return
+    const generation = this.generationOf(record.sessionId)
+    const result = this.memory.claimApplied({
+      caller,
+      memoryIds,
+      sessionId: record.sessionId,
+      assignmentId,
+      ticketId: ticket.id,
+      projectId: ticket.projectId ?? '',
+      nodeId: record.nodeId,
+      generation,
+      evidenceKind: 'assignment',
+      evidenceId: assignmentId,
+    })
+    if (result.refused.length === 0) return
+    this.audit.record({ actor: 'worker', kind: 'memory', action: 'applied-refused', targetKind: 'assignment',
+      targetId: assignmentId, outcome: 'skipped',
+      detail: `${result.refused.length} 个记忆 id 不在本次任务的注入集合里，没有计入。` })
+  }
+
+  /**
+   * Count the memories a finished task really used.
+   *
+   * The count happens when the work is really over — the Assignment ended, the Ticket closed as completed — and never
+   * before: a progress report and a read add nothing, and an exposure never makes a memory more useful. The same task is
+   * counted once, because the gate of the evidence is idempotent, and a memory that was replaced in the meantime is not
+   * counted at all: the version that is in force now is the one that counts.
+   */
+  private creditAppliedMemories(ticket: Ticket, assignmentId: string): void {
+    if (ticket.ended?.outcome !== 'completed') return
+    const claimed = this.memory.claimedMemoryIds({ evidenceKind: 'assignment', evidenceId: assignmentId })
+    if (claimed.length === 0) return
+    const result = this.memory.creditEffectiveUse({ memoryIds: claimed, evidence: { assignmentId } })
+    if (!result.ok) return
+    const counted = result.credited.filter(credit => !credit.alreadyCredited)
+    if (counted.length === 0) return
+    this.audit.record({ actor: 'system', kind: 'memory', action: 'applied-counted', targetKind: 'assignment',
+      targetId: assignmentId, detail: `${counted.length} 条记忆被这次完成证实使用。` })
+  }
+
+  /**
+   * Count the memories a review really used, when the PM accepted the result.
+   *
+   * The review is the evidence: an accepted review is a conclusion the control plane confirmed. The memories of the
+   * Assignment under review and the memories the PM itself named **for that Ticket and that Assignment** are counted
+   * together, once.
+   *
+   * **The PM's own claims are bound to one Ticket and one Assignment.** A claim the PM made about another Ticket of the
+   * same Project is not counted here, and a claim it made in an earlier round of this Ticket is not counted either: a
+   * later review of the Project must not pay for the claims of every review that came before it.
+   */
+  private creditReviewedMemories(ticketId: string, assignmentId: string, reviewId: string): void {
+    const claimed = [
+      ...this.memory.claimedMemoryIds({ evidenceKind: 'assignment', evidenceId: assignmentId }),
+      ...this.memory.claimedMemoryIds({ evidenceKind: 'ticket', evidenceId: ticketId, assignmentId }),
+    ]
+    if (claimed.length === 0) return
+    const result = this.memory.creditEffectiveUse({ memoryIds: claimed, evidence: { reviewId, assignmentId } })
+    if (!result.ok) return
+    const counted = result.credited.filter(credit => !credit.alreadyCredited)
+    if (counted.length === 0) return
+    this.audit.record({ actor: 'system', kind: 'memory', action: 'applied-counted', targetKind: 'review',
+      targetId: reviewId, detail: `${counted.length} 条记忆被这次验收证实使用。` })
+  }
+
+  /**
+   * Take the usefulness away from the memories that misled a result.
+   *
+   * A result the PM sent back is a negative fact about the memories that were in front of it: their confidence falls a
+   * step, and one that falls under the floor waits for somebody to look at it again instead of being injected on its own.
+   */
+  private penalizeReviewedMemories(assignmentId: string, reason: string): void {
+    const claimed = this.memory.claimedMemoryIds({ evidenceKind: 'assignment', evidenceId: assignmentId })
+    if (claimed.length === 0) return
+    const penalized = this.memory.penalizeMemories(claimed, reason)
+    if (penalized === 0) return
+    this.audit.record({ actor: 'system', kind: 'memory', action: 'applied-disputed', targetKind: 'assignment',
+      targetId: assignmentId, detail: `${penalized} 条记忆的置信度下降。` })
+  }
+
+  /**
    * One memory that a person says misled somebody.
    *
    * The console is the operator's own console, so this is the one place a memory may be called misleading: its confidence
@@ -8940,6 +9752,71 @@ export class ControlPlane {
     return this.memory.disputeMemory({
       caller: this.operatorCaller(),
       memoryId: input.memoryId,
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    })
+  }
+
+  /**
+   * One memory, read by its id, as the operator reads it.
+   *
+   * A memory that is not in force is not there, and an id that was never given is answered in exactly the same way: the
+   * answer does not say whether the id ever existed, and it does not say whether the memory was forgotten or never was.
+   */
+  memoryRecordForOperator(memoryId: string): MemoryRecordView | undefined {
+    const found = this.memory.readMemory(this.operatorCaller(), memoryId)
+    if (!found.found) return undefined
+    return found.memory
+  }
+
+  /**
+   * Replace a memory with a new version of it, at the console.
+   *
+   * The act belongs to the operator alone and names the version it was made on: a memory that changed in the meantime is
+   * refused, so two people never overwrite each other. The new version takes the place of the old one, the old one keeps
+   * its history, and the trust of the fact does not change.
+   */
+  memoryEditByOperator(input: { memoryId: string; content: string; checksum: string }): MemoryGovernanceResult {
+    return this.memory.editMemory({
+      caller: this.operatorCaller(),
+      memoryId: input.memoryId,
+      content: input.content,
+      expectedChecksum: input.checksum,
+    })
+  }
+
+  /**
+   * Pin a memory, or let it go, at the console.
+   *
+   * A pinned memory comes before an unpinned one when the ranking ties, and nothing else about it changes. The act belongs
+   * to the operator alone and names the version it was made on.
+   */
+  memoryPinByOperator(input: { memoryId: string; pinned: boolean; checksum: string }): MemoryGovernanceResult {
+    return this.memory.pinMemory({
+      caller: this.operatorCaller(),
+      memoryId: input.memoryId,
+      pinned: input.pinned,
+      expectedChecksum: input.checksum,
+    })
+  }
+
+  /**
+   * Delete a memory for good, at the console.
+   *
+   * The act belongs to the operator alone: the body of the memory goes away with the row that held it, together with the
+   * copies of those words that wait in the queue, the entries the keyword index holds and the claims that named it.
+   * Nothing else may do this — not a model, not an API, and not a request that names itself the operator.
+   *
+   * **One transaction, or nothing.** The review jobs and the returns of the manager name the candidates that went with the
+   * memory, and they go with it: a job that was already dispatched cannot still read a body that is gone.
+   *
+   * The answer says what is gone and never what it said: the body and the fingerprint of a deleted memory are not
+   * repeated to the caller.
+   */
+  memoryDeleteByOperator(input: { memoryId: string; checksum: string; reason?: string }): MemoryDeleteResult {
+    return this.memory.deleteMemory({
+      caller: this.operatorCaller(),
+      memoryId: input.memoryId,
+      expectedChecksum: input.checksum,
       ...(input.reason === undefined ? {} : { reason: input.reason }),
     })
   }
@@ -9039,11 +9916,15 @@ export class ControlPlane {
         if (ticket === undefined) return undefined
         const assignment = ticket.assignments.find(entry => entry.id === id)
         if (assignment === undefined) return undefined
+        // The machine the work really ran on: the Session that ran it, and nothing else. A fact about that machine may
+        // be credited by this work, and by no other.
+        const worker = assignment.sessionId === undefined ? undefined : this.sessions.get(assignment.sessionId)
         return {
           at: assignment.endedAt ?? assignment.startedAt ?? assignment.createdAt,
           authoritative: assignment.state === 'ended',
           tainted: false,
           ...(ticket.projectId === undefined ? {} : { projectId: ticket.projectId }),
+          ...(worker?.nodeId === undefined ? {} : { nodeId: worker.nodeId }),
         }
       }
       case 'review': {
@@ -9083,9 +9964,14 @@ export class ControlPlane {
         return { at: row.at, authoritative: false, tainted: false, projectId: row.projectId }
       }
       case 'operator_message': {
-        const row = this.consoleStore.routerMessage(id)
+        // The Router knows the request id it was given; the message itself is stored under the same name with another
+        // prefix, so both spellings find the same row. The row is a message the person wrote directly to the Router: an
+        // attachment, an observation from outside and the model's own words are not messages of theirs, and nothing but
+        // this row may be named as the person's own words.
+        const messageId = id.startsWith('router-req-') ? `router-msg-${id.slice('router-req-'.length)}` : id
+        const row = this.consoleStore.routerMessage(messageId)
         if (row === undefined) return undefined
-        return { at: row.at, authoritative: false, tainted: false }
+        return { at: row.at, authoritative: false, tainted: false, text: row.text }
       }
       case 'external_event': {
         const row = this.externalEvents.disposition(id)
@@ -9478,7 +10364,7 @@ export class ControlPlane {
    * together, or neither is.
    */
   private memoryReevaluateFor(caller: MemoryCaller, input: { content: string; scopeType: string; scopeId: string;
-    candidateId?: string; checksum?: string }): MemorySubmitResult {
+    candidateId?: string; checksum?: string; sourceRefs?: readonly SourceRefInput[] }): MemorySubmitResult {
     const candidateId = input.candidateId ?? ''
     const request = this.manager.pendingReturnOf(candidateId, caller.sessionId)
     if (request === undefined) {
@@ -9506,7 +10392,8 @@ export class ControlPlane {
     try {
       outcome = this.memory.transaction((): MemorySubmitResult => {
         const result = this.memory.reevaluate({ caller, candidateId, expectedChecksum: request.checksum,
-          ...(input.content === undefined ? {} : { content: input.content }) })
+          ...(input.content === undefined ? {} : { content: input.content }),
+          ...(input.sourceRefs === undefined ? {} : { sourceRefs: input.sourceRefs }) })
         if (!result.ok) return result
         this.manager.markReturnReevaluated(request.returnId)
         return result

@@ -36,7 +36,8 @@ import type { Store } from '../app/store.ts'
 import { redact } from '../infra/redact.ts'
 import { NodeUnconfirmedError, type SessionRecord, type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
-import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
+import { readContext, type CoordinationDeliveryKind, type CoordinationDeliveryRow, type DeliveryOutbox,
+  type DeliveryRevalidation } from './delivery-outbox.ts'
 import { fastRoute, type FastRouteDecision, type FastRouteFacts } from './fast-router.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
 import { compilePattern, safeMatches, PatternError } from './safe-regex.ts'
@@ -499,7 +500,7 @@ export interface EventSubscriptionHost {
    * repeated on a guess.
    */
   deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void,
-    validateBeforeEnsure?: () => void): Promise<void>
+    validateBeforeEnsure?: () => void, kind?: CoordinationDeliveryKind): Promise<void>
   /**
    * The optional semantic evaluator.
    *
@@ -1605,7 +1606,7 @@ export class EventSubscriptionService {
         return { status: 'failed', reason: 'the delivery was already claimed' }
       }
       await this.host.deliver(targetSessionId, text, key, () => { this.assertSendable(row, targetSessionId, row.revision) },
-        () => { this.assertSendable(row, targetSessionId, row.revision) })
+        () => { this.assertSendable(row, targetSessionId, row.revision) }, 'external_wakeup')
     } catch (error) {
       if (error instanceof NodeUnconfirmedError) {
         // The receipt is missing: the event may have arrived, and it is never sent again on a guess.

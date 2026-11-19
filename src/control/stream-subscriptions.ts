@@ -36,7 +36,8 @@ import { randomUUID } from 'node:crypto'
 import type { ProjectProfile, Ticket } from '../core/index.ts'
 import type { Store } from '../app/store.ts'
 import { redact } from '../infra/redact.ts'
-import { readContext, type CoordinationDeliveryRow, type DeliveryOutbox, type DeliveryRevalidation } from './delivery-outbox.ts'
+import { readContext, type CoordinationDeliveryKind, type CoordinationDeliveryRow, type DeliveryOutbox,
+  type DeliveryRevalidation } from './delivery-outbox.ts'
 import { NodeUnconfirmedError, type SessionRecord, type SessionRole } from '../shared/protocol.ts'
 import type { AuditInput } from './console-audit.ts'
 import type { NodeResolutionResult, ResolvedTarget } from './node-resolver.ts'
@@ -335,7 +336,7 @@ export interface StreamSubscriptionHost {
    * reaches the wire, and never even wakes the Session it was planned for.
    */
   deliver(sessionId: string, text: string, idempotencyKey: string, validateForSend?: () => void,
-    validateBeforeEnsure?: () => void): Promise<void>
+    validateBeforeEnsure?: () => void, kind?: CoordinationDeliveryKind): Promise<void>
   /** Write one line of the audit trail. */
   audit(input: AuditInput): void
 }
@@ -775,7 +776,7 @@ export class StreamSubscriptionService {
         this.assertSendable(current)
       }, () => {
         this.assertSendable(current)
-      })
+      }, 'stream_digest')
     } catch (error) {
       // A missing receipt is not a refusal: the digest may have arrived, so it is neither a failure nor to be repeated.
       if (error instanceof NodeUnconfirmedError) {

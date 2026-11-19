@@ -266,12 +266,31 @@ const longTerm = (over: Partial<ComponentProps<typeof LongTermMemoryView>> = {})
     onInspect: over.onInspect ?? (() => {}),
     searchQuery: over.searchQuery ?? '',
     search: over.search,
+    searchScope: over.searchScope ?? '',
+    searchScopeOptions: over.searchScopeOptions ?? [
+      { value: '', label: '全部作用域' },
+      { value: 'user_global|global', label: '全局偏好' },
+    ],
     searchState: over.searchState ?? 'idle',
     searchError: over.searchError ?? '',
+    editing: over.editing ?? '',
+    editText: over.editText ?? '',
+    deleting: over.deleting ?? '',
+    includeInactive: over.includeInactive ?? false,
+    onIncludeInactiveChange: over.onIncludeInactiveChange ?? (() => {}),
     onSearchQueryChange: over.onSearchQueryChange ?? (() => {}),
     onSearch: over.onSearch ?? (() => {}),
+    onSearchScopeChange: over.onSearchScopeChange ?? (() => {}),
     onClearSearch: over.onClearSearch ?? (() => {}),
     onDispute: over.onDispute ?? (() => {}),
+    onEditStart: over.onEditStart ?? (() => {}),
+    onEditTextChange: over.onEditTextChange ?? (() => {}),
+    onEditCancel: over.onEditCancel ?? (() => {}),
+    onEditSave: over.onEditSave ?? (() => {}),
+    onTogglePin: over.onTogglePin ?? (() => {}),
+    onDeleteStart: over.onDeleteStart ?? (() => {}),
+    onDeleteCancel: over.onDeleteCancel ?? (() => {}),
+    onDelete: over.onDelete ?? (() => {}),
     onOpenProjects: over.onOpenProjects ?? (() => {}),
   })
 
@@ -568,11 +587,56 @@ describe('the long-term memory panel', () => {
     expect(page).toContain('提交候选')
   })
 
-  it('does not offer a way to forget a memory, because that is not decided yet', () => {
+  it('offers the governance of a memory, and asks a second time before it deletes one', () => {
     const page = html(longTerm({ memories: [memory()] }))
-    expect(page).toContain('遗忘一条记忆的做法还没有定')
-    expect(page).not.toContain('>遗忘</button>')
+    expect(page).toContain('编辑')
+    expect(page).toContain('置顶')
+    expect(page).toContain('永久删除')
+    // The deletion itself waits: the row has to be asked once more, and the act is not a single click.
+    expect(page).not.toContain('确认永久删除')
     expect(page).not.toContain('>删除</button>')
+  })
+
+  it('says what a permanent deletion does before it is done', () => {
+    const page = html(longTerm({ memories: [memory()], deleting: 'mem_000000000001' }))
+    expect(page).toContain('确认永久删除')
+    // The wording of the confirmation itself: what goes, and what stays.
+    expect(page).toContain('都会被抹去')
+    expect(page).toContain('正文')
+    expect(page).toContain('待审副本')
+    expect(page).toContain('关键词索引')
+    expect(page).toContain('不留指纹')
+    // The history around it keeps its own rules, and the fact may be extracted again as a new one.
+    expect(page).toContain('旧工单与会话按各自规则保留')
+    expect(page).toContain('备份不被改写')
+    expect(page).toContain('新的记忆')
+  })
+
+  it('shows the rows that are not in force, with their own state, and still offers the deletion', () => {
+    const page = html(longTerm({
+      memories: [memory(), memory({ memoryId: 'mem_000000000002', status: 'superseded' })],
+      includeInactive: true,
+    }))
+    // The filter is offered, and the list says what it holds.
+    expect(page).toContain('只看生效中的记忆')
+    expect(page).toContain('含历史版本')
+    expect(page).toContain('历史版本，已被新版本取代')
+    // The old version is still in the running library: it can be deleted, and the deletion asks a second time.
+    expect(page).toContain('aria-label="永久删除记忆 mem_000000000002"')
+    // The edit and the pin are for the memories that are in force.
+    expect(page).toMatch(/aria-label="编辑记忆 mem_000000000002"[^>]*disabled/)
+    expect(page).toMatch(/aria-label="置顶记忆 mem_000000000002"[^>]*disabled/)
+    expect(page).not.toMatch(/aria-label="编辑记忆 mem_000000000001"[^>]*disabled/)
+  })
+
+  it('offers the scope of the search, and names the one that is chosen', () => {
+    const page = html(longTerm({ searchScope: 'project|project:p1', searchScopeOptions: [
+      { value: '', label: '全部作用域' },
+      { value: 'project|project:p1', label: '项目：控制台改造' },
+    ] }))
+    expect(page).toContain('id="memory-search-scope"')
+    expect(page).toContain('全部作用域')
+    expect(page).toContain('项目：控制台改造')
   })
 
   it('shows the candidates that wait for a person apart, and offers the decision there', () => {
@@ -637,7 +701,7 @@ describe('the search of the long-term memory', () => {
     expect(page).toContain('检索')
     expect(page).toContain('清除')
     // The search is a read: nothing about it writes a memory.
-    expect(page).not.toContain('>遗忘</button>')
+    expect(page).not.toContain('>永久删除</button>')
   })
 
   it('shows what the search found, with its scope, its sources and the reasons of its score', () => {

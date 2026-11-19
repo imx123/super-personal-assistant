@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ControlPlane } from '../src/control/control-plane.ts'
 import { FetchControlPlaneServer as ControlPlaneServer } from './fixtures/fetch-servers.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 
 const SECRET = 'operator-secret'
@@ -199,14 +200,16 @@ describe('the operator routes', () => {
 
     const toPm = await post(`/v1/console/sessions/${pmSessionId}/message`, { text: '进展如何' })
     expect(toPm.status).toBe(200)
-    expect(node.messages.get(pmSessionId)).toContain('进展如何')
+    expect(messagesWithoutContext(node.messages.get(pmSessionId))).toContain('进展如何')
 
     const toWorker = await post(`/v1/console/sessions/${workerSession}/message`, { text: '先做第二步' })
     expect(toWorker.status).toBe(200)
     // The message is a Ticket Input, so the domain keeps it and delivers it to the current Assignment.
     const ticket = control!.store.tickets.get(ticketId)!
     expect(ticket.inputs.some(input => input.kind === 'note' && input.text === '先做第二步')).toBe(true)
-    await until(() => (node.messages.get(workerSession) ?? []).includes('先做第二步'),
+    // The Worker receives the words of the person with the reference material beside them, so the words are read without
+    // that material — the same way the PM's own words are read.
+    await until(() => messagesWithoutContext(node.messages.get(workerSession)).includes('先做第二步'),
       'the message did not reach the Worker')
   })
 

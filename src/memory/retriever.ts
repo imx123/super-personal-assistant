@@ -44,6 +44,7 @@
 import { createHash } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { allowedScopes, parseSourceRefs, type MemoryCaller, type MemoryScopeSet, type MemorySourceRef } from './memory-scope.ts'
+import { enableFtsSecureDelete } from './secure-delete.ts'
 
 /**
  * A provider that turns text into numbers.
@@ -397,6 +398,10 @@ export class MemoryRetriever {
       // rebuilt from the table whenever the database is opened again.
       this.onError(error)
     }
+    // The index holds the words of every memory it indexed. The setting below makes it overwrite what it deletes, so a
+    // deleted body does not stay readable inside the index; the core setting of the same name does the same for the
+    // tables of the database itself.
+    enableFtsSecureDelete(this.db, 'long_term_memories_fts', this.onError)
   }
 
   /**
@@ -496,10 +501,14 @@ export class MemoryRetriever {
     const lexical = this.lexicalScores(authorized, query, scopes, input.scope)
     const candidates = this.candidateSet(authorized, lexical)
     const semantic = await this.semanticScores(candidates, query, nowMs)
+    // The semantic path waits — for the provider — and a memory may be deleted while it waits. A row that is gone is not
+    // an answer: the rows are read again, so a fact that left the recall while the provider was busy leaves it too.
+    const alive = this.stillInForce(candidates)
     const conflicted = this.conflictedMemories()
 
     const scored: MemoryHit[] = []
     for (const row of candidates) {
+      if (!alive.has(row.seq)) continue
       const lex = lexical.get(row.seq)
       const vector = semantic.scores.get(row.seq) ?? 0
       const lexicalScore = lex?.lexical ?? 0
@@ -625,6 +634,23 @@ export class MemoryRetriever {
     }
     carrying.sort((left, right) => (lexical.get(right.seq)?.lexical ?? 0) - (lexical.get(left.seq)?.lexical ?? 0))
     return [...carrying, ...rest].slice(0, this.config.candidateLimit)
+  }
+
+  /**
+   * The candidates that are still in force.
+   *
+   * A memory that was deleted while the semantic path waited is not in the answer: the rows are read again, and a row
+   * that is gone — or that is no longer in force — leaves the set with it.
+   */
+  private stillInForce(candidates: readonly EligibleRow[]): Set<number> {
+    const alive = new Set<number>()
+    if (candidates.length === 0) return alive
+    const placeholders = candidates.map(() => '?').join(', ')
+    const rows = this.db.prepare(
+      `SELECT seq FROM long_term_memories WHERE status = 'active' AND seq IN (${placeholders})`)
+      .all(...candidates.map(row => row.seq)) as { seq: number }[]
+    for (const row of rows) alive.add(Number(row.seq))
+    return alive
   }
 
   /**
@@ -839,8 +865,8 @@ export class MemoryRetriever {
    * One memory, read by its id.
    *
    * A memory that is not in force is not there as far as this read is concerned, and an id that was never given is
-   * answered in exactly the same way: the answer does not say whether the id ever existed, and it does not say whether
-   * the id was forgotten or never was.
+   * answered in exactly the same way: the answer does not say whether the id ever existed. A deleted id is not there
+   * either, and a memory the caller may not see is not there either — the three are one answer.
    */
   read(caller: MemoryCaller, memoryId: string): MemoryReadResult {
     if (memoryId === '') return { found: false }

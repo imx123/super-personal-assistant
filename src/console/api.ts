@@ -1427,6 +1427,58 @@ export function disputeMemory(input: { memoryId: string; reason?: string }): Pro
     { ...(input.reason === undefined ? {} : { reason: input.reason }) })
 }
 
+/**
+ * Replace a memory with a new version of it.
+ *
+ * The edit names the version it was made on: a memory that changed in the meantime is refused rather than overwritten, so
+ * two people never write over each other. The old memory keeps its history and leaves the recall; the answer holds both.
+ */
+export function editMemory(input: { memoryId: string; content: string; checksum: string }):
+  Promise<{ memory: MemoryRecordView; replaced?: MemoryRecordView }> {
+  return write<{ memory: MemoryRecordView; replaced?: MemoryRecordView }>(
+    `/v1/console/memory/memories/${encodeURIComponent(input.memoryId)}/edit`,
+    { content: input.content, checksum: input.checksum })
+}
+
+/**
+ * Pin a memory, or let it go.
+ *
+ * A pinned memory comes before an unpinned one when the ranking ties, and nothing else about it changes. The act names the
+ * version it was made on.
+ */
+export function pinMemory(input: { memoryId: string; pinned: boolean; checksum: string }):
+  Promise<{ memory: MemoryRecordView }> {
+  return write<{ memory: MemoryRecordView }>(
+    `/v1/console/memory/memories/${encodeURIComponent(input.memoryId)}/pin`,
+    { pinned: input.pinned, checksum: input.checksum })
+}
+
+/**
+ * Delete a memory for good.
+ *
+ * The deletion is a deletion: the body of the memory goes away with the row that held it, together with the copies of
+ * those words that wait in the queue and the entries the keyword index holds. Nothing of it is kept — no fingerprint, no
+ * archived copy — and the same words may be proposed again afterwards, as a new fact with a new id.
+ *
+ * Only the operator's own key may do it. The answer names what is gone and never what it said.
+ */
+export function deleteMemory(input: { memoryId: string; checksum: string; reason?: string }):
+  Promise<{ deleted: MemoryDeletionView }> {
+  return write<{ deleted: MemoryDeletionView }>(
+    `/v1/console/memory/memories/${encodeURIComponent(input.memoryId)}/delete`,
+    { checksum: input.checksum, ...(input.reason === undefined ? {} : { reason: input.reason }) })
+}
+
+/** What one deletion took away. It names the rows that went, never what they said. */
+export interface MemoryDeletionView {
+  memoryId: string
+  scopeType: string
+  scopeId: string
+  removedMemories: number
+  removedCandidates: number
+  removedSnapshots: number
+}
+
 /** Read the queue of candidates. */
 export function readMemoryCandidates(query: { status?: string; limit?: number } = {}): Promise<MemoryCandidatePage> {
   const params = new URLSearchParams()
@@ -1436,11 +1488,19 @@ export function readMemoryCandidates(query: { status?: string; limit?: number } 
   return read<MemoryCandidatePage>(`/v1/console/memory/candidates${search === '' ? '' : `?${search}`}`)
 }
 
-/** Read the memories that are in force. */
-export function readLongTermMemories(query: { status?: string; limit?: number } = {}): Promise<MemoryRecordPage> {
+/**
+ * Read the memories that are in force.
+ *
+ * The list holds the memories that are in force. `includeInactive` turns on the rows that are not: the history versions
+ * and the memories that wait for a review are still in the running library, and a person governs them from the same
+ * list. A status may ask for one state on its own.
+ */
+export function readLongTermMemories(query: { status?: string; limit?: number; includeInactive?: boolean } = {}):
+  Promise<MemoryRecordPage> {
   const params = new URLSearchParams()
   if (query.status !== undefined && query.status !== '') params.set('status', query.status)
   if (query.limit !== undefined) params.set('limit', String(query.limit))
+  if (query.includeInactive === true) params.set('includeInactive', 'true')
   const search = params.toString()
   return read<MemoryRecordPage>(`/v1/console/memory/memories${search === '' ? '' : `?${search}`}`)
 }

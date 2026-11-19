@@ -33,7 +33,7 @@
 ### 1.2 SQLite 存储与备份一致性约束
 
 - 现有 `console.sqlite` 中的控制台事件日志受默认 $20{,}000$ 条 / $7$ 天自动裁剪规则限制，**严禁将 `Event History` 或 `Long-term Memory` 寄生在会被自动裁剪的日志表上**。
-- 持久事件历史表（`event_history_index`）与长期记忆表族（`memory_candidates`、`long_term_memories`、`memory_tombstones`、`memory_maintenance_runs`）可置于不受裁剪策略影响的独立 SQLite 库（如 `SUPERAGENT_MEMORY_DB`）或控制面持久库中；备份与回滚脚本必须将其与 `control.sqlite` 作为**同一原子快照组**处理，防止回滚后记忆的来源 `ticketId` / `assignmentId` 变成悬空引用。
+- 持久事件历史表（`event_history_index`）与长期记忆表族（`memory_candidates`、`long_term_memories`、`memory_maintenance_runs`）可置于不受裁剪策略影响的独立 SQLite 库（如 `SUPERAGENT_MEMORY_DB`）或控制面持久库中；备份与回滚脚本必须将其与 `control.sqlite` 作为**同一原子快照组**处理，防止回滚后记忆的来源 `ticketId` / `assignmentId` 变成悬空引用。
 
 ---
 
@@ -42,7 +42,7 @@
 Superagent 独立控制面本身不直接运行生成式大模型，真实模型会话均通过执行节点（Node）承载。Phase 5 各组件在双进程架构中的职责落点如下：
 
 1. **Memory Service（驻留控制面，严格零生成式 LLM）**：
-   - 位于 `src/memory/memory-service.ts`，纯程序化执行候选入队、幂等去重、作用域门禁、状态流转、版本更替、软归档/墓碑拦截及检索重排。
+   - 位于 `src/memory/memory-service.ts`，纯程序化执行候选入队、幂等去重、作用域门禁、状态流转、版本更替、永久删除及检索重排。
    - **向量编码与生成式推理彻底解耦**：在 `Memory Service` 外层定义可选的纯数值编码接口 `EmbeddingProvider`（仅输入文本返回浮点向量，不含任何提示词生成或对话能力）。当未配置本地/远端 `EmbeddingProvider` 或服务不可用时，检索器自动平滑降级为 SQLite FTS5 / BM25 确定性关键词检索，不阻塞系统运行。
 2. **Memory Manager（受限系统角色 `memory_manager.v1`）**：
    - 在 `src/control/roles.ts` 与节点工具桥中注册受限系统角色 `memory_manager.v1`，通过 `NodeResolver` 在主节点上按需唤醒短生命周期审核会话。
@@ -97,13 +97,14 @@ Superagent 独立控制面本身不直接运行生成式大模型，真实模型
 4. **证据不足（Insufficient Evidence -> 待确认或超时冷置）**：
    - 进入 `pending_human_confirm` 队列在控制台展示；超过配置保留期仍无补充证据的低置信候选转为 `expired_candidate`，不进入可信记忆库。
 
-### 4.2 用户显式偏好的“写后即读”与人工遗忘权（Tombstone）
+### 4.2 用户显式偏好的“写后即读”与人工遗忘权
 
 1. **消除同会话写后读滞后**：
    - 用户在主窗口明确表达全局偏好后若立即发出下一条指令，异步审核可能尚未完成。控制面对主窗口 `operator_explicit` 候选支持**当前 Router 会话内读穿透**（标记为 `provisional_same_session` 参与本会话后续拼装），待 Memory Manager 异步审结后无缝切换为正式记录。
-2. **控制台治理与墓碑防复活（`memory_tombstones`）**：
+2. **控制台治理与永久删除**：
    - 控制台需提供长期记忆列表的查看来源、手动编辑、置顶（`pinned`）与**删除/遗忘**操作。
-   - 用户手工删除某条记忆时，除将该记录标为 `forgotten` 外，必须在 `memory_tombstones` 表中记录其规范化内容指纹与作用域。后续每日维护或历史报告重审时若再次提取出命中墓碑指纹的候选，Memory Service 直接静默拦截（除非用户再次通过 `operator_explicit` 显式重新设定）。
+   - 用户遗忘记忆时，永久删除记忆正文、关联待审副本、关键词索引与向量。删除操作不为该条记忆保留墓碑或归档副本，既有工单和会话记录按自身保留规则处理。
+   - Agent 按记忆 ID 读取时，未知 ID 和已删除 ID 均返回同一种未找到错误，用户可见文案为「记忆不存在或已被用户删除」。搜索结果直接省略已删除记忆，旧 ID 不得重新分配。
 
 ---
 
@@ -175,7 +176,7 @@ Superagent 独立控制面本身不直接运行生成式大模型，真实模型
 | **P5-0** | §0、§1、§2、§3 | 厘清五类对象与 SQLite 归属；确认四级作用域（含 `node_env`）与防投毒规则；输出 `docs/023-phase5-memory-contract.zh-CN.md` 及必要 ADR。 |
 | **P5-1** | §1.1、§6.1 | `Live State` 按角色权限返回实时快照（接入 `NodeResolver.getLiveNodeSnapshots()`），断线如实报 `offline/unknown`，零长期记忆写入。 |
 | **P5-2** | §1.1、§1.2、§6.1 | `event_history_index` 独立于 7 天控制台日志裁剪；按 Ticket/Project 隔离精确查询；不建全局对话向量索引。 |
-| **P5-3** | §2.1、§3、§4 | `Memory Service` 零生成式 LLM 调用；实现候选队列、跨作用域提权拦截、版本更替链（`supersedes_id`）与墓碑防复活（`memory_tombstones`）。 |
+| **P5-3** | §2.1、§3、§4 | `Memory Service` 零生成式 LLM 调用；实现候选队列、跨作用域提权拦截、版本更替链（`supersedes_id`）、永久删除和按 ID 读取的未找到错误。 |
 | **P5-4** | §2.2、§2.3、§4.1、§6.2 | 注册受限角色 `memory_manager.v1`；纯重复直接归并、退回不隐式复活已停会话且最多重评 $1$ 次；离线维护如实记为未完成。 |
 | **P5-5** | §2.1、§5、§6.1 | SQL/索引层硬性前置过滤；双路相关性归一化与 $R_{\min}$ 门槛；`last_verified_at` 衰减；验收结单才累加 $U$ 并支持负反馈降权。 |
-| **P5-6** | §4.2、§6.1、§6.2 | 演示完整闭环（含同会话显式偏好写后即读、快路由/常规工单跨票复用、控制台查看来源与遗忘拦截、重启恢复后三域状态一致）。 |
+| **P5-6** | §4.2、§6.1、§6.2 | 演示完整闭环（含同会话显式偏好写后即读、快路由/常规工单跨票复用、控制台查看来源、永久删除及删除后按 ID 读取返回未找到、重启恢复后三域状态一致）。 |

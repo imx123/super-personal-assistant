@@ -7,8 +7,8 @@
  * control plane is exercised through its own real paths — the console's own routes and the records the control plane
  * really holds — so that what the memory holds is what really happened and not a label somebody typed.
  *
- * The forgetting of a memory is not part of this: the contract leaves the question open, so there is nothing here that
- * forgets anything, and no test pretends otherwise.
+ * The deletion of a memory is not part of this: it has its own file (`tests/memory-delete.spec.ts`), because it is a
+ * different kind of act — one that takes a body away — and it deserves assertions of its own.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'

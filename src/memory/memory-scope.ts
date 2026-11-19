@@ -22,6 +22,7 @@
  * global scope, and it carries its warning with it wherever it is read.
  */
 import { createHash } from 'node:crypto'
+import { stripQuoted } from '../control/fast-router.ts'
 import { redact } from '../infra/redact.ts'
 
 /** Where a fact belongs. `ticket` is deliberately not one of them: a Ticket's own detail is not a memory. */
@@ -296,6 +297,13 @@ export interface MemorySourceRecord {
   readonly projectId?: string
   /** The machine the record was made on, when it has one. */
   readonly nodeId?: string
+  /**
+   * The person's own words, when the record is a message the person wrote directly.
+   *
+   * It is here for one check only: a fact that claims to be the person's own words has to be found in them. The words are
+   * never written into the memory table — only the id of the message and a redacted line about it are.
+   */
+  readonly text?: string
 }
 
 /** How the control plane is asked about a record a source reference names. */
@@ -328,7 +336,7 @@ export interface ValidatedSources {
  * quotes a message the person wrote and that the control plane still holds.
  */
 export function validateSourceRefs(inputs: readonly SourceRefInput[], resolve: SourceResolver,
-  options: { readonly operator: boolean; readonly scope?: MemoryScope }): ValidatedSources {
+  options: { readonly operator: boolean; readonly scope?: MemoryScope; readonly content?: string }): ValidatedSources {
   const refs: MemorySourceRef[] = []
   let tainted = false
   let authoritative = false
@@ -348,6 +356,13 @@ export function validateSourceRefs(inputs: readonly SourceRefInput[], resolve: S
     if (record.tainted) tainted = true
     if (record.authoritative) authoritative = true
     if (input.kind === 'operator_message') operatorMessage = true
+    // The words of a fact that claims to be the person's own must be found in the person's own message. A fact that is
+    // not there may come from a quotation, from an attachment or from a paraphrase of somebody else's words, and then it
+    // is not the person's own words: it loses the trust of them and stays untrusted all the way down.
+    if (input.kind === 'operator_message' && options.content !== undefined && record.text !== undefined
+      && !groundedInMessage(options.content, record.text)) {
+      tainted = true
+    }
     // A record belongs to the Project or the machine it was made in: a fact about another one may not lean on it, or it
     // would be about something else than the record it names says.
     if (belongsToAnotherScope(record, options.scope)) tainted = true
@@ -367,6 +382,24 @@ export function validateSourceRefs(inputs: readonly SourceRefInput[], resolve: S
       : authoritative ? 'verified_execution'
         : 'external_tainted'
   return { refs, trust, operatorSpoken: spoken }
+}
+
+/**
+ * Whether the words of a fact are the words of the person.
+ *
+ * The words have to be found in the message the person wrote, and they have to be found outside every quotation: a person
+ * who quotes somebody else did not say those words themselves. Everything else — an attachment, an observation from
+ * outside, the model's own paraphrase — is not in the message at all and is therefore not the person's words either.
+ *
+ * The comparison is the same one the fingerprint uses: NFKC, folded blanks, trimmed and lower-cased, so that the same
+ * words in the same order are the same words however they were spaced or cased.
+ */
+export function groundedInMessage(content: string, message: string): boolean {
+  const needle = normalizeMemoryText(content)
+  if (needle === '') return false
+  if (!normalizeMemoryText(message).includes(needle)) return false
+  // The quoted spans are taken out of the message first: what is left is what the person wrote with their own voice.
+  return normalizeMemoryText(stripQuoted(message)).includes(needle)
 }
 
 /**

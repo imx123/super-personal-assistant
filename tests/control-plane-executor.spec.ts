@@ -8,6 +8,7 @@ import { ControlPlane } from '../src/control/control-plane.ts'
 import { KV } from '../src/kv.ts'
 import { FakeNode } from '../src/node/fake-node.ts'
 import type { NodeCommand, NodeEvent, NodePort, SessionInspection } from '../src/shared/protocol.ts'
+import { messagesWithoutContext } from './fixtures/context.ts'
 
 const SECRET = 'executor-secret'
 const START = '2026-01-01T00:00:00.000Z'
@@ -125,10 +126,11 @@ describe('control-plane NodeExecutor', () => {
       'the Assignment did not reach running before delivery')
 
     plane.engine.messageTicket(ticket!.id, 'more context for this Ticket')
-    await until(() => node.messages.get(`worker-${assignment.id}`)?.includes('more context for this Ticket') === true,
+    await until(() => messagesWithoutContext(node.messages.get(`worker-${assignment.id}`))
+      .includes('more context for this Ticket'),
       'the waiting input was not delivered')
 
-    expect(node.messages.get(`worker-${assignment.id}`)).toContain('more context for this Ticket')
+    expect(messagesWithoutContext(node.messages.get(`worker-${assignment.id}`))).toContain('more context for this Ticket')
   })
 
   it('delivers a Trigger Input’s own message and task meta, not only its id', async () => {

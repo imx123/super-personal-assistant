@@ -311,7 +311,7 @@ describe('the fast router of the control plane', () => {
     expect(answer.routing).toMatchObject({ outcome: 'existing_project_pm', stage: 'assigned', sessionId: pmSessionId,
       target: { kind: 'project', id: projectId, title: '周报整理' } })
 
-    // The PM received the instruction, and only the instruction.
+    // The PM received the instruction, with the control plane's own reference material beside it and in its own fence.
     const received = messagesOf(pmSessionId)
     expect(received).toHaveLength(1)
     expect(received[0]).toContain('把登录改成 SSO')
