@@ -1,6 +1,6 @@
 # Superagent 项目交接
 
-2026-11-18 更新。交付分支为 `next`，项目基线为 `6875ef9`，Phase 3 阶段签收记录为 `23b97db`。接手时先用 `git status -sb` 和 `git log -5 --oneline` 核对检出版本。
+2026-11-19 更新。交付分支为本地 `next`。Phase 5 已通过单节点 P5-Gate，受测代码为 `2f9ee4a`。项目基线为 `6875ef9`，Phase 3 签收记录为 `23b97db`。接手时先用 `git status -sb` 和 `git log -5 --oneline` 核对检出版本。
 
 ## 1. 实施进度与接手顺序
 
@@ -19,11 +19,18 @@
 | P4-4 外部观察事件订阅 | 已通过真实 DSH 与 Edge 的合成群聊、短信和三种投递模式验收。 | `3a975aa` |
 | P4-5 协调投递持久化与恢复 | 六类投递落库，故障注入与真实 DSH 重启对账已验收。 | `bfbd1e6` |
 | P4-Gate | 单节点阶段验收通过。真实 DSH 闭环通过，Windows 兼容回归与已知基线一致。 | `9fbe505` |
-| P5-0 三域记忆契约 | 尚未开始实施。 | — |
+| P5-0 三域记忆契约 | 完成，三域数据边界与「记忆」入口。 | `b1722ae` |
+| P5-1 实时状态 | 完成，按角色和授权作用域提供实时快照。 | `c2fc46a` |
+| P5-2 持久事件历史 | 完成，关键事实可按工单检索，独立于短期日志。 | `30c6d97` |
+| P5-3 候选和长期库 | 完成，候选队列、来源、作用域门禁和版本流转。 | `297d31e` |
+| P5-4 审核及巡检 | 完成，四工具 Memory Manager、审核追溯和每日维护。 | `811f2ad` |
+| P5-5 记忆检索 | 完成，作用域前置过滤、中文关键词、评分说明和控制台搜索。 | `e60462c` |
+| P5-6 上下文和治理 | 完成，派工召回、真实采用计效与永久删除。 | `2f9ee4a` |
+| P5-Gate | 单节点签收，真实 DSH、Gemma 4 12B、Edge 和 Windows 基线对照通过。 | 受测代码 `2f9ee4a` |
 
 P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定向回归通过。真实 DSH 核对了两条闭环、会话干预和 Worker 停止后的重启恢复。全量测试的遗留问题和真实证据见 [P3-Gate 记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p3-gate)。
 
-`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P4-0 至 P4-Gate 已签收，下一项是 P5-0 三域记忆数据契约与设计。 [P4-Gate 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-gate) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
+`next` 的 Phase 4 和 Phase 5 由 Claude Code 以 `max` effort 实施，Codex 负责独立验收。P5-0 至 P5-Gate 均已签收。 [P5-Gate 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p5-gate) · [主线计划](docs/roadmap/NEXT_MAINLINE_PLAN_v1.1.md) · [Phase 4 补充规范](docs/roadmap/NEXT_PHASE4_SUPPLEMENT_v1.0.md) · [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
 
 `feat/multi-node` 由跨设备负责人实施和验收。两条线共用 `NodeResolver` 接口。双 Windows 通过 Tailscale 验收后，在临时集成工作树复跑双机用例、单节点回滚和届时的主线用例。Android 是后续扩展。 [跨设备计划](docs/roadmap/MULTI_NODE_PLAN_v1.1.md)
 
@@ -48,6 +55,10 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 - 控制台首页可创建外部事件订阅、查看投递状态、注入模拟群聊或短信。群聊可按群 ID 和文本关键词组合匹配，短信可按文本关键词匹配。命中默认直送该订阅的目标。只有操作员可以显式开启双层路由。 [外部事件验收](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p4-4)
 - 更改任务时区并重启控制面后，重新保存日或周计划即可按新偏移计算下次运行。按间隔运行的计划保留原节奏。调度器开始执行每条计划时读取当时有效的正文和目标项目。
 
+控制台侧栏「记忆」位于 `/console#/memory`。实时状态显示当前节点和工作；事件历史按工单与项目查询和翻页；长期记忆提供候选、审核、巡检、作用域搜索与评分说明。操作员可以查看来源、编辑成新版本、置顶或永久删除，可切换显示历史及待复核记忆。只读连接密钥可查看。 [控制台](docs/017-console.zh-CN.md) · [上下文与治理](docs/025-phase5-context-and-governance.zh-CN.md)
+
+按已批准的永久删除规范，二次确认会移除运行库正文、相关待审副本和索引，不留指纹。按 ID 读取已删记忆会返回「记忆不存在或已被用户删除」。既有工单、会话和备份按各自规则保留。如果从原来源重新提取同一事实，系统会分配新 ID。 [Phase 5 补充规范](docs/roadmap/NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)
+
 ## 3. 两套入口与数据归属
 
 | 入口 | 代码 | 负责什么 |
@@ -57,7 +68,7 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 | 原有 DSH 插件 | `src/index.ts`、`src/app/runtime.ts`、`src/client/` | 保留插件自身的主会话、GitHub/飞书来源、执行器与 DSH 面板。面板 API 为 `/orchestrator/api`。这套运行时与独立控制面各自持有数据。 |
 | 协议测试入口 | `src/node/main.ts` | `node lib/node.js` 运行 FakeNode，适合验证协议与调试。真实节点用上一行的 DSH profile 入口。 |
 
-`src/core/` 负责两套入口共用的工单状态和权限规则。独立控制面把业务状态保存到 `SUPERAGENT_CONTROL_DB`，把事件、操作日志、项目备忘、定时计划及运行设置保存到 `SUPERAGENT_CONSOLE_DB`。实际 DSH 对话和会话日志由节点的专用 `DSH_HOME` 持有，项目源码留在执行节点的工作区。
+`src/core/` 负责两套入口共用的工单状态和权限规则。独立控制面在 `SUPERAGENT_CONTROL_DB` 保存业务状态、持久事件历史和长期记忆表，在 `SUPERAGENT_CONSOLE_DB` 保存短期控制台事件、操作日志、手工项目备忘、定时计划及运行设置。长期记忆和持久历史随业务库同一快照备份和回滚。实际 DSH 对话和会话日志由节点的专用 `DSH_HOME` 持有，项目源码留在执行节点的工作区。
 
 正常派工走 Router 或 PM 工具，再由 `src/control/executor.ts` 启动 Worker。排查执行时，以 `GET /v1/sessions` 里的记录为准。独立节点的 Worker 会话 ID 是 `worker-<assignmentId>`，底层领域记录中的 `Assignment.sessionId` 仍可能沿用旧命名。
 
@@ -78,9 +89,9 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 | --- | --- |
 | 一个入口、工单所有权、PM 与 Worker 协作 | 单节点主流程已跑通。独立工单归 Router，项目工单归项目 PM，多次派工分别对应执行会话。 |
 | 双层路由与项目创建条件 | 确定性快路由和高层 Router 已接入。自动建项目经过四条件校验，首页显示判断依据与真实 PM 状态。属于已有项目的普通任务由高层 Router 直接交给该项目的 PM，服务端按本人原话复核，无需人工确认；门禁建项目后工作说明交给新项目的 PM，由它自行建单。 |
-| 事件订阅和审批 | 定时唤醒和 Agent 主动上报已接通。独立控制面还缺邮件、日历、仓库事件订阅，以及自动拒绝累计到阈值后触发上级审查。 |
+| 事件订阅和审批 | 定时唤醒、Agent 上报、直属下级会话摘要和权限拒绝审查已验收。外部事件以合成群聊和短信验证关键词匹配与定向投递。 |
 | 多节点与其他运行时 | 当前只连接一个 DSH 节点。同节点恢复已经验证。节点选择、故障时改派其他节点、跨节点同步项目文件，以及 Claude/Codex 执行适配尚未实现。 |
-| 三域记忆 | 已能查实时状态、工单历史和项目备忘。长期记忆的候选、审核、索引、召回和维护还没做。控制台的事件日志受保留规则约束。 |
+| 三域记忆 | 实时状态、持久事件历史、长期记忆已上线。手工项目备忘独立保存，和相关记忆一起供授权回合读取。控制台有长期记忆治理与维护。 |
 
 同一项目的 Worker 当前共用工作目录。PM 的只读 diff 反映目录快照，其中可能包含其他 Worker 或人改动的内容。代码审阅要求仓库位于项目工作区，当前实现会拒绝 linked worktree 等使用外置 Git 元数据的布局。待确认的 Router 转发提议与普通 PM 通知的投递状态保存在内存。重启后可以从持久工单查报告，尚未确认的 Router 转发须重新发起。
 
@@ -89,6 +100,10 @@ P3-Gate 已在 `b2ff528` 通过。类型检查、构建及 56 文件 753 项定�
 工作区隔离只在 Git 层验证：19 项检查通过，覆盖两个派工写不同文件、写同一文件、linked worktree 合并冲突、失败目录保留和单派工 diff。真实 DSH 没有切换路径，生产继续用共享目录和现有审阅校验，候选方案与取舍见 [工作区实验与设计记录](docs/roadmap/PHASE3_WORKSPACE_SPIKE.md)。
 
 ## 6. 验证范围
+
+P5-Gate 在 Windows 上使用 DSH Desktop `0.2.2.0`、隔离 `phase3-live` profile、`dsh-superagent/node` 与 Edge。两张工单验证审核入库、授权跨票召回及重启，脚本模型驱动实际角色与工具，本机 Gemma 4 12B 另完成从记忆取值、写文件和报告。控制台在 390px 核对三个面板、历史版本切换、永久删除和按 ID 未找到。待复核记录的删除由服务测试验证。证据对应执行日志中 `live-okV5fi`、`live-U5mQ7F` 与 `live-Pvwee8` 等目录。 [P5-Gate 验收记录](docs/roadmap/PHASE3_5_EXECUTION_LOG.md#p5-gate)
+
+同构建通过类型检查和 961 项定向用例。Windows 全量 2,350 项通过、45 项基线失败；旧 jsdom 文件的 React 渲染失败与对照一致。双 Windows/Tailscale 验收属于跨设备分支。
 
 P3-3B 类型检查、构建通过，55 个定向文件共 737 项通过、1 项因 Windows 目录联接限制跳过。真实验收使用 Edge、DSH Desktop `0.2.2.0`、隔离 `phase3-live` profile、`dsh-superagent/node` 和本机 Gemma 4 12B，通过两条新验收链路，包括已有项目免确认交接并完成工单，以及门禁自动创建一个项目后由 PM 派三个工单、Worker 写出三个文件、PM 完成三次验收，项目报告回到 Router 收件箱。证据见 [执行日志](docs/roadmap/PHASE3_5_EXECUTION_LOG.md)。
 

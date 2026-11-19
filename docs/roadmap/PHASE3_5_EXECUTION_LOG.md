@@ -1,6 +1,6 @@
 # Phase 3–5 执行日志
 
-2026-11-18 更新。项目基线为 `6875ef9`，Phase 3 验收记录提交为 `23b97db`。Codex 负责 `next` 的 Phase 4、Phase 5 实施和验收，`feat/multi-node` 由跨设备负责人实施和验收。每个任务独立提交，上一阶段通过后进入下一阶段。
+2026-11-19 更新。项目基线为 `6875ef9`，Phase 3 验收记录提交为 `23b97db`。Claude Code 以 `max` effort 实施 `next` 的 Phase 4 和 Phase 5，Codex 独立验收，`feat/multi-node` 由跨设备负责人实施和验收。每个任务独立提交，上一阶段通过后进入下一阶段。
 
 后续执行以 [主线计划 v1.1](NEXT_MAINLINE_PLAN_v1.1.md)、[Phase 4 补充规范](NEXT_PHASE4_SUPPLEMENT_v1.0.md)和 [Phase 5 记忆补充规范](NEXT_PHASE5_MEMORY_SUPPLEMENT_v1.0.md)为准，阶段细节采用对应补充规范。[跨设备计划 v1.1](MULTI_NODE_PLAN_v1.1.md)用于核对共享接口、文件及数据归属和合流验收。原件中「P3-Gate 待验收」是编写时状态，当前以本日志的 [P3-Gate 签收](#p3-gate)为准。
 
@@ -25,8 +25,8 @@
 | P5-3 | P5-0 | Memory Service 与候选队列 | DONE |
 | P5-4 | P5-3、P4-1 | Manager 审核及维护，真实模型 | DONE |
 | P5-5 | P5-1、P5-2、P5-3 | 按需检索与排序，验证检索进入模型 | DONE |
-| P5-6 | P3、P4、P5 主功能 | 三域与路由协作闭环，真实模型 | IN_PROGRESS |
-| P5-Gate | P5-0–P5-6 | 三域、权限、恢复与全链路回归 | NOT_STARTED |
+| P5-6 | P3、P4、P5 主功能 | 三域与路由协作闭环，真实模型与控制台治理 | DONE |
+| P5-Gate | P5-0–P5-6 | 三域、权限、恢复与全链路回归 | DONE |
 
 ## Phase 4 实施方向
 
@@ -300,3 +300,20 @@ P5-5 开始实施权限前置的检索、评分与控制台搜索。
 - 类型检查和构建通过。25 个定向文件 507 项通过。Windows 全量 2,289 项通过、45 项失败，失败集合及测试文件错误与 P5-4 基线一致。报告见 `.artifacts/phase5-p5-5-20261119/`。
 
 P5-6 开始实施派工与回合上下文拼装、实际使用归因和控制台记忆治理。
+
+## P5-6
+
+2026-11-19 签收。Claude Code 使用 Sonnet 5.5 和 `max` effort 实施，Codex 独立验收。隔离候选 `bfde44a` 与本地 `next` 的 `2f9ee4a` 树内容一致。
+
+- Router、PM 与 Worker 在授权范围内读取实时状态、手工项目备忘与符合相关度门槛的长期记忆。上下文附在原文之后并标明数据边界。用户明确设定的偏好在等待人工审核时仅能被同一 Router 会话读到。快路由的 Worker 在首轮获得相关记忆，Router 仍为零模型回合。
+- 注入账本按投递确认、Session、工单、派工、节点及代际核对实际采用的记忆。重复投递和报告不会重复记账。只读和曝光不提高效用，工作完成或验收通过后才更新。
+- 控制台 `/console#/memory` 提供来源、按作用域检索、编辑新版本、置顶和永久删除。可显示历史版本与待复核记录。按用户选定草稿，二次确认清除运行库当前正文、同作用域同内容的副本与对应索引，不保留指纹。历史工单、会话和旧备份各按自身规则处理，从原来源重新提取时分配新 ID。已删、未知和无权读取的 ID 返回同一未找到结果。 [上下文与治理](../025-phase5-context-and-governance.zh-CN.md)
+- 实机使用隔离 DSH Desktop 0.2.2.0 的 `phase3-live` profile 和 `dsh-superagent/node`。两张工单的审核、召回、效用和重启证据见 `.artifacts/phase3-5-20261117/live-okV5fi/evidence.json`。快路由和同会话偏好见 `live-nCJy1i`，本机 Gemma 4 12B 按记忆写文件并上报见 `live-U5mQ7F`，Edge 在 390px 验证生效与历史版删除、按 ID 读取、FTS 清除和新 ID 见 `live-Pvwee8`。用例均使用合成数据。
+
+## P5-Gate
+
+2026-11-19 单节点签收。受测代码为本地 `next` 的 `2f9ee4a`。类型检查和构建通过，重建后的控制面与控制台 bundle 散列和实机构建相同。
+
+- 60 个定向文件共 961 项通过。独立跑 Windows 全量，2,350 项通过、45 项失败，失败集合和测试文件错误与 P5-5 基线一致。全量和模型并行时有一次旧报告压力用例超时，独立复跑通过。13 个旧 jsdom 文件使用同一锁定依赖预加载复跑，12 项通过、104 项 React 渲染失败，与 P5-5 对照相同。报告见 `.artifacts/phase5-p5-6-20261119/gate-focused.json`、`gate-vitest-dedicated.json`、`p55-jsdom-reference.json` 和 `accepted-legacy-jsdom.json`。
+- 同一构建复验快路由、PM 自动交接与 Scheduler（`live-puQF02`），真实 DSH 两 Worker 重叠执行、PM 验收及停用后的持久拒绝（`live-XYKD0L`），下级增量摘要（`live-aaTsou`），权限拒绝审查包作用域（`live-P3gE2N`），合成群聊与短信关键词订阅（`live-quzmWu`）和回执重启对账（`live-yf5wOc`）。早一轮双 Worker 的 Gemma 夹具在 PM 回合收到空模型响应，双 Worker 签收采用脚本模型驱动真实 DSH。Gemma 在 P5 快路由采用记忆并实际写文件的验证通过。
+- Edge 复验实时状态及断线状态（`live-G3jEr6`）、按项目翻页与延迟响应隔离（`live-8JcZiR`）、中文关键词与评分（`live-8LTDXm`）、永久删除及范围隔离（`live-Pvwee8`）。证据及截图在 `.artifacts/phase3-5-20261117/` 对应目录。跨设备合流仍由 `feat/multi-node` 的双机验收决定。
